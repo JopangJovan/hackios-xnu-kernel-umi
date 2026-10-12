@@ -8,7 +8,9 @@ usage: touch.py STEP...
   key NAME [MS]               press a button: lock, home, volup, voldown; fivefingers = five fingers on the
                               screen for MS (held 1500 ms they end the run)
   stacks PROCESS              have the kernel print where the threads of that process are (the
-                              addresses come out in the log; qemu/symstack.py names them)
+                              addresses come out in the log; qemu/symstack.py names them).
+                              "stacks top" is something else: which processes have had the processor
+                              since it was last asked ("top:" lines in the log)
   wait SECONDS
 Positions are fractions of the screen: 0 0 is the top left corner, 1 1 the bottom right.
 Example, the "swipe up to open" gesture:  touch.py swipe 0.5 0.98 0.5 0.4 250

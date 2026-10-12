@@ -3,8 +3,9 @@
 
 usage: symstack.py LOG [PROCESS]
 
-Reads the "ustacks:" (boot-args ustacks=NAME ustacks_at=SECONDS [ustacks_ms=PERIOD]) and "usertrap:" lines of a
-console log, subtracts the shared cache slide and looks every address up in the iOS dyld
+Reads the "ustacks:" (boot-args ustacks=NAME ustacks_at=SECONDS [ustacks_ms=PERIOD]), "usertrap:" and
+"userabort:" lines of a console log (and, before a "userabort:", the "First throw call stack" of the exception
+that led to it), subtracts the shared cache slide and looks every address up in the iOS dyld
 shared cache with "ipsw dyld a2s". Lookups take a few seconds each, so the answers are kept
 in ios165/a2s.json. Addresses outside the cache (the program itself) are shown as they are.
 """
@@ -39,8 +40,24 @@ def main():
     log = sys.argv[1]
     only = sys.argv[2] if len(sys.argv) > 2 else None
     slide, show = 0, True
+    thrown = None                       # the addresses after "*** First throw call stack:", until the abort
     for line in open(log, errors='replace'):
         line = line.rstrip('\n')
+        if re.fullmatch(r'\((0x[0-9a-f]+ ?)+\)', line):
+            thrown = line[1:-1].split()
+            continue
+        m = re.search(r'userabort: (\S+)\[(\d+)\] aborts, shared cache slide (0x[0-9a-f]+); called from: (.*)', line)
+        if m:
+            if only is None or m.group(1) == only:
+                print(f'userabort: {m.group(1)}[{m.group(2)}]')
+                for text in m.group(4).split():
+                    print(f'    {name(int(text, 16), int(m.group(3), 16))}')
+                if thrown:
+                    print('  the exception was thrown from')
+                    for text in thrown:
+                        print(f'    {name(int(text, 16), int(m.group(3), 16))}')
+            thrown = None
+            continue
         m = re.search(r'(ustacks|usertrap): (\S+)\[(\d+)\].*shared cache slide (0x[0-9a-f]+)', line)
         if m:
             slide = int(m.group(4), 16)
