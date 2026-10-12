@@ -1,0 +1,43 @@
+#!/bin/bash
+# Boot the whole system under QEMU: the big system image preloaded at the loader's resident
+# address (it becomes /dev/md0, the root) and the small image in the payload (/dev/md1), the
+# same arrangement `xl ramdisk` + `xl run` make on the phone.
+# usage: run-ios.sh [seconds] [extra qemu args...]
+# env: ROOT=<small image>, IMG=<system image>, CMDLINE=<extra boot-args>
+# The machine has a display (ramfb; without one SpringBoard does not start): the loader sets a mode of the
+# size of the phone's screen. qemu/screendump.sh saves a picture of it (through the monitor on port 4444).
+# Add "-display gtk" to see it in a window and use it with the mouse: the pointer with the left button
+# held is a finger (the keys L, H, Up and Down are the lock, home and volume buttons).
+# Touches can also be sent from a script: qemu/touch.py (through the QMP socket on port 4445).
+#
+# The system image is not read into QEMU: guest RAM is a private mapping of qemu/ram.img, a sparse
+# file that holds the image at the right offset (reflinked, so it costs neither disk space nor
+# host RAM).
+cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
+K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+[ -f $K ] || { K=prebuilt/mach.development.bcm2837; echo "run-ios.sh: no kernel built here, using $K" >&2; }
+IMG=${IMG:-userland/system.packfs}
+ROOT=${ROOT:-userland/root.packfs}
+[ -f "$IMG" ] && [ -f "$ROOT" ] || { echo "run-ios.sh: $IMG or $ROOT is missing (userland/build.sh makes them)"; exit 1; }
+SECS=${1:-60}; shift
+RAM_BASE=0x40000000 RD_ADDR=0xFC000000 RAM_SIZE=$((12 << 30))
+
+if [ ! -f qemu/ram.img ] || [ "$IMG" -nt qemu/ram.img ]; then
+	python3 - "$IMG" qemu/ram.img $((RD_ADDR - RAM_BASE)) $RAM_SIZE <<'PY' || exit 1
+import os, sys
+src = os.open(sys.argv[1], os.O_RDONLY)
+dst = os.open(sys.argv[2], os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+offset, size = int(sys.argv[3]), int(sys.argv[4])
+os.ftruncate(dst, size)
+total, done = os.fstat(src).st_size, 0
+while done < total:
+    done += os.copy_file_range(src, dst, total - done, done, offset + done)
+PY
+fi
+xnuloader/mkpayload.py -o qemu/payload.bin kernel=$K ramdisk=$ROOT --rdres "$(printf '%x' "$(stat -c %s "$IMG")")" \
+	--cmdline "loader_return_after=$SECS epoch=$(date +%s) virtio_input=1 $CMDLINE" >/dev/null || exit 1
+QEMU_MEM=12G exec qemu/run.sh $((SECS + 40)) \
+	-object memory-backend-file,id=ram,size=$RAM_SIZE,mem-path="$PWD/qemu/ram.img",share=off \
+	-machine memory-backend=ram \
+	-global virtio-mmio.force-legacy=false -device virtio-tablet-device -device virtio-keyboard-device \
+	-device ramfb -monitor tcp:127.0.0.1:4444,server,nowait -qmp tcp:127.0.0.1:4445,server,nowait "$@"

@@ -1,0 +1,177 @@
+#!/bin/bash
+# xl — drive the XNU loader on the phone over USB (fastboot protocol).
+#
+#   xl enter            get the phone into the resident loader (from Android or stock fastboot)
+#   xl run [N]          upload the current kernel, run it (optionally stop at checkpoint N), fetch the log
+#   xl ramdisk [FILE]   upload the big system image (default userland/system.packfs) once; it stays in
+#                       the phone's RAM across kernel runs and is the root filesystem (/dev/md0)
+#                       ("xl ramdisk none" forgets it; the image sent with the kernel is then the root)
+#   xl screenshot [F]   save what is in the phone's framebuffer as a PNG (default logs/screen.png)
+#   xl recording [F]    fetch the screen recording the last run made (rec_secs=N among XL_CMDLINE) and
+#                       make a video of it (default logs/recording.mp4)
+#   xl selftest         exercise only the kernel->loader return path
+#   xl log              fetch the loader's current log
+#   xl hang             watchdog test: make the loader hang on purpose
+#   xl reboot           cold-reset the phone (back to Android)
+#   xl reload           restart the phone into a freshly built loader (after changing xnuloader/)
+#   xl memmap           the phone's memory map as its firmware reports it
+#   xl state            where is the phone right now
+#
+# Logs land in logs/. Environment for `run`:
+#   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
+#               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls)
+#   XL_SECS     seconds after which the kernel returns to the loader on its own (default 8)
+#   XL_SB_DELAY seconds SpringBoard waits before it starts (default 8; see userland/src/inject_sb.c)
+#               Among XL_CMDLINE, for the phone: bootcpu=7 runs the kernel on the biggest core instead of
+#               the small one the firmware starts on (the loader then watches from the first core, and a
+#               kernel that hangs still gets its log out); cpufreq=1 sets that core to its top speed;
+#               touchscreen=1 turns the touch screen on.
+#   XL_RAMDISK  the image sent with the kernel: the small one that is mounted on /redwood
+#               (default userland/root.packfs; "none" sends none). Without a system image in the
+#               phone's RAM it is the root itself (e.g. XL_RAMDISK=userland/hello).
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+# the kernel and the loader built here, or else the ones that come with the repository
+K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+[ -f $K ] || K=prebuilt/mach.development.bcm2837
+L=xnuloader/loader.efi
+[ -f $L ] || L=prebuilt/loader.efi
+mkdir -p logs
+
+fb() { timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
+in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
+is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
+state() {
+	if is_loader; then echo loader
+	elif in_fastboot; then echo fastboot
+	elif [ "$(adb get-state 2>/dev/null)" = device ]; then echo android
+	else echo absent; fi
+}
+wait_for() { # wait_for <state> <seconds>
+	local i
+	for ((i = 0; i < $2; i += 2)); do [ "$(state)" = "$1" ] && return 0; sleep 2; done
+	return 1
+}
+
+enter() {
+	case "$(state)" in
+	loader) return 0 ;;
+	android) adb reboot bootloader; wait_for fastboot 60 || { echo "xl: phone did not reach fastboot"; return 1; } ;;
+	fastboot) ;;
+	absent) echo "xl: waiting for the phone (Android or fastboot)..."
+		local i; for ((i = 0; i < 180; i += 3)); do [ "$(state)" != absent ] && break; sleep 3; done
+		[ "$(state)" = absent ] && { echo "xl: phone not reachable"; return 1; }
+		enter; return ;;
+	esac
+	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null &&
+		./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null || { echo "xl: image build failed"; return 1; }
+	# Right after the phone enters fastboot the first "boot" is sometimes not taken: try twice.
+	local try
+	for try in 1 2; do
+		FB_TIMEOUT=40 fb boot xnu-usb.img | grep -q OKAY || { sleep 3; continue; }
+		sleep 6
+		wait_for loader 30 && return 0
+		[ "$(state)" = fastboot ] || break
+	done
+	echo "xl: loader did not come up on USB (state: $(state))"; return 1
+}
+
+fetch_log() { # fetch_log <file>
+	rm -f "$1"
+	FB_TIMEOUT=20 fb get_staged "$1" >/dev/null
+	[ -s "$1" ] && tr -d '\0' < "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+
+run() { # run <oem command> <label>
+	enter || return 1
+	local stamp log result
+	stamp=$(date +%H%M%S); log="logs/$stamp-$2.log"
+	if [ "$1" != "oem selftest" ]; then
+		# The kernel hands control back after XL_SECS seconds even if it is just waiting.
+		local rd=${XL_RAMDISK:-userland/root.packfs}
+		case "$rd" in
+		none|resident) rd= ;;
+		*) [ -f "$rd" ] || { echo "xl: ramdisk $rd not found"; return 1; } ;;
+		esac
+		case $K in prebuilt/*) echo "xl: no kernel built here, running $K" >&2 ;; esac
+		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} ${XL_CMDLINE--v}" >/dev/null || return 1
+		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
+	fi
+	fb $1 >/dev/null
+	result=$(FB_TIMEOUT=$(( ${XL_SECS:-8} + 100 )) fb getvar result | grep '^result:')
+	if [ -z "$result" ]; then
+		echo "xl: no answer — the kernel hung; waiting for the watchdog to reset the phone"
+		wait_for android 120 && echo "xl: phone is back in Android" || echo "xl: phone did not come back (state: $(state))"
+		return 2
+	fi
+	fetch_log "$log"
+	ln -sf "$(basename "$log")" logs/last.log
+	echo "$result  [$log]"
+	case "$result" in
+	*hung*|*no-such-core*)
+		# (bootcpu=N) the kernel is stuck on the core it was given and nothing can take the core back
+		echo "xl: the kernel did not come back from its core; restarting the phone"
+		fb reboot >/dev/null
+		return 2 ;;
+	esac
+}
+
+recording() { # recording [file.mp4]
+	enter || return 1
+	local out=${1:-logs/recording.mp4}
+	fb oem recording | grep -q OKAY || { echo "xl: the last run left no recording (boot-arg rec_secs=N)"; return 1; }
+	FB_TIMEOUT=120 fb get_staged logs/recording.raw >/dev/null
+	tools/recording.py logs/recording.raw "$out" && rm -f logs/recording.raw
+}
+
+ramdisk() { # ramdisk [<file>|none]
+	enter || return 1
+	if [ "$1" = none ]; then fb oem ramdisk none >/dev/null; echo "xl: resident ramdisk dropped"; return; fi
+	set -- "${1:-userland/system.packfs}"
+	[ -f "$1" ] || { echo "xl: $1 not found"; return 1; }
+	local t0=$(date +%s) size=$(stat -c %s "$1")
+	fb oem ramdisk | grep -q OKAY || { echo "xl: the loader refused (no memory window?)"; return 1; }
+	FB_TIMEOUT=1800 fb stage "$1" | grep -q OKAY || { echo "xl: upload failed"; return 1; }
+	local dt=$(( $(date +%s) - t0 )); [ $dt -lt 1 ] && dt=1
+	echo "xl: $(( size / 1048576 )) MB uploaded in $dt s ($(( size / 1048576 / dt )) MB/s)"
+}
+
+screenshot() { # screenshot [file.png]
+	enter || return 1
+	local out=${1:-logs/screen.png} geom
+	geom=$(fb getvar screen | sed -n 's/^screen: //p')
+	[ -n "$geom" ] && fb oem screenshot | grep -q OKAY || { echo "xl: the loader has no display"; return 1; }
+	FB_TIMEOUT=60 fb get_staged logs/screen.raw >/dev/null
+	python3 - logs/screen.raw "$out" $geom <<'PY' && rm -f logs/screen.raw && echo "xl: $out ($geom)"
+import struct, sys, zlib
+raw, out, width, height, stride = sys.argv[1], sys.argv[2], *map(int, sys.argv[3:6])
+data = open(raw, 'rb').read()
+rows = bytearray()
+for y in range(height):
+    line = data[y * stride:y * stride + width * 4]
+    rows.append(0)                                    # PNG filter type: none
+    rgb = bytearray(width * 3)
+    rgb[0::3], rgb[1::3], rgb[2::3] = line[2::4], line[1::4], line[0::4]   # the panel is BGRX
+    rows += rgb
+def chunk(kind, body):
+    return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
+with open(out, 'wb') as f:
+    f.write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)) +
+            chunk(b'IDAT', zlib.compress(bytes(rows), 6)) + chunk(b'IEND', b''))
+PY
+}
+
+case "$1" in
+enter) enter && echo "xl: loader is up" ;;
+screenshot) screenshot "$2" ;;
+recording) recording "$2" ;;
+ramdisk) ramdisk "$2" ;;
+run) run "oem run $2" "run${2:+-cp$2}" ;;
+selftest) run "oem selftest" selftest ;;
+log) enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loader.log ;;
+memmap) enter && fb oem memmap >/dev/null && fb oem log >/dev/null && fetch_log logs/loader.log && sed -n '/^memory map/,$p' logs/loader.log ;;
+hang) enter && fb oem hang; echo "xl: waiting for the watchdog..."; t0=$(date +%s); wait_for android 150 && echo "xl: back in Android after $(( $(date +%s) - t0 )) s" || echo "xl: not back (state: $(state))" ;;
+reboot) fb reboot; ;;
+reload) [ "$(state)" = loader ] && { fb reboot >/dev/null; wait_for android 120; }; enter && echo "xl: loader is up" ;;
+state) state ;;
+*) sed -n '2,23p' "$0" ;;
+esac
