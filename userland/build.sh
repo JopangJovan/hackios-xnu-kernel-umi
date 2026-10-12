@@ -19,8 +19,12 @@
 #                                   where nothing else can touch the screen yet)
 #                      GL=1         with an OpenGL ES implementation for the window server: Mesa
 #                                   (tools/mk-mesa.sh fetches and builds it, once) behind src/eagl.c, as
-#                                   lib/libOSMesa.8.dylib (13 MB) and lib/libredwood-gl.dylib. CoreAnimation
-#                                   then draws with its OpenGL ES renderer instead of its software one.
+#                                   lib/libOSMesa.8.dylib (15 MB) and lib/libredwood-gl.dylib. CoreAnimation
+#                                   then draws with its OpenGL ES renderer instead of its software one --
+#                                   by the phone's GPU where the kernel keeps it on (boot-arg adreno_keep=1),
+#                                   by Mesa's software driver elsewhere.
+#                                   GL=test: only the library and bin/gl_test (a triangle, src/gl_test.c;
+#                                   RC_JOBS=rc.jobs.gltest runs it); the window server stays as it is.
 #   system.packfs    the system image, the root filesystem (second RAM disk, /dev/md1): the part of
 #                    iOS 16.5 chosen by ../ios165/select-system.py at its real paths, the dyld
 #                    shared cache, and src/stage0.c as /sbin/launchd (the real one is
@@ -105,6 +109,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
 			$DYN -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation \
 				-framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libredwood-gl.dylib src/eagl.c src/gl_osmesa.c
+			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
 			cp $M/libOSMesa.8.dylib obj/
 		fi
 	fi
@@ -112,7 +117,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
-	[ -n "$GL" ] && cp obj/libredwood-gl.dylib obj/libOSMesa.8.dylib root/lib/
+	if [ -n "$GL" ]; then
+		cp obj/libOSMesa.8.dylib root/lib/
+		cp obj/gl_test root/bin/
+		[ "$GL" = test ] || cp obj/libredwood-gl.dylib root/lib/
+	fi
 	echo "$INJECT" > root/etc/inject.conf
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
