@@ -31,7 +31,7 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
         'osanalytics', 'lockdown', 'mediaserverd', 'audio', 'jetsamproperties', 'mobileactivationd',
-        'mobile.installd', 'installcoordinationd', 'purplebuddy', 'restore', 'usb', 'accessoryd',
+        'installcoordinationd', 'purplebuddy', 'restore', 'usb', 'accessoryd',
         'mobileassetd', 'nsurlsessiond', 'apsd', 'itunesstored', 'appstored', 'cloudd', 'bird',
         # these start, crash and are asked for again, over and over
         'aggregated', 'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd')
