@@ -208,6 +208,11 @@ REST=1 userland/build.sh
 список исключений — `DENY` в `userland/mkjobs.py`, пропустить службу из него для опыта: `ALLOW="слово"`.
 Остальные переменные (`JOBS`, `OSLOG`, `INJECT`, `RC_JOBS`) описаны в начале `userland/build.sh`.
 
+`GL=1 REST=1 userland/build.sh` — образ, в котором оконный сервер рисует через OpenGL ES, а не программным
+растеризатором CoreAnimation: за `EAGLContext` встаёт Mesa (пока с программным же драйвером softpipe — проверка
+пути, а не ускорение). Mesa в репозитории нет: `tools/mk-mesa.sh` один раз скачивает и собирает её (нужны meson,
+ninja, bison, flex); прослойка — `userland/src/eagl.c`.
+
 После пересборки ядра/загрузчика/программ `tools/update-prebuilt.sh` обновляет `prebuilt/`.
 
 ### UEFI для телефона
@@ -251,7 +256,7 @@ Userland не изменён ни в одном байте: всё, чего е�
 | `mkpackfs.py` | сборщик образов packfs (формат описан в `bsd/miscfs/packfs/packfs.h` ядра) |
 | `qemu/` | запуск в QEMU, касания, снимки экрана, разбор стеков |
 | `uefi/`, `mkxnuimg.py` | порт UEFI на redwood и упаковка загрузочного образа для `fastboot boot` |
-| `tools/` | `recording.py` (запись экрана → mp4), `update-prebuilt.sh`, `new-workspace.sh` (вторая рабочая копия со своим ядром и QEMU), `mk-zstddec.sh` |
+| `tools/` | `recording.py` (запись экрана → mp4), `update-prebuilt.sh`, `new-workspace.sh` (вторая рабочая копия со своим ядром и QEMU), `mk-zstddec.sh`, `mk-mesa.sh` (Mesa для `GL=1`) |
 | `prebuilt/` | собранные ядро, загрузчик, наши программы и куски UEFI |
 
 Скрипты не зависят от того, куда склонирован репозиторий.
@@ -276,6 +281,8 @@ Userland не изменён ни в одном байте: всё, чего е�
 - `xnu/` — производная работа от XNU, распространяется на условиях APSL 2.0, как и сам XNU; `prebuilt/mach.*` —
   ядро, собранное из этих исходников.
 - `xnu/files/bsd/miscfs/packfs/zstddeclib.c` — декодер Zstandard (Meta, BSD), сгенерирован `tools/mk-zstddec.sh`;
+- Mesa (лицензия MIT) в репозитории нет: `tools/mk-mesa.sh` берёт выпуск 25.0.7 с archive.mesa3d.org,
+  `tools/mesa/*.patch` — наши правки к нему;
 - `xnu-deps/build/lzbitmap/libzbitmap.*` — libzbitmap (Corellium, GPL-2.0+ OR MIT);
   `xnu-deps/hostinc/mach-o/{loader,nlist,fat}.h` — заголовки из XNU (APSL 2.0).
 - `uefi/files/Binaries/redwood` и `prebuilt/uefi/SILICIUM_UEFI.fd` содержат драйверы UEFI из прошивки Xiaomi
