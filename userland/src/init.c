@@ -747,6 +747,33 @@ configure_inject(void)
 	}
 }
 
+/*
+ * The kernel is configured for a very small machine (the size class "xsmall" of
+ * config/MASTER.arm64.bcm2837) and so stops at 1024 vnodes, whatever the memory. An iOS system
+ * with an application open needs more: the table fills ("vnode: table is full"), opens wait and
+ * idle daemons are killed to free vnodes. Give it what the kernel's own rule gives a bigger
+ * configuration -- one for every 64 KB of memory, and 1024 -- up to MAX_VNODES.
+ */
+#define MAX_VNODES      32768
+
+static void
+configure_vnodes(void)
+{
+	unsigned long long memsize = 0;
+	size_t len = sizeof(memsize);
+	int vnodes;
+
+	if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) != 0) {
+		return;
+	}
+	vnodes = memsize / 65536 + 1024 > MAX_VNODES ? MAX_VNODES : (int)(memsize / 65536) + 1024;
+	if (sysctlbyname("kern.maxvnodes", NULL, NULL, &vnodes, sizeof(vnodes)) == 0) {
+		printf("init: up to %d vnodes\n", vnodes);
+	} else {
+		printf("init: kern.maxvnodes: error %d\n", errno);
+	}
+}
+
 int
 main(int argc, char **argv, char **envp)
 {
@@ -787,6 +814,7 @@ main(int argc, char **argv, char **envp)
 	/* daemons that do not run as root get the console as their standard error too */
 	chmod("/dev/console", 0666);
 	configure_inject();
+	configure_vnodes();
 	run_rc(in_image("/etc/rc"));
 	printf("\n=== init: done ===\n");
 	reboot(RB_HALT);

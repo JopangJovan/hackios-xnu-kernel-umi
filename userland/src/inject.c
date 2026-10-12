@@ -313,7 +313,7 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
  */
 #define EDGE_SIDE       (16.0 / 375)
 #define EDGE_TOP        (16.0 / 812)
-#define EDGE_BOTTOM     (24.0 / 812)
+#define EDGE_BOTTOM     (34.0 / 812)    /* the strip below the applications' content, where the home bar is */
 
 static struct {
 	bool touching, edge;
