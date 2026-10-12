@@ -20,12 +20,13 @@
  *                              what is drawn into it (it becomes a framebuffer's colour
  *                              attachment) is the screen; or it is a picture to be shown
  *
- * A GPU's driver does the last two by using the IOSurface's memory as the texture's. Nothing of
- * the kind is assumed here: the texture is an ordinary one, filled from the IOSurface when that
- * has changed (its seed) and read back into it when a frame ends (glFlush, glFinish), with
- * nothing but OpenGL ES calls. So this file does not know what draws: the library is reached
- * through its gl* functions and the four functions of redwood_gl.h. A driver that can share the
- * memory needs surface_to_texture() and target_to_surface() replaced, and nothing else.
+ * A GPU's driver does the last two by using the IOSurface's memory as the texture's, and so it
+ * is done here where the library can (redwood_gl_surface_texture(); surface_shared()): nothing
+ * is copied, and a frame's end waits for the GPU. Where it cannot (a software driver, a surface
+ * the GPU cannot address, a picture to be turned over) the texture is an ordinary one, filled
+ * from the IOSurface when that has changed (its seed) and read back into it when a frame ends
+ * (glFlush, glFinish), with nothing but OpenGL ES calls. Either way this file does not know
+ * what draws: the library is reached through its gl* functions and the functions of redwood_gl.h.
  *
  * Where CoreAnimation relies on iOS's library being what it is, this stands in between:
  * blue-first pixels into a texture called GL_RGBA (internal_format()), shaders that read
@@ -35,9 +36,13 @@
  * What CoreAnimation asks of OpenGL ES is written down as it goes (the log lines "redwood-gl:"):
  * strings and limits it reads, texture formats and sizes, calls and triangles per frame. More
  * with the kernel's boot-args: gltrace=FIRST-LAST writes down every call of those frames (lines
- * "gl:", with a pixel of the framebuffer after each draw), glshaders=1 the text of every shader,
- * glshow=TEXTURE puts that texture over the corner of the picture, glplain=0 leaves the draws
- * without a program alone.
+ * "gl:"; after each draw a pixel or two of the framebuffer and how much of it is not black);
+ * gltrace_at=SECONDS does so for the first frame that long after the window server started,
+ * gltrace_draws=N for the first frame after one of N draws; glshaders=1 writes down the text of
+ * every shader, glshow=TEXTURE puts that texture over the corner of the picture, glplain=0
+ * leaves the draws without a program alone, glcopy=1 copies every IOSurface as if the library
+ * could not share one, glenv=NAME=VALUE puts that into the environment for the library to find
+ * (its own switches: FD_MESA_DEBUG=sysmem, say).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -178,6 +183,7 @@ struct image {
 	IOSurfaceRef surface;
 	bool target;                    /* drawn into (attachImage) rather than shown (texImageIOSurface) */
 	bool invert, drawn;
+	bool shared;                    /* the texture is the surface's memory: nothing to copy */
 	GLenum to, internal, format, type;
 	uint32_t plane, seed;
 	GLsizei width, height;
@@ -205,11 +211,11 @@ struct eagl {
 	} arrays[8];                    /* the vertex arrays, as given */
 	bool in_frame;
 	/* a frame's worth */
-	unsigned calls, draws, triangles, uploads, clears;
-	uint64_t upload_bytes, began;
+	unsigned calls, draws, triangles, uploads, clears, last_draws;
+	uint64_t upload_bytes, began, attaching, flushing;
 	/* everything so far */
-	unsigned frames, shaders, programs, errors;
-	uint64_t all_calls, all_draws, all_triangles, readback_us, frame_us;
+	unsigned frames, shaders, programs, errors, shared, refused;
+	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
 	unsigned most_calls, most_triangles;
 	const char *sources[64];        /* the text of the shaders being made, by name modulo this */
 	bool fragment[64];              /* ... and which of the two kinds each is */
@@ -217,11 +223,14 @@ struct eagl {
 };
 
 static unsigned trace_first, trace_last;        /* the frames whose calls are written down */
+static uint64_t trace_at;                       /* ... or the first frame from this time on (now_us()) */
+static unsigned trace_draws;                    /* ... or the first frame after one of so many draws */
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
 static __thread struct eagl *current;
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
+static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
 
 static const char *eagl_slot_name(unsigned offset);
 
@@ -327,10 +336,12 @@ summary(struct eagl *e)
 	unsigned frames = e->frames ? e->frames : 1;
 
 	say("redwood-gl: after %u frames: %llu calls, %llu draws and %llu triangles a frame on average; the most in one: "
-	    "%u calls, %u triangles; %llu ms a frame, of which %llu copying the picture out; %u shaders, %u programs; "
-	    "biggest texture %u x %u; %u errors\n", e->frames, e->all_calls / frames, e->all_draws / frames,
-	    e->all_triangles / frames, e->most_calls, e->most_triangles, e->frame_us / frames / 1000,
-	    e->readback_us / frames / 1000, e->shaders, e->programs, widest_texture, tallest_texture, e->errors);
+	    "%u calls, %u triangles; %llu us a frame, of which %llu handing the commands on, %llu waiting for the picture "
+	    "to be drawn and %llu copying it out, and before each %llu making textures of IOSurfaces; %u IOSurfaces were "
+	    "the textures' memory, %u had to be copied; %u shaders, %u programs; biggest texture %u x %u; %u errors\n",
+	    e->frames, e->all_calls / frames, e->all_draws / frames, e->all_triangles / frames, e->most_calls,
+	    e->most_triangles, e->frame_us / frames, e->flush_us / frames, e->wait_us / frames, e->readback_us / frames,
+	    e->attach_us / frames, e->shared, e->refused, e->shaders, e->programs, widest_texture, tallest_texture, e->errors);
 	for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]) && formats[i].count; i++) {
 		say("redwood-gl:   textures: %s %#x/%#x/%#x: %u times, up to %u x %u\n", formats[i].how, formats[i].internal,
 		    formats[i].format, formats[i].type, formats[i].count, formats[i].widest, formats[i].tallest);
@@ -414,9 +425,27 @@ bytes_a_pixel(GLenum format, GLenum type)
 }
 
 /*
- * Fill a texture, which is bound, from its IOSurface. This and target_to_surface() are where a
- * driver that maps the IOSurface's memory would do something else.
+ * Make a texture, which is bound, of its IOSurface's own memory, if that is what is asked for
+ * (the whole of a surface of blue-first pixels, the same way up) and the library can do it.
  */
+static bool
+surface_shared(struct eagl *e, struct image *image)
+{
+	IOSurfaceRef surface = image->surface;
+
+	if (!share_surfaces || image->invert || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
+	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
+	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
+	    !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+		e->refused++;
+		return false;
+	}
+	image->shared = true;
+	e->shared++;
+	return true;
+}
+
+/* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
 {
@@ -427,6 +456,9 @@ surface_to_texture(struct eagl *e, struct image *image)
 	GLint row_length = 0, alignment = 4;
 	uint8_t *base, *flipped = NULL;
 
+	if (image->shared) {
+		return;
+	}
 	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
 		say("redwood-gl: an IOSurface cannot be locked\n");
 		return;
@@ -453,7 +485,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	e->upload_bytes += row * (size_t)image->height;
 }
 
-/* What has been drawn into a texture, into its IOSurface. */
+/* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
 static void
 target_to_surface(struct eagl *e, struct image *image)
 {
@@ -461,6 +493,14 @@ target_to_surface(struct eagl *e, struct image *image)
 	size_t row = IOSurfaceGetBytesPerRow(surface);
 	uint8_t *base;
 
+	image->drawn = false;
+	if (image->shared) {
+		/* whoever looks at the surface's seed is to see that it has changed */
+		if (IOSurfaceLock(surface, 0, NULL) == 0) {
+			IOSurfaceUnlock(surface, 0, NULL);
+		}
+		return;
+	}
 	if (e->reader == 0) {
 		glGenFramebuffers(1, &e->reader);
 	}
@@ -481,7 +521,6 @@ target_to_surface(struct eagl *e, struct image *image)
 		IOSurfaceUnlock(surface, 0, NULL);
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
-	image->drawn = false;
 }
 
 /*
@@ -538,13 +577,18 @@ frame_begin(struct eagl *e)
 	e->in_frame = true;
 	e->began = now_us();
 	eagl_tracing = e->frames + 1 >= trace_first && e->frames + 1 <= trace_last;
+	if ((trace_at != 0 && e->began >= trace_at) || (trace_draws != 0 && e->last_draws == trace_draws)) {
+		eagl_tracing = 1;               /* (once) */
+		trace_at = 0;
+		trace_draws = 0;
+	}
 	if (eagl_tracing) {
 		eagl_trace("---- frame %u (framebuffer %u)\n", e->frames + 1, e->framebuffer);
 	}
 	for (unsigned i = 0; i < e->image_count; i++) {
 		struct image *image = &e->images[i];
 
-		if (image->target || IOSurfaceGetSeed(image->surface) == image->seed) {
+		if (image->target || image->shared || IOSurfaceGetSeed(image->surface) == image->seed) {
 			continue;
 		}
 		if (!rebound) {
@@ -559,20 +603,32 @@ frame_begin(struct eagl *e)
 	}
 }
 
-/* glFlush, glFinish: what was drawn must be where the display takes it from. */
+/*
+ * glFlush, glFinish: what was drawn must be where the display takes it from. `finished`: the
+ * library has been waited for already.
+ */
 static void
-frame_end(struct eagl *e)
+frame_end(struct eagl *e, bool finished)
 {
-	uint64_t before = now_us(), after;
-	unsigned copied = 0;
+	uint64_t before = now_us(), waited, after;
+	unsigned copied = 0, in_place = 0;
 
 	for (unsigned i = 0; i < e->image_count; i++) {
+		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
+			in_place++;
+		}
+	}
+	if (in_place != 0 && !finished) {
+		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
+	}
+	waited = now_us();
+	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn) {
+			copied += !e->images[i].shared;
 			target_to_surface(e, &e->images[i]);
 			if (shown_texture != 0) {
 				show_texture(e, &e->images[i]);
 			}
-			copied++;
 		}
 	}
 	if (!e->in_frame) {
@@ -584,7 +640,10 @@ frame_end(struct eagl *e)
 	e->all_calls += e->calls;
 	e->all_draws += e->draws;
 	e->all_triangles += e->triangles;
-	e->readback_us += after - before;
+	e->wait_us += waited - before;
+	e->readback_us += after - waited;
+	e->attach_us += e->attaching;
+	e->flush_us += e->flushing;
 	e->frame_us += after - e->began;
 	if (e->calls > e->most_calls) {
 		e->most_calls = e->calls;
@@ -594,8 +653,10 @@ frame_end(struct eagl *e)
 	}
 	if (e->frames <= 40 || e->frames % 20 == 0) {
 		say("redwood-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
-		    "(%llu KB); %u picture%s copied out; %llu ms\n", e->frames, e->calls, e->draws, e->triangles, e->clears,
-		    e->uploads, e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", (after - e->began) / 1000);
+		    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu copying "
+		    "out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
+		    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
+		    after - waited, e->attaching);
 	}
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
@@ -603,8 +664,9 @@ frame_end(struct eagl *e)
 	if (e->frames == 600 && e->errors == 0) {
 		check_errors = 0;
 	}
+	e->last_draws = e->draws;
 	e->calls = e->draws = e->triangles = e->uploads = e->clears = 0;
-	e->upload_bytes = 0;
+	e->upload_bytes = e->attaching = e->flushing = 0;
 }
 
 /* Something is about to be drawn into the framebuffer that is bound. */
@@ -637,7 +699,7 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 		e->bound[e->unit] = texture;
 	}
 	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->target &&
-	    IOSurfaceGetSeed(image->surface) != image->seed) {
+	    !image->shared && IOSurfaceGetSeed(image->surface) != image->seed) {
 		surface_to_texture(e, image);
 	}
 	EAGL_LEAVE(e, 0x30);
@@ -665,13 +727,35 @@ static void
 trace_pixels(struct eagl *e)
 {
 	GLint view[4] = { 0, 0, 0, 0 };
-	uint8_t middle[4] = { 0, 0, 0, 0 }, low[4] = { 0, 0, 0, 0 };
+	uint8_t middle[4] = { 0, 0, 0, 0 }, low[4] = { 0, 0, 0, 0 }, *all;
+	unsigned lit = 0, left = ~0u, bottom = ~0u, right = 0, top = 0;
 
 	glGetIntegerv(GL_VIEWPORT, view);
 	glReadPixels(view[0] + view[2] / 2, view[1] + view[3] / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, middle);
 	glReadPixels(view[0] + view[2] / 2, view[1] + view[3] / 8, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, low);
-	eagl_trace("    framebuffer %u (%d x %d): middle %u %u %u %u, an eighth up %u %u %u %u (red green blue alpha)%s\n",
-	    e->framebuffer, view[2], view[3], middle[0], middle[1], middle[2], middle[3], low[0], low[1], low[2], low[3],
+	/* ... and how much of the picture is anything but black, and where */
+	if (view[2] > 0 && view[3] > 0 && (all = malloc((size_t)view[2] * (size_t)view[3] * 4)) != NULL) {
+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
+		glReadPixels(view[0], view[1], view[2], view[3], GL_RGBA, GL_UNSIGNED_BYTE, all);
+		glPixelStorei(GL_PACK_ALIGNMENT, 4);
+		for (unsigned y = 0; y < (unsigned)view[3]; y++) {
+			const uint8_t *row = all + (size_t)y * (size_t)view[2] * 4;
+
+			for (unsigned x = 0; x < (unsigned)view[2]; x++) {
+				if (row[4 * x] | row[4 * x + 1] | row[4 * x + 2]) {
+					lit++;
+					left = x < left ? x : left;
+					right = x > right ? x : right;
+					bottom = y < bottom ? y : bottom;
+					top = y > top ? y : top;
+				}
+			}
+		}
+		free(all);
+	}
+	eagl_trace("    framebuffer %u (%d x %d): middle %u %u %u %u, an eighth up %u %u %u %u (red green blue alpha); %u pixels "
+	    "not black, within %d,%d to %d,%d%s\n", e->framebuffer, view[2], view[3], middle[0], middle[1], middle[2], middle[3],
+	    low[0], low[1], low[2], low[3], lit, lit ? (int)left : 0, lit ? (int)bottom : 0, (int)right, (int)top,
 	    glGetError() ? " (not readable)" : "");
 }
 
@@ -913,7 +997,7 @@ my_glFinish(void *context)
 		eagl_trace("glFinish()\n");
 	}
 	glFinish();
-	frame_end(e);
+	frame_end(e, true);
 	EAGL_LEAVE(e, 0x2d0);
 }
 
@@ -921,13 +1005,16 @@ static void
 my_glFlush(void *context)
 {
 	struct eagl *e = context;
+	uint64_t began;
 
 	EAGL_ENTER(e, 0x2d8);
 	if (eagl_tracing) {
 		eagl_trace("glFlush()\n");
 	}
+	began = now_us();
 	glFlush();
-	frame_end(e);
+	e->flushing += now_us() - began;
+	frame_end(e, false);
 	EAGL_LEAVE(e, 0x2d8);
 }
 
@@ -941,7 +1028,7 @@ my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
 	(void)name;
 	EAGL_ENTER(e, 0xeb8);
 	glFinish();
-	frame_end(e);
+	frame_end(e, true);
 	EAGL_LEAVE(e, 0xeb8);
 }
 
@@ -1361,6 +1448,7 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	struct eagl *e = context_of(self);
 	struct image *image;
 	GLint texture = 0;
+	uint64_t began;
 
 	(void)selector;
 	if (e == NULL || surface == NULL) {
@@ -1388,7 +1476,11 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 		    IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetPlaneCount(surface), texture, width,
 		    height, plane, invert ? ", inverted" : "");
 	}
-	surface_to_texture(e, image);
+	began = now_us();
+	if (!surface_shared(e, image)) {
+		surface_to_texture(e, image);
+	}
+	e->attaching += now_us() - began;
 	eagl_leave(e, 0x970);
 	return YES;
 }
@@ -1402,6 +1494,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	struct image *image;
 	GLint texture = 0;
 	uint32_t pixels;
+	uint64_t began;
 
 	(void)selector;
 	if (e == NULL || surface == NULL) {
@@ -1422,19 +1515,23 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	image->invert = inverted;
 	image->width = (GLsizei)IOSurfaceGetWidth(surface);
 	image->height = (GLsizei)IOSurfaceGetHeight(surface);
-	if (attached++ < 24) {
-		say("redwood-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s\n", texture,
-		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
-		    IOSurfaceGetBytesPerRow(surface), inverted ? ", drawn inverted" : "");
-	}
+	image->internal = image->format = GL_BGRA;
+	image->type = GL_UNSIGNED_BYTE;
 	note_format("IOSurface attached", GL_BGRA, GL_BGRA, GL_UNSIGNED_BYTE, image->width, image->height);
 	/*
 	 * What is attached is as often read as drawn into (a picture CoreAnimation has made a surface
-	 * around, to be shown): the texture starts with what the surface holds.
+	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
 	 */
-	image->internal = image->format = GL_BGRA;
-	image->type = GL_UNSIGNED_BYTE;
-	surface_to_texture(e, image);
+	began = now_us();
+	if (!surface_shared(e, image)) {
+		surface_to_texture(e, image);
+	}
+	e->attaching += now_us() - began;
+	if (attached++ < 24) {
+		say("redwood-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
+		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
+		    IOSurfaceGetBytesPerRow(surface), inverted ? ", drawn inverted" : "", image->shared ? ": its memory" : ": a copy");
+	}
 	eagl_leave(e, 0x970);
 	return YES;
 }
@@ -1492,12 +1589,34 @@ install(void)
 				trace_last = (unsigned)strtoul(argument + 1, NULL, 10);
 			}
 		}
+		if ((argument = strstr(arguments, "gltrace_at=")) != NULL) {
+			trace_at = now_us() + strtoull(argument + 11, NULL, 10) * 1000000;
+		}
+		if ((argument = strstr(arguments, "gltrace_draws=")) != NULL) {
+			trace_draws = (unsigned)strtoul(argument + 14, NULL, 10);
+		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
 			plain_draws = (int)strtoul(argument + 8, NULL, 10);
 		}
 		if ((argument = strstr(arguments, "glshow=")) != NULL) {
 			shown_texture = (GLuint)strtoul(argument + 7, NULL, 10);
+		}
+		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+		for (argument = arguments; (argument = strstr(argument, "glenv=")) != NULL; argument += 6) {
+			char setting[128];
+			size_t length = strcspn(argument + 6, " ");
+			char *value;
+
+			if (length < sizeof(setting)) {
+				memcpy(setting, argument + 6, length);
+				setting[length] = 0;
+				if ((value = strchr(setting, '=')) != NULL) {
+					*value = 0;
+					setenv(setting, value + 1, 1);
+					say("redwood-gl: in the environment: %s=%s\n", setting, value + 1);
+				}
+			}
 		}
 	}
 
