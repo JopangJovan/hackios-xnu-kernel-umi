@@ -64,6 +64,22 @@ miniamfi_vnode_check_signature(__unused struct vnode *vp, __unused struct label 
 #define AMFI_SYSCALL_CHECK_DYLD_POLICY  0x5a
 #define AMFI_DYLD_OUTPUT_ALLOW_ALL      0xffULL
 
+/*
+ * Request 0x60, "query boot-arg state" (amfi_interface_query_bootarg_state() in libamfi): the
+ * argument points to 64 bits of flags, one for each boot-arg that switches a part of AMFI off
+ * (amfi_get_out_of_my_way and its kin). ExtensionKit asks, and unless one of the bits 0x86 is set
+ * it wants the signature of the system's table of extension points
+ * (/System/Library/xpc/extensions.plist.sig) verified by AMFI's IOKit service. There is no such
+ * service here ("Unable to find AMFI"); the table is then not read and LaunchServices knows no
+ * extension point: every application extension is refused when the applications are registered
+ * ("does not correspond to a known extension point"), pkd cannot make a record for any extension
+ * point, and Shortcuts dies on a nil one. Nothing is enforced by this kernel, so that is what it
+ * says. (Which of the three bits stands for which boot-arg is not known; ExtensionKit takes any
+ * of them.)
+ */
+#define AMFI_SYSCALL_QUERY_BOOTARG_STATE 0x60
+#define AMFI_BOOTARG_STATE_NOT_ENFORCING 0x86ULL
+
 static int
 miniamfi_policy_syscall(__unused struct proc *p, int call, user_addr_t arg)
 {
@@ -72,8 +88,12 @@ miniamfi_policy_syscall(__unused struct proc *p, int call, user_addr_t arg)
 		user_addr_t output_flags;
 	} args;
 	uint64_t flags = AMFI_DYLD_OUTPUT_ALLOW_ALL;
+	uint64_t state = AMFI_BOOTARG_STATE_NOT_ENFORCING;
 	int error;
 
+	if (call == AMFI_SYSCALL_QUERY_BOOTARG_STATE) {
+		return copyout(&state, arg, sizeof(state));
+	}
 	if (call != AMFI_SYSCALL_CHECK_DYLD_POLICY) {
 		return ENOPOLICY;               /* what user space got before there was a handler */
 	}

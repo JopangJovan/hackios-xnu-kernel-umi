@@ -620,6 +620,26 @@ packfs_ioctl(__unused struct vnop_ioctl_args *ap)
 	return ENOTTY;
 }
 
+/*
+ * Extended attributes: nothing in the image has one. The answer to a question about one is
+ * therefore "no such attribute" (ENOATTR); the default, ENOTSUP, is taken for a failure.
+ * Security.framework asks every bundle for the attributes a code signature may be kept in, and
+ * with ENOTSUP MobileInstallation could not validate a single application or extension
+ * ("Failed to verify code signature of ... POSIX error 45") when LaunchServices registered them.
+ */
+static int
+packfs_getxattr(__unused struct vnop_getxattr_args *ap)
+{
+	return ENOATTR;
+}
+
+static int
+packfs_listxattr(struct vnop_listxattr_args *ap)
+{
+	*ap->a_size = 0;
+	return 0;
+}
+
 static int
 packfs_mmap(__unused struct vnop_mmap_args *ap)
 {
@@ -714,6 +734,8 @@ const struct vnodeopv_entry_desc packfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_getattr_desc, .opve_impl = (VOPFUNC)packfs_getattr },
 	{ .opve_op = &vnop_read_desc, .opve_impl = (VOPFUNC)packfs_read },
 	{ .opve_op = &vnop_ioctl_desc, .opve_impl = (VOPFUNC)packfs_ioctl },
+	{ .opve_op = &vnop_getxattr_desc, .opve_impl = (VOPFUNC)packfs_getxattr },
+	{ .opve_op = &vnop_listxattr_desc, .opve_impl = (VOPFUNC)packfs_listxattr },
 	{ .opve_op = &vnop_fsync_desc, .opve_impl = (VOPFUNC)nop_fsync },
 	{ .opve_op = &vnop_readdir_desc, .opve_impl = (VOPFUNC)packfs_readdir },
 	{ .opve_op = &vnop_readlink_desc, .opve_impl = (VOPFUNC)packfs_readlink },

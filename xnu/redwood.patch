@@ -128,19 +128,22 @@ index fd7a94b20794..69eaceedd248 100644
  		if (cc > 1) {
  			console_write((char *)buf, cc);
 diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
-index 7fd9be1a5f38..f158f323a071 100644
+index 7fd9be1a5f38..231a58c622db 100644
 --- a/bsd/dev/arm/systemcalls.c
 +++ b/bsd/dev/arm/systemcalls.c
-@@ -36,6 +36,52 @@
+@@ -36,6 +36,58 @@
  #include <security/mac_framework.h>
  #endif
  
 +/*
 + * Bring-up aid: boot-arg systrace=1 logs every BSD system call that fails,
 + * systrace=2 logs all of them (to the kernel message buffer). For calls that
-+ * take a path, the path is shown.
++ * take a path, the path is shown. systrace_name=NAME keeps it to the processes
++ * of that name: with a whole system running, everybody's failed calls are
++ * megabytes a minute.
 + */
 +static TUNABLE(uint32_t, systrace_level, "systrace", 0);
++static TUNABLE_STR(systrace_name, MAXCOMLEN + 1, "systrace_name", "");
 +extern const char *syscallnames[];
 +
 +static void
@@ -161,6 +164,9 @@ index 7fd9be1a5f38..f158f323a071 100644
 +	size_t done;
 +
 +	if (systrace_level < 2 && (error == 0 || error == EJUSTRETURN || error == ERESTART)) {
++		return;
++	}
++	if (systrace_name[0] != 0 && strncmp(proc->p_comm, systrace_name, MAXCOMLEN) != 0) {
 +		return;
 +	}
 +	for (unsigned i = 0; i < sizeof(path_arg0) / sizeof(path_arg0[0]); i++) {
@@ -184,7 +190,7 @@ index 7fd9be1a5f38..f158f323a071 100644
  #if CONFIG_DTRACE
  extern int32_t dtrace_systrace_syscall(struct proc *, void *, int *);
  extern void dtrace_systrace_syscall_return(unsigned short, int, int *);
-@@ -181,6 +227,10 @@ unix_syscall(
+@@ -181,6 +233,10 @@ unix_syscall(
  	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
  	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
  

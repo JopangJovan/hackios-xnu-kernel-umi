@@ -150,7 +150,9 @@ user_abort_trace(void)
  * and the return addresses up the stack. Shows what a daemon that "does nothing" waits for.
  * ustacks_now(NAME) does it at once: under QEMU, "qemu/touch.py stacks NAME" on the host.
  * The addresses are symbolized on the host (qemu/symstack.py).
+ * The name "top" asks for something else: who has had the processor (see ustacks_top()).
  */
+#include <kern/recount.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 #include <kern/queue.h>
@@ -233,6 +235,88 @@ ustacks_task(task_t task, struct proc *proc)
 	vm_map_deallocate(map);
 }
 
+/*
+ * ustacks_now("top"): the processes that have had the processor since this was last asked (the
+ * first time: since boot), each with its share of that time. A system that feels slow is either
+ * busy -- this says with what -- or waiting for something, and the two look the same on the screen.
+ */
+#define USTACKS_TOP_TASKS 512
+#define USTACKS_TOP_LINES 12
+
+static void
+ustacks_top(void)
+{
+	static struct {
+		int pid;
+		uint64_t total;                 /* user + system time so far, in Mach time units */
+		uint64_t used;                  /* ... of it since the last time */
+		char name[33];                  /* as long as a process name gets (2 * MAXCOMLEN + 1) */
+	} now[USTACKS_TOP_TASKS];
+	static struct {
+		int pid;
+		uint64_t total;
+	} before[USTACKS_TOP_TASKS];
+	static unsigned before_count;
+	static uint64_t before_when;
+	uint64_t when = mach_absolute_time(), elapsed = when - before_when, elapsed_ns, busy = 0;
+	unsigned count = 0;
+	task_t task;
+
+	lck_mtx_lock(&tasks_threads_lock);
+	queue_iterate(&tasks, task, task_t, tasks) {
+		struct proc *proc = get_bsdtask_info(task);
+		struct recount_times_mach times;
+
+		if (count == USTACKS_TOP_TASKS || proc == NULL) {
+			continue;
+		}
+		times = recount_task_times(task);
+		now[count].pid = proc_pid(proc);
+		now[count].total = times.rtm_user + times.rtm_system;
+		strlcpy(now[count].name, proc_name_address(proc), sizeof(now[count].name));
+		count++;
+	}
+	lck_mtx_unlock(&tasks_threads_lock);
+
+	/* a process that was not there the last time has used all it has since */
+	for (unsigned i = 0; i < count; i++) {
+		uint64_t earlier = 0;
+
+		for (unsigned j = 0; j < before_count; j++) {
+			if (before[j].pid == now[i].pid) {
+				earlier = before[j].total;
+				break;
+			}
+		}
+		now[i].used = now[i].total - MIN(earlier, now[i].total);
+		busy += now[i].used;
+	}
+	absolutetime_to_nanoseconds(elapsed, &elapsed_ns);
+	printf("top: in the last %llu ms the processor was busy %llu%% of the time\n", elapsed_ns / NSEC_PER_MSEC,
+	    elapsed ? busy * 100 / elapsed : 0);
+	for (unsigned i = 0; i < count; i++) {
+		before[i].pid = now[i].pid;
+		before[i].total = now[i].total;
+	}
+	before_count = count;
+	before_when = when;
+	for (unsigned line = 0; line < USTACKS_TOP_LINES && count != 0 && elapsed != 0; line++) {
+		unsigned most = 0;
+
+		for (unsigned i = 1; i < count; i++) {
+			if (now[i].used > now[most].used) {
+				most = i;
+			}
+		}
+		if (now[most].used * 1000 / elapsed == 0) {
+			break;
+		}
+		printf("top:  %3llu.%llu%%  %s[%d]\n", now[most].used * 100 / elapsed, now[most].used * 1000 / elapsed % 10,
+		    now[most].name, now[most].pid);
+		now[most].used = 0;
+	}
+}
+
 static void
 ustacks_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
@@ -240,6 +324,10 @@ ustacks_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	unsigned count = 0;
 	task_t task;
 
+	if (strcmp(ustacks_name, "top") == 0) {
+		ustacks_top();
+		return;
+	}
 	lck_mtx_lock(&tasks_threads_lock);
 	queue_iterate(&tasks, task, task_t, tasks) {
 		struct proc *proc = get_bsdtask_info(task);
