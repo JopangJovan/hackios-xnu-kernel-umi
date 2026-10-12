@@ -9,6 +9,7 @@
  */
 extern "C" {
 #include <pexpert/pexpert.h>
+#include <pexpert/arm64/board_config.h>
 #include <kern/cpu_number.h>
 }
 #include <machine/machine_routines.h>
@@ -20,7 +21,18 @@ extern "C" {
 
 #include "MiniDrivers.h"
 
-extern "C" kern_return_t processor_start(processor_t processor);
+extern "C" {
+kern_return_t processor_start(processor_t processor);
+kern_return_t processor_exit(processor_t processor);
+extern uint32_t processor_avail_count;
+
+/* osfmk/arm64/psci_smp.c and gic_v3_irq.c */
+void psci_smp_init(void);
+kern_return_t psci_smp_start_cpu(int cpu);
+void psci_smp_cpu_running(void);
+void psci_smp_cpu_off(void) __dead2;
+void gic_v3_irq_signal(uint32_t phys_id);
+}
 
 /*
  * GenericARMCPU: registers a device-tree CPU node with the kernel. The closed
@@ -28,12 +40,17 @@ extern "C" kern_return_t processor_start(processor_t processor);
  * forever for the CPU count (ml_wait_max_cpus) and never calls
  * cpu_machine_init() on the boot processor.
  *
- * Only the boot CPU is brought up for now. Secondary CPUs need a start
- * method (PSCI CPU_ON) and inter-processor interrupts through the GIC.
+ * The other processors are started through the firmware (PSCI CPU_ON, see
+ * osfmk/arm64/psci_smp.c) and signalled with interrupts of the GIC
+ * (osfmk/arm64/gic_v3_irq.c). How many there are is the device tree's and the
+ * boot-arg cpus=N's to say (ml_parse_cpu_topology()); with one, nothing of
+ * that is used.
  */
 class GenericARMCPU : public IOCPU
 {
 	OSDeclareDefaultStructors(GenericARMCPU);
+
+	uint32_t physID;        /* the device tree's "reg": the low affinity fields of the core's MPIDR */
 
 public:
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
@@ -41,72 +58,115 @@ public:
 	virtual void quiesceCPU(void) APPLE_KEXT_OVERRIDE;
 	virtual kern_return_t startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr) APPLE_KEXT_OVERRIDE;
 	virtual void haltCPU(void) APPLE_KEXT_OVERRIDE;
+	virtual void signalCPU(IOCPU * target) APPLE_KEXT_OVERRIDE;
 	virtual const OSSymbol * getCPUName(void) APPLE_KEXT_OVERRIDE;
+
+	static int cpuNumberOfNub(IOService * nub);
+	void run(void);
 };
 
 OSDefineMetaClassAndStructors(GenericARMCPU, IOCPU);
 
+/* The kernel's number for the processor of a /cpus node, -1 if it is not to be used (boot-arg cpus=N). */
+int
+GenericARMCPU::cpuNumberOfNub(IOService * nub)
+{
+	OSData * reg = OSDynamicCast(OSData, nub->getProperty("reg"));
+
+	if (nub->getProperty("state") == NULL || reg == NULL || reg->getLength() < sizeof(uint32_t)) {
+		return -1;
+	}
+	return ml_get_cpu_number(*(const uint32_t *)reg->getBytesNoCopy());
+}
+
+/* Registers the processor; run() starts it. */
 bool
 GenericARMCPU::start(IOService * provider)
 {
 	ml_processor_info_t info;
 	perfmon_interrupt_handler_func pmi_handler = NULL;
-	uint32_t phys_id = 0;
+	int cpu = cpuNumberOfNub(provider);
 
-	if (!IOCPU::start(provider)) {
+	if (cpu < 0 || !IOCPU::start(provider)) {
 		return false;
 	}
+	const ml_topology_cpu_t * topology = &ml_get_topology_info()->cpus[cpu];
 
-	OSData * reg = OSDynamicCast(OSData, provider->getProperty("reg"));
-	if (reg != NULL && reg->getLength() >= sizeof(uint32_t)) {
-		phys_id = *(const uint32_t *)reg->getBytesNoCopy();
-	}
-
-	setCPUNumber((UInt32)ml_get_boot_cpu_number());
+	physID = topology->phys_id;
+	setCPUNumber((UInt32)cpu);
 
 	bzero(&info, sizeof(info));
 	info.cpu_id = (cpu_id_t)this;
 	info.log_id = getCPUNumber();
-	info.phys_id = phys_id;
-	info.cluster_type = CLUSTER_TYPE_SMP;
+	info.phys_id = physID;
+	info.cluster_id = topology->cluster_id;
+	info.cluster_type = topology->cluster_type;
 	if (ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler) != KERN_SUCCESS) {
 		IOLog("GenericARMCPU: ml_processor_register failed\n");
 		return false;
 	}
 
-	/* Unblocks everything that waits for the CPU count to be known. */
-	ml_set_max_cpus(1);
-
 	setCPUState(kIOCPUStateUninitalized);
 	registerService();
-
-	/* Runs cpu_machine_init() -> initCPU(true) on this (the boot) processor. */
-	processor_start(machProcessor);
-	IOLog("GenericARMCPU: cpu %u (phys id 0x%x) registered\n", (unsigned)getCPUNumber(), phys_id);
+	IOLog("GenericARMCPU: cpu %u (phys id 0x%x) registered\n", (unsigned)getCPUNumber(), physID);
 	return true;
 }
 
+/*
+ * The boot processor: runs cpu_machine_init() -> initCPU(true) on it, right here.
+ * Any other: cpu_start() -> startCPU(), and the new core comes to initCPU() by itself.
+ */
+void
+GenericARMCPU::run(void)
+{
+	processor_start(machProcessor);
+}
+
+/* On the processor itself, with its interrupts off, when it joins (or rejoins) the scheduler. */
 void
 GenericARMCPU::initCPU(bool boot)
 {
-	/* The interrupt controller and timer were set up in arm_init (pe_init_fiq). */
+	/* The interrupt controller and timer were set up in arm_init / arm_init_cpu (pe_init_fiq). */
 	setCPUState(kIOCPUStateRunning);
+	if (ml_get_cpu_count() > 1) {
+		psci_smp_cpu_running();
+		/*
+		 * A processor takes no signals until it has handled an interrupt for one
+		 * (cpu_signal_handler() lifts SIGPdisabled), and until then it does not go to
+		 * sleep when idle either: send it its first.
+		 */
+		gic_v3_irq_signal(physID);
+	}
 }
 
+/* On the processor itself, at the end of processor_exit(): it is to stop for good. */
 void
 GenericARMCPU::quiesceCPU(void)
 {
+	if (getCPUNumber() != (UInt32)master_cpu) {
+		setCPUState(kIOCPUStateStopped);
+		psci_smp_cpu_off();
+	}
 }
 
 kern_return_t
 GenericARMCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
 {
-	return KERN_NOT_SUPPORTED;
+	return psci_smp_start_cpu((int)getCPUNumber());
 }
 
 void
 GenericARMCPU::haltCPU(void)
 {
+	if (getCPUNumber() != (UInt32)master_cpu) {
+		processor_exit(machProcessor);
+	}
+}
+
+void
+GenericARMCPU::signalCPU(IOCPU * target)
+{
+	gic_v3_irq_signal(((GenericARMCPU *)target)->physID);
 }
 
 const OSSymbol *
@@ -157,30 +217,52 @@ GenericARMPE::start(IOService * provider)
 	IOLog("GenericARMPE: platform \"%s\"\n", provider->getName());
 
 	/*
-	 * super::start() published the /cpus children as nubs. Attach a CPU
-	 * driver to the boot processor's nub (device-tree state "running").
+	 * super::start() published the /cpus children as nubs. Attach a CPU driver to each
+	 * one the kernel has a number for, register them all -- that settles the CPU count --
+	 * and then start them, the boot processor (number master_cpu) first.
 	 */
+	GenericARMCPU * cpus[MAX_CPUS] = {};
+	unsigned int count = 0;
 	OSIterator * iter = getChildIterator(gIOServicePlane);
 	if (iter != NULL) {
 		OSObject * obj;
 		while ((obj = iter->getNextObject()) != NULL) {
 			IOService * nub = OSDynamicCast(IOService, obj);
-			OSData * state = nub ? OSDynamicCast(OSData, nub->getProperty("state")) : NULL;
+			int number = nub ? GenericARMCPU::cpuNumberOfNub(nub) : -1;
 
-			if (state == NULL || strncmp((const char *)state->getBytesNoCopy(), "running", state->getLength()) != 0) {
+			if (number < 0 || number >= MAX_CPUS || cpus[number] != NULL) {
 				continue;
 			}
 			GenericARMCPU * cpu = new GenericARMCPU;
 			if (cpu != NULL && cpu->init() && cpu->attach(nub)) {
-				if (!cpu->start(nub)) {
-					cpu->detach(nub);
+				if (cpu->start(nub)) {
+					cpus[number] = cpu;     /* kept: the kernel has its address as the cpu's id */
+					count++;
+					continue;
 				}
+				cpu->detach(nub);
 			}
 			if (cpu != NULL) {
 				cpu->release();
 			}
 		}
 		iter->release();
+	}
+	if (cpus[master_cpu] != NULL) {
+		/* Unblocks everything that waits for the CPU count to be known. */
+		ml_set_max_cpus(count);
+		if (count > 1) {
+			psci_smp_init();
+		}
+		cpus[master_cpu]->run();
+		for (unsigned int number = 0; number < MAX_CPUS; number++) {
+			if (cpus[number] != NULL && number != (unsigned int)master_cpu) {
+				cpus[number]->run();
+			}
+		}
+		if (count > 1) {
+			IOLog("GenericARMPE: %u of %u processors are running\n", processor_avail_count, count);
+		}
 	}
 
 	/* BSD looks the platform expert up by class (IOSecureBSDRoot). */

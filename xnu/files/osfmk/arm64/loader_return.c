@@ -12,10 +12,15 @@
  * Only valid while the kernel does not drive hardware that UEFI also uses.
  */
 #include <mach/mach_types.h>
+#include <machine/atomic.h>
+#include <kern/cpu_number.h>
 #include <kern/debug.h>
 #include <kern/startup.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
+#include <arm/cpu_internal.h>
+#include <arm/machine_routines.h>
+#include <arm64/psci_smp.h>
 #include <arm64/proc_reg.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/arm64/board_config.h>
@@ -54,26 +59,48 @@ static bool     loader_log_wrapped;
 static bool     loader_log_linear;       /* the pieces have been put in order: only appending from now on */
 static char     loader_log_scratch[LOADER_LOG_RING];
 
+/*
+ * Characters come from every processor, and from interrupt handlers on top of whatever was
+ * writing one. The lock is of the simplest kind, good from the first line of C code to the
+ * last of a panic; whoever cannot have it for a long while (its holder is gone: a panic
+ * inside this very function) goes ahead without it.
+ */
+static uint32_t loader_log_lock;
+
 void
 loader_log_putc(char c)
 {
+	uint64_t daif;
+	bool locked = false;
+
 	if (c == '\r') {
 		return;
 	}
+	daif = __builtin_arm_rsr64("DAIF");
+	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
+		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+	}
+
 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
 		if (loader_log_len < LOADER_LOG_SIZE) {
 			loader_log[loader_log_len++] = c;
 		}
-		return;
+	} else {
+		loader_log[LOADER_LOG_HEAD + loader_log_ring_at] = c;
+		if (++loader_log_ring_at == LOADER_LOG_RING) {
+			loader_log_ring_at = 0;
+			loader_log_wrapped = true;
+		}
+		if (!loader_log_wrapped) {
+			loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
+		}
 	}
-	loader_log[LOADER_LOG_HEAD + loader_log_ring_at] = c;
-	if (++loader_log_ring_at == LOADER_LOG_RING) {
-		loader_log_ring_at = 0;
-		loader_log_wrapped = true;
+
+	if (locked) {
+		os_atomic_store(&loader_log_lock, 0, release);
 	}
-	if (!loader_log_wrapped) {
-		loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
-	}
+	__builtin_arm_wsr64("DAIF", daif);
 }
 
 /* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */
@@ -263,6 +290,14 @@ loader_log_append_msgbuf(void)
 void
 loader_return(void)
 {
+#if defined(GENERIC_PSCI_SMP)
+	/*
+	 * With more than one processor: the others switch themselves off first, and the rest of
+	 * this is done by the boot processor, the one the loader gave us. This call comes back
+	 * on that processor only (on another one it has it call loader_return() in its turn).
+	 */
+	psci_smp_stop_others();
+#endif
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that
@@ -296,14 +331,37 @@ loader_checkpoint(uint64_t n)
  * after that long, whatever the kernel is doing. This is how the log gets out
  * when the kernel does not panic but simply waits (e.g. for a root device).
  */
+/*
+ * For trying the ways out when there is more than one processor: boot-arg return_cpu=<n> has
+ * that processor make the timed return, from an interrupt handler -- any but the boot processor
+ * has to hand it over (psci_smp_stop_others()) --, and return_panic=1 makes a panic of it.
+ */
+static void
+loader_return_test(void *as_panic)
+{
+	if (as_panic != (void *)1) {
+		panic("return_panic: the panic that was asked for, on cpu %d", cpu_number());
+	}
+	loader_return();
+}
+
 static void
 loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	static const char banner[] = "\n--- loader_return_after expired ---\n";
+	uint32_t cpu = 0, as_panic = 0;
+
 	for (const char *c = banner; *c; c++) {
 		loader_log_putc(*c);
 	}
-	loader_return();
+	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
+	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
+	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
+		for (;;) {
+			delay_for_interval(1000, NSEC_PER_MSEC);        /* that processor ends it */
+		}
+	}
+	loader_return_test((void *)(uintptr_t)(as_panic ? 2 : 1));
 }
 
 __startup_func

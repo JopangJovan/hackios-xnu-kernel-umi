@@ -1465,10 +1465,20 @@ index 0316792a3f42..bbef0a4b26d4 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..5bd6037e6b02 100644
+index e26a1d70f470..f91095c98d26 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -335,7 +335,11 @@ arm_setup_pre_sign(void)
+@@ -73,6 +73,9 @@
+ #include <sys/kdebug.h>
+ 
+ #include <pexpert/pexpert.h>
++#if defined(__arm64__)
++#include <arm64/psci_smp.h>
++#endif
+ 
+ #include <console/serial_protos.h>
+ 
+@@ -335,7 +338,11 @@ arm_setup_pre_sign(void)
   */
  
  __startup_func
@@ -1480,7 +1490,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  arm_init(
  	boot_args       *args)
  {
-@@ -354,6 +358,7 @@ arm_init(
+@@ -354,6 +361,7 @@ arm_init(
  	const_boot_args = *args;
  	BootArgs = args = &const_boot_args;
  
@@ -1488,7 +1498,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  	cpu_data_init(&BootCpuData);
  #if defined(HAS_APPLE_PAC)
  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +367,19 @@ arm_init(
+@@ -362,14 +370,19 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -1508,7 +1518,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  
  #if (DEVELOPMENT || DEBUG)
  	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +395,7 @@ arm_init(
+@@ -385,6 +398,7 @@ arm_init(
  	}
  
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
@@ -1516,7 +1526,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +433,13 @@ arm_init(
+@@ -422,10 +436,13 @@ arm_init(
  	}
  #endif
  
@@ -1530,7 +1540,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +453,14 @@ arm_init(
+@@ -439,11 +456,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -1545,7 +1555,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +469,16 @@ arm_init(
+@@ -452,12 +472,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -1562,7 +1572,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +486,7 @@ arm_init(
+@@ -465,6 +489,7 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
@@ -1570,7 +1580,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  
  	processor_bootstrap();
  
-@@ -514,6 +536,7 @@ arm_init(
+@@ -514,6 +539,7 @@ arm_init(
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
  	arm_vm_init(xmaxmem, args);
@@ -1578,7 +1588,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,7 +550,9 @@ arm_init(
+@@ -527,7 +553,9 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -1588,7 +1598,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  	kprintf("kprintf initialized\n");
  
  	serialmode = 0;
-@@ -569,6 +594,7 @@ arm_init(
+@@ -569,6 +597,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -1596,7 +1606,7 @@ index e26a1d70f470..5bd6037e6b02 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +673,7 @@ arm_init(
+@@ -647,6 +676,7 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
@@ -1604,6 +1614,44 @@ index e26a1d70f470..5bd6037e6b02 100644
  	machine_startup(args);
  }
  
+@@ -673,6 +703,9 @@ arm_init_cpu(
+ 
+ 
+ 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
++#if defined(GENERIC_PSCI_SMP)
++	psci_smp_cpu_reached(PSCI_SMP_CPU_IN_KERNEL);
++#endif
+ 
+ #if APPLE_ARM64_ARCH_FAMILY
+ 	configure_late_apple_regs();
+diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
+index 39daaf8db949..64ceb1a5f201 100644
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -79,6 +79,9 @@
+ #include <arm/cpu_data_internal.h>
+ #include <arm/cpu_internal.h>
+ #include <arm/misc_protos.h>
++#if defined(__arm64__)
++#include <arm64/psci_smp.h>
++#endif
+ #include <libkern/OSKextLibPrivate.h>
+ #include <vm/vm_kern.h>
+ #include <kern/kern_cdata.h>
+@@ -1156,6 +1159,13 @@ wait_while_mp_kdp_trap(bool check_SIGPdebug)
+ 			found_SIGPdebug = true;
+ 			break;
+ 		}
++#if defined(GENERIC_PSCI_SMP)
++		/*
++		 * The panic this processor is waiting out ends in a return to the boot loader:
++		 * its interrupts are off here, so this is where it is told (psci_smp.c).
++		 */
++		psci_smp_stop_here();
++#endif
+ 		__builtin_arm_wfe();
+ 	}
+ 	os_atomic_clear_exclusive();
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
 index fc2096fa0010..d71b2640cb8c 100644
 --- a/osfmk/arm/pmap/pmap.c
@@ -1689,6 +1737,24 @@ index b9549da357b4..cca31ea32502 100644
  #define __USES_V_CRYPTO_INTRINSICS 1
  #else
  #define __USES_V_CRYPTO_INTRINSICS 0
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 94e91306b143..0ec1323086b7 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -568,7 +568,12 @@ cpu_idle(void)
+ #endif /* MONOTONIC */
+ 
+ 	if (wfi) {
+-#if !defined(APPLE_ARM64_ARCH_FAMILY)
++#if !defined(APPLE_ARM64_ARCH_FAMILY) && !defined(GENERIC_PSCI_SMP)
++		/*
++		 * (Not on the generic boards either. There a core keeps its cache while it waits,
++		 * and this would empty it by set and way every time: slow, wrong among several
++		 * processors, and under a hypervisor every one of those instructions is a trap.)
++		 */
+ 		platform_cache_idle_enter();
+ #endif
+ 
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 index e76e7e70ab9c..d702d171e3d1 100644
 --- a/osfmk/arm64/machine_routines.c
@@ -1729,10 +1795,57 @@ index e76e7e70ab9c..d702d171e3d1 100644
  
  void
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index e5336e5a1cce..df132aa3c772 100644
+index e5336e5a1cce..a54e35035cde 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -233,40 +233,88 @@ LEXT(_start)
+@@ -126,6 +126,27 @@ LEXT(LowResetVectorBase)
+ 	.globl EXT(reset_vector)
+ LEXT(reset_vector)
+ 	// Preserve x0 for start_first_cpu, if called
++#if defined(GENERIC_PSCI_SMP)
++	/*
++	 * A core that the firmware has just started for us (PSCI CPU_ON, see
++	 * psci_smp.c) has no vectors at all, and under a third-party hypervisor
++	 * even the OS lock write can trap: vectors first. Not the boot
++	 * processor's early ones, which hand the exception to the boot loader:
++	 * that is not for this core to do.
++	 */
++	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
++	adrp	x0, EXT(LowSecondaryExceptionVectorBase)@page
++	add		x0, x0, EXT(LowSecondaryExceptionVectorBase)@pageoff
++	msr		VBAR_EL1, x0
++	isb
++	// The MMU and the caches are off, says PSCI; of the rest of SCTLR it
++	// says nothing. Only the bits that must be set, until common_start.
++	MOV64	x0, 0x30D00800
++	msr		SCTLR_EL1, x0
++	isb
++	// Unlock the core for debugging
++	msr		OSLAR_EL1, xzr
++#else /* defined(GENERIC_PSCI_SMP) */
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+@@ -136,6 +157,7 @@ LEXT(reset_vector)
+ 	add     x0, x0, EXT(LowExceptionVectorBase)@pageoff
+ 	msr     VBAR_EL1, x0
+ #endif
++#endif /* defined(GENERIC_PSCI_SMP) */
+ 
+ 
+ 
+@@ -143,7 +165,9 @@ LEXT(reset_vector)
+ 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+ 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
+-#if HAS_CLUSTER
++#if HAS_CLUSTER || defined(GENERIC_PSCI_SMP)
++	// (generic boards: some number their cores in Affinity1 and leave Affinity0 at zero;
++	// a cpu data's phys id is both fields, as the device tree's "reg" has them)
+ 	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1
+ #else
+ 	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
+@@ -233,40 +257,175 @@ LEXT(_start)
  	.global	EXT(LowExceptionVectorBase)
  LEXT(LowExceptionVectorBase)
  	/* EL1 SP 0 */
@@ -1834,10 +1947,97 @@ index e5336e5a1cce..df132aa3c772 100644
 +	.quad	0						// PA of the loader's return stub
 +	.quad	0						// checkpoint number to stop at (0 = none)
 +	.quad	0						// (physical - virtual) offset of the static kernel image
++
++#if defined(GENERIC_PSCI_SMP)
++/*
++ * The same for a core other than the boot processor, from its first
++ * instruction (reset_vector) until common_start gives it the kernel's
++ * vectors. The boot loader is not this core's to return to; it leaves a note
++ * of what happened where the processor that is waiting for it looks
++ * (psci_smp_start_cpu()) and switches itself off again.
++ *
++ * VBAR holds a physical address here too, so the note is addressed
++ * physically; the store goes straight to memory when the MMU is still off,
++ * and is sent there when it is not.
++ */
++	.align	11
++	.globl EXT(LowSecondaryExceptionVectorBase)
++LEXT(LowSecondaryExceptionVectorBase)
++	/* EL1 SP 0 */
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	/* EL1 SP1 */
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	/* EL0 64 */
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	/* EL0 32 */
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++	.align	7
++	b		Lsecondary_early_exception
++
++	.align	3
++Lsecondary_early_exception:
++	// struct psci_smp_start_fault: { valid, MPIDR, ESR, ELR, FAR, LR, SP }
++	adrp	x9, EXT(psci_smp_start_fault)@page
++	add		x9, x9, EXT(psci_smp_start_fault)@pageoff
++	mrs		x10, MPIDR_EL1
++	str		x10, [x9, #8]
++	mrs		x10, ESR_EL1
++	str		x10, [x9, #16]
++	mrs		x10, ELR_EL1
++	str		x10, [x9, #24]
++	mrs		x10, FAR_EL1
++	str		x10, [x9, #32]
++	str		lr, [x9, #40]
++	mov		x10, sp
++	str		x10, [x9, #48]
++	mov		x10, #1
++	str		x10, [x9]
++	dc		cvac, x9
++	dsb		sy
++	// PSCI CPU_OFF, by the firmware's calling convention (psci_smp_hvc)
++	adrp	x9, EXT(psci_smp_hvc)@page
++	add		x9, x9, EXT(psci_smp_hvc)@pageoff
++	ldr		w9, [x9]
++	mov		x0, #0x0002
++	movk	x0, #0x8400, lsl #16
++	cbnz	w9, 1f
++	smc		#0
++	b		2f
++1:
++	hvc		#0
++2:
++	wfi											// it does not return; if it does, stay here
++	b		2b
++#endif /* defined(GENERIC_PSCI_SMP) */
  	.align 12, 0
  
  #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
-@@ -452,22 +500,51 @@ start_cpu:
+@@ -452,22 +611,51 @@ start_cpu:
   * Cold boot init routine.  Called from __start
   *   x0 - Boot args
   */
@@ -1892,7 +2092,7 @@ index e5336e5a1cce..df132aa3c772 100644
  
  	// Get the kernel memory parameters from the boot args
  	ldr		x22, [x20, BA_VIRT_BASE]			// Get the kernel virt base
-@@ -612,6 +689,7 @@ Lkernelcache_base_found:
+@@ -612,6 +800,7 @@ Lkernelcache_base_found:
  	/* Ensure TTEs are visible */
  	dsb		ish
  
@@ -1900,7 +2100,7 @@ index e5336e5a1cce..df132aa3c772 100644
  
  	b		common_start
  
-@@ -686,7 +764,10 @@ common_start:
+@@ -686,7 +875,10 @@ common_start:
  	dsb		ish
  
  
@@ -1912,7 +2112,7 @@ index e5336e5a1cce..df132aa3c772 100644
  	// Setup timer interrupt routing; must be done before MMU is enabled
  	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
  	and		x15, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
-@@ -740,10 +821,17 @@ common_start:
+@@ -740,10 +932,17 @@ common_start:
  	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
  #endif /* HAS_APPLE_PAC */
  
@@ -1942,7 +2142,7 @@ index 9d98c50094a0..9e3476124e54 100644
 +osfmk/minicrypto/mc_provider.c	standard
 +osfmk/minicrypto/mc_aes.c	standard
 diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
-index c40d57bcc677..6e1041216be1 100644
+index c40d57bcc677..1b7a1fcdfcdf 100644
 --- a/osfmk/conf/files.arm64
 +++ b/osfmk/conf/files.arm64
 @@ -25,8 +25,8 @@ osfmk/arm64/WKdmCompress_4k.s	standard
@@ -1956,7 +2156,7 @@ index c40d57bcc677..6e1041216be1 100644
  osfmk/arm64/bcopy.s standard
  osfmk/arm64/bzero.s standard
  osfmk/arm/caches.c		standard
-@@ -104,3 +104,7 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
+@@ -104,3 +104,8 @@ osfmk/arm64/machine_remote_time.c optional config_mach_bridge_recv_time
  osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
  
  osfmk/arm/counter.c	standard
@@ -1964,6 +2164,7 @@ index c40d57bcc677..6e1041216be1 100644
 +osfmk/arm64/loader_return.c	optional nos_arm_asm
 +osfmk/arm64/user_exception_trace.c	standard
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
++osfmk/arm64/psci_smp.c	optional nos_arm_asm
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 index 384118e8d7a9..2573d2ebd4e6 100644
 --- a/osfmk/console/video_console.c
@@ -2151,14 +2352,15 @@ index 65144c74239c..ab6260d52d84 100644
  }
  
 diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
-index d9f0723244e5..e78fb263d98a 100644
+index d9f0723244e5..53fe4f371d7f 100644
 --- a/pexpert/pexpert/arm64/BCM2837.h
 +++ b/pexpert/pexpert/arm64/BCM2837.h
-@@ -11,6 +11,14 @@
+@@ -11,6 +11,15 @@
  #define BCM2837
  #define BCM2837_BRINGUP
  #define ARM_ARCH_TIMER
 +#define GENERIC_GIC_V3_IRQ                 1 /* interrupts via GICv3 Group 1, see osfmk/arm64/gic_v3_irq.c */
++#define GENERIC_PSCI_SMP                  1 /* more cores are started through PSCI, see osfmk/arm64/psci_smp.c */
 +
 +/*
 + * The cores this kernel really runs on (Cortex-A55/A78, QEMU cortex-a76) are
@@ -2169,7 +2371,7 @@ index d9f0723244e5..e78fb263d98a 100644
  
  #define __ARM_ARCH__              8
  #define __ARM_VMSA__              8
-@@ -22,6 +30,7 @@
+@@ -22,6 +31,7 @@
  #ifndef ASSEMBLER
  
  #define PI3_UART
@@ -2177,7 +2379,7 @@ index d9f0723244e5..e78fb263d98a 100644
  
  #define PI3_BREAK                               asm volatile("brk #0");
  
-@@ -60,8 +69,11 @@
+@@ -60,8 +70,11 @@
  #define BCM2837_PUT32(addr, value) do { *((volatile uint32_t *) addr) = value; } while(0)
  #define BCM2837_GET32(addr) *((volatile uint32_t *) addr)
  
@@ -2191,6 +2393,19 @@ index d9f0723244e5..e78fb263d98a 100644
  #endif /* ! ASSEMBLER */
  
  #endif /* ! _PEXPERT_ARM_BCM2837_H */
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index c84b2100bc19..aaad5cd2e8c6 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -91,7 +91,7 @@
+ #include <pexpert/arm64/BCM2837.h>
+ 
+ #define MAX_L2_CLINE                   6
+-#define MAX_CPUS                       4
++#define MAX_CPUS                       8 /* the Raspberry Pi has four; the boards this runs on now have up to eight */
+ #define MAX_CPU_CLUSTERS               1
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
 diff --git a/security/mac_vfs_subr.c b/security/mac_vfs_subr.c
 index 97028c06bb92..0daad830d0c0 100644
 --- a/security/mac_vfs_subr.c

@@ -8,8 +8,14 @@
  *
  *   - the CPU interface is driven through the ICC_*_EL1 system registers
  *   - the EL1 virtual timer PPI is routed to the kernel's rtclock
+ *   - with more than one processor (psci_smp.c), two software-generated
+ *     interrupts carry the kernel's signals between them: cpu_signal() and
+ *     the order to stop when the system goes back to the boot loader
  *   - any other interrupt that fires is masked and counted, until a real
  *     driver registers a handler for it
+ *
+ * Every processor has its own CPU interface, redistributor frame and timer,
+ * and sets them up for itself (gic_v3_irq_cpu_init(), from PE_init_cpu()).
  *
  * Registers come from the device tree node /arm-io/gic:
  *   reg = <distributor offset, size, redistributor offset, size>
@@ -17,8 +23,11 @@
 #include <mach/mach_types.h>
 #include <kern/debug.h>
 #include <arm/cpu_data_internal.h>
+#include <arm/cpu_internal.h>
+#include <arm/machine_cpu.h>
 #include <arm/machine_routines.h>
 #include <arm/rtclock.h>
+#include <arm64/psci_smp.h>
 #include <arm64/proc_reg.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
@@ -42,23 +51,28 @@
 #define GICR_IGROUPR0           (GICR_SGI_BASE + 0x0080)
 #define GICR_ISENABLER0         (GICR_SGI_BASE + 0x0100)
 #define GICR_ICENABLER0         (GICR_SGI_BASE + 0x0180)
+#define GICR_ICACTIVER0         (GICR_SGI_BASE + 0x0380)
 #define GICR_IPRIORITYR(n)      (GICR_SGI_BASE + 0x0400 + (n))
 #define GICR_IGRPMODR0          (GICR_SGI_BASE + 0x0d00)
 
+#define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
+#define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
 #define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
 #define GIC_INTID_SPURIOUS_MIN  1020
 #define GIC_PRIORITY_DEFAULT    0xa0
 
 static vm_offset_t gicd_base, gicr_base;
 static vm_size_t   gicr_size;
-static vm_offset_t gicr_cpu_base;           /* boot CPU's redistributor frame */
+static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
 
-static uint64_t gic_active_iar;             /* acknowledged, not yet EOI'd */
+static uint64_t gic_active_iar[MAX_CPUS];   /* acknowledged, not yet EOI'd */
 uint64_t        gic_unhandled_count;
 uint32_t        gic_last_unhandled;
 
 void gic_v3_irq_cpu_init(void);
 void gic_v3_irq_quiesce(void);
+void gic_v3_irq_signal(uint32_t phys_id);
+void gic_v3_irq_signal_stop(uint32_t phys_id);
 
 static inline uint32_t
 gic_read32(vm_offset_t addr)
@@ -76,15 +90,45 @@ static void
 gic_mask(uint32_t intid)
 {
 	if (intid < 32) {
-		gic_write32(gicr_cpu_base + GICR_ICENABLER0, 1u << intid);
+		gic_write32(gicr_cpu_base[cpu_number()] + GICR_ICENABLER0, 1u << intid);
 	} else {
 		gic_write32(gicd_base + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
 	}
 }
 
+/*
+ * A software-generated interrupt for the processor with that MPIDR (its two
+ * low affinity fields, as in the device tree's "reg").
+ * ICC_SGI1R_EL1: Aff1 in [23:16], the interrupt in [27:24], and in [15:0] a
+ * bit for every Aff0 addressed -- which is why Aff0 has to be below 16.
+ */
+static void
+gic_send_sgi(uint32_t phys_id, uint32_t sgi)
+{
+	uint64_t aff0 = phys_id & 0xff, aff1 = (phys_id >> 8) & 0xff;
+
+	__builtin_arm_wsr64("ICC_SGI1R_EL1", ((uint64_t)sgi << 24) | (aff1 << 16) | (1ULL << (aff0 & 15)));
+	__builtin_arm_isb(ISB_SY);
+}
+
+/* The platform's half of cpu_signal(): interrupt that processor (GenericARMCPU::signalCPU()). */
+void
+gic_v3_irq_signal(uint32_t phys_id)
+{
+	gic_send_sgi(phys_id, GIC_SGI_SIGNAL);
+}
+
+void
+gic_v3_irq_signal_stop(uint32_t phys_id)
+{
+	gic_send_sgi(phys_id, GIC_SGI_STOP);
+}
+
 static void
 gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub, __unused int source)
 {
+	int cpu = cpu_number();
+
 	for (;;) {
 		uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
 		uint32_t intid = (uint32_t)(iar & 0xffffff);
@@ -92,12 +136,17 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 		if (intid >= GIC_INTID_SPURIOUS_MIN) {
 			break;
 		}
-		gic_active_iar = iar;
+		gic_active_iar[cpu] = iar;
 
 		if (intid == GIC_INTID_VTIMER) {
 			/* same sequence as the FIQ path in sleh_fiq() */
 			getCpuDatap()->cpu_decrementer = -1; /* Large */
 			rtclock_intr(TRUE);
+		} else if (intid == GIC_SGI_SIGNAL) {
+			cpu_signal_handler();
+		} else if (intid == GIC_SGI_STOP) {
+			/* comes back only if nobody has in fact asked for that */
+			psci_smp_stop_here();
 		} else {
 			/* nobody owns this interrupt yet: keep it from storming */
 			gic_mask(intid);
@@ -107,22 +156,29 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 
 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
 		__builtin_arm_isb(ISB_SY);
-		gic_active_iar = 0;
+		gic_active_iar[cpu] = 0;
 	}
 }
 
 /*
  * Leave the controller in a state another environment can take over from:
- * finish any interrupt that was acknowledged but not completed. Used when
- * control goes back to the boot loader (see loader_return.c).
+ * finish any interrupt that this processor acknowledged but did not complete.
+ * Used when control goes back to the boot loader (see loader_return.c), and
+ * by a processor that is about to be switched off for that (psci_smp.c).
  */
 void
 gic_v3_irq_quiesce(void)
 {
-	if (gic_active_iar != 0) {
-		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar);
+	int cpu;
+
+	if (gicd_base == 0) {
+		return;         /* as early as this there is no interrupt, nor a cpu number to ask for */
+	}
+	cpu = cpu_number();
+	if (gic_active_iar[cpu] != 0) {
+		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar[cpu]);
 		__builtin_arm_isb(ISB_SY);
-		gic_active_iar = 0;
+		gic_active_iar[cpu] = 0;
 	}
 }
 
@@ -146,10 +202,14 @@ gic_find_redistributor(void)
 	panic("gic: no redistributor for MPIDR 0x%llx", mpidr);
 }
 
-/* Per-CPU bring-up; only the boot CPU is supported for now. */
+/* Per-CPU bring-up: every processor calls this for itself, the boot processor first. */
 void
 gic_v3_irq_cpu_init(void)
 {
+	int cpu = cpu_number();
+	vm_offset_t gicr;
+	uint32_t mine = 1u << GIC_INTID_VTIMER;
+
 	if (gicd_base == 0) {
 		DTEntry entry;
 		void const *prop;
@@ -169,7 +229,7 @@ gic_v3_irq_cpu_init(void)
 		if (gicd_base == 0 || gicr_base == 0) {
 			panic("gic: cannot map the distributor/redistributor");
 		}
-	} else if (gicr_cpu_base != 0) {
+	} else if (gicr_cpu_base[cpu] != 0) {
 		return;
 	}
 
@@ -177,21 +237,35 @@ gic_v3_irq_cpu_init(void)
 	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);
 	__builtin_arm_isb(ISB_SY);
 
-	gicr_cpu_base = gic_find_redistributor();
+	gicr = gicr_cpu_base[cpu] = gic_find_redistributor();
 
-	uint32_t waker = gic_read32(gicr_cpu_base + GICR_WAKER);
+	uint32_t waker = gic_read32(gicr + GICR_WAKER);
 	if (waker & (GICR_WAKER_PROCSLEEP | GICR_WAKER_CHILDASLEEP)) {
-		gic_write32(gicr_cpu_base + GICR_WAKER, waker & ~GICR_WAKER_PROCSLEEP);
-		while (gic_read32(gicr_cpu_base + GICR_WAKER) & GICR_WAKER_CHILDASLEEP) {
+		gic_write32(gicr + GICR_WAKER, waker & ~GICR_WAKER_PROCSLEEP);
+		while (gic_read32(gicr + GICR_WAKER) & GICR_WAKER_CHILDASLEEP) {
 			/* spin until the redistributor is awake */
 		}
 	}
 
-	/* Virtual timer PPI: Group 1 (IRQ), default priority, enabled */
-	gic_write32(gicr_cpu_base + GICR_IGROUPR0, gic_read32(gicr_cpu_base + GICR_IGROUPR0) | (1u << GIC_INTID_VTIMER));
-	gic_write32(gicr_cpu_base + GICR_IGRPMODR0, gic_read32(gicr_cpu_base + GICR_IGRPMODR0) & ~(1u << GIC_INTID_VTIMER));
-	*(volatile uint8_t *)(gicr_cpu_base + GICR_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
-	gic_write32(gicr_cpu_base + GICR_ISENABLER0, 1u << GIC_INTID_VTIMER);
+	/*
+	 * The interrupts between processors, where there is more than one. A core that an earlier
+	 * kernel switched off in the middle of one (a return to the boot loader, started again
+	 * since) may still have it marked active, and would then never see another.
+	 */
+	if (ml_get_cpu_count() > 1) {
+		uint32_t sgis = (1u << GIC_SGI_SIGNAL) | (1u << GIC_SGI_STOP);
+
+		gic_write32(gicr + GICR_ICACTIVER0, sgis);
+		*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_SGI_SIGNAL)) = GIC_PRIORITY_DEFAULT;
+		*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_SGI_STOP)) = GIC_PRIORITY_DEFAULT;
+		mine |= sgis;
+	}
+
+	/* Virtual timer PPI (and those): Group 1 (IRQ), default priority, enabled */
+	gic_write32(gicr + GICR_IGROUPR0, gic_read32(gicr + GICR_IGROUPR0) | mine);
+	gic_write32(gicr + GICR_IGRPMODR0, gic_read32(gicr + GICR_IGRPMODR0) & ~mine);
+	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
+	gic_write32(gicr + GICR_ISENABLER0, mine);
 
 	/* Distributor: affinity routing, Group 1 enabled (normally already so) */
 	uint32_t ctlr = gic_read32(gicd_base + GICD_CTLR);
@@ -209,8 +283,8 @@ gic_v3_irq_cpu_init(void)
 	__builtin_arm_isb(ISB_SY);
 
 	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
-	kprintf("gic: v3, distributor %p, redistributor %p, virtual timer on PPI %d\n",
-	    (void *)gicd_base, (void *)gicr_cpu_base, GIC_INTID_VTIMER);
+	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
+	    (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER);
 }
 
 #endif /* GENERIC_GIC_V3_IRQ */
