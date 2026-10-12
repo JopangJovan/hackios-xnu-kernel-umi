@@ -111,6 +111,9 @@ struct ramfs_mount {
 	uint64_t            rm_max_pages;
 };
 
+/* file pages in use on all the mounts together (each mount has its own lock): for the kernel's memory report */
+_Atomic uint64_t ramfs_pages_in_use;
+
 #define RAMFS_MP(mp)    ((struct ramfs_mount *)vfs_fsprivate(mp))
 #define RAMFS_NODE(vp)  ((struct ramfs_node *)vnode_fsnode(vp))
 
@@ -183,6 +186,7 @@ ramfs_free_pages(struct ramfs_node *node, uint64_t from)
 			node->rn_pages[i] = NULL;
 			node->rn_nalloc--;
 			node->rn_mount->rm_pages--;
+			os_atomic_dec(&ramfs_pages_in_use, relaxed);
 		}
 	}
 }
@@ -401,6 +405,7 @@ ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, 
 		*spare = NULL;
 		node->rn_nalloc++;
 		rm->rm_pages++;
+		os_atomic_inc(&ramfs_pages_in_use, relaxed);
 	}
 	memcpy((char *)node->rn_pages[index] + (off & PAGE_MASK), src, len);
 	if (off + len > node->rn_size) {

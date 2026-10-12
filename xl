@@ -160,6 +160,14 @@ with open(out, 'wb') as f:
 PY
 }
 
+# One command at a time: the loader answers one host at a time, and a second command sent while a
+# run is waiting for its result ("xl state" in another terminal is enough) can cost that run its log.
+case "$1" in
+"") ;;
+*)	exec 9> logs/.xl.lock
+	flock -n 9 || { echo "xl: busy: another xl command (a run?) is talking to the phone" >&2; exit 1; } ;;
+esac
+
 case "$1" in
 enter) enter && echo "xl: loader is up" ;;
 screenshot) screenshot "$2" ;;

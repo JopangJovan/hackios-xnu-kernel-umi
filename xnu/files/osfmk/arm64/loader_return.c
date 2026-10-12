@@ -19,6 +19,8 @@
 #include <arm64/proc_reg.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/arm64/board_config.h>
+#include <vm/vm_page.h>
+#include <vm/vm_compressor.h>
 
 /*
  * The console log handed back to the loader. A long session writes more than fits, and both
@@ -332,6 +334,39 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
 static thread_call_t hv_wdt_call;
 static uint32_t hv_wdt_enabled;
 
+#define MEMORY_REPORT_BEATS     6               /* a line about memory every so many heartbeats */
+
+extern unsigned int memorystatus_available_pages, memorystatus_available_pages_critical,
+    memorystatus_available_pages_critical_base;
+extern uint32_t c_segment_pages_compressed;
+extern _Atomic uint64_t ramfs_pages_in_use;
+extern void MiniIOSurfaceUsage(uint32_t *count, uint64_t *bytes);
+
+/*
+ * Where the memory is, in megabytes: for reading a session's log afterwards. "available" is what
+ * the kernel's own count says (free and file-backed): below the first threshold it kills idle
+ * daemons, and once none is left and it is below the second, whatever is next in line -- the
+ * window server included.
+ */
+static void
+memory_report(void)
+{
+#define MB(pages)       ((unsigned int)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
+	uint32_t surfaces = 0;
+	uint64_t surface_bytes = 0;
+
+	MiniIOSurfaceUsage(&surfaces, &surface_bytes);
+	printf("memory: free %u, files %u, programs %u, wired %u (%u surfaces %u, ramfs %u), compressor %u (holding %u) MB; "
+	    "available %u, kills below %u (the idle) and %u (anybody)\n",
+	    MB(vm_page_free_count), MB(vm_page_pageable_external_count), MB(vm_page_pageable_internal_count),
+	    MB(vm_page_wire_count), surfaces, (unsigned int)(surface_bytes >> 20),
+	    MB(os_atomic_load(&ramfs_pages_in_use, relaxed)),
+	    MB(VM_PAGE_COMPRESSOR_COUNT), MB(c_segment_pages_compressed),
+	    MB(memorystatus_available_pages),
+	    MB(memorystatus_available_pages_critical), MB(memorystatus_available_pages_critical_base));
+#undef MB
+}
+
 /* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */
 static void
 hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
@@ -347,7 +382,9 @@ hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
 		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
 	}
-	loader_live.heartbeat++;
+	if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
+		memory_report();
+	}
 
 	clock_interval_to_deadline(HV_WDT_PET_SECONDS, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(hv_wdt_call, deadline);

@@ -1641,7 +1641,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_end(&w);
 	dt_end(&w);
 
+	/*
+	 * What iBoot's device tree tells the kernel to do unless told otherwise. The compressor: an
+	 * embedded kernel left to itself keeps it for the freezer alone, and with nothing being
+	 * compressed the memory is gone twice as fast (2 = VM_PAGER_COMPRESSOR_NO_SWAP, as on a phone).
+	 */
 	dt_begin(&w, "defaults");
+	dt_prop_u32(&w, "kern.vm_compressor", 2);
 	dt_end(&w);
 
 	/* the product: screen class, artwork scale, name ... as on the real phone */

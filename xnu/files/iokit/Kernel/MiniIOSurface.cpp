@@ -476,6 +476,14 @@ MiniIOSurfaceCopy(uint32_t sid)
 	return s;
 }
 
+/* How many surfaces there are and how much (wired) memory they hold: for the kernel's memory report. */
+extern "C" void
+MiniIOSurfaceUsage(uint32_t * count, uint64_t * bytes)
+{
+	*count = gSurfaceCount;
+	*bytes = gSurfaceBytes;
+}
+
 void
 MiniIOSurfaceDrop(MiniIOSurface * s)
 {
