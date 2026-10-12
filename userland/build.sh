@@ -14,6 +14,8 @@
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
 #                                   (default: src/inject.c in backboardd, src/inject_sb.c in SpringBoard);
 #                                   init hands the list to the kernel (etc/inject.conf -> sysctl kern.exec_inject)
+#                      EXTRA="..."  more programs for /redwood/bin (files on this machine): one-off
+#                                   diagnostics, which a file given as RC_JOBS can then run
 #                      RC_JOBS=<file> what the job com.redwood.demo runs: rc.jobs (default), or
 #                                   rc.jobs.unlock, which also swipes the lock screen away (for the phone,
 #                                   where nothing else can touch the screen yet)
@@ -119,6 +121,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
+	for f in $EXTRA; do cp "$f" root/bin/; done
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	if [ -n "$GL" ]; then
