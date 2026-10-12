@@ -31,7 +31,7 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'mobile.installd', 'installcoordinationd', 'purplebuddy', 'restore', 'usb', 'accessoryd',
         'mobileassetd', 'nsurlsessiond', 'apsd', 'itunesstored', 'appstored', 'cloudd', 'bird',
         # these start, crash and are asked for again, over and over
-        'aggregated', 'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd')
+        'aggregated', 'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd')
 
 args = sys.argv[1:]
 rest = args[:1] == ['--rest']
