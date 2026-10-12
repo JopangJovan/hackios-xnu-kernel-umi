@@ -42,6 +42,7 @@ void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's touch screen */
 void redwood_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
+void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 #endif
 
 #endif /* _SYS_REDWOOD_INPUT_H_ */
