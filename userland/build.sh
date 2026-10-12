@@ -17,6 +17,10 @@
 #                      RC_JOBS=<file> what the job com.redwood.demo runs: rc.jobs (default), or
 #                                   rc.jobs.unlock, which also swipes the lock screen away (for the phone,
 #                                   where nothing else can touch the screen yet)
+#                      GL=1         with an OpenGL ES implementation for the window server: Mesa
+#                                   (tools/mk-mesa.sh fetches and builds it, once) behind src/eagl.c, as
+#                                   lib/libOSMesa.8.dylib (13 MB) and lib/libredwood-gl.dylib. CoreAnimation
+#                                   then draws with its OpenGL ES renderer instead of its software one.
 #   system.packfs    the system image, the root filesystem (second RAM disk, /dev/md1): the part of
 #                    iOS 16.5 chosen by ../ios165/select-system.py at its real paths, the dyld
 #                    shared cache, and src/stage0.c as /sbin/launchd (the real one is
@@ -94,11 +98,21 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood.dylib src/inject.c
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-sb.dylib -framework CoreFoundation -lobjc \
 			-o obj/libredwood-sb.dylib src/inject_sb.c
+		if [ -n "$GL" ]; then
+			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
+			M=../xnu-deps/build/mesa/out
+			[ -f $M/libOSMesa.8.dylib ] || ../tools/mk-mesa.sh
+			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
+			$DYN -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation \
+				-framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libredwood-gl.dylib src/eagl.c src/gl_osmesa.c
+			cp $M/libOSMesa.8.dylib obj/
+		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
+	[ -n "$GL" ] && cp obj/libredwood-gl.dylib obj/libOSMesa.8.dylib root/lib/
 	echo "$INJECT" > root/etc/inject.conf
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo

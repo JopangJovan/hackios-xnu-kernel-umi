@@ -27,6 +27,7 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
@@ -44,6 +45,7 @@
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
 #define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide */
+#define REDWOOD_GL "/redwood/lib/libredwood-gl.dylib"
 
 static uintptr_t slide;
 
@@ -170,7 +172,7 @@ my_finish_update(void *display, void *update, unsigned flags)
 static void *
 my_renderer(void *server)
 {
-	static int failed;
+	static int failed, said;
 	void *renderer;
 
 	if (failed) {
@@ -180,6 +182,9 @@ my_renderer(void *server)
 	if (renderer == NULL) {
 		failed = 1;
 		say("redwood: no accelerated renderer; the software one will draw\n");
+	} else if (!said) {
+		said = 1;
+		say("redwood: the server has an accelerated renderer (%p)\n", renderer);
 	}
 	return renderer;
 }
@@ -195,6 +200,38 @@ my_render_update(void *server, void *update, unsigned *flags)
 	return r;
 }
 
+/*
+ * CoreAnimation draws a layer's pixels with one of ninety "functions" (a fragment shader each: an
+ * image as it is, an image through a colour matrix, a blur of so many samples, ...), and asks
+ * its renderer which of them it has. Its OpenGL ES renderer has not half of them (the Metal one
+ * has all). Which ones are asked for and missing is worth knowing: said once each.
+ * (The last of the ninety, "cst", is not asked about: the OpenGL ES renderer draws it with no
+ * program at all, which draws nothing. The lock screen's wallpaper goes that way.)
+ */
+#define VT_GLES_CONTEXT         0x1d5b3b540UL   /* vtable for CA::OGL::GLESContext */
+
+static int (*orig_function_supported)(void *context);
+
+static int
+my_function_supported(void *context)
+{
+	static const char names[] =
+	    "clr img ida cim cid mua m1a lrp lrc lra add spl s1a cma bds bco bim c33 c3b c4b c4p c3a c3x c4x bia grl ds4 ds6 "
+	    "ds8 ups db2 db4 nb7 n11 n15 n19 n23 n27 vrd vrb sb3 axl rad rac con vcm vdk vlt map mpc crv hue clm hom opa met "
+	    "srl ega sdr alt p3c edr hrm lut ovr ovl lub aup alm stl pc0 pc1 prc psl ps0 ps1 psm psr pcr pbl peo bib asg a75 "
+	    "a50 atc ipc apl 3dl cst ";
+	static uint8_t said[256];
+	int supported = orig_function_supported(context);
+	uint8_t function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
+
+	if (!supported && !said[function]) {
+		said[function] = 1;
+		say("redwood: CoreAnimation's OpenGL ES renderer has no function %u (\"%.3s\"): what needs it is not drawn\n",
+		    function, function < 90 ? names + 4 * function : "?");
+	}
+	return supported;
+}
+
 static void
 window_server_fixes(void)
 {
@@ -208,6 +245,10 @@ window_server_fixes(void)
 	orig_renderer = replace_virtual("renderer", VSLOT(VT_EAGL_SERVER, 0x1a0), 0x1882e2548UL, my_renderer);
 	orig_render_update = replace_virtual("render_update", VSLOT(VT_EAGL_SERVER, 0x178), 0x18835770cUL,
 	    my_render_update);
+	if (access(REDWOOD_GL, R_OK) == 0) {
+		orig_function_supported = replace_virtual("function_supported", VSLOT(VT_GLES_CONTEXT, 0x378), 0x1884a9308UL,
+		    my_function_supported);
+	}
 	say("redwood: window server hooks %s\n", orig_is_ready && orig_ignore_update_p && orig_begin_update &&
 	    orig_finish_update && orig_renderer && orig_render_update ? "installed" : "INCOMPLETE");
 }
@@ -656,6 +697,16 @@ redwood_init(void)
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
 	if (strcmp(name, "backboardd") == 0) {
+		/*
+		 * An OpenGL ES implementation for CoreAnimation, where the image has one (build.sh GL=1;
+		 * src/eagl.c): it puts itself behind EAGLContext as it is loaded, and the renderer the
+		 * server then gets is the OpenGL ES one.
+		 */
+		if (access(REDWOOD_GL, R_OK) == 0) {
+			if (dlopen(REDWOOD_GL, RTLD_NOW) == NULL) {
+				say("redwood: %s: %s\n", REDWOOD_GL, dlerror());
+			}
+		}
 		window_server_fixes();
 		/*
 		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
