@@ -88,6 +88,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/surf_test.c
 		$DYN -o obj/rwtouch src/rwtouch.c
 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
+		$DYN -o obj/cpu_test src/cpu_test.c
 		# our library for inside stock iOS programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libredwood.dylib src/inject.c
@@ -95,6 +96,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood-sb.dylib src/inject_sb.c
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
+	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	echo "$INJECT" > root/etc/inject.conf
