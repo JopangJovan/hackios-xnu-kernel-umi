@@ -34,7 +34,7 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'installcoordinationd', 'purplebuddy', 'restore', 'usb', 'accessoryd',
         'mobileassetd', 'nsurlsessiond', 'apsd', 'itunesstored', 'appstored', 'cloudd', 'bird',
         # these start, crash and are asked for again, over and over
-        'aggregated', 'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd')
+        'aggregated', 'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
