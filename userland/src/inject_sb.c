@@ -15,6 +15,9 @@
  *     found the window server then never takes our touch screen service for its own.
  *     (A wrapper program in the launchd job would be the obvious way to wait; launchd panics
  *     the system when a system job runs anything that is not Apple's.)
+ *   - The picture SpringBoard keeps of an application that leaves the screen (for the application
+ *     switcher and the next launch) is saved as JPEG or PNG, not as an ASTC texture: see
+ *     snapshot_output_format().
  *   - Darwin notifications as a remote control, for scripts (rwtouch notify NAME):
  *       com.redwood.unlock      what the lock screen does after "swipe up to open"
  */
@@ -55,25 +58,33 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 static uintptr_t slide;
 
 /*
- * Replace -[CLASS SELECTOR], whose code must now be at the unslid address `expected` (iOS 16.5, 20F66:
- * what a replacement does depends on what the original did). Returns the original.
+ * Replace -[CLASS SELECTOR] (or +[CLASS SELECTOR]: `kind` is that first character), whose code must now
+ * be at the unslid address `expected` (iOS 16.5, 20F66: what a replacement does depends on what the
+ * original did). Returns the original.
  * (dyld interposing of the C functions underneath does not reach calls made from inside the
  * shared cache: there one library branches straight into the other.)
  */
 static IMP
-replace_method(const char *class_name, const char *selector, uintptr_t expected, IMP replacement)
+replace_method_of_kind(char kind, const char *class_name, const char *selector, uintptr_t expected, IMP replacement)
 {
 	Class cls = objc_getClass(class_name);
-	Method method = cls ? class_getInstanceMethod(cls, sel_registerName(selector)) : NULL;
+	Method method = cls == NULL ? NULL : kind == '+' ? class_getClassMethod(cls, sel_registerName(selector)) :
+	    class_getInstanceMethod(cls, sel_registerName(selector));
 	IMP original = method ? method_getImplementation(method) : NULL;
 
 	if (original == NULL || (uintptr_t)original != expected + slide) {
-		say("redwood: -[%s %s]: found %#lx, expected %#lx; left alone\n", class_name, selector,
+		say("redwood: %c[%s %s]: found %#lx, expected %#lx; left alone\n", kind, class_name, selector,
 		    original ? (uintptr_t)original - slide : 0, expected);
 		return NULL;
 	}
 	method_setImplementation(method, replacement);
 	return original;
+}
+
+static IMP
+replace_method(const char *class_name, const char *selector, uintptr_t expected, IMP replacement)
+{
+	return replace_method_of_kind('-', class_name, selector, expected, replacement);
 }
 
 /*
@@ -99,6 +110,32 @@ set_setup_required_reason(id self, SEL selector, long reason)
 		say("redwood: SpringBoard wants the setup assistant (reason %ld); not here\n", reason);
 	}
 	original_set_setup_required_reason(self, selector, 0);
+}
+
+/*
+ * +[XBApplicationSnapshotManifestImpl _outputFormatForSnapshot:] chooses the file format of the picture
+ * SpringBoard takes of an application that leaves the screen: 0 = PNG, 1 and 2 = ATX (an ASTC texture),
+ * 3 = JPEG. A device with a wide colour display that can decode ASTC gets ATX, and iOS compresses it on
+ * the processor: fast with the vector code of Apple's cores, but here it takes one core more than ten
+ * seconds per picture (under QEMU; seconds on the phone) -- and all that time the application waits for
+ * the answer, until the watchdog for scene updates (10 s, there is no setting to scale it) kills it:
+ * no application survived going to the background. JPEG takes a fraction of a second; it has no
+ * transparency, so a picture that needs it becomes a PNG (which is what iOS itself does on a device
+ * without ASTC).
+ */
+#define SNAPSHOT_FORMAT_PNG             0
+#define SNAPSHOT_FORMAT_JPEG            3
+
+static long
+snapshot_output_format(__unused id self, __unused SEL selector, id snapshot)
+{
+	SEL opaque = sel_registerName("isImageOpaque");
+
+	if (snapshot != NULL && class_getInstanceMethod(object_getClass(snapshot), opaque) != NULL &&
+	    ((BOOL (*)(id, SEL))objc_msgSend)(snapshot, opaque)) {
+		return SNAPSHOT_FORMAT_JPEG;
+	}
+	return SNAPSHOT_FORMAT_PNG;
 }
 
 /* ---- remote control ------------------------------------------------------------------------------ */
@@ -136,7 +173,7 @@ redwood_springboard_init(void)
 {
 	const char *name = getprogname();
 	size_t length = 0;
-	IMP activation;
+	IMP activation, snapshot_format;
 	int token;
 
 	if (name == NULL || strcmp(name, "SpringBoard") != 0) {
@@ -146,8 +183,11 @@ redwood_springboard_init(void)
 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);
 	original_set_setup_required_reason = (void (*)(id, SEL, long))replace_method("SBSetupManager",
 	    "_setSetupRequiredReason:", 0x1c4cdd3a4UL, (IMP)set_setup_required_reason);
-	say("redwood: SpringBoard: activation %s, setup assistant %s\n", activation ? "answered here" : "NOT replaced",
-	    original_set_setup_required_reason ? "refused" : "NOT replaced");
+	snapshot_format = replace_method_of_kind('+', "XBApplicationSnapshotManifestImpl", "_outputFormatForSnapshot:",
+	    0x1f1c91480UL, (IMP)snapshot_output_format);
+	say("redwood: SpringBoard: activation %s, setup assistant %s, application snapshots %s\n",
+	    activation ? "answered here" : "NOT replaced", original_set_setup_required_reason ? "refused" : "NOT replaced",
+	    snapshot_format ? "as JPEG" : "NOT changed");
 	{
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
