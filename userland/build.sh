@@ -116,6 +116,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	cp com.redwood.demo.plist root/LaunchDaemons/
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
+# firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
+# (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/redwood_adreno.c, finds it in fw/
+if [ -d ../fw-gpu ]; then
+	mkdir -p root/fw
+	cp ../fw-gpu/* root/fw/
+fi
 ../mkpackfs.py -o root.packfs root
 
 # --- the system image -----------------------------------------------------------------------------
