@@ -1125,10 +1125,32 @@ static const char fragment_start[] =
     "#define textureCube texture\n"
     "#define sampler2DRect sampler2D\n"
     "#define texture2DRect(s, c) texture(s, (c) / vec2(textureSize(s, 0)))\n"
-    "layout(location = 0) out highp vec4 redwood_colour[1];\n"
-    "#define gl_FragData redwood_colour\n"
-    "#define gl_FragColor redwood_colour[0]\n"
+    "highp vec4 redwood_data[1];\n"
+    "#define gl_FragData redwood_data\n"
+    "#define gl_FragColor redwood_data[0]\n";
+/*
+ * What a fragment shader of the first version writes to (gl_FragData), and with the extension a
+ * GPU's driver offers and CoreAnimation then uses (EXT_shader_framebuffer_fetch) reads what is
+ * there already from (gl_LastFragData), are in 3.00 one variable of the shader's own, declared
+ * "out" or "inout". The shader's main() is given another name and called from one that reads
+ * that variable before and writes it after.
+ */
+static const char fragment_plain[] =
+    "layout(location = 0) out highp vec4 redwood_colour;\n"
+    "#define main redwood_main\n"
     "#line 1\n";
+static const char fragment_plain_end[] =
+    "\n#undef main\n"
+    "void main() { redwood_main(); redwood_colour = redwood_data[0]; }\n";
+static const char fragment_fetch[] =
+    "layout(location = 0) inout highp vec4 redwood_colour;\n"
+    "highp vec4 redwood_last[1];\n"
+    "#define gl_LastFragData redwood_last\n"
+    "#define main redwood_main\n"
+    "#line 1\n";
+static const char fragment_fetch_end[] =
+    "\n#undef main\n"
+    "void main() { redwood_last[0] = redwood_colour; redwood_main(); redwood_colour = redwood_data[0]; }\n";
 static const char vertex_start[] =
     "#define attribute in\n"
     "#define varying out\n"
@@ -1157,8 +1179,8 @@ static void
 my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *const *strings, const GLint *lengths)
 {
 	struct eagl *e = context;
-	const char *start = e->fragment[shader % 64] ? fragment_start : vertex_start;
-	const GLchar *parts[3] = { "#version 300 es\n", start, NULL };
+	bool fragment = e->fragment[shader % 64], fetch;
+	const GLchar *parts[5] = { "#version 300 es\n", fragment ? fragment_start : vertex_start, "", NULL, "" };
 	size_t size = 1, extensions = 0;
 	char *text, *line, *head;
 
@@ -1166,7 +1188,7 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	for (GLsizei i = 0; i < count; i++) {
 		size += lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]);
 	}
-	if ((text = calloc(1, 2 * size + sizeof(fragment_start) + 64)) == NULL) {
+	if ((text = calloc(1, 2 * size + 64)) == NULL) {
 		glShaderSource(shader, count, strings, lengths);
 		return;
 	}
@@ -1185,10 +1207,15 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 		extensions++;
 	}
 	parts[0] = head;
-	parts[2] = text;
+	parts[3] = text;
+	if (fragment) {
+		fetch = strstr(text, "gl_LastFragData") != NULL;
+		parts[2] = fetch ? fragment_fetch : fragment_plain;
+		parts[4] = fetch ? fragment_fetch_end : fragment_plain_end;
+	}
 	free((void *)e->sources[shader % 64]);
 	e->sources[shader % 64] = text;
-	glShaderSource(shader, 3, parts, NULL);
+	glShaderSource(shader, 5, parts, NULL);
 	EAGL_LEAVE(e, 0x12a0);
 }
 

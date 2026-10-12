@@ -200,9 +200,12 @@ REST=1 userland/build.sh
 Остальные переменные (`JOBS`, `OSLOG`, `INJECT`, `RC_JOBS`) описаны в начале `userland/build.sh`.
 
 `GL=1 REST=1 userland/build.sh` — образ, в котором оконный сервер рисует через OpenGL ES, а не программным
-растеризатором CoreAnimation: за `EAGLContext` встаёт Mesa (пока с программным же драйвером softpipe — проверка
-пути, а не ускорение). Mesa в репозитории нет: `tools/mk-mesa.sh` один раз скачивает и собирает её (нужны meson,
-ninja, bison, flex); прослойка — `userland/src/eagl.c`.
+растеризатором CoreAnimation: за `EAGLContext` встаёт Mesa (прослойка — `userland/src/eagl.c`). На телефоне с
+параметрами ядра `adreno=21 adreno_skip=0x1c00 adreno_pause=0 adreno_keep=1` рисует сам Adreno: драйвер freedreno
+из Mesa говорит с ядром (`iokit/Kernel/RedwoodGPU.cpp`) на языке линуксового msm DRM. Без этих параметров и в
+QEMU — программный softpipe. После первого запуска с момента включения телефона добавляйте `adreno_zap=0`.
+Mesa в репозитории нет: `tools/mk-mesa.sh` один раз скачивает и собирает её (нужны meson, ninja, bison, flex).
+`GL=test RC_JOBS=rc.jobs.gltest` — только библиотека и `gl_test`: один треугольник на экран.
 
 После пересборки ядра/загрузчика/программ `tools/update-prebuilt.sh` обновляет `prebuilt/`.
 
