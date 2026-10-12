@@ -4,6 +4,7 @@
 /*
 !/.gitignore
 !/README.md
+!/docs/
 !/xl
 !/mkpackfs.py
 !/mkxnuimg.py
