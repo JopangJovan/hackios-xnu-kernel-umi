@@ -15,22 +15,26 @@
  *   3  reads   the GPU's own clock controller, as the boot loader left it
  *   4  writes  the "CX" power switch on: the half of the GPU block that is not the 3D core --
  *              the power management processor ("GMU"), the bus interface, the GPU's SMMU
- *   5  writes  the clocks of that half on
+ *   5  writes  the clocks of that half on, and measures with the SoC's frequency counter whether
+ *              they run: the control register of one of them does not say
  *   6  reads   the first words from the GPU block itself: registers of the GMU (among them a
  *              counter that should be seen counting) and of the bus interface
  *   7  reads   the GMU's own channel to RPMh
  *   8  reads   the SMMU in front of the GPU: its ID registers, and which stream goes where
  *   9  reads   that SMMU's first translation context
  *  10  writes  two words into the GMU's memory and reads them back: the way its firmware goes
- *  11  asks    TrustZone three questions that pass no memory, the last of them whether it can
- *              authenticate a GPU "zap shader" -- without which the 3D core stays locked
+ *  11  asks    TrustZone questions that pass no memory: whether it takes calls from this kernel,
+ *              and which firmware images it says it authenticates
+ *  12  asks    TrustZone to check the signature of the GPU's "zap shader", the signed image
+ *              without which the 3D core stays locked in secure mode: its header goes from the
+ *              small image (fw/a660_zap.mdt) into memory of ours that TrustZone is pointed at
  *
- * What is left after that needs files from the phone's Android side: a translation context for
- * the GMU, its firmware (a660_gmu.bin) loaded and started, a conversation with it (HFI) that
- * makes it power the 3D core; then the core's microcode (a660_sqe.fw) and the signed zap shader
- * (a660_zap) that only TrustZone can run to let the core out of secure mode. There is no register
- * that holds the chip ID (0x06030500, "qcom,chipid" in the device tree): the fuses of step 2 are
- * all the hardware says about itself, and the GMU's version is a property of its firmware.
+ * What is left after that: a translation context for the GMU, its firmware (a660_gmu.bin) loaded
+ * and started, a conversation with it (HFI) that makes it power the 3D core; then the core's
+ * microcode (a660_sqe.fw), and the rest of the zap shader's loading. The firmware is the phone's
+ * own, from /vendor/firmware of its Android. There is no register that holds the chip ID
+ * (0x06030500, "qcom,chipid" in the device tree): the fuses of step 2 are all the hardware says
+ * about itself, and the GMU's version is a property of its firmware.
  *
  * More boot-args:
  *   adreno_only=K      step K alone (what steps 6 to 10 need, they check for themselves: within
@@ -51,15 +55,19 @@
  * qfprom@780000), register layouts from Linux, where SC7280 is this SoC: drivers/clk/qcom/
  * {gcc,gpucc}-sc7280.c, gdsc.c, clk-rcg2.c, drivers/gpu/drm/msm/adreno/a6xx_gmu.c with
  * registers/adreno/a6xx{,_gmu}.xml, drivers/iommu/arm/arm-smmu/arm-smmu.h, drivers/soc/qcom/
- * cmd-db.c, drivers/firmware/qcom/qcom_scm{,-smc}.c. The phone's vendor kernel agrees on every
- * offset used here.
+ * cmd-db.c, drivers/firmware/qcom/qcom_scm{,-smc}.c, drivers/soc/qcom/mdt_loader.c. The phone's
+ * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <mach/vm_param.h>
+#include <miscfs/packfs/packfs.h>
 #include <pexpert/pexpert.h>
 #include <sys/redwood_input.h>
+#include <sys/stat.h>
 #include <sys/systm.h>
+#include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
@@ -68,6 +76,7 @@ static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20
 static uint32_t step;                   /* the one being performed */
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
 static char last_write[96] = "nothing written";
+static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
 
 static void
 sleep_us(uint32_t us)
@@ -152,6 +161,9 @@ get(struct block *b, const char *name, uint32_t offset)
 	uint32_t value;
 
 	need(b);
+	if (quiet) {
+		return rd(b->base + offset);
+	}
 	if (step == newest_step) {
 		printf("adreno: %u: about to read %s %s at %#x\n", step, b->name, name, b->phys + offset);
 		hold(true);
@@ -165,10 +177,12 @@ static void
 put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 {
 	need(b);
-	printf("adreno: %u: about to write %s %s at %#x: %#x\n", step, b->name, name, b->phys + offset, value);
-	snprintf(last_write, sizeof(last_write), "step %u wrote %#x to %s %s at %#x", step, value, b->name, name,
-	    b->phys + offset);
-	hold(true);
+	if (!quiet) {
+		printf("adreno: %u: about to write %s %s at %#x: %#x\n", step, b->name, name, b->phys + offset, value);
+		snprintf(last_write, sizeof(last_write), "step %u wrote %#x to %s %s at %#x", step, value, b->name, name,
+		    b->phys + offset);
+		hold(true);
+	}
 	wr(b->base + offset, value);
 }
 
@@ -521,6 +535,8 @@ clock_source(const char *name, uint32_t rcgr, uint32_t source)
 	return true;
 }
 
+static bool measure_clocks(void);
+
 /*
  * The clocks the device tree gives the GMU and the SMMU, at the rates both the vendor's driver
  * and Linux bring the GMU up with: 200 MHz for the GMU, 150 MHz for the "hub" (a6xx_gmu_resume).
@@ -552,32 +568,211 @@ step_clocks(void)
 	}
 
 	announce("in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
-	return clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false) &&
-	       clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) &&
-	       clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) &&
-	       clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true) &&
-	       clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true) &&
-	       clock_on(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) &&
-	       clock_on(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR, false);
+	if (!clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false) ||
+	    !clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) ||
+	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
+	    !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true) ||
+	    !clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true) ||
+	    !clock_on(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) ||
+	    !clock_on(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR, false)) {
+		return false;
+	}
+	return measure_clocks();
 }
 
-/* What every later step stands on: CX powered and its clocks running. */
+/*
+ * Whether a clock runs is not always to be had from its control register: the one of the register
+ * bus inside the GPU block, gpu_cc_ahb, reads 0 on this phone before and after its enable bit is
+ * written (Linux, for which it has "no bit to check", writes the bit and waits 10 us). The SoC can
+ * measure instead: a clock controller can put any of its clocks on a debug output, and the global
+ * controller counts what it is given there against the crystal. The vendor's kernel shows the
+ * result as "clk_measure"; registers, selections and procedure are its debugcc-yupik.c and
+ * clk-debug.c (mainline Linux has no counterpart).
+ */
+#define GCC_DEBUG_MUX           0x62000         /* [9:0] which clock goes to the counter */
+#define GCC_DEBUG_MUX_GPUCC     0x146           /* ... the debug output of the GPU's clock controller */
+#define GCC_DEBUG_DIV           0x62004         /* [3:0] divider - 1; both controllers divide by 2 */
+#define GCC_DEBUG_CBCR          0x62008
+#define GCC_XO_DIV4_CBCR        0x6200c         /* the counter's time base: the crystal / 4, 4.8 MHz */
+#define GCC_MEASURE_CTL         0x62038         /* [19:0] how many ticks of the time base to count for */
+#define MEASURE_RUN             (1u << 20)
+#define MEASURE_CLEAR           (1u << 21)
+#define GCC_MEASURE_STATUS      0x6203c         /* [24:0] the count */
+#define MEASURE_DONE            (1u << 25)
+#define MEASURE_BRIEF           0x1000          /* ticks: a millisecond */
+#define MEASURE_FULL            0x20000         /* 27 ms */
+#define MEASURE_FAILED          0xffffffffu
+#define GPUCC_DEBUG_DIV         0x10fc
+#define GPUCC_DEBUG_CBCR        0x1100
+#define GPUCC_DEBUG_MUX         0x1568          /* [7:0] which of the GPU's clocks */
+#define GPUCC_DEBUG_CXO_AON     0x0b
+#define GPUCC_DEBUG_GX_GMU      0x11
+#define GPUCC_DEBUG_AHB         0x12
+#define GPUCC_DEBUG_CX_GMU      0x1a
+#define GPUCC_DEBUG_CXO         0x1b
+#define GPUCC_DEBUG_HUB_CX_INT  0x1c
+#define GPUCC_DEBUG_CB          0x26
+#define GPUCC_DEBUG_HUB_AON     0x27
+
+/* Let the counter run for so many ticks of its time base; what it counted of the clock on its input. */
+static uint32_t
+count_clock(uint32_t ticks)
+{
+	uint32_t control = get(&gcc, "measure control", GCC_MEASURE_CTL) & ~(MEASURE_RUN | MEASURE_CLEAR | 0xfffffu);
+	uint32_t status = 0;
+
+	put(&gcc, "measure control", GCC_MEASURE_CTL, control | MEASURE_CLEAR);
+	sleep_us(10);
+	put(&gcc, "measure control", GCC_MEASURE_CTL, control | ticks);
+	put(&gcc, "measure control", GCC_MEASURE_CTL, control | ticks | MEASURE_RUN);
+	for (int i = 0; i < 2000 && !(status & MEASURE_DONE); i++) {
+		sleep_us(100);
+		status = rd(gcc.base + GCC_MEASURE_STATUS);
+	}
+	put(&gcc, "measure control", GCC_MEASURE_CTL, control | ticks);
+	return status & MEASURE_DONE ? get(&gcc, "measure status", GCC_MEASURE_STATUS) & 0x1ffffff : MEASURE_FAILED;
+}
+
+/*
+ * The rate in Hz of one of the GPU clock controller's clocks; 0 if it does not run, MEASURE_FAILED
+ * if the counter does not finish. Everything that is changed for it is put back.
+ */
+static uint32_t
+measure(uint32_t select)
+{
+	uint32_t gpu_mux = get(&gpucc, "debug mux", GPUCC_DEBUG_MUX), gpu_div = get(&gpucc, "debug divider", GPUCC_DEBUG_DIV);
+	uint32_t gpu_cbcr = get(&gpucc, "debug output", GPUCC_DEBUG_CBCR), mux = get(&gcc, "debug mux", GCC_DEBUG_MUX);
+	uint32_t div = get(&gcc, "debug divider", GCC_DEBUG_DIV), cbcr = get(&gcc, "debug input", GCC_DEBUG_CBCR);
+	uint32_t base = get(&gcc, "crystal/4", GCC_XO_DIV4_CBCR), control = get(&gcc, "measure control", GCC_MEASURE_CTL);
+	uint32_t brief, full;
+
+	put(&gpucc, "debug mux", GPUCC_DEBUG_MUX, (gpu_mux & ~0xffu) | select);
+	put(&gpucc, "debug divider", GPUCC_DEBUG_DIV, (gpu_div & ~0xfu) | 1);
+	put(&gpucc, "debug output", GPUCC_DEBUG_CBCR, gpu_cbcr | CBCR_ENABLE);
+	put(&gcc, "debug mux", GCC_DEBUG_MUX, (mux & ~0x3ffu) | GCC_DEBUG_MUX_GPUCC);
+	put(&gcc, "debug divider", GCC_DEBUG_DIV, (div & ~0xfu) | 1);
+	put(&gcc, "debug input", GCC_DEBUG_CBCR, cbcr | CBCR_ENABLE);
+	put(&gcc, "crystal/4", GCC_XO_DIV4_CBCR, base | CBCR_ENABLE);
+	/* a counter whose input stands still keeps its last count: the two counts differ only if the clock runs */
+	brief = count_clock(MEASURE_BRIEF);
+	full = brief == MEASURE_FAILED ? MEASURE_FAILED : count_clock(MEASURE_FULL);
+	put(&gcc, "measure control", GCC_MEASURE_CTL, control);
+	put(&gcc, "crystal/4", GCC_XO_DIV4_CBCR, base);
+	put(&gcc, "debug input", GCC_DEBUG_CBCR, cbcr);
+	put(&gcc, "debug divider", GCC_DEBUG_DIV, div);
+	put(&gcc, "debug mux", GCC_DEBUG_MUX, mux);
+	put(&gpucc, "debug output", GPUCC_DEBUG_CBCR, gpu_cbcr);
+	put(&gpucc, "debug divider", GPUCC_DEBUG_DIV, gpu_div);
+	put(&gpucc, "debug mux", GPUCC_DEBUG_MUX, gpu_mux);
+
+	if (full == MEASURE_FAILED) {
+		return MEASURE_FAILED;
+	}
+	if (full == brief) {
+		return 0;
+	}
+	/* the vendor's formula; times 4 for the two dividers on the way to the counter */
+	return (uint32_t)(((uint64_t)full * 10 + 15) * 4800000 / ((uint64_t)MEASURE_FULL * 10 + 35) * 4);
+}
+
+static uint32_t
+measure_quietly(uint32_t select)
+{
+	uint32_t hz;
+
+	quiet = true;
+	hz = measure(select);
+	quiet = false;
+	return hz;
+}
+
+/*
+ * Measure the clocks step 5 has turned on. The crystal's comes first and aloud: its rate is known,
+ * so it shows whether the counter can be believed; one that is off (the 3D core's) comes last.
+ */
+static bool
+measure_clocks(void)
+{
+	static const struct {
+		const char *name;
+		uint32_t select;
+	} clocks[] = {
+		{ "cx_gmu (200 MHz was asked for)", GPUCC_DEBUG_CX_GMU }, { "hub_cx_int (from 150 MHz)", GPUCC_DEBUG_HUB_CX_INT },
+		{ "hub_aon", GPUCC_DEBUG_HUB_AON }, { "cb", GPUCC_DEBUG_CB }, { "cxo_aon", GPUCC_DEBUG_CXO_AON },
+		{ "gx_gmu (should be off)", GPUCC_DEBUG_GX_GMU }, { "ahb, THE ONE IN QUESTION,", GPUCC_DEBUG_AHB },
+	};
+	uint32_t hz, ahb_hz = MEASURE_FAILED;
+
+	announce("measure the GPU block's clocks with the SoC's frequency counter (debug registers at gcc 0x162000.., "
+	    "gpucc 0x3d910fc, 0x3d91100, 0x3d91568)");
+	hz = measure(GPUCC_DEBUG_CXO);
+	if (hz == MEASURE_FAILED) {
+		printf("adreno: %u: the counter did not finish: it cannot be used as it is set up here\n", step);
+		return false;
+	}
+	printf("adreno: %u: measured: cxo runs at %u Hz (the crystal: 19200000)\n", step, hz);
+	if (hz < 18600000 || hz > 19800000) {
+		printf("adreno: %u: the counter does not show the crystal's rate: nothing it says can be used\n", step);
+		return false;
+	}
+	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+		hz = measure_quietly(clocks[i].select);
+		if (hz == MEASURE_FAILED) {
+			printf("adreno: %u: measured: %s: the counter did not finish\n", step, clocks[i].name);
+		} else {
+			printf("adreno: %u: measured: %s runs at %u Hz\n", step, clocks[i].name, hz);
+		}
+		if (clocks[i].select == GPUCC_DEBUG_AHB) {
+			ahb_hz = hz;
+		}
+	}
+	if (ahb_hz != MEASURE_FAILED && ahb_hz >= 1000000) {
+		printf("adreno: %u: THE REGISTER BUS OF THE GPU BLOCK HAS ITS CLOCK, whatever its control register says\n", step);
+		return true;
+	}
+	/* for study: what else is there in the clock controller that could be its switch */
+	printf("adreno: %u: the register bus of the GPU block has no clock; what is not 0 in gpucc 0x1000..0x15fc:\n", step);
+	for (uint32_t offset = 0x1000; offset < 0x1600; offset += 16) {
+		uint32_t row[4] = { rd(gpucc.base + offset), rd(gpucc.base + offset + 4), rd(gpucc.base + offset + 8),
+			            rd(gpucc.base + offset + 12) };
+
+		if (row[0] | row[1] | row[2] | row[3]) {
+			printf("adreno: %u: gpucc %#x: %#x %#x %#x %#x\n", step, gpucc.phys + offset, row[0], row[1], row[2],
+			    row[3]);
+		}
+	}
+	return false;
+}
+
+/*
+ * What every later step stands on: CX powered, the GMU's clock running by its control register,
+ * and the register bus's clock running by measurement (see above).
+ */
 static bool
 cx_ready(void)
 {
-	uint32_t gmu_clock, ahb_clock;
+	uint32_t gmu_clock, ahb_hz;
 
 	if (!gpucc_answers()) {
 		return false;
 	}
 	gmu_clock = rd(gpucc.base + GPUCC_CX_GMU_CBCR);
-	ahb_clock = rd(gpucc.base + GPUCC_AHB_CBCR);
-	if (cx_is_on() && (gmu_clock & (CBCR_ENABLE | CBCR_OFF)) == CBCR_ENABLE && (ahb_clock & CBCR_ENABLE)) {
-		return true;
+	if (!cx_is_on() || (gmu_clock & (CBCR_ENABLE | CBCR_OFF)) != CBCR_ENABLE) {
+		printf("adreno: %u: needs CX on (it is %s) and the GMU's clock running (cx_gmu %#x): steps 4 and 5\n", step,
+		    cx_is_on() ? "on" : "off", gmu_clock);
+		return false;
 	}
-	printf("adreno: %u: needs CX on (it is %s) and its clocks running (cx_gmu %#x, ahb %#x): steps 4 and 5\n", step,
-	    cx_is_on() ? "on" : "off", gmu_clock, ahb_clock);
-	return false;
+	ahb_hz = measure_quietly(GPUCC_DEBUG_AHB);
+	if (ahb_hz == MEASURE_FAILED) {
+		printf("adreno: %u: the frequency counter did not finish (step 5 shows whether it works)\n", step);
+	} else {
+		printf("adreno: %u: the GPU block's register bus clock (ahb) measures %u Hz\n", step, ahb_hz);
+	}
+	if (ahb_hz == MEASURE_FAILED || ahb_hz < 1000000) {
+		printf("adreno: %u: without that clock a register of the GPU block would not answer: not touching it\n", step);
+		return false;
+	}
+	return true;
 }
 
 /* ---- step 6: the first words from the GPU block ------------------------------------------------------- */
@@ -836,10 +1031,13 @@ step_gmu_memory(void)
  * The 3D core comes out of reset in "secure" mode, and on a phone only TrustZone lets it out: it
  * does when handed the vendor's signed zap shader to authenticate (a6xx_gpu.c: a6xx_hw_init;
  * qcom_scm.c: qcom_scm_pas_*; the GPU is image 13). Whether it will do that for this kernel
- * decides whether there can be a GPU at all. Three questions that pass no memory show whether it
+ * decides whether there can be a GPU at all. Questions that pass no memory show whether it
  * listens: the one Linux asks before anything else (is the call "is this call available"
- * available), whether the calls that authenticate an image are, and whether image 13 is one it
- * authenticates. A call is an SMC, which the hypervisor passes on; convention: qcom_scm-smc.c.
+ * available), whether the calls that authenticate an image are, and which images it says it
+ * "supports". The last is asked of the GPU's and, for comparison, of images this phone is known
+ * to start that way (dt: qcom,pas-id of the audio, modem and video firmware): no GPU driver asks
+ * it, Linux's or the vendor's, so what the answer for the GPU means is not known beforehand.
+ * A call is an SMC, which the hypervisor passes on; convention: qcom_scm-smc.c.
  */
 #define SCM_FAST                (1ull << 31)            /* answered at once; without it a call may be preempted */
 #define SCM_64                  (1ull << 30)
@@ -850,23 +1048,24 @@ step_gmu_memory(void)
 #define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
 #define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
 #define SCM_ONE_VALUE           1                       /* the word describing the arguments: one, a plain number */
+#define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)            /* two: a number, and the address of memory it may read and write */
 #define SCM_INTERRUPTED         1                       /* a call that was preempted says so, and is made again so */
 #define PAS_GPU                 13
 
-/* One call with one argument. What TrustZone returns: 0 or an error of its own, and a word of answer. */
+/* One call. What TrustZone returns: 0 or an error of its own, and a word of answer. */
 static int32_t
-scm(const char *what, uint64_t function, uint64_t argument, uint64_t *answer)
+scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t *answer)
 {
 	uint64_t session = 0;
 
-	printf("adreno: %u: about to ask TrustZone %s: smc %#llx, argument %#llx\n", step, what, function, argument);
-	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx)", step, function, argument);
+	printf("adreno: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx\n", step, what, function, first, second);
+	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
 	hold(true);
 	for (int i = 0; i < 100; i++) {
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
-		register uint64_t x1 __asm__("x1") = SCM_ONE_VALUE;
-		register uint64_t x2 __asm__("x2") = argument;
-		register uint64_t x3 __asm__("x3") = 0;
+		register uint64_t x1 __asm__("x1") = arguments;
+		register uint64_t x2 __asm__("x2") = first;
+		register uint64_t x3 __asm__("x3") = second;
 		register uint64_t x4 __asm__("x4") = 0;
 		register uint64_t x5 __asm__("x5") = 0;
 		register uint64_t x6 __asm__("x6") = session;
@@ -888,40 +1087,184 @@ scm(const char *what, uint64_t function, uint64_t argument, uint64_t *answer)
 static bool
 step_trustzone(void)
 {
+	static const struct {
+		const char *name;
+		uint32_t id;
+	} images[] = { { "audio", 1 }, { "modem", 4 }, { "video", 9 }, { "GPU zap shader", PAS_GPU } };
 	uint64_t answer = 0, how = SCM_FAST | SCM_64 | SCM_SIP;
+	uint32_t fast[4] = { 0 }, slow[4] = { 0 };
 
 	announce("ask TrustZone what Linux asks it first: is the call \"is this call available\" available");
-	if (scm("whether it can be asked", how | SCM_IS_CALL_AVAILABLE, SCM_SIP | SCM_IS_CALL_AVAILABLE, &answer) != 0 ||
-	    answer != 1) {
+	if (scm("whether it can be asked", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_IS_CALL_AVAILABLE, 0,
+	    &answer) != 0 || answer != 1) {
 		how = SCM_FAST | SCM_SIP;       /* the same with 32-bit arguments, Linux's second try */
-		if (scm("the same, the 32-bit way", how | SCM_IS_CALL_AVAILABLE, SCM_SIP | SCM_IS_CALL_AVAILABLE, &answer) != 0 ||
-		    answer != 1) {
+		if (scm("the same, the 32-bit way", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_IS_CALL_AVAILABLE,
+		    0, &answer) != 0 || answer != 1) {
 			printf("adreno: %u: TrustZone does not answer the way it answers Linux\n", step);
 			return false;
 		}
 	}
 
-	announce("ask TrustZone whether it has the calls that authenticate a firmware image, and whether the GPU's is one");
-	scm("for the call that takes an image's signature", how | SCM_IS_CALL_AVAILABLE, SCM_SIP | SCM_PAS_INIT_IMAGE, &answer);
-	scm("for the call that authenticates and starts an image", how | SCM_IS_CALL_AVAILABLE, SCM_SIP | SCM_PAS_AUTH_AND_RESET,
-	    &answer);
-	if (scm("whether the GPU's zap shader is an image it authenticates", how | SCM_PAS_IS_SUPPORTED, PAS_GPU, &answer) != 0) {
-		/* Linux makes this one as a call that may be preempted */
-		if (scm("the same, as a slow call", (how & ~SCM_FAST) | SCM_PAS_IS_SUPPORTED, PAS_GPU, &answer) != 0) {
-			printf("adreno: %u: TrustZone does not say\n", step);
-			return false;
+	announce("ask TrustZone whether it has the calls that authenticate a firmware image");
+	scm("for the call that takes an image's signature", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
+	    SCM_SIP | SCM_PAS_INIT_IMAGE, 0, &answer);
+	scm("for the call that authenticates and starts an image", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
+	    SCM_SIP | SCM_PAS_AUTH_AND_RESET, 0, &answer);
+
+	announce("ask TrustZone which images it \"supports\": three this phone starts through it, and the GPU's; each asked "
+	    "both ways, at once and (as Linux does) as a call that may be preempted");
+	for (unsigned i = 0; i < 4; i++) {
+		answer = 0;
+		fast[i] = scm(images[i].name, how | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, images[i].id, 0, &answer) == 0 && answer;
+		answer = 0;
+		slow[i] = scm(images[i].name, (how & ~SCM_FAST) | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, images[i].id, 0,
+		    &answer) == 0 && answer;
+	}
+	printf("adreno: %u: \"supported\", asked at once / as Linux asks: audio %u/%u, modem %u/%u, video %u/%u, GPU %u/%u\n",
+	    step, fast[0], slow[0], fast[1], slow[1], fast[2], slow[2], fast[3], slow[3]);
+	printf("adreno: %u: %s\n", step, fast[3] || slow[3] ? "TrustZone lists the GPU's zap shader" :
+	    fast[0] || slow[0] || fast[1] || slow[1] || fast[2] || slow[2] ?
+	    "TrustZone lists others but not the GPU's: step 12 will show whether that matters" :
+	    "TrustZone lists none, not even those the phone starts: this question tells nothing here");
+	return true;
+}
+
+/* ---- step 12: the zap shader's signature ----------------------------------------------------------------- */
+
+extern dev_t mdevlookup(int devid);
+extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
+extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
+
+/* An entry of a directory of a packfs image in memory, by name. */
+static const struct packfs_dnode *
+image_entry(const uint8_t *image, const struct packfs_super *super, const struct packfs_dnode *directory, const char *name)
+{
+	const struct packfs_dnode *nodes = (const struct packfs_dnode *)(image + super->ps_nodes_off);
+	size_t length = strlen(name);
+
+	if (directory == NULL || !S_ISDIR(directory->pd_mode) || directory->pd_data + directory->pd_size > super->ps_node_count) {
+		return NULL;
+	}
+	for (uint64_t i = 0; i < directory->pd_size; i++) {
+		const struct packfs_dnode *node = &nodes[directory->pd_data + i];
+
+		if (node->pd_name_len == length && (uint64_t)node->pd_name + length <= super->ps_strings_size &&
+		    memcmp(image + super->ps_strings_off + node->pd_name, name, length) == 0) {
+			return node;
 		}
 	}
-	printf("adreno: %u: TrustZone %s\n", step, answer ? "CAN AUTHENTICATE A GPU ZAP SHADER" :
-	    "says it does not authenticate a GPU zap shader");
-	return answer != 0;
+	return NULL;
+}
+
+/*
+ * A file of the small image that travels with the kernel -- userland/build.sh puts what is in
+ * fw-gpu/ into its directory fw/ -- found in the memory of the RAM disk itself: at this point of
+ * the start that image is the root if there is no system image, and not mounted at all if there
+ * is one (it is /dev/md1 then; see userland/src/stage0.c).
+ */
+static const uint8_t *
+image_file(const char *directory, const char *name, uint64_t *size)
+{
+	for (int disk = 1; disk >= 0; disk--) {
+		const struct packfs_super *super;
+		const struct packfs_dnode *file;
+		vm_offset_t base = 0;
+		uint64_t length = 0;
+		dev_t dev = mdevlookup(disk);
+
+		if (dev == (dev_t)-1 || mdevgetkernelrange(dev, &base, &length) != 0 || length < PACKFS_SUPER_SIZE) {
+			continue;
+		}
+		super = (const struct packfs_super *)base;
+		if (memcmp(super->ps_magic, PACKFS_MAGIC, sizeof(super->ps_magic)) != 0 || super->ps_image_size > length ||
+		    super->ps_node_count == 0 ||
+		    super->ps_nodes_off + (uint64_t)super->ps_node_count * sizeof(struct packfs_dnode) > super->ps_image_size ||
+		    super->ps_strings_off + super->ps_strings_size > super->ps_image_size) {
+			continue;
+		}
+		file = (const struct packfs_dnode *)(base + super->ps_nodes_off);       /* the root directory */
+		file = image_entry((const uint8_t *)base, super, file, directory);
+		file = image_entry((const uint8_t *)base, super, file, name);
+		if (file != NULL && S_ISREG(file->pd_mode) && !(file->pd_flags & PACKFS_F_CHUNKED) &&
+		    file->pd_data + file->pd_size <= super->ps_image_size) {
+			printf("adreno: %u: %s/%s: %llu bytes in the image of /dev/md%d\n", step, directory, name, file->pd_size,
+			    disk);
+			*size = file->pd_size;
+			return (const uint8_t *)base + file->pd_data;
+		}
+	}
+	printf("adreno: %u: no %s/%s in the small image: put the phone's /vendor/firmware/%s into fw-gpu/ and run "
+	    "userland/build.sh\n", step, directory, name, name);
+	return NULL;
+}
+
+/*
+ * The first of the three calls with which Linux has a zap shader loaded (mdt_loader.c:
+ * qcom_mdt_pas_init, qcom_scm.c: qcom_scm_pas_init_image): TrustZone is given the image's header --
+ * the ELF header and the block of hashes and certificates, which is all of the file a660_zap.mdt
+ * -- and checks the signature. Nothing of the GPU is involved, so it can be asked now. The other
+ * two (where the image will be, and "authenticate and start") need the 3D core powered.
+ *
+ * The header goes in memory of ours, page-aligned and in one piece. Qualcomm's note at that
+ * call says that for these calls the hypervisor itself arranges TrustZone's access to the memory
+ * ("creates SHM bridges on behalf of Linux"), and that TrustZone protects the memory while it
+ * works: so it is not touched again here, and never freed.
+ */
+static bool
+step_zap_signature(void)
+{
+	const uint8_t *header;
+	vm_offset_t page = 0;
+	uint64_t size = 0, answer = ~0ull;
+	uint32_t segments, hashes;
+	int32_t result;
+
+	announce("find the zap shader's header, fw/a660_zap.mdt, in the small image that came with the kernel");
+	header = image_file("fw", "a660_zap.mdt", &size);
+	if (header == NULL) {
+		return false;
+	}
+	/* a 32-bit ELF: the count of segments at 44, the table of them at 52, 32 bytes each, the file size of one at +16 */
+	segments = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
+	if (memcmp(header, "\177ELF\1", 5) != 0 || segments < 2 || size > PAGE_SIZE) {
+		printf("adreno: %u: that is not such a header (%02x %02x %02x %02x, %u segments)\n", step, header[0], header[1],
+		    header[2], header[3], segments);
+		return false;
+	}
+	memcpy(&hashes, header + 52 + 32 + 16, sizeof(hashes));
+	printf("adreno: %u: an ELF header of %u segments, %u bytes with its table, then %llu bytes; by the table, %u of hashes\n",
+	    step, segments, 52 + 32 * segments, size - (52 + 32 * segments), hashes);
+	if (52 + 32 * segments + (uint64_t)hashes != size) {
+		printf("adreno: %u: the file is not the header followed by the hashes alone: not what TrustZone takes\n", step);
+		return false;
+	}
+	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		printf("adreno: %u: no memory\n", step);
+		return false;
+	}
+	memcpy((void *)page, header, size);
+	/* TrustZone reads memory, not this processor's cache */
+	for (vm_offset_t line = page; line < page + PAGE_SIZE; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+
+	announce("hand the header to TrustZone to check its signature (image 13); a call that may be preempted, as Linux's is");
+	result = scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
+	    kvtophys(page), &answer);
+	if (result == 0 && answer == 0) {
+		printf("adreno: %u: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n", step);
+		return true;
+	}
+	printf("adreno: %u: TrustZone does not take it: the call returns %d, its answer is %#llx\n", step, result, answer);
+	return false;
 }
 
 /* ---- all of it together ---------------------------------------------------------------------------- */
 
 static bool(*const steps[])(void) = {
 	step_outside, step_fuses, step_gpucc, step_cx_power, step_clocks, step_first_words, step_rscc, step_smmu,
-	step_smmu_context, step_gmu_memory, step_trustzone,
+	step_smmu_context, step_gmu_memory, step_trustzone, step_zap_signature,
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 
