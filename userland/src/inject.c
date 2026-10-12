@@ -272,6 +272,7 @@ extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreateWithType(CFAllocato
 extern void IOHIDEventSystemClientScheduleWithDispatchQueue(IOHIDEventSystemClientRef client, dispatch_queue_t queue);
 extern IOHIDServiceClientRef IOHIDVirtualServiceClientCreateWithCallbacks(IOHIDEventSystemClientRef client, CFDictionaryRef attributes,
     const struct virtual_service_callbacks *callbacks, void *target, void *refcon);
+extern Boolean IOHIDVirtualServiceClientRemove(IOHIDServiceClientRef service);
 extern Boolean IOHIDVirtualServiceClientDispatchEvent(IOHIDServiceClientRef service, IOHIDEventRef event);
 extern IOHIDEventRef IOHIDEventCreateDigitizerEvent(CFAllocatorRef allocator, uint64_t time, uint32_t transducer, uint32_t index,
     uint32_t identity, uint32_t event_mask, uint32_t button_mask, double x, double y, double z, double tip_pressure,
@@ -326,12 +327,18 @@ number(int value)
 	return CFNumberCreate(NULL, kCFNumberIntType, &value);
 }
 
+/* A service of ours (the callbacks' refcon): what it says of itself, and whether the event server has taken it. */
+struct service {
+	CFMutableDictionaryRef properties;
+	volatile bool opened;
+};
+
 /* The properties of a service of ours; the event server asks for them one at a time. */
 static CFTypeRef
 service_copy_property(__unused void *target, void *refcon, __unused IOHIDServiceClientRef service, CFStringRef key)
 {
 	static CFMutableSetRef asked;
-	CFTypeRef value = CFDictionaryGetValue((CFDictionaryRef)refcon, key);
+	CFTypeRef value = CFDictionaryGetValue(((struct service *)refcon)->properties, key);
 
 	if (asked == NULL) {
 		asked = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
@@ -359,13 +366,18 @@ static volatile int touch_mode;
 
 /* What the event server tells a service of ours: said once per name, to learn what there is. */
 static Boolean
-service_set_property(__unused void *target, __unused void *refcon, __unused IOHIDServiceClientRef service, CFStringRef key,
+service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceClientRef service, CFStringRef key,
     CFTypeRef value)
 {
 	static CFMutableSetRef told;
 	char name[96] = "?", text[160] = "?";
 	CFStringRef description;
 
+	/* the last thing the event server does when it opens a service; see make_service() */
+	if (key != NULL && value != NULL && CFEqual(key, CFSTR("DeviceOpenedByEventSystem")) &&
+	    CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value)) {
+		((struct service *)refcon)->opened = true;
+	}
 	if (key != NULL && value != NULL && CFEqual(key, CFSTR("TouchDetectionMode")) && CFGetTypeID(value) == CFNumberGetTypeID()) {
 		int mode = 0;
 
@@ -402,10 +414,22 @@ static const struct virtual_service_callbacks service_callbacks = {
 	.copyProperty = service_copy_property,
 };
 
-/* A HID service of ours inside the event server: built in, with one usage. */
+/*
+ * A HID service of ours inside the event server: built in, with one usage.
+ *
+ * The event server is this very program, and it is still starting. A client that reaches it at
+ * the wrong moment of that (backboardd's "HID system open ... start": the connection is made
+ * and then replaced, "IOHIDEventSystemServer died. Reestablishing connection.") is left with a
+ * service the server cannot talk to and never opens -- and a touch screen that backboardd waits
+ * for in vain ("still waiting for a main screen digitizer"). When that moment comes depends on
+ * how fast the machine is and on how many processors it has, so no fixed delay avoids it:
+ * the service is made again until the server has opened it.
+ */
 static IOHIDServiceClientRef
 make_service(IOHIDEventSystemClientRef client, const char *product, int page, int usage, bool display)
 {
+	struct service *made = calloc(1, sizeof(*made));
+	IOHIDServiceClientRef service = NULL;
 	CFMutableDictionaryRef properties = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
 	    &kCFTypeDictionaryValueCallBacks);
 	CFMutableDictionaryRef pair = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
@@ -432,7 +456,25 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 		CFDictionarySetValue(properties, CFSTR("DisplayIntegrated"), kCFBooleanTrue);
 	}
 	/* the dictionary stays: it is what service_copy_property() answers from */
-	return IOHIDVirtualServiceClientCreateWithCallbacks(client, properties, &service_callbacks, NULL, properties);
+	made->properties = properties;
+	for (int attempt = 1; attempt <= 20; attempt++) {
+		made->opened = false;
+		service = IOHIDVirtualServiceClientCreateWithCallbacks(client, properties, &service_callbacks, NULL, made);
+		if (service == NULL) {
+			break;
+		}
+		for (int tenths = 0; tenths < 20 && !made->opened; tenths++) {
+			usleep(100000);
+		}
+		if (made->opened) {
+			break;
+		}
+		say("redwood: input: the event server has not opened \"%s\" (attempt %d): making it again\n", product, attempt);
+		IOHIDVirtualServiceClientRemove(service);
+		CFRelease(service);
+		service = NULL;
+	}
+	return service;
 }
 
 /* One frame of the touch screen: the hand, and under it every finger that is down or has just lifted. */
@@ -616,10 +658,11 @@ redwood_init(void)
 	if (strcmp(name, "backboardd") == 0) {
 		window_server_fixes();
 		/*
-		 * brightness_fixes() is not used for now: with it backboardd no longer takes our touch
+		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
 		 * screen service for its own ("still waiting for a main screen digitizer"), whether the
-		 * service is made before or after the touch processing starts. Why is not known yet;
-		 * until it is, the five seconds stay.
+		 * service was made before or after the touch processing starts. (Most likely it only
+		 * moved the start of the event server onto the moment make_service() now knows how to
+		 * survive; not tried again since, and until it is, the five seconds stay.)
 		 */
 		input_start();
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {

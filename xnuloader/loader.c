@@ -449,17 +449,28 @@ struct platform {
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
+	int cores;                       /* at most this many processor cores, numbered from 0 ... */
+	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
+	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 };
 
 static const struct platform platform_qemu_virt = {
 	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
 	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .uart = 0x09000000, .psci_hvc = 1,
+	.cores = 8, .core_shift = 0,
+	/*
+	 * QEMU's emulated cores stop each other all the time (every flush of a page from all the
+	 * TLBs is a rendezvous of all its CPU threads), and the kernel's patience with a spin lock
+	 * is that of real hardware: an eighth of a second by a 24 MHz clock, a twentieth here.
+	 */
+	.timeout_scale = 20,
 };
 
 static const struct platform platform_redwood = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -657,6 +668,8 @@ jump_to_kernel(uint64_t entry, uint64_t boot_args_pa)
 
 #define PSCI_CPU_OFF       0x84000002u
 #define PSCI_CPU_ON        0xC4000003u
+#define PSCI_AFFINITY_INFO 0xC4000004u      /* (MPIDR, 0): 0 = that core is on, 1 = off, 2 = being started */
+#define PSCI_NOT_SUPPORTED (-1)
 
 /* each alone in a cache line: one core reads them with its caches off */
 static struct {
@@ -857,6 +870,29 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
 	print("\n");
 }
 
+/* A call of the firmware's power interface, the way this platform makes them. */
+static int64_t
+psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	int64_t status;
+
+	if (PLAT->psci_hvc) {
+		register uint64_t x0 __asm__("x0") = function;
+		register uint64_t x1 __asm__("x1") = a1;
+		register uint64_t x2 __asm__("x2") = a2;
+		register uint64_t x3 __asm__("x3") = a3;
+
+		__asm__ volatile ("hvc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3)
+                        : : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
+		status = (int64_t)x0;
+	} else {
+		smc_x3 = a3;
+		status = (int64_t)smc_call(function, a1, a2, NULL, NULL);
+		smc_x3 = 0;
+	}
+	return status;
+}
+
 /*
  * Run the kernel on the core with that MPIDR and wait until it is back. Returns 0 when it has
  * been and gone (the caller goes on as after loader_return_stub), a negative number if the
@@ -886,20 +922,8 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	clean_dcache((uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_entry + 0x1000);
 	clean_dcache((uint64_t)(uintptr_t)loader_ctx, (uint64_t)(uintptr_t)loader_ctx + sizeof(loader_ctx));
 
-	if (psci_by_hvc) {
-		register uint64_t x0 __asm__("x0") = PSCI_CPU_ON;
-		register uint64_t x1 __asm__("x1") = mpidr;
-		register uint64_t x2 __asm__("x2") = (uint64_t)(uintptr_t)&other_cpu_entry;
-		register uint64_t x3 __asm__("x3") = (uint64_t)(uintptr_t)&other_cpu_start;
-
-		__asm__ volatile ("hvc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3)
-                        : : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
-		status = (int64_t)x0;
-	} else {
-		smc_x3 = (uint64_t)(uintptr_t)&other_cpu_start;         /* arrives in that core's x0 */
-		status = (int64_t)smc_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, NULL, NULL);
-		smc_x3 = 0;
-	}
+	/* the last argument arrives in that core's x0 */
+	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
 
 	started = last_pet = last_beat_at = READ_SYSREG(CNTVCT_EL0);
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
@@ -1443,11 +1467,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
+	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
+	int more_cores = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
-			/* this phone numbers its cores in the second affinity field, QEMU in the first */
-			kernel_mpidr = (uint64_t)(c[8] - '0') << (PLAT == &platform_redwood ? 8 : 0);
+			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
 		}
+		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 	}
 	if (checkpoint == CHECKPOINT_SELFTEST) {
 		kernel_mpidr = this_mpidr;
@@ -1525,10 +1551,16 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	for (const char *c = pi.cmdline; *c; c++) {
 		own_serial |= starts_with(c, "serial=");
 	}
-	const char *base_cmdline = (PLAT->uart != 0 && !own_serial) ? "debug=0x8 serial=3 cpus=1 " : "debug=0x8 cpus=1 ";
+	const char *base_cmdline = (PLAT->uart != 0 && !own_serial) ? "debug=0x8 serial=3 " : "debug=0x8 ";
 	uint32_t n = 0;
 	for (const char *c = base_cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 		ba->commandLine[n++] = *c;
+	}
+	/* one processor unless the payload asks for more (of two "cpus=" the kernel takes the first) */
+	if (!more_cores) {
+		for (const char *c = "cpus=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
 	}
 	/* the root is the first RAM disk unless the payload says otherwise */
 	int own_root = 0;
@@ -1586,6 +1618,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* what MobileGestalt answers "main screen scale" from: 3 device pixels per point */
 	dt_prop_u32(&w, "display-scale", 3);
 	dt_prop_u32(&w, "display-rotation", 0);
+	/* how the kernel is to ask the firmware for more cores (PSCI) */
+	dt_prop_str(&w, "psci-method", plat->psci_hvc ? "hvc" : "smc");
 	/* the time now, by the firmware's clock (the kernel has no real-time clock driver) */
 	uint64_t epoch = firmware_epoch();
 	if (epoch != 0) {
@@ -1639,6 +1673,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop(&w, "RAMDisk1", second, sizeof(second));
 	}
 	dt_end(&w);
+	if (more_cores && plat->timeout_scale != 0) {
+		/* multiplies every "machine timeout" of the kernel (machine_timeout_init_with_suffix()) */
+		dt_begin(&w, "machine-timeouts");
+		dt_prop_u32(&w, "global-scale", plat->timeout_scale);
+		dt_end(&w);
+	}
 	dt_end(&w);
 
 	/*
@@ -1666,19 +1706,60 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop(&w, "reg", pram_reg, sizeof(pram_reg));
 	dt_end(&w);
 
+	/*
+	 * The processors. The first is the one the kernel starts on. With "cpus=N" in its
+	 * arguments the kernel takes that one and the next N-1 of this list and starts them
+	 * itself (PSCI CPU_ON); "cpumask=M" picks by position, bit 0 being the first. So the
+	 * order matters: after the boot core come those whose numbers are nearest to its own
+	 * (on the phone, where the kernel boots on the biggest core, 7: the other big ones
+	 * 6, 5, 4, then the small ones 3, 2, 1). Only cores that are off are listed: the one
+	 * this loader stays on while it watches is not the kernel's, nor any the firmware runs.
+	 */
+	uint64_t cpu_mpidr[8] = { kernel_mpidr };
+	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
+
+	if (more_cores) {
+		for (int distance = 1; distance < plat->cores; distance++) {
+			for (int side = 0; side < 2; side++) {
+				int core = side == 0 ? boot_core + distance : boot_core - distance;
+				uint64_t mpidr = (uint64_t)core << plat->core_shift;
+				int64_t state;
+
+				if (core < 0 || core >= plat->cores || mpidr == this_mpidr) {
+					continue;
+				}
+				state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
+				if (state == 1 || state == PSCI_NOT_SUPPORTED) {
+					cpu_mpidr[cpu_count++] = mpidr;
+				} else if (state >= 0) {
+					print("core %x is not off (the firmware says %d): not the kernel's to take\n", mpidr, (uint64_t)state);
+				}
+			}
+		}
+		print("cores for the kernel, in the order it takes them:");
+		for (int i = 0; i < cpu_count; i++) {
+			print(" %x", cpu_mpidr[i]);
+		}
+		print("\n");
+	}
+
 	dt_begin(&w, "cpus");
-	dt_begin(&w, "cpu0");
-	dt_prop_str(&w, "device_type", "cpu");
-	dt_prop_str(&w, "state", "running");
-	dt_prop_u32(&w, "reg", (uint32_t)kernel_mpidr);
-	dt_prop_u32(&w, "cpu-id", 0);
-	dt_prop_u64(&w, "timebase-frequency", cntfrq);
-	dt_prop_u64(&w, "fixed-frequency", cntfrq);
-	dt_prop_u64(&w, "clock-frequency", 1800000000ULL);
-	dt_prop_u64(&w, "bus-frequency", 100000000ULL);
-	dt_prop_u64(&w, "memory-frequency", 100000000ULL);
-	dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-	dt_end(&w);
+	for (int i = 0; i < cpu_count; i++) {
+		char name[5] = { 'c', 'p', 'u', (char)('0' + i), 0 };
+
+		dt_begin(&w, name);
+		dt_prop_str(&w, "device_type", "cpu");
+		dt_prop_str(&w, "state", i == 0 ? "running" : "waiting");
+		dt_prop_u32(&w, "reg", (uint32_t)cpu_mpidr[i]);
+		dt_prop_u32(&w, "cpu-id", (uint32_t)i);
+		dt_prop_u64(&w, "timebase-frequency", cntfrq);
+		dt_prop_u64(&w, "fixed-frequency", cntfrq);
+		dt_prop_u64(&w, "clock-frequency", 1800000000ULL);
+		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
+		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
+		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
+		dt_end(&w);
+	}
 	dt_end(&w);
 
 	dt_begin(&w, "arm-io");
@@ -1776,6 +1857,15 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* --- the kernel came back ------------------------------------------- */
 	wdt_set_ms(WDT_BITE_MS);
+	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */
+	for (int i = 1; i < cpu_count; i++) {
+		int64_t state = psci_call(PSCI_AFFINITY_INFO, cpu_mpidr[i], 0, 0);
+
+		if (state != 1 && state != PSCI_NOT_SUPPORTED) {
+			print("THE KERNEL LEFT CORE %x RUNNING (the firmware says %d): restart before running another\n", cpu_mpidr[i],
+			    (uint64_t)state);
+		}
+	}
 	recording_data = NULL;
 	recording_len = 0;
 	if (kernel_live != NULL && kernel_live->recording != 0 && checkpoint != CHECKPOINT_SELFTEST) {

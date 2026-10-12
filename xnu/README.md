@@ -52,6 +52,7 @@ xnu-deps/setup.sh        # ~30 с: исходники зависимостей, 
 | Файлы | Что |
 |---|---|
 | `osfmk/arm64/gic_v3_irq.c`, `generic_arm64_support.c`, `kpc.c`, `ppl/`, `tunables/` | платформа: GICv3, таймер, заглушки вырезанных Apple файлов |
+| `osfmk/arm64/psci_smp.c` | несколько процессоров: запуск ядер через PSCI (boot-arg `cpus=N`), их остановка перед возвратом в загрузчик |
 | `osfmk/arm64/loader_return.c` | возврат в загрузчик с журналом, «сердцебиение», сторожевой таймер гипервизора Qualcomm |
 | `osfmk/arm64/user_exception_trace.c` | отладка userland: `usertrap:`, `userabort:`, стеки потоков (`ustacks`) |
 | `osfmk/minicrypto/` | замена corecrypto: MD5/SHA-1/SHA-2, HMAC, DRBG, AES (исходники Apple corecrypto не использованы) |
