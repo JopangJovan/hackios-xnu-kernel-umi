@@ -23,6 +23,7 @@ The whole root is 7.9 GB and the kernel on the phone has about 4 GB of RAM for e
     (userland/build.sh moves the extracted files);
   - machine-learning models, other languages' localizations, media and GPU shader libraries
     are left out, and so are a few very big daemons that have nothing to do with the display;
+  - /Library (the wallpapers, regional tables) without its sounds;
   - of pictures, what the user interface itself is drawn with: small images, asset catalogs of
     moderate size; the fonts except the two biggest (colour emoji and Chinese);
   - the empty LANGUAGE.lproj directories of the bundles whose strings are in one .loctable file
@@ -34,10 +35,14 @@ import stat
 import sys
 
 WHOLE = ('usr/libexec/', 'usr/sbin/', 'usr/bin/', 'usr/lib/', 'usr/share/', 'sbin/', 'bin/', 'private/etc/',
-         'System/Library/', 'Applications/')
+         'System/Library/', 'Applications/', 'Library/')
 # ... except these parts of /System/Library: big, and not needed to get a picture on the screen
-SKIP_SYSTEM_LIBRARY = ('LinguisticData', 'PreinstalledAssetsV2', 'NanoTimeKit', 'Health', 'Audio',
-                       'OnBoardingBundles', 'Assistant', 'AccessibilityBundles',
+# (not OnBoardingBundles, the privacy notices: an application's first screen links to its notice, and
+# News refuses to start without its own -- "a legal requirement"; nor Health, the plug-ins the Health
+# application and its daemon are made of: both stop with a fatal error when the directory is not there.
+# Of Health only the pictures and films of the activity awards are left out, see SKIP_PREFIX and HEALTH)
+SKIP_SYSTEM_LIBRARY = ('LinguisticData', 'PreinstalledAssetsV2', 'NanoTimeKit', 'Audio',
+                       'Assistant', 'AccessibilityBundles',
                        'VideoProcessors', 'ScreenReader', 'Photos', 'Carrier Bundles', 'NanoPreferenceBundles',
                        'ImagingNetworks', 'ProductDocuments', 'AppPlaceholders', 'UserNotifications',
                        'Caches')
@@ -49,6 +54,10 @@ SMALL = 4 << 20
 SKIP_EXT = ('.weights', '.weights_nonane', '.metallib', '.mov', '.pcm', '.scnz', '.espresso.net',
             '.espresso.shape', '.caf', '.m4a', '.aiff', '.mp4', '.heic', '.wav', '.art', '.scube',
             '.ds', '.dat', '.bin')
+# ... but '.dat' and '.bin' are also what these keep the tables in that the user interface is made with:
+# the layouts of the on-screen keyboard, the emoji, the list of public domain suffixes
+DATA_FRAMEWORKS = tuple(f'System/Library/{name}.framework/' for name in (
+    'PrivateFrameworks/TextInputUI', 'PrivateFrameworks/CoreEmoji', 'Frameworks/CFNetwork'))
 # never from applications: their sound, video and 3D content
 SKIP_APP_EXT = ('.mov', '.mp4', '.m4a', '.caf', '.wav', '.heic', '.aiff', '.metallib', '.scnz', '.usdz')
 # pictures the user interface is drawn with: small images, and asset catalogs up to this size
@@ -65,8 +74,12 @@ ALL_PICTURES = ('System/Library/PrivateFrameworks/ProgressUI.framework/',)
 # ... and asset catalogs: the SF Symbols (UIKit crashes on the first system image without them)
 BIG_CATALOGS = ('System/Library/PrivateFrameworks/SFSymbols.framework/',)
 # taken whole in principle, but not these: big and of no use until much later
+# (/Library is the wallpapers and a few tables of regional settings, apart from the sounds)
+HEALTH = 'System/Library/Health/'
 SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra/',
-               'usr/standalone/') + tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
+               'usr/standalone/', 'Library/Audio/', 'Library/Ringtones/',
+               HEALTH + 'Assets/FitnessUIAssets.bundle/') + \
+    tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
 KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
 
@@ -119,7 +132,7 @@ def wanted_file(path, size):
         return True
     if path.startswith(('usr/libexec/', 'usr/sbin/')):
         return size <= BIG_PROGRAM
-    if path.startswith('Applications/'):
+    if path.startswith(('Applications/', HEALTH)):
         return not path.lower().endswith(SKIP_APP_EXT) and '.mlmodelc/' not in path
     if path.startswith(FRAMEWORKS):
         if re.search(r'/(XPCServices|Support|Helpers)/', path):
@@ -128,6 +141,8 @@ def wanted_file(path, size):
             return size <= MAX_ASSET_CATALOG or path.startswith(BIG_CATALOGS)
         if path.endswith('.loctable'):
             return size <= MAX_STRING_TABLE
+        if path.startswith(DATA_FRAMEWORKS) and path.lower().endswith(('.dat', '.bin')):
+            return size <= SMALL
         return size <= SMALL and not path.lower().endswith(SKIP_EXT) and '.mlmodelc/' not in path
     return path.startswith(WHOLE)
 
