@@ -61,6 +61,7 @@ xnu-deps/setup.sh        # ~30 с: исходники зависимостей, 
 | `bsd/kern/kern_minimac.c`, `libkern/amfi/` | заглушки AMFI и Sandbox (MAC-политики), права из подписи программы |
 | `bsd/dev/redwood_input.c`, `redwood_goodix.c`, `redwood_virtio_input.c` | ввод: `/dev/redwood-touch`, драйвер Goodix GT9916 (SPI бит-бангом по GPIO), virtio-input для QEMU |
 | `bsd/dev/redwood_cpufreq.c` | частота процессора (Qualcomm EPSS) |
+| `bsd/dev/redwood_adreno.c` | GPU телефона (Adreno 642L): пока только пошаговое включение питания и тактов и чтение первых регистров (`adreno=N`) |
 | `bsd/pthread/pthread_kext_static.c` | pthread kext, слинкованный в ядро |
 
 Патч, помимо врезок под всё это, чинит то, что мешает собрать и запустить открытый XNU вне Apple: makefile'ы под
