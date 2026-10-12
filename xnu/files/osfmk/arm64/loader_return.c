@@ -146,6 +146,7 @@ struct loader_live {
 	const bool *log_wrapped;        /* the ring has gone round */
 	uint64_t log_head, log_ring;    /* sizes of the two parts */
 	const uint64_t *recording;      /* loader_recording: { physical address, length } of a screen recording */
+	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 };
 
 /*
@@ -379,6 +380,37 @@ loader_return_timer_init(void)
 	thread_call_enter_delayed(call, deadline);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
+
+/*
+ * A loader that watches from another core also listens to the host, and passes on a request to
+ * end the run ("xl stop") by setting loader_live.stop. Look once a second.
+ */
+static thread_call_t loader_stop_call;
+
+static void
+loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t deadline;
+
+	if (loader_live.stop) {
+		static const char banner[] = "\n--- the host asked for the end of the run: back to the loader ---\n";
+		for (const char *c = banner; *c; c++) {
+			loader_log_putc(*c);
+		}
+		loader_return();
+	}
+	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(loader_stop_call, deadline);
+}
+
+__startup_func
+static void
+loader_stop_poll_init(void)
+{
+	loader_stop_call = thread_call_allocate(loader_stop_poll, NULL);
+	loader_stop_poll(NULL, NULL);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_stop_poll_init);
 
 /*
  * boot-arg hv_wdt_pet=1: the loader has armed the Qualcomm hypervisor's

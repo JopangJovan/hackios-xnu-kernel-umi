@@ -780,6 +780,7 @@ struct kernel_live {
 	uint64_t log, log_len, log_ring_at, log_wrapped;        /* the kernel's virtual addresses: add the slide */
 	uint64_t log_head, log_ring;    /* the log: this much from the start of the boot, then a ring this big */
 	uint64_t recording;             /* (a virtual address too) { physical address, bytes } of a screen recording */
+	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 };
 
 /* The screen recording the last kernel left in memory, if it made one ("oem recording" stages it). */
@@ -794,6 +795,14 @@ static uint64_t recording_len;
 
 static void wdt_pet(void);
 static int wdt_armed;
+
+/*
+ * While a kernel runs on another core and this one watches it: where it shows its signs of life,
+ * for the commands that the host sends meanwhile (usb_poll_command).
+ */
+static const struct kernel_live *running_live;
+static uint64_t running_slide;
+static void usb_poll_command(void);
 
 static uint64_t
 seconds_since(uint64_t then)
@@ -837,6 +846,43 @@ log_of_hung_kernel(const struct kernel_live *live, uint64_t slide)
 		loader_ctx[CTX_LOG_PA] = (uint64_t)(uintptr_t)log;
 		loader_ctx[CTX_LOG_LEN] = len;
 	}
+}
+
+/*
+ * The log of a kernel that is alive and is merely being asked how it is doing ("oem log" during
+ * a run): a copy in the right order after the loader's own log, with nothing moved under the
+ * kernel's feet.
+ */
+static void
+compose_live_log(const struct kernel_live *live, uint64_t slide)
+{
+	static const char sep[] = "\n== KERNEL LOG (the kernel is still running) ==\n";
+	const char *log = (const char *)(live->log + slide);
+	uint32_t len = *(volatile uint32_t *)(live->log_len + slide);
+	uint32_t ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
+	int wrapped = *(volatile uint8_t *)(live->log_wrapped + slide);
+	uint64_t n, room = sizeof(out_buf) - 8192;
+
+	compose_logs(NULL, 0);
+	n = staged_len;
+#define PUT(from, size) do { \
+	uint64_t take = (size); \
+	if (n + take > room) { \
+	        take = room - n; \
+	} \
+	memcpy(out_buf + n, (from), take); \
+	n += take; \
+} while (0)
+	PUT(sep, sizeof(sep) - 1);
+	if (!wrapped || ring_at >= live->log_ring) {
+		PUT(log, len <= live->log_head + live->log_ring ? len : live->log_head + live->log_ring);
+	} else {
+		PUT(log, live->log_head);
+		PUT(log + live->log_head + ring_at, live->log_ring - ring_at);
+		PUT(log + live->log_head, ring_at);
+	}
+#undef PUT
+	staged_len = n;
 }
 
 static void print(const char *fmt, ...);
@@ -909,6 +955,8 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	int64_t status;
 	int arrived = 0, watching_only = 0;
 
+	running_live = live;
+	running_slide = slide;
 	other_cpu_start.entry = entry;
 	other_cpu_start.boot_args = boot_args_pa;
 	other_cpu_stage = 0;
@@ -991,9 +1039,11 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				status = OTHER_CPU_HUNG;
 			}
 		}
+		usb_poll_command();
 		for (volatile int i = 0; i < 20000; i++) {
 		}
 	}
+	running_live = NULL;
 
 	if (watching_only) {
 		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
@@ -2008,7 +2058,7 @@ usb_wait(uint8_t endpoint)
 {
 	/* static: a long transfer is many short waits, and the watchdog must be fed across them */
 	static uint64_t last_pet;
-	uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
+	uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0);
 
 	for (;;) {
 		uint32_t msg = UsbDeviceEventNoEvent;
@@ -2018,6 +2068,10 @@ usb_wait(uint8_t endpoint)
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
+			return -1;
+		}
+		/* with a kernel running, a host that went away must not keep this core from watching it */
+		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
 			return -1;
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
@@ -2030,10 +2084,14 @@ usb_wait(uint8_t endpoint)
 	}
 }
 
+static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
+
 static int64_t
 usb_rx(uint8_t *buf, uint64_t len)
 {
-	if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
+	if (usb_rx_queued) {
+		usb_rx_queued = 0;      /* (every command is received the same way, into the same buffer) */
+	} else if (EFI_ERROR(USB->send(USB_EP_OUT, len, buf))) {
 		return -1;
 	}
 	return usb_wait(USB_EP_OUT);
@@ -2085,32 +2143,32 @@ starts_with(const char *s, const char *prefix)
 	return 1;
 }
 
+/*
+ * One command from the host. While a kernel runs on another core (running_live) only what does
+ * not disturb it: questions, the screen, the log so far, and "oem stop".
+ */
 static void
-usb_command_loop(void)
+fb_command(char *cmd)
 {
-	screen_quiet = 1;
-	for (;;) {
-		if (!usb_connected) {
-			usb_wait(0xff); /* returns on the next cable state change */
-			continue;
-		}
-		int64_t n = usb_rx(usb_rx_buf, 511);
-		if (n <= 0) {
-			continue;
-		}
-		char cmd[128];
-		if (n > (int64_t)sizeof(cmd) - 1) {
-			n = sizeof(cmd) - 1;
-		}
-		memcpy(cmd, usb_rx_buf, (size_t)n);
-		cmd[n] = 0;
+	int busy = running_live != NULL;
 
-		if (starts_with(cmd, "getvar:")) {
+	{
+		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
+		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
+		    starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
+			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
+		} else if (starts_with(cmd, "oem stop")) {
+			/* the kernel looks at this once a second and comes back as it does when its time is up */
+			if (busy) {
+				((struct kernel_live *)(uintptr_t)running_live)->stop = 1;
+			}
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "getvar:")) {
 			const char *var = cmd + 7;
 			if (str_eq(var, "product")) {
 				fb_reply("OKAY", "xnuloader");
 			} else if (str_eq(var, "version")) {
-				fb_reply("OKAY", "0.4");
+				fb_reply("OKAY", "0.5");
 			} else if (str_eq(var, "max-download-size")) {
 				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
 			} else if (str_eq(var, "result")) {
@@ -2132,13 +2190,13 @@ usb_command_loop(void)
 			if (starts_with(cmd, "oem ramdisk none")) {
 				resident_rd_size = 0;
 				fb_reply("OKAY", "");
-				continue;
+				return;
 			}
 			parse_payload(&pi, 0);
 			log_len = 0;
 			if (!choose_window(&pi) || win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE) {
 				fb_reply("FAIL", "no memory window");
-				continue;
+				return;
 			}
 			download_to_ramdisk = 1;
 			fb_reply("OKAY", "");
@@ -2156,7 +2214,7 @@ usb_command_loop(void)
 			}
 			if (total == 0 || total > limit) {
 				fb_reply("FAIL", "bad size");
-				continue;
+				return;
 			}
 			fb_reply_data(total);
 			while (got < total) {
@@ -2191,7 +2249,7 @@ usb_command_loop(void)
 			/* stage the raw framebuffer; "getvar screen" gives its geometry */
 			if (SCREEN.base == 0) {
 				fb_reply("FAIL", "no display");
-				continue;
+				return;
 			}
 			staged_data = (const char *)(uintptr_t)SCREEN.base;
 			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
@@ -2200,7 +2258,7 @@ usb_command_loop(void)
 			/* stage what the kernel's display driver recorded (boot-arg rec_secs) */
 			if (recording_data == NULL) {
 				fb_reply("FAIL", "no recording");
-				continue;
+				return;
 			}
 			staged_data = recording_data;
 			staged_len = recording_len;
@@ -2236,7 +2294,11 @@ usb_command_loop(void)
 			print_memory_map();
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem log")) {
-			compose_logs(NULL, 0);
+			if (busy) {
+				compose_live_log(running_live, running_slide);
+			} else {
+				compose_logs(NULL, 0);
+			}
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
 			fb_reply("OKAY", "");
@@ -2245,6 +2307,69 @@ usb_command_loop(void)
 		} else {
 			fb_reply("FAIL", "unknown command");
 		}
+	}
+}
+
+/*
+ * A kernel is running on another core and this one watches it: see whether the host has said
+ * something meanwhile, without waiting for it to. This is how a run can be asked to end, and
+ * the screen and the log be had while it lasts.
+ */
+static void
+usb_poll_command(void)
+{
+	uint32_t msg = UsbDeviceEventNoEvent;
+	uint64_t size = 0, n;
+	usb_device_event_data data;
+	char cmd[128];
+
+	if (USB == NULL) {
+		return;         /* this run was not started over USB */
+	}
+	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
+		usb_rx_queued = 1;
+	}
+	USB->handle_event(&msg, &size, &data);
+	if (msg == UsbDeviceEventDeviceStateChange) {
+		usb_connected = (data.device_state == UsbDeviceStateConnected);
+		usb_rx_queued = 0;
+		return;
+	}
+	if (msg != UsbDeviceEventTransferNotification || data.transfer.endpoint_index != USB_EP_OUT) {
+		return;
+	}
+	usb_rx_queued = 0;
+	if (data.transfer.status != UsbDeviceTransferStatusCompleteOK || data.transfer.bytes_completed == 0) {
+		return;
+	}
+	n = data.transfer.bytes_completed < sizeof(cmd) - 1 ? data.transfer.bytes_completed : sizeof(cmd) - 1;
+	memcpy(cmd, usb_rx_buf, (size_t)n);
+	cmd[n] = 0;
+	fb_command(cmd);
+}
+
+static void
+usb_command_loop(void)
+{
+	screen_quiet = 1;
+	for (;;) {
+		char cmd[128];
+		int64_t n;
+
+		if (!usb_connected) {
+			usb_wait(0xff); /* returns on the next cable state change */
+			continue;
+		}
+		n = usb_rx(usb_rx_buf, 511);
+		if (n <= 0) {
+			continue;
+		}
+		if (n > (int64_t)sizeof(cmd) - 1) {
+			n = sizeof(cmd) - 1;
+		}
+		memcpy(cmd, usb_rx_buf, (size_t)n);
+		cmd[n] = 0;
+		fb_command(cmd);
 	}
 }
 
