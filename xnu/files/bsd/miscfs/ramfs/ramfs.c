@@ -41,6 +41,7 @@
 #include <sys/unistd.h>
 #include <sys/vnode_internal.h>
 #include <sys/xattr.h>
+#include <uuid/uuid.h>
 #include <vfs/vfs_support.h>
 
 #define RAMFS_MAX_NAME          255
@@ -1695,6 +1696,60 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_INT_EXTENDED_ATTR |
 		    VOL_CAP_INT_NAMEDSTREAMS;
 		VFSATTR_SET_SUPPORTED(fsap, f_capabilities);
+	}
+	/*
+	 * The rest of what getattrlist(2) may be asked about a volume. Unless the caller also asks
+	 * which attributes came back, one that the filesystem leaves out fails the whole call with
+	 * EINVAL, and callers take that badly: CacheDelete then hands assetsd a nil volume, which
+	 * ends in an uncaught exception.
+	 */
+	VFSATTR_RETURN(fsap, f_filecount, nodes);
+	VFSATTR_RETURN(fsap, f_dircount, 0);
+	VFSATTR_RETURN(fsap, f_maxobjcount, rm->rm_max_pages);
+	VFSATTR_RETURN(fsap, f_owner, 0);
+	VFSATTR_RETURN(fsap, f_fssubtype, 0);
+	VFSATTR_RETURN(fsap, f_signature, 0x4244);              /* 'BD', what the VFS layer defaults to */
+	VFSATTR_RETURN(fsap, f_carbon_fsid, 0);
+	VFSATTR_RETURN(fsap, f_quota, 0);
+	VFSATTR_RETURN(fsap, f_reserved, 0);
+	if (VFSATTR_IS_ACTIVE(fsap, f_fsid)) {
+		fsap->f_fsid = vfs_statfs(mp)->f_fsid;
+		VFSATTR_SET_SUPPORTED(fsap, f_fsid);
+	}
+	if (VFSATTR_IS_ACTIVE(fsap, f_create_time) || VFSATTR_IS_ACTIVE(fsap, f_modify_time) ||
+	    VFSATTR_IS_ACTIVE(fsap, f_access_time) || VFSATTR_IS_ACTIVE(fsap, f_backup_time)) {
+		struct timeval boot;
+		struct timespec since = { .tv_sec = 0, .tv_nsec = 0 };
+
+		/* nothing here is older than this boot */
+		boottime_timeval(&boot);
+		since.tv_sec = boot.tv_sec;
+		VFSATTR_RETURN(fsap, f_create_time, since);
+		VFSATTR_RETURN(fsap, f_modify_time, since);
+		VFSATTR_RETURN(fsap, f_access_time, since);
+		since.tv_sec = 0;
+		VFSATTR_RETURN(fsap, f_backup_time, since);
+	}
+	if (VFSATTR_IS_ACTIVE(fsap, f_uuid)) {
+		/* the same at every boot as long as the mounts are made in the same order: programs key caches by it */
+		static const uuid_t base = { 'r', 'e', 'd', 'w', 'o', 'o', 0x50, 'd', 0x80, 'R', 0, 0, 0, 0, 0, 0 };
+		fsid_t fsid = vfs_statfs(mp)->f_fsid;
+
+		memcpy(fsap->f_uuid, base, sizeof(uuid_t));
+		memcpy(&fsap->f_uuid[10], &fsid.val[0], 4);
+		fsap->f_uuid[14] = (uint8_t)fsid.val[1];
+		VFSATTR_SET_SUPPORTED(fsap, f_uuid);
+	}
+	if (VFSATTR_IS_ACTIVE(fsap, f_attributes)) {
+		vol_attributes_attr_t *attr = &fsap->f_attributes;
+
+		attr->validattr.commonattr = ATTR_CMN_VALIDMASK;
+		attr->validattr.volattr = ATTR_VOL_VALIDMASK;
+		attr->validattr.dirattr = ATTR_DIR_VALIDMASK;
+		attr->validattr.fileattr = ATTR_FILE_VALIDMASK;
+		attr->validattr.forkattr = 0;
+		attr->nativeattr = attr->validattr;
+		VFSATTR_SET_SUPPORTED(fsap, f_attributes);
 	}
 	if (VFSATTR_IS_ACTIVE(fsap, f_vol_name)) {
 		strlcpy(fsap->f_vol_name, "ramfs", MAXPATHLEN);
