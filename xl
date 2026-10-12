@@ -38,9 +38,12 @@ K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bc
 L=xnuloader/loader.efi
 [ -f $L ] || L=prebuilt/loader.efi
 mkdir -p logs
+# There is one phone, whichever working copy (tools/new-workspace.sh) talks to it: the locks are
+# outside all of them.
+PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-redwood-phone
 
 # one fastboot at a time (a run in one terminal, "xl screenshot" in another): each takes the lock for itself
-fb() { flock -w 90 logs/.xl.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
+fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
 # does the loader answer while its kernel runs (0.5 and later)? an older one answers only when the run is over
 live_loader() { fb getvar version | grep -Eq 'version: 0\.([5-9]|[1-9][0-9])'; }
 in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
@@ -88,8 +91,9 @@ fetch_log() { # fetch_log <file>
 
 run() { # run <oem command> <label>
 	enter || return 1
-	exec 8> logs/.xl.run
-	flock -n 8 || { echo "xl: a run is in progress (xl stop ends it)"; return 1; }
+	exec 8> $PHONE.run
+	flock -n 8 || { echo "xl: a run is in progress, started from $(cat $PHONE.who 2>/dev/null) (xl stop ends it)"; return 1; }
+	pwd > $PHONE.who
 	local stamp log result
 	stamp=$(date +%H%M%S); log="logs/$stamp-$2.log"
 	if [ "$1" != "oem selftest" ]; then
@@ -189,7 +193,7 @@ PY
 # log, stop, reboot. Anything else would wait for nothing.
 case "$1" in
 ""|run|selftest|state|screenshot|log|stop|reboot) ;;
-*)	if ! flock -n logs/.xl.run true 2>/dev/null; then
+*)	if ! flock -n $PHONE.run true 2>/dev/null; then
 		echo "xl: a run is in progress: only state, screenshot, log, stop and reboot now" >&2; exit 1
 	fi ;;
 esac
