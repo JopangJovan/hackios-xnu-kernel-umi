@@ -12,7 +12,10 @@ costs time and pushes everybody else out of the log that comes back from the pho
 The program itself must be in the system image; a warning is printed if it was not extracted.
 
 With --rest, the other jobs of iOS follow (their standard error on the console as well, their os_log
-only when named in OSLOG), but strictly on demand: whatever starts them by
+only when named in OSLOG), and with them the "launch angels" (System/Library/LaunchAngels: the
+applications without an icon that draw parts of the system's own interface in a process of their
+own -- the wallpaper, the keyboard, the now playing controls -- and are reached through a Mach
+service like a daemon), but strictly on demand: whatever starts them by
 itself (RunAtLoad, KeepAlive) is taken out, so that launchd runs one only when a program asks
 for one of its Mach services. That is how an application finds the daemons it needs without
 all 490 of them being started at boot. Left out: jobs without Mach services (nothing could
@@ -40,6 +43,7 @@ if rest:
 src_root, dest, labels = args[0], args[1], args[2:]
 oslog = os.environ.get('OSLOG', '').split()
 src = f'{src_root}/System/Library/LaunchDaemons'
+angels = f'{src_root}/System/Library/LaunchAngels'
 os.makedirs(dest, exist_ok=True)
 for label in labels:
     with open(f'{src}/{label}.plist', 'rb') as f:
@@ -55,11 +59,14 @@ for label in labels:
 
 if rest:
     count = 0
-    for name in sorted(os.listdir(src)):
+    rest_jobs = [(src, name) for name in sorted(os.listdir(src))]
+    if os.path.isdir(angels):
+        rest_jobs += [(angels, name) for name in sorted(os.listdir(angels))]
+    for directory, name in rest_jobs:
         label = name[:-len('.plist')]
         if not name.endswith('.plist') or label in labels or any(word in label for word in DENY):
             continue
-        with open(f'{src}/{name}', 'rb') as f:
+        with open(f'{directory}/{name}', 'rb') as f:
             job = plistlib.load(f)
         program = job.get('Program') or (job.get('ProgramArguments') or [''])[0]
         if not job.get('MachServices') or not os.path.isfile(f'{src_root}{program}'):
