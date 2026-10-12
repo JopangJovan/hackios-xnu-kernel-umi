@@ -206,7 +206,7 @@ my_render_update(void *server, void *update, unsigned *flags)
  * its renderer which of them it has. Its OpenGL ES renderer has not half of them (the Metal one
  * has all). Which ones are asked for and missing is worth knowing: said once each.
  * (The last of the ninety, "cst", is not asked about: the OpenGL ES renderer draws it with no
- * program at all, which draws nothing. The lock screen's wallpaper goes that way.)
+ * program at all. The lock screen's wallpaper goes that way; see plain_draw_begin() in eagl.c.)
  */
 #define VT_GLES_CONTEXT         0x1d5b3b540UL   /* vtable for CA::OGL::GLESContext */
 

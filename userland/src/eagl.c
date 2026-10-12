@@ -28,14 +28,16 @@
  * memory needs surface_to_texture() and target_to_surface() replaced, and nothing else.
  *
  * Where CoreAnimation relies on iOS's library being what it is, this stands in between:
- * blue-first pixels into a texture called GL_RGBA (internal_format()), and shaders that read
- * textures at coordinates in pixels (my_glShaderSource()).
+ * blue-first pixels into a texture called GL_RGBA (internal_format()), shaders that read
+ * textures at coordinates in pixels (my_glShaderSource()), and draws made with no program
+ * (plain_draw_begin()).
  *
  * What CoreAnimation asks of OpenGL ES is written down as it goes (the log lines "redwood-gl:"):
  * strings and limits it reads, texture formats and sizes, calls and triangles per frame. More
  * with the kernel's boot-args: gltrace=FIRST-LAST writes down every call of those frames (lines
  * "gl:", with a pixel of the framebuffer after each draw), glshaders=1 the text of every shader,
- * glshow=TEXTURE puts that texture over the corner of the picture.
+ * glshow=TEXTURE puts that texture over the corner of the picture, glplain=0 leaves the draws
+ * without a program alone.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -93,6 +95,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_COMPILE_STATUS               0x8b81
 #define GL_LINK_STATUS                  0x8b82
 #define GL_SHADING_LANGUAGE_VERSION     0x8b8c
+#define GL_FRAGMENT_SHADER              0x8b30
 #define GL_COLOR_ATTACHMENT0            0x8ce0
 #define GL_FRAMEBUFFER_COMPLETE         0x8cd5
 #define GL_FRAMEBUFFER                  0x8d40
@@ -190,6 +193,16 @@ struct eagl {
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour[FRAMEBUFFERS];    /* the texture that is each framebuffer's colour attachment */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
+	GLuint program;                 /* the one in use, as CoreAnimation has it */
+	GLuint plain;                   /* a program of ours for when that is none (plain_draw()) */
+	GLint plain_matrix, plain_textured;
+	unsigned unit;                  /* the texture unit being spoken of */
+	GLuint bound[8];                /* the 2D texture bound to each of the first units */
+	const GLfloat *matrix;          /* where CoreAnimation keeps the matrix it gives its programs */
+	struct {
+		const void *pointer;
+		GLsizei stride;
+	} arrays[8];                    /* the vertex arrays, as given */
 	bool in_frame;
 	/* a frame's worth */
 	unsigned calls, draws, triangles, uploads, clears;
@@ -200,6 +213,7 @@ struct eagl {
 	unsigned most_calls, most_triangles;
 	const char *sources[64];        /* the text of the shaders being made, by name modulo this */
 	bool fragment[64];              /* ... and which of the two kinds each is */
+	unsigned plain_said;
 };
 
 static unsigned trace_first, trace_last;        /* the frames whose calls are written down */
@@ -619,6 +633,9 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 		eagl_trace("glBindTexture(%#x, %u)\n", target, texture);
 	}
 	glBindTexture(target, texture);
+	if (target == GL_TEXTURE_2D && e->unit < 8) {
+		e->bound[e->unit] = texture;
+	}
 	if (texture != 0 && e->image_count != 0 && (image = image_of(e, texture)) != NULL && !image->target &&
 	    IOSurfaceGetSeed(image->surface) != image->seed) {
 		surface_to_texture(e, image);
@@ -665,10 +682,183 @@ triangles_of(GLenum mode, GLsizei count)
 	       count > 2 ? (unsigned)count - 2 : 0;
 }
 
+/*
+ * CoreAnimation's OpenGL ES renderer draws the last of its ninety "functions" (0x59, "cst" in the
+ * table its Metal renderer names its shaders by; no textures of its own by that table) with no
+ * program at all: glUseProgram(0), and then the draw. On iOS's library that may have meant
+ * something; in OpenGL ES it draws nothing, and what goes that way is missing from the picture:
+ * the lock screen's wallpaper, and the clock that is that wallpaper seen through its digits.
+ * Here such a draw is made with a program of ours, the plainest there could be: CoreAnimation's
+ * own vertex arrays (position 0, colour 1, texture coordinates 2, the latter in the texture's
+ * pixels), the matrix it gives every program of its own (always from one place of its: that
+ * place is read), and the colour times the texture on the first unit. With that the lock screen
+ * has its wallpaper and its clock, and the home screen is as it was.
+ * Only draws with a texture bound are treated so. CoreAnimation also makes draws with no program
+ * and no texture, over the whole of a surface, several a frame: given the colour alone
+ * (glplain=2) they paint the screen white, so whatever they are for, it is not that; they are
+ * left to draw nothing, as before. What the function is on the Metal side was not found out.
+ */
+#define GL_VERTEX_SHADER                0x8b31
+#define GL_VERTEX_ATTRIB_ARRAY_ENABLED  0x8622
+
+static const char plain_vertex[] =
+    "#version 300 es\n"
+    "uniform highp mat4 vertex_matrix;\n"
+    "in highp vec4 vertex_position;\n"
+    "in lowp vec4 vertex_color;\n"
+    "in highp vec2 vertex_texcoord0;\n"
+    "out lowp vec4 color;\n"
+    "out highp vec2 texcoord;\n"
+    "void main() {\n"
+    "  gl_Position = vertex_matrix * vertex_position;\n"
+    "  color = vertex_color;\n"
+    "  texcoord = vertex_texcoord0;\n"
+    "}\n";
+static const char plain_fragment[] =
+    "#version 300 es\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform lowp float textured;\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "out lowp vec4 result;\n"
+    "void main() {\n"
+    "  result = textured > 0.5 ? color * texture(texture0, texcoord / vec2(textureSize(texture0, 0))) : color;\n"
+    "}\n";
+
+static int plain_draws = 1;             /* boot-arg glplain=0: leave such draws as they are; 2: also those without a texture */
+
+static bool
+plain_draw_begin(struct eagl *e, GLint enabled[3])
+{
+	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	const GLchar *text;
+	GLuint shader;
+	GLint good = 0;
+
+	if (e->program != 0 || !plain_draws || (plain_draws == 1 && e->bound[0] == 0)) {
+		return false;
+	}
+	if (e->plain == 0) {
+		e->plain = glCreateProgram();
+		shader = glCreateShader(GL_VERTEX_SHADER);
+		text = plain_vertex;
+		glShaderSource(shader, 1, &text, NULL);
+		glCompileShader(shader);
+		glAttachShader(e->plain, shader);
+		shader = glCreateShader(GL_FRAGMENT_SHADER);
+		text = plain_fragment;
+		glShaderSource(shader, 1, &text, NULL);
+		glCompileShader(shader);
+		glAttachShader(e->plain, shader);
+		glBindAttribLocation(e->plain, 0, "vertex_position");
+		glBindAttribLocation(e->plain, 1, "vertex_color");
+		glBindAttribLocation(e->plain, 2, "vertex_texcoord0");
+		glLinkProgram(e->plain);
+		glGetProgramiv(e->plain, GL_LINK_STATUS, &good);
+		e->plain_matrix = glGetUniformLocation(e->plain, "vertex_matrix");
+		e->plain_textured = glGetUniformLocation(e->plain, "textured");
+		say("redwood-gl: a program of ours for the draws CoreAnimation makes with none: %s\n", good ? "made" : "NOT MADE");
+	}
+	glUseProgram(e->plain);
+	glUniformMatrix4fv(e->plain_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
+	glUniform1f(e->plain_textured, e->bound[0] != 0 ? 1 : 0);
+	for (GLuint i = 0; i < 3; i++) {
+		glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+		if (!enabled[i]) {
+			glEnableVertexAttribArray(i);
+		}
+	}
+	if (eagl_tracing || e->plain_said < 4) {
+		const GLfloat *position = e->arrays[0].pointer, *where = e->arrays[2].pointer;
+
+		e->plain_said++;
+		say("redwood-gl: a draw with no program, into framebuffer %u: texture %u on the first unit; arrays %d %d %d; first "
+		    "corner %g %g, texture coordinates %g %g\n", e->framebuffer, e->bound[0], enabled[0], enabled[1], enabled[2],
+		    position ? (double)position[0] : 0, position ? (double)position[1] : 0, where ? (double)where[0] : 0,
+		    where ? (double)where[1] : 0);
+	}
+	return true;
+}
+
+static void
+plain_draw_end(struct eagl *e, const GLint enabled[3])
+{
+	for (GLuint i = 0; i < 3; i++) {
+		if (!enabled[i]) {
+			glDisableVertexAttribArray(i);
+		}
+	}
+	glUseProgram(0);
+	(void)e;
+}
+
+static void
+my_glUseProgram(void *context, GLuint program)
+{
+	struct eagl *e = context;
+
+	EAGL_ENTER(e, 0x12c8);
+	if (eagl_tracing) {
+		eagl_trace("glUseProgram(%u)\n", program);
+	}
+	e->program = program;
+	glUseProgram(program);
+	EAGL_LEAVE(e, 0x12c8);
+}
+
+static void
+my_glActiveTexture(void *context, GLenum unit)
+{
+	struct eagl *e = context;
+
+	EAGL_ENTER(e, 0xab8);
+	if (eagl_tracing) {
+		eagl_trace("glActiveTexture(%#x)\n", unit);
+	}
+	e->unit = unit - 0x84c0;
+	glActiveTexture(unit);
+	EAGL_LEAVE(e, 0xab8);
+}
+
+static void
+my_glUniformMatrix4fv(void *context, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
+{
+	struct eagl *e = context;
+
+	EAGL_ENTER(e, 0x1368);
+	if (eagl_tracing) {
+		eagl_trace("glUniformMatrix4fv(%d, %d, %d, %p)\n", location, count, transpose, (const void *)value);
+		eagl_trace_floats(value, 16);
+	}
+	e->matrix = value;
+	glUniformMatrix4fv(location, count, transpose, value);
+	EAGL_LEAVE(e, 0x1368);
+}
+
+static void
+my_glVertexAttribPointer(void *context, GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride,
+    const void *pointer)
+{
+	struct eagl *e = context;
+
+	EAGL_ENTER(e, 0x1000);
+	if (eagl_tracing) {
+		eagl_trace("glVertexAttribPointer(%u, %d, %#x, %d, %d, %p)\n", index, size, type, normalized, stride, pointer);
+	}
+	if (index < 8) {
+		e->arrays[index].pointer = pointer;
+		e->arrays[index].stride = stride;
+	}
+	glVertexAttribPointer(index, size, type, normalized, stride, pointer);
+	EAGL_LEAVE(e, 0x1000);
+}
+
 static void
 my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 {
 	struct eagl *e = context;
+	GLint enabled[3];
+	bool plain;
 
 	EAGL_ENTER(e, 0x210);
 	drawing(e);
@@ -677,7 +867,11 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	if (eagl_tracing) {
 		eagl_trace("glDrawArrays(%#x, %d, %d)\n", mode, first, count);
 	}
+	plain = plain_draw_begin(e, enabled);
 	glDrawArrays(mode, first, count);
+	if (plain) {
+		plain_draw_end(e, enabled);
+	}
 	EAGL_LEAVE(e, 0x210);
 	if (eagl_tracing) {
 		trace_pixels(e);
@@ -688,6 +882,8 @@ static void
 my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
 	struct eagl *e = context;
+	GLint enabled[3];
+	bool plain;
 
 	EAGL_ENTER(e, 0x220);
 	drawing(e);
@@ -696,7 +892,11 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	if (eagl_tracing) {
 		eagl_trace("glDrawElements(%#x, %d, %#x, %p)\n", mode, count, type, indices);
 	}
+	plain = plain_draw_begin(e, enabled);
 	glDrawElements(mode, count, type, indices);
+	if (plain) {
+		plain_draw_end(e, enabled);
+	}
 	EAGL_LEAVE(e, 0x220);
 	if (eagl_tracing) {
 		trace_pixels(e);
@@ -917,8 +1117,6 @@ my_glPopGroupMarkerEXT(void *context)
  * version that 3.00 dropped are defined back, and texture2DRect() divides by textureSize().
  * (All of a program's shaders must be of one version, so all are treated alike.)
  */
-#define GL_FRAGMENT_SHADER      0x8b30
-
 static const char fragment_start[] =
     "#define varying in\n"
     "#define texture2D texture\n"
@@ -1268,6 +1466,9 @@ install(void)
 			}
 		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
+		if ((argument = strstr(arguments, "glplain=")) != NULL) {
+			plain_draws = (int)strtoul(argument + 8, NULL, 10);
+		}
 		if ((argument = strstr(arguments, "glshow=")) != NULL) {
 			shown_texture = (GLuint)strtoul(argument + 7, NULL, 10);
 		}
