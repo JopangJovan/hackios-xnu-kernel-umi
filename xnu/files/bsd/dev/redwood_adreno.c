@@ -63,8 +63,10 @@
  *   adreno_fine=1      the newest step waits like that before every single access
  *   adreno_keep=1      with adreno=21: the GPU is not stopped again but kept for the system to draw
  *                      with, through the service RedwoodGPU (see "the GPU kept on" below); it is
- *                      given back five seconds before a run's time is up
+ *                      given back when the run ends (adreno_dirty=1: left as a panic leaves it)
  *   adreno_zap=0       step 19 has been done since the phone started: not again
+ *   adreno_speed=N     step 17 asks the GMU for the 3D core's Nth speed instead of the first:
+ *                      1 315 MHz, 2 450 MHz, 3 550 MHz (the most this phone's GPU is rated for)
  *   adreno_blind=1     step 20 starts the command processor with its microcode nowhere, and
  *   adreno_stream1=N   step 18 leaves the core's second stream out (0) or gives it an empty
  *                      context of its own (2): what the SMMU then records shows what the core
@@ -72,6 +74,8 @@
  *   adreno_watch=S     after the last step, say once a second for S seconds (default 20) that
  *                      the machine is still alive, and what was written last
  *   adreno_return=1    when all is over, go back to the loader instead of starting the system
+ *   display_probe=1    before any step: read what the firmware left the display controller
+ *                      doing (display_probe() below; nothing is written)
  * The system does not go on starting until all of this is over, so that the end of the log is
  * ours; the touch screen driver's start would talk across it (leave touchscreen=1 out).
  *
@@ -84,7 +88,6 @@
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
 #include <kern/clock.h>
-#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -1218,6 +1221,7 @@ struct gpu_space {
 		bool changed;           /* since it was last written out of this processor's cache (space_commit()) */
 	} tables[SPACE_TABLES];
 	uint64_t *last_entry, *last_table;      /* the level 2 entry looked up last, and its table */
+	uint32_t last_changed;                  /* the table an entry was written in last */
 };
 
 static uint64_t *
@@ -1248,9 +1252,14 @@ space_new_table(struct gpu_space *space)
 static void
 space_changed(struct gpu_space *space, const uint64_t *entry)
 {
+	if ((uintptr_t)entry - (uintptr_t)space->tables[space->last_changed].table < 4096) {
+		space->tables[space->last_changed].changed = true;      /* page after page of one buffer */
+		return;
+	}
 	for (uint32_t i = space->table_count; i-- > 0;) {
 		if ((uintptr_t)entry - (uintptr_t)space->tables[i].table < 4096) {
 			space->tables[i].changed = true;
+			space->last_changed = i;
 			return;
 		}
 	}
@@ -2278,6 +2287,8 @@ static struct block gpu = { "gpu", 0x03d00000, 0x40000 };
 #define GMU_CORE_REQUEST        (1u << 30)      /* of host2gmu_intr_set: keep the 3D core up for us; bit 31: no more */
 #define GMU_CORE_GRANTED        (1u << 31)      /* of gmu2host_intr_info */
 
+static uint32_t core_khz;               /* the 3D core's speed, as asked of the GMU */
+
 /*
  * What the vendor's driver sends at this point (a6xx_hfi_start; Linux the same with fewer
  * levels): the table of speeds of the 3D core with the supply level each needs -- the phone's
@@ -2294,7 +2305,7 @@ step_core_power(void)
 	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
-	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 1, HFI_NO_INDEX }, granted = 0;
+	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 1, HFI_NO_INDEX }, granted = 0, speed = 1;
 	uint16_t gfx[16], cx[16], mx[16];
 	unsigned gfx_levels, cx_levels, mx_levels;
 
@@ -2342,7 +2353,12 @@ step_core_power(void)
 		return false;
 	}
 
-	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted: 315 MHz; "
+	if (PE_parse_boot_argn("adreno_speed", &speed, sizeof(speed)) && speed >= 1 && speed < perf.gpu_levels) {
+		vote[2] = speed;
+	}
+	core_khz = speeds[vote[2]].khz;
+	printf("adreno: %u: the speed wanted: %u MHz\n", step, core_khz / 1000);
+	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted; "
 	    "from here on it casts votes in RPMh by itself");
 	if (!hfi_send("the table of speeds", HFI_PERF_TABLE, &perf.header, sizeof(perf) / 4) ||
 	    !hfi_send("the table of bus votes", HFI_BW_TABLE, &bw.header, sizeof(bw) / 4) ||
@@ -2373,8 +2389,8 @@ step_core_power(void)
 	if (!hfi_send("\"start\"", HFI_START, start, 1)) {
 		return false;
 	}
-	printf("adreno: %u: measured: the 3D core's clock runs at %u Hz (315 MHz was asked for), the GMU's in it at %u Hz\n", step,
-	    measure_quietly(GPUCC_DEBUG_GX_GFX3D), measure_quietly(GPUCC_DEBUG_GX_GMU));
+	printf("adreno: %u: measured: the 3D core's clock runs at %u Hz (%u MHz was asked for), the GMU's in it at %u Hz\n", step,
+	    measure_quietly(GPUCC_DEBUG_GX_GFX3D), core_khz / 1000, measure_quietly(GPUCC_DEBUG_GX_GMU));
 
 	announce("read registers of the 3D core itself (0x3d00000): the first time it has power");
 	get(&gpu, "rbbm_status", RBBM_STATUS);
@@ -2410,6 +2426,7 @@ step_core_power(void)
 #define GBIF_QSB_SIDE0          (4 * 0x03)      /* of the bus interface (step 6) */
 #define RBBM_GBIF_CLIENT_QOS_CNTL GPU_WORD(0x0011)
 #define RBBM_GBIF_HALT          GPU_WORD(0x0016)
+#define RBBM_GBIF_HALT_ACK      GPU_WORD(0x0017)
 #define RBBM_INTERFACE_HANG_INT_CNTL GPU_WORD(0x001f)
 #define RBBM_PERFCTR_CNTL       GPU_WORD(0x0500)
 #define RBBM_PERFCTR_GPU_BUSY_MASKED GPU_WORD(0x050b)
@@ -3061,6 +3078,24 @@ redwood_adreno_quiesce(void)
 		wr(gmu.base + GMU_CM3_SYSRESET, 1);
 		gmu_runs = false;
 	}
+	if (core_runs) {
+		/*
+		 * The 3D core may be in the middle of a frame. Its bus interface is told to let what
+		 * is under way finish and to start nothing more (Linux's
+		 * a6xx_bus_clear_pending_transactions), and stays so: nothing of it reaches memory
+		 * after this, whatever becomes of its tables.
+		 */
+		wr(gpu.base + RBBM_GBIF_HALT, 1);
+		for (int i = 0; i < 100000 && !(rd(gpu.base + RBBM_GBIF_HALT_ACK) & 1); i++) {
+		}
+		wr(gbif.base + GBIF_HALT, 1);
+		for (int i = 0; i < 100000 && !(rd(gbif.base + GBIF_HALT_ACK) & 1); i++) {
+		}
+		wr(gbif.base + GBIF_HALT, 2);
+		for (int i = 0; i < 100000 && !(rd(gbif.base + GBIF_HALT_ACK) & 2); i++) {
+		}
+		core_runs = false;
+	}
 	if (gmu_space_is_on) {
 		wr(smmu.base + smmu_context(&gmu_space) + SMMU_CB_SCTLR, 0);
 		gmu_space_is_on = false;
@@ -3090,6 +3125,10 @@ redwood_adreno_quiesce(void)
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
+#define GPU_TIMES_AT            0x400           /* ... and when the core began and ended each of its last submissions */
+#define GPU_TIMES               64
+#define CP_ALWAYS_ON_COUNTER    0x0980          /* ticks of the 19.2 MHz crystal, 64 bits: for the core to read itself */
+#define CP_REG_TO_MEM           0x3e
 #define CP_SCRATCH_REG2         0x0885
 #define CP_IB1_BASE             GPU_WORD(0x0928)
 #define CP_IB1_REM_SIZE         GPU_WORD(0x092a)
@@ -3101,6 +3140,10 @@ redwood_adreno_quiesce(void)
 
 static bool gpu_kept;
 static uint32_t gpu_fence;              /* the number of the last submission */
+static uint32_t gpu_timed;              /* ... of the last whose times have been added up */
+static uint64_t gpu_ticks;              /* how long the core has worked on the submissions added up */
+static uint32_t gpu_timed_count;
+static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
 static struct {
 	uint64_t start, size;
 } gpu_free[1024];                       /* the addresses not in use, in order */
@@ -3111,13 +3154,14 @@ extern void RedwoodGPUStop(void);       /* takes the clients' lock, then calls r
 static void gpu_block_stop(void);
 
 /*
- * A run that the loader ends after so many seconds (boot-arg loader_return_after) gives the GPU
- * back a few seconds before that, in order and with time to do it: the next kernel then finds
- * the GPU block as the phone's own start leaves it. A run that ends otherwise (a panic, xl stop)
- * leaves it running, and the next kernel's step 4 has to deal with that.
+ * A run that ends in order -- its time is up, the host asks for the end, five fingers on the
+ * screen, a halt: whoever is about to call loader_return() for one of these calls
+ * redwood_adreno_stop() first, from a thread that may wait -- gives the GPU back as the steps'
+ * own ending does, and the next kernel finds the GPU block as the phone's start leaves it. A
+ * panic cannot: it leaves the GPU block running but quiet (redwood_adreno_quiesce()), and the
+ * next kernel's step 4 takes it down (stale_stop()). Boot-arg adreno_dirty=1 makes every ending
+ * a panic's in this respect, to see that work.
  */
-#define GPU_STOP_AHEAD          5
-
 void
 redwood_gpu_stop(void)
 {
@@ -3129,10 +3173,14 @@ redwood_gpu_stop(void)
 	}
 }
 
-static void
-gpu_stop_timer(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+void
+redwood_adreno_stop(void)
 {
-	RedwoodGPUStop();
+	uint32_t dirty = 0;
+
+	if (gpu_kept && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
+		RedwoodGPUStop();
+	}
 }
 
 bool
@@ -3161,7 +3209,7 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
-		*value = 315000000;
+		*value = core_khz * 1000ull;
 		return true;
 	case 0x05:                              /* TIMESTAMP */
 		*value = mach_absolute_time();
@@ -3278,6 +3326,49 @@ redwood_gpu_last(void)
 	return gpu_fence;
 }
 
+/* The core is to write down what time it is: at one end of submission `fence`. */
+static void
+ring_time(uint32_t fence, uint32_t end)
+{
+	ring_command(CP_REG_TO_MEM, 3);
+	ring(CP_ALWAYS_ON_COUNTER | 2u << 18 | 1u << 30);       /* two words, a 64-bit register */
+	ring(CORE_SCRATCH_ADDRESS + GPU_TIMES_AT + 16 * (fence % GPU_TIMES) + 8 * end);
+	ring(0);
+}
+
+/* Add up the times of the submissions the core has finished since this was last done. */
+static void
+gpu_times(void)
+{
+	volatile uint64_t *times = (volatile uint64_t *)(core_scratch.memory + GPU_TIMES_AT);
+	uint32_t done;
+
+	to_memory(core_scratch.memory, 4096);
+	done = *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+	if (done - gpu_timed > GPU_TIMES) {
+		gpu_timed = done - GPU_TIMES;           /* (the older ones have been written over) */
+	}
+	while (gpu_timed != done) {
+		uint32_t slot = ++gpu_timed % GPU_TIMES;
+
+		if (gpu_timed != 0 && times[2 * slot + 1] > times[2 * slot]) {
+			gpu_ticks += times[2 * slot + 1] - times[2 * slot];
+			gpu_timed_count++;
+		}
+	}
+}
+
+/* How long the 3D core has worked since this was last asked, and on how many submissions. */
+void
+redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions)
+{
+	gpu_times();
+	*microseconds = gpu_ticks * 10 / 192;
+	*submissions = gpu_timed_count;
+	gpu_ticks = 0;
+	gpu_timed_count = 0;
+}
+
 /*
  * Command buffers for the 3D core to run, in order: each an address and a count of words. As
  * Linux's a6xx_submit puts them in the ring. Returns the submission's number; 0: the ring is
@@ -3286,7 +3377,7 @@ redwood_gpu_last(void)
 uint32_t
 redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
-	uint32_t wanted = 16 + 4 * count, room = 0;
+	uint32_t wanted = 26 + 4 * count, room = 0;
 
 	for (int i = 0; i < 20000; i++) {
 		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
@@ -3298,6 +3389,11 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
 	if (room < wanted) {
 		return 0;
 	}
+	gpu_times();
+	if (++gpu_fence == 0) {
+		gpu_fence = 1;
+	}
+	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
@@ -3308,9 +3404,10 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
 		ring((uint32_t)(addresses[i] >> 32));
 		ring(words[i]);
 	}
-	if (++gpu_fence == 0) {
-		gpu_fence = 1;
+	if (gpu_exact) {
+		ring_command(CP_WAIT_FOR_IDLE, 0);      /* the time is the pipeline's, not the command processor's, which is ahead of it */
 	}
+	ring_time(gpu_fence, 1);
 	ring_register(CP_SCRATCH_REG2, gpu_fence);
 	ring_command(CP_EVENT_WRITE, 4);
 	ring(EVENT_CACHE_FLUSH);
@@ -3356,6 +3453,81 @@ static bool(*const steps[])(void) = {
  * as long as the steps and the watch after them last, nothing else writes to the log, so that
  * its end -- all that the loader's notes keep -- is about what is being done here.
  */
+/* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */
+
+/*
+ * The panel is a DSI video panel (dt: qcom,mdss_dsi_m20_36_02_0a_dsc_vid: 1080 x 2400 at 120
+ * frames a second, 2432 lines with the porches; or at 60 with a longer vertical front porch):
+ * the display controller sends it the framebuffer over and over at the rate of its timing
+ * registers, which nobody has touched since the firmware. This reads them, and nothing is
+ * written. Each read is behind a check that what it reads has its clock: the bus clock of the
+ * display's clock controller (by GCC, which answers always), in that controller the display
+ * block's power switch and bus clock, then the timing of the interface the panel hangs on
+ * (Linux's dpu_hw_intf.c has the registers' meaning). Every read is announced and waited for
+ * (adreno_pause), as in the newest step.
+ */
+static struct block dispcc = { "dispcc", 0x0af00000, 0x2000 };          /* dt: clock-controller@af00000 */
+static struct block disp_intf = { "intf1", 0x0ae36000, 0x300 };         /* dt: mdss_dsi0's mdp_intf_base */
+#define GCC_DISP_AHB_CBCR       0x27004
+#define DISPCC_MDSS_CORE_GDSCR  0x1004          /* dt: disp_cc_mdss_core_gdsc */
+#define DISPCC_MDSS_PCLK0_CBCR  0x1010
+#define DISPCC_MDSS_MDP_CBCR    0x1014
+#define DISPCC_MDSS_AHB_CBCR    0x1050
+#define INTF_TIMING_ENGINE_EN   0x000
+#define INTF_HSYNC_CTL          0x008           /* clocks a line << 16 | of which the pulse */
+#define INTF_VSYNC_PERIOD       0x00c           /* clocks a frame */
+#define INTF_DISPLAY_V_START    0x01c           /* clocks before the first line shown, and */
+#define INTF_DISPLAY_V_END      0x024           /* ... up to the last */
+#define INTF_DISPLAY_HCTL       0x03c
+#define INTF_FRAME_LINE_COUNT_EN 0x0a8
+#define INTF_FRAME_COUNT        0x0ac
+#define INTF_LINE_COUNT         0x0b0
+
+static void
+display_probe(void)
+{
+	uint32_t saved_fine = fine, line, frame, shown, counting, frames[2], lines[2];
+
+	step = newest_step = 0;
+	fine = 1;
+	announce("the display: has its clock controller its bus clock (gcc 0x127004; GCC answers always)");
+	if (get(&gcc, "disp_ahb_cbcr", GCC_DISP_AHB_CBCR) & CBCR_OFF) {
+		printf("adreno: 0: the display's clock controller has no bus clock: nothing more is read\n");
+		goto out;
+	}
+	announce("the display block's power switch and clocks, in its clock controller (0xaf00000: NOT READ BEFORE)");
+	if (!(get(&dispcc, "mdss_core_gdscr", DISPCC_MDSS_CORE_GDSCR) & GDSC_POWER_ON) ||
+	    (get(&dispcc, "mdss_ahb_cbcr", DISPCC_MDSS_AHB_CBCR) & CBCR_OFF)) {
+		printf("adreno: 0: the display block is without power or without its bus clock: nothing more is read\n");
+		goto out;
+	}
+	get(&dispcc, "mdss_mdp_cbcr", DISPCC_MDSS_MDP_CBCR);
+	get(&dispcc, "mdss_pclk0_cbcr", DISPCC_MDSS_PCLK0_CBCR);
+	announce("the timing of the interface the panel hangs on (0xae36000: NOT READ BEFORE)");
+	get(&disp_intf, "timing_engine_en", INTF_TIMING_ENGINE_EN);
+	line = get(&disp_intf, "hsync_ctl", INTF_HSYNC_CTL) >> 16;
+	frame = get(&disp_intf, "vsync_period", INTF_VSYNC_PERIOD);
+	shown = get(&disp_intf, "display_v_end", INTF_DISPLAY_V_END) - get(&disp_intf, "display_v_start", INTF_DISPLAY_V_START);
+	get(&disp_intf, "display_hctl", INTF_DISPLAY_HCTL);
+	counting = get(&disp_intf, "frame_line_count_en", INTF_FRAME_LINE_COUNT_EN);
+	frames[0] = get(&disp_intf, "frame_count", INTF_FRAME_COUNT);
+	lines[0] = get(&disp_intf, "line_count", INTF_LINE_COUNT);
+	quiet = true;
+	sleep_ms(1000);
+	frames[1] = get(&disp_intf, "frame_count", INTF_FRAME_COUNT);
+	lines[1] = get(&disp_intf, "line_count", INTF_LINE_COUNT);
+	quiet = false;
+	if (line != 0) {
+		printf("adreno: 0: THE DISPLAY: %u lines a frame, of which %u shown, %u clocks a line (the device tree's timing "
+		    "for 120 frames a second has 2432 lines; for 60, about twice that)\n", frame / line, (shown + 1) / line, line);
+	}
+	printf("adreno: 0: the interface's counters (%s, frame_line_count_en %#x): frames %u then %u a second later, "
+	    "lines %u then %u\n", (counting & 1) ? "counting" : "not counting", counting, frames[0], frames[1], lines[0], lines[1]);
+out:
+	fine = saved_fine;
+	newest_step = 0;
+}
+
 void
 redwood_adreno_init(void)
 {
@@ -3367,14 +3539,17 @@ redwood_adreno_init(void)
 		last_step = only;
 		skip_steps = ~(1u << only);
 	}
+	PE_parse_boot_argn("adreno_pause", &pause_ms, sizeof(pause_ms));
+	PE_parse_boot_argn("adreno_fine", &fine, sizeof(fine));
+	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
+		display_probe();
+	}
 	if (last_step == 0) {
 		return;
 	}
 	if (last_step > STEPS) {
 		last_step = STEPS;
 	}
-	PE_parse_boot_argn("adreno_pause", &pause_ms, sizeof(pause_ms));
-	PE_parse_boot_argn("adreno_fine", &fine, sizeof(fine));
 	PE_parse_boot_argn("adreno_watch", &watch_seconds, sizeof(watch_seconds));
 	for (newest_step = last_step; newest_step > 0 && (skip_steps & 1u << newest_step); newest_step--) {
 	}
@@ -3397,18 +3572,13 @@ redwood_adreno_init(void)
 			gpu_free[0].start = GPU_ADDRESSES_START;
 			gpu_free[0].size = GPU_ADDRESSES_SIZE;
 			gpu_free_count = 1;
-			*(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT) = 0;
+			bzero((void *)core_scratch.memory, 4096);
 			to_memory(core_scratch.memory, 4096);
+			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
 			gpu_kept = true;
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with (adreno_keep): the service RedwoodGPU\n");
 			RedwoodGPUStart();
-			if (PE_parse_boot_argn("loader_return_after", &only, sizeof(only)) && only > GPU_STOP_AHEAD + 5) {
-				uint64_t deadline;
-
-				clock_interval_to_deadline(only - GPU_STOP_AHEAD, NSEC_PER_SEC, &deadline);
-				thread_call_enter_delayed(thread_call_allocate(gpu_stop_timer, NULL), deadline);
-			}
 			return;
 		}
 		printf("adreno: not kept: the steps did not get as far as a 3D core that takes commands\n");

@@ -2,8 +2,8 @@
 
 Наши правки XNU `xnu-8796.121.2` (ядро iOS 16.5, Darwin 22.5.0):
 
-- `redwood.patch` — изменения в файлах Apple (56 файлов);
-- `files/` — новые файлы по их путям в дереве XNU (31 файл);
+- `redwood.patch` — изменения в файлах Apple (60 файлов);
+- `files/` — новые файлы по их путям в дереве XNU (37 файлов);
 - `apply.sh` — берёт исходники у Apple и накладывает всё это; `export.sh` — обратное действие.
 
 Собирается на Linux стоковым clang, без macOS и Xcode.
@@ -62,7 +62,7 @@ xnu-deps/setup.sh        # ~30 с: исходники зависимостей, 
 | `bsd/kern/kern_minimac.c`, `libkern/amfi/` | заглушки AMFI и Sandbox (MAC-политики), права из подписи программы |
 | `bsd/dev/redwood_input.c`, `redwood_goodix.c`, `redwood_virtio_input.c` | ввод: `/dev/redwood-touch`, драйвер Goodix GT9916 (SPI бит-бангом по GPIO), virtio-input для QEMU |
 | `bsd/dev/redwood_cpufreq.c` | частота процессора (Qualcomm EPSS) |
-| `bsd/dev/redwood_adreno.c` | GPU телефона (Adreno 642L): пока только пошаговое включение питания и тактов и чтение первых регистров (`adreno=N`) |
+| `bsd/dev/redwood_adreno.c`, `iokit/Kernel/RedwoodGPU.cpp` | GPU телефона (Adreno 642L): пошаговое включение (`adreno=N`: питание, GMU, zap-шейдер, микрокод), буферы и очередь команд; клиент IOKit с подмножеством msm DRM для Mesa |
 | `bsd/pthread/pthread_kext_static.c` | pthread kext, слинкованный в ядро |
 
 Патч, помимо врезок под всё это, чинит то, что мешает собрать и запустить открытый XNU вне Apple: makefile'ы под

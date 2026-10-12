@@ -44,6 +44,7 @@ extern void gic_v3_irq_quiesce(void);
 void loader_log_putc(char c);
 void loader_return(void);
 extern void redwood_adreno_quiesce(void);
+extern void redwood_adreno_stop(void);
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -358,6 +359,9 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 		loader_log_putc(*c);
 	}
 	PE_parse_boot_argn("return_panic", &as_panic, sizeof(as_panic));
+	if (!as_panic) {
+		redwood_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
+	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
 	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
 		for (;;) {
@@ -399,6 +403,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		for (const char *c = banner; *c; c++) {
 			loader_log_putc(*c);
 		}
+		redwood_adreno_stop();
 		loader_return();
 	}
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
