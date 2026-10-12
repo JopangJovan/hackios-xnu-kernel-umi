@@ -277,15 +277,17 @@ GenericARMPE::excludeList(void)
 bool
 GenericARMPE::getMachineName(char * name, int maxLength)
 {
-	uint32_t real = 0;
+	uint32_t real = 1;
 
 	/*
-	 * (boot-arg machine_name=1 for the real thing. Not the default yet: as an "iPhone10,3"
-	 * backboardd no longer takes our virtual touch screen for the phone's own, and without
-	 * touches the name of the device matters little.)
+	 * hw.machine is the model the loader put into the device tree, "iPhone10,3". It has to
+	 * begin with "iPhone": CoreFoundation picks the device-specific variants of resources
+	 * (Something~iphone.plist, Key~iphone in an Info.plist) by this string, and for a name it
+	 * does not know it picks none at all -- Control Center, for one, then lays its modules out
+	 * without their sizes. (boot-arg machine_name=0: the plain "arm64" this used to be.)
 	 */
-	if (!PE_parse_boot_argn("machine_name", &real, sizeof(real)) || !real ||
-	    !IODTPlatformExpert::getMachineName(name, maxLength) || name[0] == 0) {
+	PE_parse_boot_argn("machine_name", &real, sizeof(real));
+	if (!real || !IODTPlatformExpert::getMachineName(name, maxLength) || name[0] == 0) {
 		strlcpy(name, "arm64", maxLength);
 	}
 	return true;

@@ -33,6 +33,9 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         # these start, crash and are asked for again, over and over
         'aggregated', 'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd')
 
+# ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
+DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
+
 args = sys.argv[1:]
 rest = args[:1] == ['--rest']
 if rest:
