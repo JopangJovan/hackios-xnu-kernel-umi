@@ -43,6 +43,7 @@ void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virti
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's touch screen */
 void redwood_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
+void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 #endif
 
 #endif /* _SYS_REDWOOD_INPUT_H_ */

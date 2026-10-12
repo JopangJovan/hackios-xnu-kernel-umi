@@ -43,6 +43,7 @@ extern void gic_v3_irq_quiesce(void);
 
 void loader_log_putc(char c);
 void loader_return(void);
+extern void redwood_adreno_quiesce(void);
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -299,6 +300,7 @@ loader_return(void)
 	 */
 	psci_smp_stop_others();
 #endif
+	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that
