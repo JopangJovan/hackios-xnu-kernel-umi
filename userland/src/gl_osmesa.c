@@ -9,7 +9,9 @@
  * its contexts gets another file like this one.
  */
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "redwood_gl.h"
 
@@ -23,11 +25,16 @@
 #define OSMESA_CONTEXT_MINOR_VERSION    0x37
 #define OSMESA_ES_PROFILE               0x38
 #define GL_UNSIGNED_BYTE                0x1401
+#define GL_TEXTURE_2D                   0x0de1
+#define GL_RENDERER                     0x1f01
 
 typedef struct osmesa_context *OSMesaContext;
 extern OSMesaContext OSMesaCreateContextAttribs(const int *attributes, OSMesaContext share);
 extern unsigned char OSMesaMakeCurrent(OSMesaContext context, void *buffer, unsigned type, int width, int height);
 extern void OSMesaDestroyContext(OSMesaContext context);
+extern void (*OSMesaGetProcAddress(const char *name))(void);
+extern const unsigned char *glGetString(unsigned name);
+extern unsigned glGetError(void);
 
 /*
  * OSMesa draws its "window" into memory handed to it. Nothing here draws into a window (the
@@ -77,4 +84,32 @@ const char *
 redwood_gl_library(void)
 {
 	return "Mesa, off-screen (OSMesa)";
+}
+
+/*
+ * OES_EGL_image, with the IOSurface's ID as the image (tools/mesa/freedreno-darwin.patch: the
+ * kernel's GPU driver makes a buffer of the surface's memory). The drivers that draw in memory
+ * of their own with this processor are not asked: they refuse every time.
+ */
+int
+redwood_gl_surface_texture(struct redwood_gl *gl, uint32_t surface)
+{
+	static void (*image_target)(unsigned target, void *image);
+	static int asked, software;
+
+	(void)gl;
+	if (!asked) {
+		const char *renderer = (const char *)glGetString(GL_RENDERER);
+
+		asked = 1;
+		image_target = (void (*)(unsigned, void *))OSMesaGetProcAddress("glEGLImageTargetTexture2DOES");
+		software = renderer == NULL || strstr(renderer, "softpipe") != NULL || strstr(renderer, "llvmpipe") != NULL;
+	}
+	if (image_target == NULL || software) {
+		return 0;
+	}
+	while (glGetError() != 0) {
+	}
+	image_target(GL_TEXTURE_2D, (void *)(uintptr_t)surface);
+	return glGetError() == 0;
 }
