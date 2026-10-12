@@ -37,7 +37,7 @@
 образ системы. **Файлов iOS в репозитории нет** — скрипт сам скачивает их с серверов Apple (из IPSW iOS 16.5
 для iPhone X) и раскладывает.
 
-Нужно: Linux x86-64, ~12 ГБ свободного места (готовое занимает ~8 ГБ), 16 ГБ ОЗУ. Пакеты (Arch):
+Нужно: Linux x86-64, ~12 ГБ свободного места (готовое занимает ~8 ГБ), от 4 ГБ свободной памяти. Пакеты (Arch):
 
 ```sh
 sudo pacman -S --needed git python 7zip lz4 gcc qemu-system-aarch64 qemu-ui-gtk edk2-aarch64
@@ -69,9 +69,11 @@ qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # сеанс на 20 ми�
 
 Замечания:
 
-- Память гостя — 12 ГБ, отображённые из разрежённого файла `qemu/ram.img` (образ системы лежит в нём по нужному
-  смещению). На btrfs/xfs это reflink и места не занимает, на ext4 образ копируется (ещё 2,5 ГБ). Если QEMU не
-  может выделить память — `sudo sysctl vm.overcommit_memory=1`.
+- Память гостя — 7 ГБ (ядру достаётся то же окно 4,2 ГБ, что и на телефоне), отображённые из разрежённого файла
+  `qemu/ram.img` (образ системы лежит в нём по нужному смещению). На btrfs/xfs это reflink и места не занимает,
+  на ext4 образ копируется (ещё 2,5 ГБ). Один запущенный QEMU занимает 2,5–3 ГБ памяти компьютера.
+- Несколько QEMU сразу: `QEMU_INSTANCE=1 qemu/run-ios.sh …` (у каждого номера свои порты; `touch.py`,
+  `screendump.sh`, `stop.sh` понимают ту же переменную). `qemu/stop.sh` завершает QEMU досрочно.
 - Прошивка UEFI для aarch64 ищется там, куда её кладёт Arch. В Debian/Ubuntu (пакет `qemu-efi-aarch64`):
   `QEMU_EFI=/usr/share/AAVMF/AAVMF_CODE.fd QEMU_VARS=/usr/share/AAVMF/AAVMF_VARS.fd qemu/run-ios.sh …`
   (проверялось только на Arch).
@@ -212,7 +214,7 @@ Userland не изменён ни в одном байте: всё, чего е�
 | `mkpackfs.py` | сборщик образов packfs (формат описан в `bsd/miscfs/packfs/packfs.h` ядра) |
 | `qemu/` | запуск в QEMU, касания, снимки экрана, разбор стеков |
 | `uefi/`, `mkxnuimg.py` | порт UEFI на redwood и упаковка загрузочного образа для `fastboot boot` |
-| `tools/` | `recording.py` (запись экрана → mp4), `update-prebuilt.sh` |
+| `tools/` | `recording.py` (запись экрана → mp4), `update-prebuilt.sh`, `new-workspace.sh` (вторая рабочая копия со своим ядром и QEMU) |
 | `prebuilt/` | собранные ядро, загрузчик, наши программы и куски UEFI |
 
 Скрипты не зависят от того, куда склонирован репозиторий.

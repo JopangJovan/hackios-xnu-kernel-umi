@@ -3,10 +3,11 @@
 # usage: screendump.sh [out.png]      (FULL=1: the whole mode, not only the phone-sized corner)
 out=$(realpath -m "${1:-$(dirname "$(readlink -f "$0")")/../logs/qemu-screen.png}")   # QEMU writes it: absolute
 mkdir -p "$(dirname "$out")"
-python3 - "$out" <<'PY'
+here=$(dirname "$(readlink -f "$0")")
+python3 - "$out" "${QEMU_INSTANCE:-$(cat "$here/instance" 2>/dev/null || echo 0)}" <<'PY'
 import socket, struct, sys, time, zlib, os
 out = sys.argv[1]; ppm = out + '.ppm'
-s = socket.create_connection(('127.0.0.1', 4444)); s.settimeout(2)
+s = socket.create_connection(('127.0.0.1', 4444 + 10 * int(sys.argv[2]))); s.settimeout(2)
 s.sendall(b'\n'); time.sleep(0.3)
 s.sendall(f'screendump {ppm}\n'.encode()); time.sleep(1.5)
 d = open(ppm, 'rb').read(); os.unlink(ppm)

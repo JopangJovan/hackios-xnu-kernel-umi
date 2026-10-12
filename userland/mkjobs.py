@@ -11,7 +11,8 @@ everything the daemon has to say -- SpringBoard alone says a megabyte in half a 
 costs time and pushes everybody else out of the log that comes back from the phone.
 The program itself must be in the system image; a warning is printed if it was not extracted.
 
-With --rest, the other jobs of iOS follow, but strictly on demand: whatever starts them by
+With --rest, the other jobs of iOS follow (their standard error on the console as well, their os_log
+only when named in OSLOG), but strictly on demand: whatever starts them by
 itself (RunAtLoad, KeepAlive) is taken out, so that launchd runs one only when a program asks
 for one of its Mach services. That is how an application finds the daemons it needs without
 all 490 of them being started at boot. Left out: jobs without Mach services (nothing could
@@ -66,6 +67,9 @@ if rest:
         for key in ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
                     'QueueDirectories', 'StartOnMount', 'LaunchEvents'):
             job.pop(key, None)
+        job['StandardErrorPath'] = '/dev/console'
+        if label in oslog:
+            job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
         with open(f'{dest}/{name}', 'wb') as f:
             plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
         count += 1

@@ -14,16 +14,26 @@ Positions are fractions of the screen: 0 0 is the top left corner, 1 1 the botto
 Example, the "swipe up to open" gesture:  touch.py swipe 0.5 0.98 0.5 0.4 250
 """
 import json
+import os
 import socket
 import sys
 import time
+
+
+def instance():
+    """Which QEMU: QEMU_INSTANCE, or the number in the file "instance" next to this script, or 0."""
+    try:
+        return int(os.environ.get('QEMU_INSTANCE') or
+                   open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance')).read())
+    except (OSError, ValueError):
+        return 0
 
 KEYS = {'lock': 'l', 'home': 'h', 'volup': 'up', 'voldown': 'down', 'fivefingers': 'f11'}
 
 
 class Qmp:
-    def __init__(self, port=4445):
-        self.sock = socket.create_connection(('127.0.0.1', port))
+    def __init__(self, port=None):
+        self.sock = socket.create_connection(('127.0.0.1', port or 4445 + 10 * instance()))
         self.file = self.sock.makefile('rw')
         self.file.readline()                        # the greeting
         self.command('qmp_capabilities')
