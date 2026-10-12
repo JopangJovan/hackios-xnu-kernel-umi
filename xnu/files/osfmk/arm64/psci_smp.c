@@ -236,9 +236,7 @@ psci_smp_cpu_off(void)
 	__builtin_arm_wsr("DAIFSet", DAIFSC_ALL);
 	/* leave nothing behind that would interrupt a core that is no longer there */
 	__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_EL0_IMASKED);
-	gic_v3_irq_quiesce();
-	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 0);
-	__builtin_arm_isb(ISB_SY);
+	gic_v3_irq_cpu_shutdown();
 	os_atomic_store(&psci_smp_cpu_stage[cpu_number()], PSCI_SMP_CPU_OFF, release);
 	__builtin_arm_dsb(DSB_SY);
 

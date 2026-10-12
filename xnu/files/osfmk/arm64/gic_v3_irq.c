@@ -51,6 +51,7 @@
 #define GICR_IGROUPR0           (GICR_SGI_BASE + 0x0080)
 #define GICR_ISENABLER0         (GICR_SGI_BASE + 0x0100)
 #define GICR_ICENABLER0         (GICR_SGI_BASE + 0x0180)
+#define GICR_ICPENDR0           (GICR_SGI_BASE + 0x0280)
 #define GICR_ICACTIVER0         (GICR_SGI_BASE + 0x0380)
 #define GICR_IPRIORITYR(n)      (GICR_SGI_BASE + 0x0400 + (n))
 #define GICR_IGRPMODR0          (GICR_SGI_BASE + 0x0d00)
@@ -65,12 +66,21 @@ static vm_offset_t gicd_base, gicr_base;
 static vm_size_t   gicr_size;
 static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
 
-static uint64_t gic_active_iar[MAX_CPUS];   /* acknowledged, not yet EOI'd */
+/*
+ * Acknowledged, not yet EOI'd; 0: none. The signal between processors is interrupt 0 and reads
+ * as 0 from ICC_IAR1_EL1, hence the mark: without it a core switched off in the middle of that
+ * signal (which is where every core but one is during a panic) kept it active, and with the
+ * active priority still set in its CPU interface the next kernel on that core saw no interrupt
+ * at all.
+ */
+#define GIC_IAR_TAKEN           (1ULL << 63)
+static uint64_t gic_active_iar[MAX_CPUS];
 uint64_t        gic_unhandled_count;
 uint32_t        gic_last_unhandled;
 
 void gic_v3_irq_cpu_init(void);
 void gic_v3_irq_quiesce(void);
+void gic_v3_irq_cpu_shutdown(void);
 void gic_v3_irq_signal(uint32_t phys_id);
 void gic_v3_irq_signal_stop(uint32_t phys_id);
 
@@ -136,7 +146,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 		if (intid >= GIC_INTID_SPURIOUS_MIN) {
 			break;
 		}
-		gic_active_iar[cpu] = iar;
+		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
 
 		if (intid == GIC_INTID_VTIMER) {
 			/* same sequence as the FIQ path in sleh_fiq() */
@@ -176,10 +186,38 @@ gic_v3_irq_quiesce(void)
 	}
 	cpu = cpu_number();
 	if (gic_active_iar[cpu] != 0) {
-		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar[cpu]);
+		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
 		__builtin_arm_isb(ISB_SY);
 		gic_active_iar[cpu] = 0;
 	}
+}
+
+/*
+ * This processor is leaving for good: the firmware is about to be asked to switch it off
+ * (psci_smp_cpu_off(), and the boot processor in the loader's stub when the kernel has a core of
+ * its own). Nothing may be left that could interrupt it. The redistributor outlives the core, and
+ * so does what is pending in it: the "stop" signal that reached a core whose interrupts were off
+ * (every core is in that state while another one panics), or its timer. A core asked to go with
+ * an interrupt pending and the CPU interface still passing it on does not go cleanly, and the
+ * next kernel that is started on it hangs.
+ */
+void
+gic_v3_irq_cpu_shutdown(void)
+{
+	vm_offset_t gicr;
+
+	if (gicd_base == 0) {
+		return;
+	}
+	gic_v3_irq_quiesce();
+	gicr = gicr_cpu_base[cpu_number()];
+	if (gicr != 0) {
+		gic_write32(gicr + GICR_ICENABLER0, 0xffffffffu);
+		gic_write32(gicr + GICR_ICPENDR0, 0xffffffffu);
+		gic_write32(gicr + GICR_ICACTIVER0, 0xffffffffu);
+	}
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 0);
+	__builtin_arm_isb(ISB_SY);
 }
 
 static vm_offset_t
@@ -256,6 +294,7 @@ gic_v3_irq_cpu_init(void)
 		uint32_t sgis = (1u << GIC_SGI_SIGNAL) | (1u << GIC_SGI_STOP);
 
 		gic_write32(gicr + GICR_ICACTIVER0, sgis);
+		gic_write32(gicr + GICR_ICPENDR0, sgis);        /* ... or one that it never took */
 		*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_SGI_SIGNAL)) = GIC_PRIORITY_DEFAULT;
 		*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_SGI_STOP)) = GIC_PRIORITY_DEFAULT;
 		mine |= sgis;
@@ -276,7 +315,13 @@ gic_v3_irq_cpu_init(void)
 		}
 	}
 
-	/* CPU interface: accept all priorities, no preemption grouping, Group 1 on */
+	/*
+	 * CPU interface: accept all priorities, no preemption grouping, Group 1 on. And no priority
+	 * active: a core that the firmware switches off and on again need not lose that, and a
+	 * kernel that left in the middle of an interrupt without ending it would leave this one
+	 * waiting for an end that never comes.
+	 */
+	__builtin_arm_wsr64("ICC_AP1R0_EL1", 0);
 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xff);
 	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
 	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);

@@ -28,6 +28,7 @@ extern void             psci_smp_stop_here(void);
 extern void             gic_v3_irq_signal(uint32_t phys_id);
 extern void             gic_v3_irq_signal_stop(uint32_t phys_id);
 extern void             gic_v3_irq_quiesce(void);
+extern void             gic_v3_irq_cpu_shutdown(void);
 
 __END_DECLS
 

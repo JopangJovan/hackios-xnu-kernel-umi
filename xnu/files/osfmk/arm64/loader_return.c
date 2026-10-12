@@ -39,6 +39,7 @@
 
 #if defined(GENERIC_GIC_V3_IRQ)
 extern void gic_v3_irq_quiesce(void);
+extern void gic_v3_irq_cpu_shutdown(void);
 #endif
 
 void loader_log_putc(char c);
@@ -180,6 +181,7 @@ loader_jump(uint64_t reason, uint64_t code)
 #if ARM_PGSHIFT == 12
 	uint64_t stub = loader_stub_slot[1];
 	uint64_t tcr, t0sz;
+	uint32_t own_core = 0;
 
 	if (stub == 0 || loader_return_entered) {
 		return;
@@ -194,6 +196,16 @@ loader_jump(uint64_t reason, uint64_t code)
 	loader_return_entered = true;
 #if defined(GENERIC_GIC_V3_IRQ)
 	gic_v3_irq_quiesce();
+	/*
+	 * With a core of its own (bootcpu=) the kernel does not go back into the loader's code on
+	 * this processor: the stub leaves the log where the loader's core finds it and has the
+	 * firmware switch this one off. It must go as the other cores do (psci_smp_cpu_off()), with
+	 * nothing pending: after a panic the "stop" signal and the timer are.
+	 */
+	if (PE_parse_boot_argn("bootcpu", &own_core, sizeof(own_core))) {
+		__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_EL0_IMASKED);
+		gic_v3_irq_cpu_shutdown();
+	}
 #endif
 
 	loader_l1[stub >> 30] = static_kvtophys(loader_l2) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
