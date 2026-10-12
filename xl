@@ -31,6 +31,8 @@
 #   XL_RAMDISK  the image sent with the kernel: the small one that is mounted on /redwood
 #               (default userland/root.packfs; "none" sends none). Without a system image in the
 #               phone's RAM it is the root itself (e.g. XL_RAMDISK=userland/hello).
+# One phone, several working copies: a run holds a lock, and `stop` and `reboot` from another working
+# copy than the one it was started from are refused (XL_FORCE=1 to end it all the same).
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # the kernel and the loader built here, or else the ones that come with the repository
 K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
@@ -189,6 +191,15 @@ with open(out, 'wb') as f:
 PY
 }
 
+# stop and reboot end a run. One that was started from another working copy is somebody else's work
+# (an agent's measurement, a long session): not ended from here unless XL_FORCE=1 says so.
+not_anothers_run() { # not_anothers_run <command>
+	flock -n $PHONE.run true 2>/dev/null && return 0
+	[ "$(cat $PHONE.who 2>/dev/null)" = "$(pwd)" ] || [ -n "$XL_FORCE" ] && return 0
+	echo "xl: a run started from $(cat $PHONE.who 2>/dev/null) is in progress; XL_FORCE=1 ./xl $1 ends it all the same" >&2
+	return 1
+}
+
 # While a run is in progress the loader takes only what does not disturb the kernel: state, screenshot,
 # log, stop, reboot. Anything else would wait for nothing.
 case "$1" in
@@ -206,10 +217,10 @@ ramdisk) ramdisk "$2" ;;
 run) run "oem run $2" "run${2:+-cp$2}" ;;
 selftest) run "oem selftest" selftest ;;
 log) enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loader.log ;;
-stop) fb oem stop | grep -q OKAY && echo "xl: asked the kernel to come back" ;;
+stop) not_anothers_run stop && fb oem stop | grep -q OKAY && echo "xl: asked the kernel to come back" ;;
 memmap) enter && fb oem memmap >/dev/null && fb oem log >/dev/null && fetch_log logs/loader.log && sed -n '/^memory map/,$p' logs/loader.log ;;
 hang) enter && fb oem hang; echo "xl: waiting for the watchdog..."; t0=$(date +%s); wait_for android 150 && echo "xl: back in Android after $(( $(date +%s) - t0 )) s" || echo "xl: not back (state: $(state))" ;;
-reboot) fb reboot; ;;
+reboot) not_anothers_run reboot && fb reboot ;;
 reload) [ "$(state)" = loader ] && { fb reboot >/dev/null; wait_for android 120; }; enter && echo "xl: loader is up" ;;
 state) state ;;
 *) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" ;;
