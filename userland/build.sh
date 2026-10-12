@@ -147,8 +147,10 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		ln "$f" $D/
 	done
 	# thousands of small files: 4K blocks for them, the kernel's 16K pages for everything bigger
-	# compressed (LZ4, read in place by packfs): half the size, which is what fits into the phone's RAM;
-	# PLAIN=1 builds the image uncompressed instead
-	../mkpackfs.py ${PLAIN:+-b 4096 -a 16384} ${PLAIN:--z} -m $IOS/system.manifest -o system.packfs sysroot
+	# compressed (read in place by packfs): half the size with LZ4, which is what fits into the phone's RAM;
+	# ZSTD=1 compresses with Zstandard instead (a quarter smaller again, slower to build and to read),
+	# PLAIN=1 builds the image uncompressed
+	if [ -n "$PLAIN" ]; then pack="-b 4096 -a 16384"; elif [ -n "$ZSTD" ]; then pack="--zstd"; else pack="-z"; fi
+	../mkpackfs.py $pack -m $IOS/system.manifest -o system.packfs sysroot
 	rm -rf sysroot
 fi

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a packfs image (the read-only filesystems of the Darwin bring-up) from a directory.
 
-usage: mkpackfs.py [-b BLOCK] [-a PAGE] [-z [LEVEL]] [-m MANIFEST] [-o IMAGE] ROOTDIR
+usage: mkpackfs.py [-b BLOCK] [-a PAGE] [-z [LEVEL] | --zstd [LEVEL]] [-m MANIFEST] [-o IMAGE] ROOTDIR
 
 The format is described in xnu bsd/miscfs/packfs/packfs.h. Permission bits, symlinks and
 modification times are taken from ROOTDIR, and everything is owned by root:wheel, unless a
@@ -10,7 +10,10 @@ manifest says otherwise. Device nodes, FIFOs and sockets are skipped (/dev is de
 With -z every file is stored "chunked": cut into 64 KB chunks, each LZ4-compressed when that
 makes it smaller. Such an image is about half the size and is read in place by the kernel, so
 it mounts only from a RAM disk (see packfs.h). LEVEL is the LZ4 HC level (default 9; 0 = the
-fast compressor).
+fast compressor). With --zstd the chunks are compressed with Zstandard instead (LEVEL 1-22,
+default 15; beyond that it gets much slower for half a per cent): the image comes out a fifth
+smaller again, which on the phone is that much more memory for the system to run in, and
+reading it costs about four times the processor time.
 
 A manifest (-m) carries what a directory on this machine cannot: lines of
     mode(octal, with the type bits) <TAB> uid <TAB> gid <TAB> path <TAB> [link target]
@@ -34,6 +37,7 @@ SUPER = struct.Struct('<8sIIQQQQQQ')
 DNODE = struct.Struct('<IIIIQQIIIIQQ')
 MAX_NAME = 255
 F_CHUNKED = 0x1
+F_ZSTD = 0x2
 CHUNK = 65536
 
 _lz4 = None
@@ -55,15 +59,35 @@ def lz4_block(data, level):
     return out.raw[:n]
 
 
+_zstd = None
+
+
+def zstd_frame(data, level):
+    """One Zstandard frame."""
+    global _zstd
+    if _zstd is None:
+        _zstd = ctypes.CDLL(ctypes.util.find_library('zstd') or 'libzstd.so.1')
+        for name in ('ZSTD_compressBound', 'ZSTD_compress'):
+            getattr(_zstd, name).restype = ctypes.c_size_t
+        _zstd.ZSTD_compressBound.argtypes = [ctypes.c_size_t]
+        _zstd.ZSTD_compress.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int]
+    bound = _zstd.ZSTD_compressBound(len(data))
+    out = ctypes.create_string_buffer(bound)
+    n = _zstd.ZSTD_compress(out, bound, data, len(data), level)
+    if _zstd.ZSTD_isError(ctypes.c_size_t(n)):
+        raise RuntimeError('Zstandard failed')
+    return out.raw[:n]
+
+
 def chunked_extent(job):
     """The extent of a chunked file: the table of chunk offsets, then the chunks."""
-    path, level = job
+    path, level, zstd = job
     with open(path, 'rb') as f:
         data = f.read()
     chunks = []
     for at in range(0, len(data), CHUNK):
         raw = data[at:at + CHUNK]
-        packed = lz4_block(raw, level)
+        packed = zstd_frame(raw, level) if zstd else lz4_block(raw, level)
         chunks.append(packed if len(packed) < len(raw) else raw)
     table = [(len(chunks) + 1) * 4]
     for chunk in chunks:
@@ -168,7 +192,7 @@ def layout(root):
     return nodes
 
 
-def build_chunked(root, block, output, level):
+def build_chunked(root, block, output, level, zstd=False):
     """Write an image in which every file is chunked and compressed."""
     nodes = layout(root)
     strings = bytearray(b'\0')
@@ -199,7 +223,7 @@ def build_chunked(root, block, output, level):
         def submit():
             node = next(todo, None)
             if node is not None:
-                pending.append((node, pool.submit(chunked_extent, (node.source, level))))
+                pending.append((node, pool.submit(chunked_extent, (node.source, level, zstd))))
 
         for _ in range(2 * (os.cpu_count() or 2)):
             submit()
@@ -224,7 +248,7 @@ def build_chunked(root, block, output, level):
                 nlink = 2 + sum(stat.S_ISDIR(c.mode) for c in node.children.values())
             else:
                 nlink = 1
-            flags = F_CHUNKED if stat.S_ISREG(node.mode) and node.size else 0
+            flags = (F_CHUNKED | (F_ZSTD if zstd else 0)) if stat.S_ISREG(node.mode) and node.size else 0
             DNODE.pack_into(meta, nodes_off + node.index * DNODE.size, node.mode, node.uid, node.gid, nlink, node.size,
                             node.data, node.parent.index, node.name_off, len(node.name), 0, node.mtime, flags)
         meta[strings_off:strings_off + len(strings)] = strings
@@ -311,6 +335,8 @@ def main():
                         help='file data alignment, a power of two >= 4096 (default 16384)')
     parser.add_argument('-z', '--compress', type=int, nargs='?', const=9, default=None, metavar='LEVEL',
                         help='store every file in LZ4-compressed chunks (an image for a RAM disk only)')
+    parser.add_argument('--zstd', type=int, nargs='?', const=15, default=None, metavar='LEVEL',
+                        help='the same with Zstandard: smaller, slower to read')
     parser.add_argument('-a', '--page-align', type=lambda v: int(v, 0), default=0, metavar='SIZE',
                         help='align files of at least SIZE bytes to SIZE (a multiple of the block size); '
                              'use -b 4096 -a 16384 for images with many small files')
@@ -324,7 +350,9 @@ def main():
     added = apply_manifest(root, args.manifest) if args.manifest else 0
     if args.page_align and args.page_align % args.block:
         sys.exit('mkpackfs: the page alignment must be a multiple of the block size')
-    if args.compress is not None:
+    if args.zstd is not None:
+        size, count = build_chunked(root, args.block, args.output, args.zstd, zstd=True)
+    elif args.compress is not None:
         size, count = build_chunked(root, args.block, args.output, args.compress)
     else:
         size, count = build(root, args.block, args.output, args.page_align or None)

@@ -64,6 +64,7 @@ packfs_extent_size(const struct packfs_mount *pm, const struct packfs_dnode *dn)
  */
 extern size_t lz4raw_decode_buffer(uint8_t *dst_buffer, size_t dst_size, const uint8_t *src_buffer, size_t src_size,
     void *work);
+extern int packfs_zstd_decode(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size);
 
 /* Put chunk `index` of the file at dst and fill the rest of dst_size (at least the chunk's length) with zeros. */
 static int
@@ -80,7 +81,8 @@ packfs_chunk(const struct packfs_mount *pm, const struct packfs_dnode *dn, uint6
 	}
 	if (end - begin == raw) {
 		memcpy(dst, extent + begin, raw);
-	} else if (lz4raw_decode_buffer(dst, raw, extent + begin, end - begin, NULL) != raw) {
+	} else if ((dn->pd_flags & PACKFS_F_ZSTD) ? packfs_zstd_decode(dst, raw, extent + begin, end - begin) != 0 :
+	    lz4raw_decode_buffer(dst, raw, extent + begin, end - begin, NULL) != raw) {
 		printf("packfs: chunk %llu of node %u does not decompress\n", (unsigned long long)index,
 		    (uint32_t)(dn - pm->pm_nodes));
 		return EIO;

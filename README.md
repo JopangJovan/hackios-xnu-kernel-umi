@@ -92,6 +92,10 @@ XL_SECS=900 XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7" ./xl run     # 15 м�
 ./xl reboot                   # обратно в Android
 ```
 
+Для телефона стоит собрать образ системы со сжатием Zstandard: `SYSTEM=1 ZSTD=1 REST=1 userland/build.sh`
+(нужна `libzstd`, сборка идёт пару минут). Он на 0,5 ГБ меньше — ровно столько памяти дополнительно достаётся
+самой системе, и заливается на 17 секунд быстрее; iOS при этом стартует секунды на две-три дольше.
+
 `./xl run` ждёт конца сеанса и кладёт журнал в `logs/`; запускать можно сколько угодно раз, образ системы в ОЗУ
 остаётся. `./xl` без аргументов печатает все команды. Пока идёт сеанс, другие команды `xl` не выполняются
 («busy»): загрузчик отвечает одному собеседнику.
@@ -166,7 +170,8 @@ REST=1 userland/build.sh
 
 - `userland/root.packfs` — маленький (наш init, библиотеки-вставки, задания launchd); едет вместе с ядром,
   пересобирается за секунды;
-- `userland/system.packfs` — корень: отобранная часть iOS 16.5 (`ios165/select-system.py`), кэш dyld, сжатие LZ4.
+- `userland/system.packfs` — корень: отобранная часть iOS 16.5 (`ios165/select-system.py`), кэш dyld. Сжат
+  кусками по 64 КБ, которые ядро читает прямо из ОЗУ: LZ4 (по умолчанию) или Zstandard (`ZSTD=1`).
   Пересобирается только при изменении входных данных или с `SYSTEM=1`.
 
 `REST=1` добавляет ~350 штатных служб iOS «по требованию» (без них часть приложений зависает на старте).
@@ -215,7 +220,7 @@ Userland не изменён ни в одном байте: всё, чего е�
 | `mkpackfs.py` | сборщик образов packfs (формат описан в `bsd/miscfs/packfs/packfs.h` ядра) |
 | `qemu/` | запуск в QEMU, касания, снимки экрана, разбор стеков |
 | `uefi/`, `mkxnuimg.py` | порт UEFI на redwood и упаковка загрузочного образа для `fastboot boot` |
-| `tools/` | `recording.py` (запись экрана → mp4), `update-prebuilt.sh`, `new-workspace.sh` (вторая рабочая копия со своим ядром и QEMU) |
+| `tools/` | `recording.py` (запись экрана → mp4), `update-prebuilt.sh`, `new-workspace.sh` (вторая рабочая копия со своим ядром и QEMU), `mk-zstddec.sh` |
 | `prebuilt/` | собранные ядро, загрузчик, наши программы и куски UEFI |
 
 Скрипты не зависят от того, куда склонирован репозиторий.
@@ -238,6 +243,7 @@ Userland не изменён ни в одном байте: всё, чего е�
 - Файлов iOS в репозитории нет: `ios165/fetch.sh` скачивает их из IPSW с CDN Apple на вашу машину.
 - `xnu/` — производная работа от XNU, распространяется на условиях APSL 2.0, как и сам XNU; `prebuilt/mach.*` —
   ядро, собранное из этих исходников.
+- `xnu/files/bsd/miscfs/packfs/zstddeclib.c` — декодер Zstandard (Meta, BSD), сгенерирован `tools/mk-zstddec.sh`;
 - `xnu-deps/build/lzbitmap/libzbitmap.*` — libzbitmap (Corellium, GPL-2.0+ OR MIT);
   `xnu-deps/hostinc/mach-o/{loader,nlist,fat}.h` — заголовки из XNU (APSL 2.0).
 - `uefi/files/Binaries/redwood` и `prebuilt/uefi/SILICIUM_UEFI.fd` содержат драйверы UEFI из прошивки Xiaomi

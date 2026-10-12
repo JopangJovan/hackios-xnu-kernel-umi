@@ -15,8 +15,9 @@
  *   - plain: one contiguous extent aligned to the image block size; the
  *     generic cluster layer does all the I/O through the block device;
  *   - chunked (PACKFS_F_CHUNKED): cut into chunks of PACKFS_CHUNK_SIZE bytes,
- *     each stored either LZ4-compressed (a raw LZ4 block) or, when that
- *     does not make it smaller, as it is. The extent starts with a table of
+ *     each stored either compressed -- a raw LZ4 block, or with PACKFS_F_ZSTD
+ *     a Zstandard frame, a quarter smaller and four times slower to read --
+ *     or, when that does not make it smaller, as it is. The extent starts with a table of
  *     32-bit offsets, one per chunk and one more for the end, counted from
  *     the start of the extent; a chunk whose stored length equals its real
  *     length is not compressed. Chunked files are read straight out of the
@@ -65,6 +66,7 @@ struct packfs_dnode {
 };
 
 #define PACKFS_F_CHUNKED        0x1     /* the extent is a chunk table followed by the chunks */
+#define PACKFS_F_ZSTD           0x2     /* ... and the chunks are Zstandard frames, not LZ4 blocks */
 #define PACKFS_CHUNK_SIZE       65536   /* a multiple of every page size we run with */
 
 #ifdef KERNEL
