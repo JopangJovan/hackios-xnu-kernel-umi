@@ -6,5 +6,12 @@
 	     watchdog gives them on Apple's hardware (20 s for the first frame) -->
 	<key>FBLaunchWatchdogScale</key>
 	<real>20</real>
+	<!-- ... and the other watchdogs have no scale: 10 s to answer any change to a scene (going to the
+	     background, the scene of the widgets coming up while the system starts) is not always enough
+	     under QEMU, where the window server takes most of the one processor during an animation. This
+	     switches all of FrontBoard's watchdogs off; an application that really hangs is closed from
+	     the application switcher. -->
+	<key>BKNoWatchdogs</key>
+	<true/>
 </dict>
 </plist>
