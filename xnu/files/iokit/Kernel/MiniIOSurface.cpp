@@ -231,8 +231,9 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	struct minisurf_result * info;
 	uint32_t width, height, format, bpe, ew, eh, bpr, alloc, offset, planeCount = 0;
 	uint32_t hsub, vsub;
-	bool wide;
+	bool wide, onePlane = false;
 	OSArray * planeInfo;
+	OSNumber * wrapped;
 	uint64_t needed;
 
 	*error = kIOReturnBadArgument;
@@ -250,6 +251,15 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	if (format == 'w30r' || format == 'l10r' || format == 'w30R') {
 		format = 'BGRA';
 	}
+	/*
+	 * The same with alpha in a plane of its own: what CoreAnimation makes the screen's own
+	 * surfaces of once it draws with a GPU's renderer (OpenGL ES, userland/src/eagl.c) instead
+	 * of its software one. One plane of BGRA here too; the framebuffer shows nothing else.
+	 */
+	if (format == 'b3a8') {
+		format = 'BGRA';
+		onePlane = true;
+	}
 	ew = dictNumber(props, "IOSurfaceElementWidth", 1);
 	eh = dictNumber(props, "IOSurfaceElementHeight", 1);
 	bpe = dictNumber(props, "IOSurfaceBytesPerElement", 0);
@@ -257,11 +267,18 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	if (width > MINISURF_MAX_DIMENSION || height > MINISURF_MAX_DIMENSION || ew == 0 || eh == 0 || ew > 255 || eh > 255) {
 		return NULL;
 	}
-	if (props->getObject("IOSurfaceAddress") != NULL || props->getObject("IOSurfaceAddressRanges") != NULL) {
-		IOLog("MiniIOSurface: wrapping client memory is not supported\n");
+	if (props->getObject("IOSurfaceAddressRanges") != NULL) {
+		IOLog("MiniIOSurface: wrapping client memory in pieces is not supported\n");
 		*error = kIOReturnUnsupported;
 		return NULL;
 	}
+	/*
+	 * A surface around memory the client has already: CoreAnimation's OpenGL ES renderer makes
+	 * them around pictures it has in memory (an application's icon), to hand them to the GPU as
+	 * they are. Here the surface is one of our own with a copy of that memory in it, made now:
+	 * good for a picture that does not change, which is what these are.
+	 */
+	wrapped = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
 
 	s = OSTypeAlloc(MiniIOSurface);
 	if (s == NULL || !s->init()) {
@@ -271,7 +288,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	}
 	info = &s->info;
 
-	planeInfo = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+	planeInfo = onePlane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
 	needed = 0;
 	if (planeInfo != NULL && planeInfo->getCount() != 0) {
 		planeCount = planeInfo->getCount();
@@ -383,6 +400,16 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	}
 	s->kbase = (uint8_t *) s->memory->getBytesNoCopy();
 	s->values = OSDictionary::withCapacity(4);
+	if (wrapped != NULL) {
+		uint32_t given = dictNumber(props, "IOSurfaceAllocSize", alloc);
+
+		if (copyin((user_addr_t) wrapped->unsigned64BitValue(), s->kbase + PAGE_SIZE, given < alloc ? given : alloc) != 0) {
+			IOLog("MiniIOSurface: the memory to make a surface around cannot be read\n");
+			s->release();
+			*error = kIOReturnVMError;
+			return NULL;
+		}
+	}
 
 	info->allocSize = alloc;
 	info->width = width;
