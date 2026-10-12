@@ -44,6 +44,24 @@ void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's t
 void redwood_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
+
+/*
+ * The GPU kept on (boot-arg adreno_keep=1), for iokit/Kernel/RedwoodGPU.cpp: see "the GPU kept on"
+ * in bsd/dev/redwood_adreno.c. One caller at a time.
+ */
+bool redwood_gpu_ready(void);
+bool redwood_gpu_parameter(uint32_t which, uint64_t *value);
+uint64_t redwood_gpu_address(uint64_t size);
+void redwood_gpu_address_free(uint64_t address, uint64_t size);
+bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+void redwood_gpu_mapped(void);
+void redwood_gpu_unmap(uint64_t address, uint64_t size);
+void redwood_gpu_to_memory(void *start, uint64_t size);
+uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+bool redwood_gpu_done(uint32_t fence);
+uint32_t redwood_gpu_last(void);
+void redwood_gpu_report(const char *why);
+void redwood_gpu_stop(void);
 #endif
 
 #endif /* _SYS_REDWOOD_INPUT_H_ */

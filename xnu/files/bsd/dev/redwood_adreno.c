@@ -61,6 +61,9 @@
  *                      the end of our log to storage every two seconds, and after a silent reset
  *                      that note is all there is.
  *   adreno_fine=1      the newest step waits like that before every single access
+ *   adreno_keep=1      with adreno=21: the GPU is not stopped again but kept for the system to draw
+ *                      with, through the service RedwoodGPU (see "the GPU kept on" below); it is
+ *                      given back five seconds before a run's time is up
  *   adreno_zap=0       step 19 has been done since the phone started: not again
  *   adreno_blind=1     step 20 starts the command processor with its microcode nowhere, and
  *   adreno_stream1=N   step 18 leaves the core's second stream out (0) or gives it an empty
@@ -81,6 +84,7 @@
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -97,6 +101,7 @@ extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 
 static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20;
 static uint32_t step;                   /* the one being performed */
+static uint32_t speed_bin;              /* which of the GPUs of this kind the fuses say this is (step 2) */
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
@@ -428,6 +433,7 @@ step_fuses(void)
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
 	bin = bin >> 5 & 0xff;
+	speed_bin = bin;
 	gaming = get8(&qfprom, "gaming bin", QFPROM_CORRECTED + QFPROM_GPU_GAMING_BIN) >> 5 & 1;
 	/* dt: qcom,gpu-models: 0xac and 0xbe are sold as Adreno 643, anything else is the 642L */
 	printf("adreno: %u: speed bin %u: an Adreno %s; gaming bin %u\n", step, bin, bin == 0xac || bin == 0xbe ? "643" : "642L",
@@ -530,6 +536,8 @@ cx_is_on(void)
 	return (rd(gpucc.base + GPUCC_CX_GDSCR) | rd(gpucc.base + GPUCC_CX_HW_CTRL)) & GDSC_POWER_ON;
 }
 
+static void stale_stop(void);
+
 /*
  * The switch hangs on the rail "cx.lvl", which is up for as long as the SoC runs at all; the
  * vendor's driver (gdsc-regulator.c) clears the collapse bit and waits for bit 31 of the register
@@ -547,8 +555,19 @@ step_cx_power(void)
 	gdscr = get(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR);
 	get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
 	if (cx_is_on()) {
-		printf("adreno: %u: CX is on already\n", step);
-		return true;
+		/*
+		 * A kernel that kept the GPU for the system to use (adreno_keep) leaves it running when
+		 * its run ends. What it left -- the GMU's processor, the 3D core's power, the GMU's
+		 * votes in RPMh, the SMMU's contexts pointing into memory that is somebody else's now --
+		 * is taken down as gpu_block_stop() would have, and the start is from nothing.
+		 */
+		printf("adreno: %u: CX is on already: an earlier kernel left the GPU block running; stopping it first\n", step);
+		stale_stop();
+		if (cx_is_on()) {
+			printf("adreno: %u: CX stays on: going on with it as it is\n", step);
+			return true;
+		}
+		gdscr = rd(gpucc.base + GPUCC_CX_GDSCR);
 	}
 	if (gdscr & GDSC_HW_CONTROL) {
 		printf("adreno: %u: the switch is under hardware control: not ours to operate\n", step);
@@ -1185,7 +1204,7 @@ to_memory(vm_offset_t start, vm_size_t size)
 	settle();
 }
 
-#define SPACE_TABLES            48
+#define SPACE_TABLES            1024            /* 2 GB of addresses, were they all in use */
 
 struct gpu_space {
 	const char *name;
@@ -1196,7 +1215,9 @@ struct gpu_space {
 	struct {
 		uint64_t phys;
 		uint64_t *table;
+		bool changed;           /* since it was last written out of this processor's cache (space_commit()) */
 	} tables[SPACE_TABLES];
+	uint64_t *last_entry, *last_table;      /* the level 2 entry looked up last, and its table */
 };
 
 static uint64_t *
@@ -1223,6 +1244,30 @@ space_new_table(struct gpu_space *space)
 }
 
 /* The table an entry of a higher table leads to; made if the entry is empty. */
+/* An entry of one of the tables has been written: that table is to go out to memory. */
+static void
+space_changed(struct gpu_space *space, const uint64_t *entry)
+{
+	for (uint32_t i = space->table_count; i-- > 0;) {
+		if ((uintptr_t)entry - (uintptr_t)space->tables[i].table < 4096) {
+			space->tables[i].changed = true;
+			return;
+		}
+	}
+}
+
+/* The SMMU reads the tables from memory, not from this processor's cache. */
+static void
+space_commit(struct gpu_space *space)
+{
+	for (uint32_t i = 0; i < space->table_count; i++) {
+		if (space->tables[i].changed) {
+			to_memory((vm_offset_t)space->tables[i].table, 4096);
+			space->tables[i].changed = false;
+		}
+	}
+}
+
 static uint64_t *
 space_next(struct gpu_space *space, uint64_t *entry)
 {
@@ -1239,6 +1284,7 @@ space_next(struct gpu_space *space, uint64_t *entry)
 	table = space_new_table(space);
 	if (table != NULL) {
 		*entry = kvtophys((vm_offset_t)table) | PTE_TABLE;
+		space_changed(space, entry);
 	}
 	return table;
 }
@@ -1253,11 +1299,22 @@ space_map(struct gpu_space *space, uint64_t address, uint64_t phys, uint64_t att
 		return false;
 	}
 	level2 = space_next(space, &space->root[address >> 30 & 0x1ff]);
-	level3 = level2 != NULL ? space_next(space, &level2[address >> 21 & 0x1ff]) : NULL;
-	if (level3 == NULL) {
+	if (level2 == NULL) {
 		return false;
 	}
-	level3[address >> 12 & 0x1ff] = phys | attributes | PTE_PAGE;
+	if (space->last_entry == &level2[address >> 21 & 0x1ff]) {
+		level3 = space->last_table;             /* page after page of one buffer: the same table */
+	} else {
+		level3 = space_next(space, &level2[address >> 21 & 0x1ff]);
+		space->last_entry = &level2[address >> 21 & 0x1ff];
+		space->last_table = level3;
+	}
+	if (level3 == NULL) {
+		space->last_entry = NULL;
+		return false;
+	}
+	level3[address >> 12 & 0x1ff] = phys == 0 && attributes == 0 ? 0 : phys | attributes | PTE_PAGE;
+	space_changed(space, level3);
 	return true;
 }
 
@@ -2416,7 +2473,9 @@ static struct gpu_space second_space = {
 static bool second_space_is_on, second_stream_is_on;
 static struct gpu_block core_ring, core_sqe, core_scratch, core_target;
 static bool core_space_is_on, core_runs, zap_is_loaded;
-static uint32_t ring_words;             /* written to the ring so far; it is never filled here */
+#define RING_WORDS              (CORE_RING_SIZE / 4)
+static uint32_t ring_at;                /* where the next word goes: the ring goes round */
+static uint32_t ring_sent;              /* up to where the core has been told to read */
 
 static uint32_t
 odd_parity(uint32_t v)
@@ -2427,7 +2486,8 @@ odd_parity(uint32_t v)
 static void
 ring(uint32_t word)
 {
-	((uint32_t *)core_ring.memory)[ring_words++] = word;
+	((uint32_t *)core_ring.memory)[ring_at] = word;
+	ring_at = (ring_at + 1) % RING_WORDS;
 }
 
 /* The header of a command with so many words after it. */
@@ -2445,28 +2505,41 @@ ring_register(uint32_t number, uint32_t value)
 	ring(value);
 }
 
+/* What has been written to the ring since the last time: out to memory, and the core told how far to read. */
+static void
+ring_send(void)
+{
+	if (ring_at >= ring_sent) {
+		to_memory(core_ring.memory + 4 * ring_sent, 4 * (ring_at - ring_sent));
+	} else {
+		to_memory(core_ring.memory + 4 * ring_sent, 4 * (RING_WORDS - ring_sent));
+		to_memory(core_ring.memory, 4 * ring_at);
+	}
+	ring_sent = ring_at;
+	wr(gpu.base + CP_RB_WPTR, ring_at);
+}
+
 /* Let the 3D core have what is in the ring, and wait until it has taken all of it and rests. */
 static bool
 ring_run(const char *what)
 {
 	uint32_t taken = ~0u, status = ~0u;
 
-	to_memory(core_ring.memory, ring_words * 4);
-	printf("adreno: %u: about to have the 3D core %s: the ring up to word %u\n", step, what, ring_words);
+	printf("adreno: %u: about to have the 3D core %s: the ring up to word %u\n", step, what, ring_at);
 	snprintf(last_write, sizeof(last_write), "step %u had the 3D core %s", step, what);
 	hold(true);
-	wr(gpu.base + CP_RB_WPTR, ring_words);
-	for (int i = 0; i < 20000 && (taken != ring_words || (status & ~1u)); i++) {
+	ring_send();
+	for (int i = 0; i < 20000 && (taken != ring_at || (status & ~1u)); i++) {
 		sleep_us(100);
 		taken = rd(gpu.base + CP_RB_RPTR);
 		status = rd(gpu.base + RBBM_STATUS);
 	}
-	if (taken == ring_words && !(status & ~1u) && rd(gpu.base + CP_HW_FAULT) == 0 && !space_faulted(&core_space)) {
+	if (taken == ring_at && !(status & ~1u) && rd(gpu.base + CP_HW_FAULT) == 0 && !space_faulted(&core_space)) {
 		printf("adreno: %u: the 3D core has done it (ring read up to %u, status %#x)\n", step, taken, status);
 		return true;
 	}
 	printf("adreno: %u: the 3D core does not get through: ring read up to %u of %u, status %#x, interrupts %#x, "
-	    "command processor: fault %#x, interrupts %#x, protection %#x\n", step, taken, ring_words, status,
+	    "command processor: fault %#x, interrupts %#x, protection %#x\n", step, taken, ring_at, status,
 	    rd(gpu.base + RBBM_INT_0_STATUS), rd(gpu.base + CP_HW_FAULT), rd(gpu.base + CP_INTERRUPT_STATUS),
 	    rd(gpu.base + CP_PROTECT_STATUS));
 	space_faulted(&core_space);
@@ -2641,6 +2714,16 @@ step_core_start(void)
 	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
 	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00200200);
 	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
+	/*
+	 * How textures in the GPU's own tiled and compressed layouts are laid out in memory (Linux's
+	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config for this GPU: highest bank bit 14, and the
+	 * rest as below); Mesa is told the same (redwood_gpu_parameter()).
+	 */
+	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | 1u << 1);
+	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 1u << 1);
+	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | 1u << 1);
+	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 1u << 21);
+	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
 	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
 	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
 	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
@@ -2854,6 +2937,43 @@ step_frame(void)
  * core given back, the GMU told to drop its votes ("slumber") and stopped, its RPMh channel put
  * to sleep; then the processor into reset and its stream sent nowhere.
  */
+/* What step 4 does when it finds the GPU block running: see there. Nothing here has been set up by this kernel. */
+static void
+stale_stop(void)
+{
+	uint32_t gx;
+
+	need(&gmu);
+	need(&rscc);
+	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
+	gx = get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+	if (gx & GDSC_POWER_ON) {
+		/* the 3D core's switch is the GMU's to operate, and the GMU is gone: vendor's a6xx_gmu_suspend */
+		put(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR, gx | GDSC_SW_COLLAPSE);
+		wait_for(&gpucc, GPUCC_GX_GDSCR, GDSC_POWER_ON, 0, 100);
+		get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+	}
+	if (rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0 && !(rd(rscc.base + RSCC_RSC_STATUS0_DRV0) & RSCC_ASLEEP)) {
+		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
+		wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 100);
+		get(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0);
+		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
+	}
+	if (smmu_layout()) {
+		for (uint32_t match = 0; match < 3; match++) {
+			put(&smmu, "smr", SMMU_SMR(match), 0);
+			put(&smmu, "s2cr", SMMU_S2CR(match), SMMU_S2CR_FAULT);
+			put(&smmu, "cb sctlr", (smmu_pages + match) * smmu_page + SMMU_CB_SCTLR, 0);
+		}
+	}
+	put(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR, rd(gpucc.base + GPUCC_CX_GDSCR) | GDSC_SW_COLLAPSE);
+	for (int i = 0; i < 1000 && cx_is_on(); i++) {
+		sleep_us(100);
+	}
+	get(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR);
+	get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
+}
+
 static void
 gpu_block_stop(void)
 {
@@ -2955,6 +3075,272 @@ redwood_adreno_quiesce(void)
 	}
 }
 
+/* ---- the GPU kept on, for the system to draw with --------------------------------------------------- */
+
+/*
+ * With boot-arg adreno_keep=1 the steps are not undone: the GPU block stays as step 21 leaves it,
+ * the 3D core powered and taking commands, and the service RedwoodGPU (iokit/Kernel/RedwoodGPU.cpp)
+ * hands it to programs through the interface of Linux's msm driver, which is what Mesa's
+ * freedreno speaks. That file keeps the buffers and the clients; what is the GPU's is here:
+ * addresses in the 3D core's SMMU context, the ring, and the word by which the core says how
+ * far it has got (a "fence": a submission's number, written by the core when it is through
+ * with it). The caller holds one lock around all of these.
+ */
+#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
+#define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
+#define GPU_ADDRESSES_SIZE      0xe0000000ull
+#define GPU_FENCE_AT            0x40            /* in the scratch page */
+#define CP_SCRATCH_REG2         0x0885
+#define CP_IB1_BASE             GPU_WORD(0x0928)
+#define CP_IB1_REM_SIZE         GPU_WORD(0x092a)
+#define CP_IB2_BASE             GPU_WORD(0x092b)
+#define CP_IB2_REM_SIZE         GPU_WORD(0x092d)
+#define CP_INDIRECT_BUFFER      0x3f
+#define EVENT_INVALIDATE_DEPTH  0x18
+#define EVENT_INVALIDATE_COLOR  0x19
+
+static bool gpu_kept;
+static uint32_t gpu_fence;              /* the number of the last submission */
+static struct {
+	uint64_t start, size;
+} gpu_free[1024];                       /* the addresses not in use, in order */
+static unsigned gpu_free_count;
+
+extern void RedwoodGPUStart(void);
+extern void RedwoodGPUStop(void);       /* takes the clients' lock, then calls redwood_gpu_stop() */
+static void gpu_block_stop(void);
+
+/*
+ * A run that the loader ends after so many seconds (boot-arg loader_return_after) gives the GPU
+ * back a few seconds before that, in order and with time to do it: the next kernel then finds
+ * the GPU block as the phone's own start leaves it. A run that ends otherwise (a panic, xl stop)
+ * leaves it running, and the next kernel's step 4 has to deal with that.
+ */
+#define GPU_STOP_AHEAD          5
+
+void
+redwood_gpu_stop(void)
+{
+	if (gpu_kept) {
+		gpu_kept = false;
+		quiet = false;
+		printf("adreno: the run is about to end: the GPU is given back\n");
+		gpu_block_stop();
+	}
+}
+
+static void
+gpu_stop_timer(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	RedwoodGPUStop();
+}
+
+bool
+redwood_gpu_ready(void)
+{
+	return gpu_kept;
+}
+
+/* The answers to msm's GET_PARAM (Linux's adreno_get_param for this GPU; the numbers are msm_drm.h's). */
+bool
+redwood_gpu_parameter(uint32_t which, uint64_t *value)
+{
+	switch (which) {
+	case 0x01:                              /* GPU_ID: none, the chip ID says it */
+	case 0x06:                              /* GMEM_BASE */
+	case 0x08:                              /* PP_PGTABLE */
+	case 0x09:                              /* FAULTS */
+	case 0x0a:                              /* SUSPENDS */
+	case 0x11:                              /* RAYTRACING */
+		*value = 0;
+		return true;
+	case 0x02:                              /* GMEM_SIZE */
+		*value = 512 * 1024;
+		return true;
+	case 0x03:                              /* CHIP_ID, with the speed bin above it */
+		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
+		return true;
+	case 0x04:                              /* MAX_FREQ */
+		*value = 315000000;
+		return true;
+	case 0x05:                              /* TIMESTAMP */
+		*value = mach_absolute_time();
+		return true;
+	case 0x07:                              /* PRIORITIES */
+		*value = 1;
+		return true;
+	case 0x10:                              /* HIGHEST_BANK_BIT */
+		*value = 14;
+		return true;
+	case 0x12:                              /* UBWC_SWIZZLE */
+		*value = 6;
+		return true;
+	case 0x13:                              /* MACROTILE_MODE */
+		*value = 1;
+		return true;
+	default:                                /* among them VA_START, VA_SIZE: addresses are ours to give */
+		return false;
+	}
+}
+
+/* Addresses for a buffer of so many bytes; 0: none left. */
+uint64_t
+redwood_gpu_address(uint64_t size)
+{
+	size = (size + 0xffff) & ~0xffffull;
+	for (unsigned i = 0; i < gpu_free_count; i++) {
+		if (gpu_free[i].size >= size) {
+			uint64_t address = gpu_free[i].start;
+
+			gpu_free[i].start += size;
+			gpu_free[i].size -= size;
+			if (gpu_free[i].size == 0) {
+				memmove(&gpu_free[i], &gpu_free[i + 1], (--gpu_free_count - i) * sizeof(gpu_free[0]));
+			}
+			return address;
+		}
+	}
+	return 0;
+}
+
+void
+redwood_gpu_address_free(uint64_t address, uint64_t size)
+{
+	unsigned at;
+
+	size = (size + 0xffff) & ~0xffffull;
+	for (at = 0; at < gpu_free_count && gpu_free[at].start < address; at++) {
+	}
+	if (at > 0 && gpu_free[at - 1].start + gpu_free[at - 1].size == address) {
+		gpu_free[at - 1].size += size;
+		if (at < gpu_free_count && address + size == gpu_free[at].start) {
+			gpu_free[at - 1].size += gpu_free[at].size;
+			memmove(&gpu_free[at], &gpu_free[at + 1], (--gpu_free_count - at) * sizeof(gpu_free[0]));
+		}
+	} else if (at < gpu_free_count && address + size == gpu_free[at].start) {
+		gpu_free[at].start = address;
+		gpu_free[at].size += size;
+	} else if (gpu_free_count < sizeof(gpu_free) / sizeof(gpu_free[0])) {
+		memmove(&gpu_free[at + 1], &gpu_free[at], (gpu_free_count++ - at) * sizeof(gpu_free[0]));
+		gpu_free[at].start = address;
+		gpu_free[at].size = size;
+	}                                       /* (or else these addresses are lost) */
+}
+
+/* One 4K page of ours at an address of the 3D core's; after the last of a buffer's, redwood_gpu_mapped(). */
+bool
+redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+{
+	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
+}
+
+void
+redwood_gpu_mapped(void)
+{
+	space_commit(&core_space);
+}
+
+void
+redwood_gpu_unmap(uint64_t address, uint64_t size)
+{
+	uint32_t context = smmu_context(&core_space);
+
+	for (uint64_t offset = 0; offset < size; offset += 4096) {
+		space_map(&core_space, address + offset, 0, 0);
+	}
+	space_commit(&core_space);
+	wr(smmu.base + context + SMMU_CB_TLBIASID, core_space.context);
+	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
+	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
+	}
+}
+
+/* Memory that the 3D core and a program see without this processor's cache in between: out of that cache. */
+void
+redwood_gpu_to_memory(void *start, uint64_t size)
+{
+	to_memory((vm_offset_t)start, size);
+}
+
+/* How far the 3D core has got. */
+bool
+redwood_gpu_done(uint32_t fence)
+{
+	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+
+	to_memory((vm_offset_t)word, 4);
+	return (int32_t)(*word - fence) >= 0;
+}
+
+uint32_t
+redwood_gpu_last(void)
+{
+	return gpu_fence;
+}
+
+/*
+ * Command buffers for the 3D core to run, in order: each an address and a count of words. As
+ * Linux's a6xx_submit puts them in the ring. Returns the submission's number; 0: the ring is
+ * full and the core is not reading it.
+ */
+uint32_t
+redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+{
+	uint32_t wanted = 16 + 4 * count, room = 0;
+
+	for (int i = 0; i < 20000; i++) {
+		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
+		if (room >= wanted) {
+			break;
+		}
+		sleep_us(100);
+	}
+	if (room < wanted) {
+		return 0;
+	}
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_INVALIDATE_DEPTH);
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_INVALIDATE_COLOR);
+	for (uint32_t i = 0; i < count; i++) {
+		ring_command(CP_INDIRECT_BUFFER, 3);
+		ring((uint32_t)addresses[i]);
+		ring((uint32_t)(addresses[i] >> 32));
+		ring(words[i]);
+	}
+	if (++gpu_fence == 0) {
+		gpu_fence = 1;
+	}
+	ring_register(CP_SCRATCH_REG2, gpu_fence);
+	ring_command(CP_EVENT_WRITE, 4);
+	ring(EVENT_CACHE_FLUSH);
+	ring(CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
+	ring(0);
+	ring(gpu_fence);
+	ring_send();
+	return gpu_fence;
+}
+
+/* A submission does not come back: what the 3D core and its SMMU context say. */
+void
+redwood_gpu_report(const char *why)
+{
+	uint32_t context = smmu_context(&core_space);
+
+	printf("adreno: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; status "
+	    "%#x, interrupts %#x; command processor: fault %#x, interrupts %#x, protection %#x\n", why, gpu_fence,
+	    *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT), rd(gpu.base + CP_RB_RPTR), ring_at,
+	    rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS), rd(gpu.base + CP_HW_FAULT),
+	    rd(gpu.base + CP_INTERRUPT_STATUS), rd(gpu.base + CP_PROTECT_STATUS));
+	printf("adreno: gpu:   in the first command buffer at %#llx, %u words to go; in the second at %#llx, %u to go\n",
+	    (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_REM_SIZE),
+	    (uint64_t)rd(gpu.base + CP_IB2_BASE + 4) << 32 | rd(gpu.base + CP_IB2_BASE), rd(gpu.base + CP_IB2_REM_SIZE));
+	step = 0;
+	if (space_faulted(&core_space)) {
+		wr(smmu.base + context + SMMU_CB_FSR, SMMU_FSR_ALL);    /* so that the next one shows */
+	}
+}
+
 /* ---- all of it together ---------------------------------------------------------------------------- */
 
 static bool(*const steps[])(void) = {
@@ -3005,6 +3391,27 @@ redwood_adreno_init(void)
 		}
 		printf("adreno: step %u: done\n", step);
 		done = step;
+	}
+	if (PE_parse_boot_argn("adreno_keep", &only, sizeof(only)) && only) {
+		if (done >= 21 && core_runs) {
+			gpu_free[0].start = GPU_ADDRESSES_START;
+			gpu_free[0].size = GPU_ADDRESSES_SIZE;
+			gpu_free_count = 1;
+			*(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT) = 0;
+			to_memory(core_scratch.memory, 4096);
+			gpu_kept = true;
+			quiet = true;
+			printf("adreno: THE GPU STAYS ON for the system to draw with (adreno_keep): the service RedwoodGPU\n");
+			RedwoodGPUStart();
+			if (PE_parse_boot_argn("loader_return_after", &only, sizeof(only)) && only > GPU_STOP_AHEAD + 5) {
+				uint64_t deadline;
+
+				clock_interval_to_deadline(only - GPU_STOP_AHEAD, NSEC_PER_SEC, &deadline);
+				thread_call_enter_delayed(thread_call_allocate(gpu_stop_timer, NULL), deadline);
+			}
+			return;
+		}
+		printf("adreno: not kept: the steps did not get as far as a 3D core that takes commands\n");
 	}
 	/*
 	 * Punishment for a write may come late (a reset some 17 seconds after it has been seen):

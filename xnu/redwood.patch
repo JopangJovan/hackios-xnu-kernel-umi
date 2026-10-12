@@ -1319,16 +1319,17 @@ index 5219fb0d9ed6..29978e9cff43 100644
  		}
  	}
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..8dab3e0a364d 100644
+index 5fb0a52062e0..5edb1f225d18 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,10 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,11 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
 +iokit/Kernel/GenericARMPE.cpp			optional iokitcpp
 +iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
 +iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
++iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
