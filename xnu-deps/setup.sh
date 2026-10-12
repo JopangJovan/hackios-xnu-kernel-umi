@@ -36,7 +36,9 @@ die() { echo "setup: $*" >&2; exit 1; }
 
 # fetch DIR URL COMMIT: one commit of a repository, without its history
 fetch() {
-	git -C "$1" rev-parse -q --verify HEAD >/dev/null 2>&1 && [ "$(git -C "$1" rev-parse --show-toplevel)" = "$XNUDEPS/$1" ] && return 0
+	# there already? (its own repository, not the one this directory is part of)
+	[ -d "$1" ] && git -C "$1" rev-parse -q --verify HEAD >/dev/null 2>&1 &&
+		[ "$(git -C "$1" rev-parse --show-toplevel)" = "$(cd "$1" && pwd -P)" ] && return 0
 	log "fetching $1"
 	rm -rf "$1"
 	git init -q "$1"

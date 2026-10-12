@@ -72,4 +72,9 @@ __pycache__/
 !/xnu-deps/build/pthread/
 /xnu-deps/build/pthread/*
 !/xnu-deps/build/pthread/build.sh
+!/xnu-deps/build/pthread/inc/
 !/xnu-deps/build/lzbitmap/
+/xnu-deps/build/lzbitmap/*
+!/xnu-deps/build/lzbitmap/unzbm.c
+!/xnu-deps/build/lzbitmap/libzbitmap.c
+!/xnu-deps/build/lzbitmap/libzbitmap.h

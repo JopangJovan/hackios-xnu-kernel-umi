@@ -21,8 +21,8 @@ git init -q "$DIR"
 trap 'echo "apply.sh: failed; removing the incomplete $DIR" >&2; rm -rf "$DIR"' ERR
 cd "$DIR"
 git remote add origin "$URL"
-git fetch -q --depth 1 origin "refs/tags/$TAG"            # that one release, without the history
-git checkout -q -b redwood FETCH_HEAD
+git fetch -q --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG"      # that one release, without the history
+git checkout -q -b redwood "$TAG"
 [ "$(git rev-parse HEAD)" = "$BASE" ] || { echo "apply.sh: $TAG is $(git rev-parse HEAD), expected $BASE" >&2; false; }
 echo 'BUILD/' >> .git/info/exclude
 git apply --whitespace=nowarn "$HERE/redwood.patch"

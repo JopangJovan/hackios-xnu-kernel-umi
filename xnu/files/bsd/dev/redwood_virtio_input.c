@@ -11,7 +11,8 @@
  *
  * The keyboard is also a way to tell the kernel something from the host while the system runs:
  * F12, a process name, Enter prints where every thread of that process is (ustacks_now(); the
- * host side is "qemu/touch.py stacks NAME").
+ * host side is "qemu/touch.py stacks NAME"). F11 is five fingers on the screen for as long as it
+ * is held, which is how the way out in redwood_input.c is tried ("qemu/touch.py key fivefingers 2000").
  */
 #include <kern/clock.h>
 #include <kern/thread_call.h>
@@ -136,6 +137,7 @@ extern void ustacks_now(const char *name);
 #define KEY_ENTER               28
 #define KEY_LEFTSHIFT           42
 #define KEY_RIGHTSHIFT          54
+#define KEY_F11                 87
 #define KEY_F12                 88
 
 /* F12 NAME Enter: the keys in between spell a process name. Returns true if the key was taken. */
@@ -223,6 +225,11 @@ input_event(struct input_device *d, const struct input_event *e)
 			d->pressed = e->value != 0;
 		} else if (command_key(e->code, e->value)) {
 			break;
+		} else if (e->code == KEY_F11 && e->value < 2) {
+			/* five more fingers, for as long as the key is held: the way out of redwood_input.c */
+			for (uint32_t i = 0; i < 5; i++) {
+				redwood_touch_post(e->value ? REDWOOD_TOUCH_DOWN : REDWOOD_TOUCH_UP, 5 + i, 13107 + 9830 * i, 32768);
+			}
 		} else if ((button = button_for_key(e->code)) != 0 && e->value < 2) {   /* 2 = key repeat */
 			redwood_touch_post(e->value ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, button, 0, 0);
 		}

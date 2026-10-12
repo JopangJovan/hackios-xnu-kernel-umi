@@ -125,9 +125,16 @@ XL_SECS=900 XL_CMDLINE="touchscreen=1 cpufreq=1 bootcpu=7" ./xl run     # 15 м�
 
 ### Ядро
 
-См. `xnu/README.md`: исходники XNU берутся у Apple (`apple-oss-distributions/xnu`, тег `xnu-8796.121.2`), поверх
-накладываются наши правки (`xnu/redwood.patch` + новые файлы в `xnu/files/`), окружение для сборки на Linux
-стоковым clang готовит `xnu-deps/setup.sh`.
+Нужны [theos](https://theos.dev/docs/installation-linux) в `~/theos` (cctools и `iPhoneOS16.5.sdk`) и пакеты
+`base-devel git curl clang lld python perl xz`. Дальше три команды, вместе около двух минут:
+
+```sh
+xnu/apply.sh             # исходники XNU (тег xnu-8796.121.2) с GitHub Apple + наши правки → xnu-src/
+xnu-deps/setup.sh        # зависимости, инструменты и SDK для сборки на Linux стоковым clang
+./xnu-build.sh -j8 -k    # → xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+```
+
+Подробности, подводные камни и обзор того, что добавлено в ядро, — в `xnu/README.md`.
 
 ### Загрузчик
 
@@ -219,6 +226,7 @@ Userland не изменён ни в одном байте: всё, чего е�
 - Файлов iOS в репозитории нет: `ios165/fetch.sh` скачивает их из IPSW с CDN Apple на вашу машину.
 - `xnu/` — производная работа от XNU, распространяется на условиях APSL 2.0, как и сам XNU; `prebuilt/mach.*` —
   ядро, собранное из этих исходников.
-- `xnu-deps/build/lzbitmap/libzbitmap.*` — libzbitmap (Corellium, GPL-2.0+ OR MIT).
+- `xnu-deps/build/lzbitmap/libzbitmap.*` — libzbitmap (Corellium, GPL-2.0+ OR MIT);
+  `xnu-deps/hostinc/mach-o/{loader,nlist,fat}.h` — заголовки из XNU (APSL 2.0).
 - `uefi/files/Binaries/redwood` и `prebuilt/uefi/SILICIUM_UEFI.fd` содержат драйверы UEFI из прошивки Xiaomi
   (так же, как их распространяет Project Silicium для других устройств); `prebuilt/uefi/mkbootimg.py` — AOSP, Apache-2.0.

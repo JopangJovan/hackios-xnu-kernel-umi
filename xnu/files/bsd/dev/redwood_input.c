@@ -3,6 +3,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
@@ -19,8 +20,52 @@ static LCK_MTX_DECLARE(touch_lock, &touch_lck_grp);
 static struct redwood_touch touch_queue[TOUCH_QUEUE];
 static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
 
-void
-redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+/*
+ * The way out when nothing else is at hand: five fingers held on the screen for a second and a
+ * half end the run -- control goes back to the loader, as when loader_return_after expires.
+ * Only a driver's fingers count, not samples a program writes to the device.
+ */
+#define EXIT_FINGERS    5
+#define EXIT_HOLD_MS    1500
+
+extern void loader_return(void);
+
+static thread_call_t exit_call;
+static uint32_t fingers_down;           /* one bit for each finger a driver says is down */
+
+static void
+exit_hold_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	printf("\n--- %d fingers held on the screen for %d ms: back to the loader ---\n", EXIT_FINGERS, EXIT_HOLD_MS);
+	loader_return();
+}
+
+/* With touch_lock held. */
+static void
+count_fingers(uint32_t type, uint32_t finger)
+{
+	int before = __builtin_popcount(fingers_down), now;
+	uint64_t deadline;
+
+	if (finger >= 32 || exit_call == NULL || (type != REDWOOD_TOUCH_DOWN && type != REDWOOD_TOUCH_UP)) {
+		return;
+	}
+	if (type == REDWOOD_TOUCH_DOWN) {
+		fingers_down |= 1u << finger;
+	} else {
+		fingers_down &= ~(1u << finger);
+	}
+	now = __builtin_popcount(fingers_down);
+	if (now >= EXIT_FINGERS && before < EXIT_FINGERS) {
+		clock_interval_to_deadline(EXIT_HOLD_MS, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(exit_call, deadline);
+	} else if (now < EXIT_FINGERS && before >= EXIT_FINGERS) {
+		thread_call_cancel(exit_call);
+	}
+}
+
+static void
+touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
 {
 	struct redwood_touch *t;
 
@@ -34,8 +79,17 @@ redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 	t->finger = finger;
 	t->x = x > 65535 ? 65535 : x;
 	t->y = y > 65535 ? 65535 : y;
+	if (from_driver) {
+		count_fingers(type, finger);
+	}
 	lck_mtx_unlock(&touch_lock);
 	wakeup(&touch_queue);
+}
+
+void
+redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+{
+	touch_post(type, finger, x, y, true);
 }
 
 static int
@@ -92,7 +146,7 @@ touch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		if (t.type < REDWOOD_TOUCH_DOWN || t.type > REDWOOD_BUTTON_UP) {
 			return EINVAL;
 		}
-		redwood_touch_post(t.type, t.finger, t.x, t.y);
+		touch_post(t.type, t.finger, t.x, t.y, false);
 	}
 	return error;
 }
@@ -111,6 +165,7 @@ redwood_input_init(void)
 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-touch") == NULL) {
 		printf("redwood-touch: cannot create the device\n");
 	}
+	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	redwood_cpufreq_init();
 	redwood_virtio_input_init();
 	redwood_goodix_init();
