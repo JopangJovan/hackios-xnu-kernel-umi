@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
+#include <notify.h>
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -563,6 +564,23 @@ send_touch(IOHIDServiceClientRef screen, const struct redwood_touch *t)
 	CFRelease(hand);
 }
 
+/*
+ * Whether the side button is held right now, for our code in SpringBoard (inject_sb.c,
+ * lock_long_press()): kept as the state of a Darwin notification, 2 = held, 1 = released
+ * (0, what a name nobody has set says, = not known), and set before the event is sent.
+ */
+static void
+publish_lock_button(bool down)
+{
+	static int token = NOTIFY_TOKEN_INVALID;
+
+	if (token == NOTIFY_TOKEN_INVALID && notify_register_check("com.redwood.button.lock", &token) != NOTIFY_STATUS_OK) {
+		token = NOTIFY_TOKEN_INVALID;
+		return;
+	}
+	notify_set_state(token, down ? 2 : 1);
+}
+
 static void
 send_button(IOHIDServiceClientRef buttons, const struct redwood_touch *t)
 {
@@ -573,6 +591,9 @@ send_button(IOHIDServiceClientRef buttons, const struct redwood_touch *t)
 
 	if (usage == 0) {
 		return;
+	}
+	if (t->finger == REDWOOD_BUTTON_LOCK) {
+		publish_lock_button(t->type == REDWOOD_BUTTON_DOWN);
 	}
 	event = IOHIDEventCreateKeyboardEvent(NULL, t->time, HID_PAGE_CONSUMER, usage, t->type == REDWOOD_BUTTON_DOWN, 0);
 	IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
