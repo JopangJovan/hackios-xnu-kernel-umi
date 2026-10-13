@@ -18,11 +18,12 @@
 #                                   rc.jobs.unlock, which also swipes the lock screen away (for the phone,
 #                                   where nothing else can touch the screen yet)
 #                      GL=1         with an OpenGL ES implementation for the window server: Mesa
-#                                   (tools/mk-mesa.sh fetches and builds it, once) behind src/eagl.c, as
-#                                   lib/libOSMesa.8.dylib (15 MB) and lib/libredwood-gl.dylib. CoreAnimation
-#                                   then draws with its OpenGL ES renderer instead of its software one --
-#                                   by the phone's GPU where the kernel keeps it on (boot-arg adreno_keep=1),
-#                                   by Mesa's software driver elsewhere.
+#                                   (tools/mk-mesa.sh fetches and builds it) behind src/eagl.c, as
+#                                   lib/libOSMesa.8.dylib (15 MB) and lib/libredwood-gl.dylib. Where the
+#                                   kernel has started the phone's GPU, CoreAnimation then draws with its
+#                                   OpenGL ES renderer, by that GPU (boot-arg gpu=1); anywhere else -- QEMU,
+#                                   no boot-arg, no firmware in ../fw-gpu -- the library is not even loaded
+#                                   and nothing changes (src/inject.c, opengl_es()).
 #                                   GL=test: only the library and bin/gl_test (a triangle, src/gl_test.c;
 #                                   RC_JOBS=rc.jobs.gltest runs it); the window server stays as it is.
 #   system.packfs    the system image, the root filesystem (second RAM disk, /dev/md1): the part of
@@ -104,8 +105,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood-sb.dylib src/inject_sb.c
 		if [ -n "$GL" ]; then
 			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
+			# (Mesa says beside the library what it was built from: one from other patches is built again)
 			M=../xnu-deps/build/mesa/out
-			[ -f $M/libOSMesa.8.dylib ] || ../tools/mk-mesa.sh
+			[ "$(cat $M/built-from 2>/dev/null)" = "$(cat ../tools/mesa/*.patch ../tools/mesa/redwood-drm/* | sha256sum)" ] ||
+				../tools/mk-mesa.sh
 			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
 			$DYN -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation \
 				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libredwood-gl.dylib \

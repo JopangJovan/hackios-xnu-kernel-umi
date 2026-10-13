@@ -26,6 +26,7 @@
  * every one is checked against what is expected to be there before it is touched.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -38,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include "redwood_input.h"
@@ -210,6 +212,7 @@ my_render_update(void *server, void *update, unsigned *flags)
  */
 #define VT_GLES_CONTEXT         0x1d5b3b540UL   /* vtable for CA::OGL::GLESContext */
 
+static int gl_loaded;                           /* CoreAnimation draws with OpenGL ES (opengl_es() below) */
 static int (*orig_function_supported)(void *context);
 
 static int
@@ -245,7 +248,7 @@ window_server_fixes(void)
 	orig_renderer = replace_virtual("renderer", VSLOT(VT_EAGL_SERVER, 0x1a0), 0x1882e2548UL, my_renderer);
 	orig_render_update = replace_virtual("render_update", VSLOT(VT_EAGL_SERVER, 0x178), 0x18835770cUL,
 	    my_render_update);
-	if (access(REDWOOD_GL, R_OK) == 0) {
+	if (gl_loaded) {
 		orig_function_supported = replace_virtual("function_supported", VSLOT(VT_GLES_CONTEXT, 0x378), 0x1884a9308UL,
 		    my_function_supported);
 	}
@@ -684,6 +687,56 @@ container_manager_fixes(void)
 
 /* ---------------------------------------------------------------------------------------------- */
 
+/*
+ * An OpenGL ES implementation for CoreAnimation (src/eagl.c, Mesa behind it): loaded, it puts
+ * itself behind EAGLContext, and the renderer the server then gets is the OpenGL ES one. That
+ * is worth it where a GPU does the drawing, and only there: on the phone, when the kernel has
+ * started the GPU and keeps it (boot-arg gpu=1), which the service RedwoodGPU says (it is there
+ * before the first program runs, or not at all). Everywhere else -- QEMU, a run without the
+ * boot-arg, a phone without the GPU's firmware in the image, a GPU that did not start --
+ * nothing is loaded, and CoreAnimation draws with its own software renderer as in an image
+ * without the library.
+ * Boot-arg gl=0: not even with a GPU; gl=1: also without one, by Mesa's software driver (slow;
+ * for working on eagl.c in QEMU).
+ */
+static void
+opengl_es(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *argument;
+	io_service_t gpu;
+	int wanted = -1, told = 0;
+
+	if (access(REDWOOD_GL, R_OK) != 0) {
+		return;                                 /* (an image built without it) */
+	}
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		for (argument = arguments; (argument = strstr(argument, "gl=")) != NULL; argument += 3) {
+			if (argument == arguments || argument[-1] == ' ') {
+				wanted = argument[3] != '0';
+				told = 1;
+			}
+		}
+	}
+	if (wanted < 0) {
+		gpu = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
+		wanted = gpu != 0;
+		if (gpu != 0) {
+			IOObjectRelease(gpu);
+		}
+	}
+	if (!wanted) {
+		say("redwood: %s: CoreAnimation keeps its software renderer\n", told ? "gl=0" : "no GPU to draw with");
+		return;
+	}
+	if (dlopen(REDWOOD_GL, RTLD_NOW) == NULL) {
+		say("redwood: %s: %s\n", REDWOOD_GL, dlerror());
+		return;
+	}
+	gl_loaded = 1;
+}
+
 __attribute__((constructor))
 static void
 redwood_init(void)
@@ -697,16 +750,7 @@ redwood_init(void)
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
 	if (strcmp(name, "backboardd") == 0) {
-		/*
-		 * An OpenGL ES implementation for CoreAnimation, where the image has one (build.sh GL=1;
-		 * src/eagl.c): it puts itself behind EAGLContext as it is loaded, and the renderer the
-		 * server then gets is the OpenGL ES one.
-		 */
-		if (access(REDWOOD_GL, R_OK) == 0) {
-			if (dlopen(REDWOOD_GL, RTLD_NOW) == NULL) {
-				say("redwood: %s: %s\n", REDWOOD_GL, dlerror());
-			}
-		}
+		opengl_es();
 		window_server_fixes();
 		/*
 		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch

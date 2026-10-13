@@ -47,7 +47,7 @@
  * shader, glshow=TEXTURE puts that texture over the corner of the picture, glplain=0 leaves the
  * draws without a program alone, glcopy=1 copies every IOSurface as if the library could not
  * share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
- * wait_for_frames), glfetch=1 lets CoreAnimation have EXT_shader_framebuffer_fetch (see
+ * wait_for_frames), glfetch=0 keeps EXT_shader_framebuffer_fetch from CoreAnimation (see
  * fetch_offered), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: FD_MESA_DEBUG=sysmem, say).
  */
@@ -268,16 +268,16 @@ static int wait_for_frames = 1;
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
  * what CoreAnimation draws a number of things with where the library offers it: the shadows
  * under the home screen's labels, when they are of the kind that darkens only what is light,
- * are quads that read the picture and write it back. Mesa's driver for this GPU has the
- * extension, and with it the first triangle of each such quad came out with pixels from
- * somewhere else whenever the picture was drawn in tiles: fragments of other icons under the
- * icons of the first and the fourth row. (Flushing overlapping primitives, a constant layer and
- * a constant sample for the read made no difference; drawn straight into memory the shadows
- * were right and the Search field went white.) So the extension is not passed on: CoreAnimation
- * then does the same with what OpenGL ES always has, and the picture is right. Boot-arg
- * glfetch=1 passes it on, for whoever wants to see or mend that.
+ * are quads that read the picture and write it back, and a colour matrix over what is there
+ * (the Search field's text) is one draw instead of a copy and a draw. Without the extension
+ * CoreAnimation does the same with what OpenGL ES always has, at four times the submissions
+ * for a home screen. (Mesa's driver for this GPU drew the first triangle of each such quad
+ * with pixels of another tile, fragments of other icons under the labels, until it was given a
+ * flush before the first draw that reads the picture after one that does not:
+ * tools/mesa/freedreno-darwin.patch, fd6_draw.cc.) Boot-arg glfetch=0 keeps the extension from
+ * CoreAnimation, to see the difference.
  */
-static int fetch_offered;
+static int fetch_offered = 1;
 
 static const char *eagl_slot_name(unsigned offset);
 
@@ -2063,7 +2063,7 @@ install(void)
 		}
 		trace_lit = strstr(arguments, "gltrace_lit=1") != NULL;
 		trace_look = strstr(arguments, "gltrace_look=1") != NULL;
-		fetch_offered = strstr(arguments, "glfetch=1") != NULL;
+		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;
 
