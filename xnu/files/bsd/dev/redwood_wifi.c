@@ -46,6 +46,11 @@
  *              the image and let the DSP out of reset, and watches the shared memory and our
  *              doorbell for the DSP's first words, answering in our item what SMP2P's rules
  *              have us answer
+ *  12  reads   GLINK's queues in the shared memory, and what the DSP has put into its own
+ *  13  writes  our side of GLINK: the versions, the channel "IPCRTR" opened both ways, our
+ *              intents; from here a thread of ours listens to the DSP
+ *  14  talks   QRTR on that channel: hello both ways, the services the DSP tells of; a port
+ *              of ours looks the Wi-Fi firmware's service up (sys/redwood_qrtr.h)
  * Steps 1 to 5 are the survey; they write to nothing but the arbiter's command word.
  *
  * What is started is stopped: when the steps are over, and wherever a run ends in order while
@@ -76,6 +81,11 @@
  *   wifi_fine=1        such a step waits like that before every single write and call
  *   wifi_wait=S        how long step 11 watches for the DSP to say that it is up (default 10)
  *   wifi_watch=S       ... and how long it goes on watching once it has (default 3)
+ *   wifi_listen=S      how long step 14 waits for the Wi-Fi firmware's service (default 3)
+ *   wifi_ask=1         step 14 also asks that service a question (its capabilities) and
+ *                      writes down the beginning of an answer
+ *   wifi_keep=1        when the steps are over the DSP and the link stay up while the system
+ *                      runs, for whoever uses sys/redwood_qrtr.h; stopped when the run ends
  *   wifi_dirty=1       the DSP is not stopped: left as a kernel that died leaves it
  *   wifi_again=1       start the DSP although the one before it was shut down without having
  *                      acknowledged a stop: THAT HAS RESET THE PHONE, twice of two
@@ -97,14 +107,18 @@
  * drivers/regulator/qcom_spmi-regulator.c, drivers/pinctrl/qcom/pinctrl-msm.c.
  */
 #include <kern/clock.h>
+#include <kern/kalloc.h>
 #include <kern/locks.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <vm/memory_types.h>
 #include <miscfs/packfs/packfs.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 #include <sys/redwood_input.h>
+#include <sys/redwood_qrtr.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -115,6 +129,9 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern void loader_return(void);
+extern kern_return_t thread_terminate(thread_t thread);
+
+static LCK_GRP_DECLARE(wifi_lock_group, "redwood-wifi");
 
 static uint32_t last_step, pause_ms = 2200, fine, watch_seconds = 3;
 static uint32_t step;                   /* the one being performed */
@@ -126,19 +143,25 @@ extern void loader_log_putc(char c);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
+static LCK_MTX_DECLARE(say_lock, &wifi_lock_group);      /* two threads talk here: a line at a time */
+
 static int
 say(const char *format, ...)
 {
 	char line[400];
 	va_list list;
+	int length;
 
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
+	lck_mtx_lock(&say_lock);
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
 	}
-	return printf("%s", line);
+	length = printf("%s", line);
+	lck_mtx_unlock(&say_lock);
+	return length;
 }
 #define printf say
 
@@ -634,6 +657,7 @@ static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 #define IPCC_SEND               0x0c            /* write client << 16 | signal: ring it */
 #define IPCC_RECEIVED           0x10            /* who rang us, the same way; all ones: nobody */
 #define IPCC_ENABLE             0x14            /* write: hear that client's signal */
+#define IPCC_DISABLE            0x18            /* write: no longer */
 #define IPCC_CLEAR              0x1c            /* write: that one has been heard */
 #define IPCC_NOBODY             0xffffffffu
 #define IPCC_AOP                0u
@@ -1248,6 +1272,46 @@ ring(uint32_t client, uint32_t signal, const char *whose)
 	put(&ipcc, whose, IPCC_SEND, client << 16 | signal);
 }
 
+static struct {
+	uint32_t glink, smp2p, mailbox, other;  /* rings heard, by kind */
+	uint32_t said;                          /* how many have been written to the log */
+	uint64_t since;
+} doorbell;
+
+/*
+ * Who has rung us (see the end of this file for what IPCC is seen to do): each pending doorbell
+ * is read and told that it has been heard, which is what an interrupt handler would do before
+ * anything else. The first few are written to the log.
+ */
+static void
+doorbells(void)
+{
+	for (unsigned i = 0; i < 8; i++) {
+		uint32_t who = rd(ipcc.base + IPCC_RECEIVED);
+
+		if (who == IPCC_NOBODY) {
+			return;
+		}
+		wr(ipcc.base + IPCC_CLEAR, who);
+		if (who == (IPCC_WPSS << 16)) {
+			doorbell.glink++;
+		} else if (who == (IPCC_WPSS << 16 | IPCC_SMP2P)) {
+			doorbell.smp2p++;
+		} else if (who == (IPCC_AOP << 16)) {
+			doorbell.mailbox++;
+		} else {
+			doorbell.other++;
+		}
+		if (doorbell.said < 24) {
+			uint64_t now = now_us() - doorbell.since;
+
+			doorbell.said++;
+			printf("wifi: doorbell: +%llu.%03llu ms: client %u, signal %u; heard and cleared\n", now / 1000, now % 1000, who >> 16,
+			    who & 0xffff);
+		}
+	}
+}
+
 /*
  * Linux's qmp_open(), a step at a time: acknowledge their link, raise ours and wait for their
  * acknowledgement, raise our channel and wait for theirs, acknowledge that and wait for their
@@ -1359,6 +1423,9 @@ mailbox_send(const char *text)
 #define OUR_ENTRY_STOP          "master-kernel"
 #define OUR_ENTRY_RADIO         "wlan"
 #define DSP_STOP                (1u << 0)       /* of "master-kernel" */
+
+static void glink_reset(void);
+static void link_stop(void);
 
 static uint32_t our_item;               /* where our SMP2P item is in the area; 0: not looked for, or not there */
 static bool smp2p_agreed;               /* the DSP's item and ours have the same version: what follows applies */
@@ -1485,7 +1552,6 @@ dsp_ask_to_stop(void)
 #define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)            /* two: a number, and the address of memory it may read and write */
 #define SCM_INTERRUPTED         1                       /* a call that was preempted says so, and is made again so */
 
-static LCK_GRP_DECLARE(wifi_lock_group, "redwood-wifi");
 static LCK_MTX_DECLARE(dsp_lock, &wifi_lock_group);     /* the DSP being started or stopped */
 static bool dsp_started;                /* TrustZone has let it out of reset, and has not shut it down since */
 static bool stopped_by_its_word;        /* the shutdown last asked for was of a DSP that had acknowledged a stop */
@@ -1537,6 +1603,7 @@ dsp_shutdown(const char *why)
 	int32_t result;
 
 	printf("wifi: %u: %s: the DSP is asked to stop, then TrustZone to shut it down\n", step, why);
+	link_stop();
 	stopped_by_its_word = dsp_ask_to_stop();
 	result = scm("to shut the Wi-Fi DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_WPSS, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
@@ -1544,6 +1611,8 @@ dsp_shutdown(const char *why)
 		return false;
 	}
 	printf("wifi: %u: THE WI-FI DSP IS SHUT DOWN\n", step);
+	wr(ipcc.base + IPCC_DISABLE, IPCC_WPSS << 16 | IPCC_SMP2P);     /* (as the boot chain left it) */
+	doorbells();
 	dsp_started = false;
 	mailbox_send("{class: image, res: load_state, name: wpss, val: off}");
 	return true;
@@ -1819,6 +1888,9 @@ step_our_item(void)
 		return false;
 	}
 	show_words("our item reads back", &ours);
+
+	announce("see that our two marks in GLINK's descriptor are at zero before the DSP starts");
+	glink_reset();
 	return true;
 }
 
@@ -1849,6 +1921,7 @@ step_start(void)
 	struct smp2p words, last;
 	uint64_t answer = ~0ull, started, now, ready_at = 0, limit;
 	uint32_t state = 0, rang, changes = 0, wait_seconds = 10;
+	bool rung;
 	int32_t result;
 	bool have, spoke = false, handed_over = false;
 
@@ -1862,13 +1935,16 @@ step_start(void)
 	if (have) {
 		show_words("before the start, the DSP's item says (from its last run; believed again once it changes)", &last);
 	}
-	announce("tell the doorbells that rings from before this kernel have been heard, tell the always-on processor that the "
-	    "image is loaded, and ask TrustZone to authenticate it and let the DSP out of reset");
+	announce("tell the doorbells that rings from before this kernel have been heard and that the DSP's SMP2P ring is "
+	    "listened for, tell the always-on processor that the image is loaded, and ask TrustZone to authenticate it and let "
+	    "the DSP out of reset");
 	/* (nobody answered them, and a ring after the start is to be the DSP's) */
 	for (unsigned i = 0; i < 8 && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY; i++) {
 		put(&ipcc, "heard", IPCC_CLEAR, rang);
 	}
-	rang = IPCC_NOBODY;
+	/* (the boot chain listens for the DSP's GLINK ring and no other: without this an SMP2P ring leaves no trace) */
+	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_WPSS << 16 | IPCC_SMP2P);
+	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
 	if (!mailbox_send("{class: image, res: load_state, name: wpss, val: on}")) {
 		lck_mtx_unlock(&dsp_lock);
@@ -1876,7 +1952,7 @@ step_start(void)
 	}
 	result = scm("to authenticate the Wi-Fi DSP's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_WPSS, 0, 0,
 	    &answer);
-	started = now_us();
+	doorbell.since = started = now_us();
 	image_written = false;                  /* (whatever the answer: the memory is not ours to look at now) */
 	if (result != 0 || answer != 0) {
 		printf("wifi: %u: TRUSTZONE DOES NOT START THE DSP: the call returns %d, its answer is %#llx\n", step, result, answer);
@@ -1895,14 +1971,8 @@ step_start(void)
 		if (now >= limit || !dsp_started) {
 			break;
 		}
-		if (rang == IPCC_NOBODY) {
-			rang = rd(ipcc.base + IPCC_RECEIVED);
-			if (rang != IPCC_NOBODY) {
-				printf("wifi: %u: +%llu.%03llu ms: OUR DOORBELL HAS BEEN RUNG: %#x (client %u, signal %u)\n", step,
-				    (now - started) / 1000, (now - started) % 1000, rang, rang >> 16, rang & 0xffff);
-				spoke = true;
-			}
-		}
+		doorbells();
+		spoke = spoke || doorbell.glink + doorbell.smp2p != 0;
 		if (dsp_words(&words) && (!have || memcmp(&words, &last, sizeof(words)) != 0)) {
 			char when[64];
 
@@ -1941,22 +2011,1097 @@ step_start(void)
 	if (our_item != 0 && smem_peek(our_item, &words, sizeof(words))) {
 		show_words("and ours", &words);
 	}
-	printf("wifi: %u: the watch is over after %llu ms; the doorbells say %#x\n", step, (now_us() - started) / 1000,
-	    rd(ipcc.base + IPCC_RECEIVED));
+	rung = doorbell.glink + doorbell.smp2p != 0;
+	printf("wifi: %u: the watch is over after %llu ms; doorbells heard: GLINK %u, SMP2P %u, the mailbox %u, others %u\n", step,
+	    (now_us() - started) / 1000, doorbell.glink, doorbell.smp2p, doorbell.mailbox, doorbell.other);
 	if (state & DSP_FATAL) {
 		return false;
 	}
 	if (ready_at != 0) {
 		printf("wifi: %u: the DSP said it was up%s\n", step, handed_over ? ", and that it has asked for its own power" : "");
 	} else if (spoke) {
-		printf("wifi: %u: THE WI-FI DSP RUNS BUT HAS NOT SAID \"UP\": it has %s%s, with %u entries\n", step, rang != IPCC_NOBODY ?
-		    "rung our doorbell" : "", have ? (rang != IPCC_NOBODY ? " and has its item in the shared memory" :
+		printf("wifi: %u: THE WI-FI DSP RUNS BUT HAS NOT SAID \"UP\": it has %s%s, with %u entries\n", step, rung ?
+		    "rung our doorbell" : "", have ? (rung ? " and has its item in the shared memory" :
 		    "its item in the shared memory") : "", last.valid);
 	} else {
 		printf("wifi: %u: NOT A WORD FROM THE DSP: no ring, and %s\n", step, have ? "its item in the shared memory is as a "
 		    "kernel before this one left it" : "no item of its in the shared memory");
 	}
 	return ready_at != 0 || spoke;
+}
+
+/* ---- GLINK ------------------------------------------------------------------------------------------- */
+
+/*
+ * GLINK between us and the DSP is two queues of bytes in the shared memory and a descriptor
+ * (Linux: qcom_glink_smem.c). Items of our partition with the DSP: 478 the descriptor, four
+ * words; 479 our queue, which we write and the DSP reads (both made by the boot chain: they are
+ * there before anything of ours runs); 480 the DSP's queue, which it makes when it starts. Each
+ * side moves the head of its own queue and the tail of the other's, and rings the other's
+ * GLINK doorbell when it has moved one. Our two marks are put to zero before the DSP starts
+ * (step 10): it reads our queue from the start when it comes up.
+ *
+ * What goes through the queues (qcom_glink_native.c) are messages of eight bytes -- a command
+ * and two parameters -- some with more behind them, each padded to eight: first the two sides'
+ * versions, then channels by name, each side giving a channel a number of its own. To send on
+ * a channel a side needs an "intent" of the other's: the other's promise of a buffer of some
+ * size, with a number; a message names the intent it uses, and the receiver says when it is
+ * done with it and whether it may be used again. A side without a fitting intent asks for one.
+ *
+ * The DSP opens three channels, and we answer one: "IPCRTR", which carries QRTR (below).
+ */
+#define ITEM_GLINK_DESCRIPTOR   478
+#define ITEM_GLINK_OUR_QUEUE    479
+#define ITEM_GLINK_THEIR_QUEUE  480
+#define GLINK_OUR_TAIL          0               /* the descriptor's words: how far the DSP has read our queue (its to move) */
+#define GLINK_OUR_HEAD          4               /* how far we have written it */
+#define GLINK_THEIR_TAIL        8               /* how far we have read the DSP's queue */
+#define GLINK_THEIR_HEAD        12              /* how far it has written it (its to move) */
+#define GLINK_RESERVE           16              /* of our queue, never filled (Linux's reserve, and room for one short message) */
+#define IPCC_GLINK              0u              /* the signal */
+
+enum {
+	GLINK_VERSION = 0, GLINK_VERSION_ACK = 1, GLINK_OPEN = 2, GLINK_CLOSE = 3, GLINK_OPEN_ACK = 4, GLINK_INTENT = 5,
+	GLINK_DONE = 6, GLINK_INTENT_REQUEST = 7, GLINK_INTENT_REQUEST_ACK = 8, GLINK_DATA = 9, GLINK_CLOSE_ACK = 11,
+	GLINK_DATA_MORE = 12, GLINK_READ_NOTIFY = 13, GLINK_DONE_REUSE = 14, GLINK_SIGNALS = 15,
+};
+#define GLINK_VERSION_1         1
+#define GLINK_INTENT_REUSE      1u              /* the feature Linux offers over this transport */
+#define GLINK_CHANNEL           "IPCRTR"
+#define GLINK_US                1               /* our number for that channel */
+
+struct glink_message {
+	uint16_t command, param1;
+	uint32_t param2;
+};
+struct glink_packet {                           /* a whole message from the channel, waiting for the link's thread */
+	struct glink_packet *next;
+	uint32_t length;
+	uint8_t data[];
+};
+
+static LCK_MTX_DECLARE(glink_lock, &wifi_lock_group);   /* the queues' marks and everything below */
+static struct {
+	uint32_t descriptor, ours, ours_size, theirs, theirs_size;      /* where in the shared memory */
+	bool up;                                /* the queues are found and ours to use */
+	bool broken;                            /* something in the DSP's queue was not understood: nothing more is read */
+	uint32_t features;
+	bool agreed;                            /* the versions are settled */
+	uint32_t their_channel;                 /* the DSP's number for IPCRTR; 0: it has not opened it */
+	bool asked, acknowledged, open;         /* our open sent; acknowledged; both ways done and our intents told */
+	bool request_answered, request_granted; /* our last request for an intent */
+	struct {
+		uint32_t id, size;
+		bool there, in_use;
+	} their_intents[64];                    /* what we may send into */
+	struct {
+		uint32_t size, fill;
+		uint8_t *data;
+	} our_intents[24];                      /* what the DSP may send into; an intent's number is its place here + 1 */
+	uint32_t our_intent_count;
+	struct glink_packet *first, *last;      /* received, in order */
+	uint32_t said, heard, trace;            /* messages each way; how many more are written to the log */
+} glink;
+
+static uint32_t
+smem_word(uint32_t offset)
+{
+	return rd((vm_offset_t)smem + offset);
+}
+
+/* The three items; false if one is missing or not of a shape this knows. */
+static bool
+glink_find(void)
+{
+	uint32_t size = 0;
+
+	glink.descriptor = smem_item(ITEM_GLINK_DESCRIPTOR, &size);
+	if (glink.descriptor == 0 || size != 32) {
+		return false;
+	}
+	glink.ours = smem_item(ITEM_GLINK_OUR_QUEUE, &glink.ours_size);
+	glink.theirs = smem_item(ITEM_GLINK_THEIR_QUEUE, &glink.theirs_size);
+	return glink.ours != 0 && glink.theirs != 0 && glink.ours_size >= 1024 && glink.theirs_size >= 1024 &&
+	       !(glink.ours_size & 7) && !(glink.theirs_size & 7);
+}
+
+/* Our two marks to zero, if they are not: before the DSP starts (see above). */
+static void
+glink_reset(void)
+{
+	uint32_t size = 0, descriptor = smem_item(ITEM_GLINK_DESCRIPTOR, &size);
+
+	if (descriptor == 0 || size != 32) {
+		printf("wifi: %u: GLINK's descriptor (item %u) is not there: nothing to reset\n", step, ITEM_GLINK_DESCRIPTOR);
+		return;
+	}
+	printf("wifi: %u: GLINK's descriptor at %#lx: our queue read to %#x and written to %#x, the DSP's read to %#x and written "
+	    "to %#x\n", step, SMEM_PHYS + descriptor, smem_word(descriptor + GLINK_OUR_TAIL), smem_word(descriptor + GLINK_OUR_HEAD),
+	    smem_word(descriptor + GLINK_THEIR_TAIL), smem_word(descriptor + GLINK_THEIR_HEAD));
+	if (smem_word(descriptor + GLINK_OUR_HEAD) != 0 || smem_word(descriptor + GLINK_THEIR_TAIL) != 0) {
+		printf("wifi: %u: about to write our two marks there (+4, +8): 0\n", step);
+		hold(true);
+		smem_poke(descriptor + GLINK_OUR_HEAD, 0);
+		smem_poke(descriptor + GLINK_THEIR_TAIL, 0);
+		settle();
+	}
+}
+
+/* How much of the DSP's queue is unread. */
+static uint32_t
+glink_waiting(void)
+{
+	uint32_t head = smem_word(glink.descriptor + GLINK_THEIR_HEAD), tail = smem_word(glink.descriptor + GLINK_THEIR_TAIL);
+
+	if (head >= glink.theirs_size || tail >= glink.theirs_size) {
+		return 0;
+	}
+	return head >= tail ? head - tail : glink.theirs_size - tail + head;
+}
+
+static void
+glink_peek(void *to, uint32_t offset, uint32_t count)
+{
+	uint32_t at = (smem_word(glink.descriptor + GLINK_THEIR_TAIL) + offset) % glink.theirs_size;
+
+	for (uint32_t i = 0; i < count; i++) {
+		((uint8_t *)to)[i] = smem[glink.theirs + (at + i) % glink.theirs_size];
+	}
+}
+
+static void
+glink_advance(uint32_t count)
+{
+	smem_poke(glink.descriptor + GLINK_THEIR_TAIL, (smem_word(glink.descriptor + GLINK_THEIR_TAIL) + count) % glink.theirs_size);
+}
+
+/* How much we may write into our queue now. */
+static uint32_t
+glink_room(void)
+{
+	uint32_t head = smem_word(glink.descriptor + GLINK_OUR_HEAD), tail = smem_word(glink.descriptor + GLINK_OUR_TAIL), room;
+
+	if (head >= glink.ours_size || tail >= glink.ours_size) {
+		return 0;
+	}
+	room = tail <= head ? glink.ours_size - head + tail : tail - head;
+	return room < GLINK_RESERVE ? 0 : room - GLINK_RESERVE;
+}
+
+/* A message into our queue, in two pieces, padded to eight bytes; then our mark, and the DSP's doorbell. */
+static bool
+glink_put(const void *first, uint32_t first_length, const void *second, uint32_t second_length)
+{
+	volatile uint8_t *queue = (volatile uint8_t *)(uintptr_t)smem + glink.ours;
+	uint32_t head = smem_word(glink.descriptor + GLINK_OUR_HEAD), length = first_length + second_length;
+	uint32_t padded = (length + 7) & ~7u;
+
+	if (!glink.up || glink_room() < padded) {
+		return false;
+	}
+	for (uint32_t i = 0; i < padded; i++) {
+		queue[(head + i) % glink.ours_size] = i < first_length ? ((const uint8_t *)first)[i] :
+		    i < length ? ((const uint8_t *)second)[i - first_length] : 0;
+	}
+	settle();
+	smem_poke(glink.descriptor + GLINK_OUR_HEAD, (head + padded) % glink.ours_size);
+	settle();
+	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_GLINK);
+	glink.said++;
+	return true;
+}
+
+static const char *
+glink_name(unsigned command)
+{
+	static const char *const names[] = {
+		"version", "version-ack", "open", "close", "open-ack", "intent", "done", "intent-request", "intent-request-ack",
+		"data", "10", "close-ack", "data-more", "read-notify", "done-reuse", "signals"
+	};
+
+	return command < sizeof(names) / sizeof(names[0]) ? names[command] : "?";
+}
+
+/* A short message of ours. */
+static void
+glink_say(unsigned command, uint32_t param1, uint32_t param2, const void *more, uint32_t more_length)
+{
+	struct glink_message message = { .command = (uint16_t)command, .param1 = (uint16_t)param1, .param2 = param2 };
+	bool sent = glink_put(&message, sizeof(message), more, more_length);
+
+	if (glink.trace > 0 || !sent) {
+		glink.trace -= glink.trace > 0;
+		printf("wifi: glink: > %s %u %#x%s\n", glink_name(command), param1, param2, sent ? "" : ": NO ROOM IN OUR QUEUE, not sent");
+	}
+}
+
+/* An intent of ours of that size: a buffer, and the DSP told of it. False: there are no more. */
+static bool
+glink_offer(uint32_t size)
+{
+	uint32_t words[2] = { size, glink.our_intent_count + 1 }, i = glink.our_intent_count;
+
+	if (i >= sizeof(glink.our_intents) / sizeof(glink.our_intents[0]) || size == 0 || size > 0x10000) {
+		return false;
+	}
+	if (glink.our_intents[i].data == NULL || glink.our_intents[i].size != size) {
+		glink.our_intents[i].data = kalloc_data(size, Z_WAITOK | Z_ZERO);       /* (kept for good: a later link uses it again) */
+	}
+	if (glink.our_intents[i].data == NULL) {
+		return false;
+	}
+	glink.our_intents[i].size = size;
+	glink.our_intents[i].fill = 0;
+	glink.our_intent_count++;
+	glink_say(GLINK_INTENT, GLINK_US, 1, words, sizeof(words));
+	return true;
+}
+
+/*
+ * Everything the DSP has put into its queue, taken out and acted on: Linux's
+ * qcom_glink_native_rx(). With glink_lock held; whoever waits for something from the DSP calls
+ * this, so it must not wait itself. Whole messages for the channel are left in a list for the
+ * link's thread.
+ */
+static void
+glink_pump(void)
+{
+	static const struct {
+		uint32_t size, count;
+	} intents[] = { { 0x800, 5 }, { 0x2000, 3 }, { 0x4400, 2 } };           /* dt: qcom,intents of qcom,wpss_qrtr */
+	struct glink_message message;
+	uint32_t words[4];
+	char name[33];
+
+	while (glink.up && !glink.broken) {
+		uint32_t waiting = glink_waiting(), length = sizeof(message);
+
+		if (waiting < sizeof(message)) {
+			return;
+		}
+		glink_peek(&message, 0, sizeof(message));
+		if (message.command == GLINK_OPEN) {
+			length += message.param2;
+		} else if (message.command == GLINK_INTENT) {
+			length += 8 * message.param2;
+		} else if (message.command == GLINK_DATA || message.command == GLINK_DATA_MORE) {
+			if (waiting < 16) {
+				return;
+			}
+			glink_peek(words, 8, 8);                /* the size of this piece, and what is still to come */
+			length = 16 + words[0];
+		}
+		length = (length + 7) & ~7u;
+		if (length > glink.theirs_size - 8) {
+			printf("wifi: glink: A MESSAGE OF %u BYTES (%s %u %#x): not believed, and nothing more is read\n", length,
+			    glink_name(message.command), message.param1, message.param2);
+			glink.broken = true;
+			return;
+		}
+		if (waiting < length) {
+			return;                                 /* (the rest of it is on its way) */
+		}
+		glink.heard++;
+		if (glink.trace > 0 && message.command != GLINK_DATA && message.command != GLINK_DATA_MORE) {
+			glink.trace--;
+			printf("wifi: glink: < %s %u %#x\n", glink_name(message.command), message.param1, message.param2);
+		}
+		switch (message.command) {
+		case GLINK_VERSION:
+			if (message.param1 == GLINK_VERSION_1) {
+				glink.features &= message.param2;
+			}
+			glink_advance(length);
+			glink_say(GLINK_VERSION_ACK, GLINK_VERSION_1, glink.features, NULL, 0);
+			break;
+		case GLINK_VERSION_ACK:
+			glink_advance(length);
+			if (message.param1 == GLINK_VERSION_1 && message.param2 == glink.features) {
+				glink.agreed = true;
+			} else if (message.param1 != 0) {
+				glink.features &= message.param2;
+				glink_say(GLINK_VERSION, GLINK_VERSION_1, glink.features, NULL, 0);
+			}
+			break;
+		case GLINK_OPEN:
+			bzero(name, sizeof(name));
+			glink_peek(name, sizeof(message), message.param2 < sizeof(name) - 1 ? message.param2 : sizeof(name) - 1);
+			glink_advance(length);
+			if (strcmp(name, GLINK_CHANNEL) != 0) {
+				printf("wifi: glink: the DSP opens \"%s\" as its channel %u: left unanswered, nobody here speaks it\n", name,
+				    message.param1);
+				break;
+			}
+			printf("wifi: glink: the DSP opens \"%s\" as its channel %u: acknowledged, and opened from our side as channel %u\n",
+			    name, message.param1, GLINK_US);
+			glink.their_channel = message.param1;
+			glink_say(GLINK_OPEN_ACK, glink.their_channel, 0, NULL, 0);
+			if (!glink.asked) {
+				bzero(name, sizeof(name));
+				strlcpy(name, GLINK_CHANNEL, sizeof(name));
+				glink_say(GLINK_OPEN, GLINK_US, sizeof(GLINK_CHANNEL), name, (sizeof(GLINK_CHANNEL) + 7) & ~7u);
+				glink.asked = true;
+			}
+			break;
+		case GLINK_OPEN_ACK:
+			glink_advance(length);
+			if (message.param1 == GLINK_US) {
+				glink.acknowledged = true;
+			}
+			break;
+		case GLINK_INTENT:
+			for (uint32_t i = 0; i < message.param2 && message.param1 == glink.their_channel; i++) {
+				glink_peek(words, 8 + 8 * i, 8);        /* a size and a number */
+				for (unsigned n = 0; n < sizeof(glink.their_intents) / sizeof(glink.their_intents[0]); n++) {
+					if (!glink.their_intents[n].there || glink.their_intents[n].id == words[1]) {
+						glink.their_intents[n].there = true;
+						glink.their_intents[n].in_use = false;
+						glink.their_intents[n].size = words[0];
+						glink.their_intents[n].id = words[1];
+						break;
+					}
+				}
+				if (glink.trace > 0) {
+					printf("wifi: glink:   the DSP will take %u bytes into its intent %u\n", words[0], words[1]);
+				}
+			}
+			glink_advance(length);
+			break;
+		case GLINK_DONE:
+		case GLINK_DONE_REUSE:
+			for (unsigned n = 0; n < sizeof(glink.their_intents) / sizeof(glink.their_intents[0]); n++) {
+				if (glink.their_intents[n].there && glink.their_intents[n].id == message.param2) {
+					glink.their_intents[n].in_use = false;
+					glink.their_intents[n].there = message.command == GLINK_DONE_REUSE;
+				}
+			}
+			glink_advance(length);
+			break;
+		case GLINK_INTENT_REQUEST:
+			glink_advance(length);
+			if (message.param1 == glink.their_channel) {
+				bool granted = glink_offer(message.param2);
+
+				glink_say(GLINK_INTENT_REQUEST_ACK, GLINK_US, granted, NULL, 0);
+			}
+			break;
+		case GLINK_INTENT_REQUEST_ACK:
+			glink_advance(length);
+			glink.request_answered = true;
+			glink.request_granted = message.param2 != 0;
+			break;
+		case GLINK_DATA:
+		case GLINK_DATA_MORE: {
+			uint32_t intent = message.param2 - 1;
+
+			if (message.param1 != glink.their_channel || intent >= glink.our_intent_count ||
+			    words[0] > glink.our_intents[intent].size - glink.our_intents[intent].fill) {
+				printf("wifi: glink: < data of %u bytes on channel %u for intent %u: NOT OURS OR TOO MUCH, dropped\n", words[0],
+				    message.param1, message.param2);
+				glink_advance(length);
+				break;
+			}
+			glink_peek(glink.our_intents[intent].data + glink.our_intents[intent].fill, 16, words[0]);
+			glink.our_intents[intent].fill += words[0];
+			glink_advance(length);
+			if (words[1] == 0) {
+				/* whole: into the list, and the intent is the DSP's to use again */
+				struct glink_packet *packet = kalloc_data(sizeof(*packet) + glink.our_intents[intent].fill, Z_WAITOK);
+
+				if (packet != NULL) {
+					packet->next = NULL;
+					packet->length = glink.our_intents[intent].fill;
+					memcpy(packet->data, glink.our_intents[intent].data, packet->length);
+					if (glink.last != NULL) {
+						glink.last->next = packet;
+					} else {
+						glink.first = packet;
+					}
+					glink.last = packet;
+				}
+				glink.our_intents[intent].fill = 0;
+				glink_say(GLINK_DONE_REUSE, GLINK_US, message.param2, NULL, 0);
+			}
+			break;
+		}
+		case GLINK_READ_NOTIFY:
+			glink_advance(length);
+			wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_GLINK);
+			break;
+		case GLINK_CLOSE:
+			glink_advance(length);
+			glink_say(GLINK_CLOSE_ACK, message.param1, 0, NULL, 0);
+			if (message.param1 == glink.their_channel) {
+				printf("wifi: glink: THE DSP CLOSES \"%s\"\n", GLINK_CHANNEL);
+				glink.open = false;
+				glink.their_channel = 0;
+			}
+			break;
+		case GLINK_CLOSE_ACK:
+		case GLINK_SIGNALS:
+			glink_advance(length);
+			break;
+		default:
+			printf("wifi: glink: A MESSAGE THIS DOES NOT KNOW (%u, %u, %#x): nothing more is read\n", message.command,
+			    message.param1, message.param2);
+			glink.broken = true;
+			return;
+		}
+		if (glink.their_channel != 0 && glink.acknowledged && !glink.open) {
+			glink.open = true;
+			printf("wifi: glink: THE CHANNEL \"%s\" IS OPEN both ways (ours %u, the DSP's %u); telling the DSP our intents\n",
+			    GLINK_CHANNEL, GLINK_US, glink.their_channel);
+			for (unsigned i = 0; i < sizeof(intents) / sizeof(intents[0]); i++) {
+				for (unsigned n = 0; n < intents[i].count; n++) {
+					glink_offer(intents[i].size);
+				}
+			}
+		}
+	}
+}
+
+/*
+ * One whole message to the DSP on the channel (Linux's __qcom_glink_send(), for messages that
+ * go in one piece). Waits, up to five seconds, for an intent of the DSP's that it fits and
+ * for room in our queue, asking for the intent if there is none.
+ */
+static int
+glink_send(const void *data, uint32_t length)
+{
+	struct {
+		struct glink_message message;
+		uint32_t size, left;
+	} header = { { GLINK_DATA, GLINK_US, 0 }, length, 0 };
+	bool asked = false;
+	int found = -1;
+
+	lck_mtx_lock(&glink_lock);
+	if (glink.up && length + sizeof(header) + 8 > glink.ours_size - GLINK_RESERVE) {
+		lck_mtx_unlock(&glink_lock);
+		return EMSGSIZE;
+	}
+	for (unsigned waited = 0;; waited++) {
+		glink_pump();
+		if (!glink.up || !glink.open || glink.broken) {
+			lck_mtx_unlock(&glink_lock);
+			return ENOTCONN;
+		}
+		found = -1;
+		for (unsigned n = 0; n < sizeof(glink.their_intents) / sizeof(glink.their_intents[0]); n++) {
+			if (glink.their_intents[n].there && !glink.their_intents[n].in_use && glink.their_intents[n].size >= length &&
+			    (found < 0 || glink.their_intents[n].size < glink.their_intents[found].size)) {
+				found = (int)n;
+			}
+		}
+		if (found >= 0 && glink_room() >= ((length + sizeof(header) + 7) & ~7u)) {
+			break;
+		}
+		if (found < 0 && !asked) {
+			glink.request_answered = false;
+			glink_say(GLINK_INTENT_REQUEST, GLINK_US, length, NULL, 0);
+			asked = true;
+		}
+		if (waited >= 5000 || (found < 0 && asked && glink.request_answered && !glink.request_granted)) {
+			lck_mtx_unlock(&glink_lock);
+			return found < 0 ? ENOBUFS : EAGAIN;
+		}
+		lck_mtx_unlock(&glink_lock);
+		sleep_ms(1);
+		lck_mtx_lock(&glink_lock);
+	}
+	glink.their_intents[found].in_use = true;
+	header.message.param2 = glink.their_intents[found].id;
+	glink_put(&header, sizeof(header), data, length);
+	lck_mtx_unlock(&glink_lock);
+	return 0;
+}
+
+/* ---- QRTR -------------------------------------------------------------------------------------------- */
+
+/*
+ * What the channel carries (Linux: net/qrtr/af_qrtr.c, ns.c, smd.c): datagrams from a port of a
+ * node to a port of a node, one in each GLINK message, behind a header of eight words. A node's
+ * services announce themselves to the other nodes through a port that all have, the control
+ * port: when a link comes up each side says hello, and is told the other's services one by one
+ * ("new server": a service, an instance, a node, a port), and later their going. We are node 1
+ * (Linux's default, and what this phone's Android is); the DSP says who it is in what it sends.
+ * The interface for the rest of the kernel is sys/redwood_qrtr.h.
+ */
+#define QRTR_US                 1u
+#define QRTR_CONTROL            0xfffffffeu     /* the control port */
+#define QRTR_FIRST_PORT         0x4000u         /* where Linux begins numbering ports that ask for no number */
+enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DEL_SERVER = 5, QRTR_DEL_CLIENT = 6, QRTR_RESUME_TX = 7 };
+
+struct qrtr_header {                            /* version 1, which Linux sends; version 2 is read as well */
+	uint32_t version, type, from_node, from_port, confirm, size, to_node, to_port;
+};
+struct qrtr_control {
+	uint32_t command;
+	uint32_t words[4];                      /* a server: service, instance, node, port; a client: node, port */
+};
+
+struct redwood_qrtr_port {
+	uint32_t number;                        /* 0: free */
+	redwood_qrtr_receive_t receive;
+	void *context;
+	struct {
+		uint32_t service, instance;     /* the instance as on the wire: version | instance << 8; 0: any */
+		redwood_qrtr_service_t callback;
+		bool fresh;                     /* not yet told of the services that were there before it */
+	} lookups[4];
+};
+
+static LCK_MTX_DECLARE(qrtr_lock, &wifi_lock_group);    /* the tables below */
+static LCK_MTX_DECLARE(qrtr_calling, &wifi_lock_group); /* held by the link's thread around a callback */
+static struct redwood_qrtr_port qrtr_ports[16];
+static struct {
+	uint32_t service, instance, node, port;
+	bool there;
+} qrtr_servers[64];
+static uint32_t qrtr_peer;                      /* the DSP's node; 0: it has not said */
+static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos;
+static thread_t link_thread_is;
+
+/* One datagram out, of any type. */
+static int
+qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
+{
+	uint32_t padded = (length + 3) & ~3u;
+	struct qrtr_header *packet;
+	int error;
+
+	if (length == 0 || length > REDWOOD_QRTR_MAX) {
+		return EMSGSIZE;
+	}
+	packet = kalloc_data(sizeof(*packet) + padded, Z_WAITOK | Z_ZERO);
+	if (packet == NULL) {
+		return ENOMEM;
+	}
+	packet->version = 1;
+	packet->type = type;
+	packet->from_node = QRTR_US;
+	packet->from_port = from_port;
+	packet->size = length;
+	packet->to_node = to_node;
+	packet->to_port = to_port;
+	memcpy(packet + 1, data, length);
+	error = glink_send(packet, (uint32_t)sizeof(*packet) + padded);
+	kfree_data(packet, sizeof(*packet) + padded);
+	qrtr_out += error == 0;
+	return error;
+}
+
+static bool
+qrtr_matches(uint32_t service, uint32_t instance, unsigned server)
+{
+	return qrtr_servers[server].there && qrtr_servers[server].service == service &&
+	       (instance == 0 || qrtr_servers[server].instance == instance);
+}
+
+/* Everybody who looked a service up is told that it has come, or gone. From the link's thread. */
+static void
+qrtr_tell(uint32_t service, uint32_t instance, uint32_t node, uint32_t port, bool arrived)
+{
+	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
+		for (unsigned l = 0; l < 4; l++) {
+			redwood_qrtr_service_t callback = NULL;
+			void *context;
+
+			lck_mtx_lock(&qrtr_lock);
+			if (qrtr_ports[p].number != 0 && qrtr_ports[p].lookups[l].callback != NULL && !qrtr_ports[p].lookups[l].fresh &&
+			    qrtr_ports[p].lookups[l].service == service &&
+			    (qrtr_ports[p].lookups[l].instance == 0 || qrtr_ports[p].lookups[l].instance == instance)) {
+				callback = qrtr_ports[p].lookups[l].callback;
+			}
+			context = qrtr_ports[p].context;
+			lck_mtx_unlock(&qrtr_lock);
+			if (callback != NULL) {
+				callback(context, arrived, node, port);
+			}
+		}
+	}
+}
+
+/* The control port's part: Linux's name service, without services of our own to tell of. */
+static void
+qrtr_control(const struct qrtr_header *header, const struct qrtr_control *control)
+{
+	struct qrtr_control hello = { .command = QRTR_HELLO };
+	int found = -1, error;
+
+	switch (control->command) {
+	case QRTR_HELLO:
+		if (qrtr_hellos++ != 0) {
+			break;                                  /* (answered once: two that answer every hello never end) */
+		}
+		error = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
+		printf("wifi: qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
+		break;
+	case QRTR_NEW_SERVER:
+		lck_mtx_lock(&qrtr_lock);
+		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+			if (qrtr_servers[i].there && qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]) {
+				found = (int)i;
+				break;
+			}
+			if (!qrtr_servers[i].there && found < 0) {
+				found = (int)i;
+			}
+		}
+		if (found >= 0) {
+			qrtr_servers[found].there = true;
+			qrtr_servers[found].service = control->words[0];
+			qrtr_servers[found].instance = control->words[1];
+			qrtr_servers[found].node = control->words[2];
+			qrtr_servers[found].port = control->words[3];
+		}
+		lck_mtx_unlock(&qrtr_lock);
+		printf("wifi: qrtr: a service: %u (%#x), version %u, instance %u, at node %u port %u\n", control->words[0],
+		    control->words[0], control->words[1] & 0xff, control->words[1] >> 8, control->words[2], control->words[3]);
+		qrtr_tell(control->words[0], control->words[1], control->words[2], control->words[3], true);
+		break;
+	case QRTR_DEL_SERVER:
+	case QRTR_BYE:
+		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+			bool gone;
+
+			lck_mtx_lock(&qrtr_lock);
+			gone = qrtr_servers[i].there && (control->command == QRTR_BYE ? qrtr_servers[i].node == header->from_node :
+			    qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]);
+			qrtr_servers[i].there = qrtr_servers[i].there && !gone;
+			lck_mtx_unlock(&qrtr_lock);
+			if (gone) {
+				printf("wifi: qrtr: service %u at node %u port %u has gone\n", qrtr_servers[i].service, qrtr_servers[i].node,
+				    qrtr_servers[i].port);
+				qrtr_tell(qrtr_servers[i].service, qrtr_servers[i].instance, qrtr_servers[i].node, qrtr_servers[i].port, false);
+			}
+		}
+		break;
+	default:
+		break;                                  /* (a client's going, and what else there is: nothing here wants it) */
+	}
+}
+
+/* A message from the channel: one datagram. From the link's thread. */
+static void
+qrtr_input(const uint8_t *data, uint32_t length)
+{
+	struct qrtr_header header;
+	redwood_qrtr_receive_t receive = NULL;
+	void *context = NULL;
+	uint32_t at;
+
+	if (length >= sizeof(header) && data[0] == 1) {
+		memcpy(&header, data, sizeof(header));
+		at = sizeof(header);
+	} else if (length >= 16 && data[0] == 3) {
+		/* version 2: version, type, flags, a length of options; the size; then four numbers of 16 bits */
+		bzero(&header, sizeof(header));
+		header.type = data[1];
+		header.confirm = data[2] & 1;
+		memcpy(&header.size, data + 4, 4);
+		header.from_node = (uint32_t)(data[8] | data[9] << 8);
+		header.from_port = (uint32_t)(data[10] | data[11] << 8);
+		header.to_node = (uint32_t)(data[12] | data[13] << 8);
+		header.to_port = (uint32_t)(data[14] | data[15] << 8);
+		header.from_port = header.from_port == 0xfffe ? QRTR_CONTROL : header.from_port;
+		header.to_port = header.to_port == 0xfffe ? QRTR_CONTROL : header.to_port;
+		at = 16 + data[3];
+	} else {
+		printf("wifi: qrtr: %u bytes that are no datagram (they begin %#x)\n", length, length ? data[0] : 0);
+		return;
+	}
+	if (header.size == 0 || at + header.size > length) {
+		printf("wifi: qrtr: a datagram of %u bytes in a message of %u: dropped\n", header.size, length);
+		return;
+	}
+	qrtr_in++;
+	if (qrtr_peer == 0) {
+		qrtr_peer = header.from_node;
+	}
+	if (header.type == QRTR_RESUME_TX) {
+		return;                                 /* (we never ask for one: GLINK's intents hold us back already) */
+	}
+	if (header.confirm) {
+		/* the sender counts what it has sent to this port, and waits for this before it sends many more */
+		struct qrtr_control resume = { .command = QRTR_RESUME_TX, .words = { header.to_node, header.to_port } };
+
+		qrtr_out_packet(QRTR_RESUME_TX, header.to_port, header.from_node, header.from_port, &resume, sizeof(resume));
+	}
+	if (header.to_port == QRTR_CONTROL) {
+		struct qrtr_control control = { 0 };
+
+		memcpy(&control, data + at, header.size < sizeof(control) ? header.size : sizeof(control));
+		qrtr_control(&header, &control);
+		return;
+	}
+	lck_mtx_lock(&qrtr_lock);
+	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
+		if (qrtr_ports[p].number == header.to_port && header.type == QRTR_DATA) {
+			receive = qrtr_ports[p].receive;
+			context = qrtr_ports[p].context;
+		}
+	}
+	lck_mtx_unlock(&qrtr_lock);
+	if (receive != NULL) {
+		receive(context, header.from_node, header.from_port, data + at, header.size);
+	}
+}
+
+/* Lookups made since the last look are told of the services that were there before them. From the link's thread. */
+static void
+qrtr_fresh(void)
+{
+	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
+		for (unsigned l = 0; l < 4; l++) {
+			redwood_qrtr_service_t callback;
+			uint32_t service, instance;
+			void *context;
+
+			lck_mtx_lock(&qrtr_lock);
+			if (qrtr_ports[p].number == 0 || !qrtr_ports[p].lookups[l].fresh) {
+				lck_mtx_unlock(&qrtr_lock);
+				continue;
+			}
+			qrtr_ports[p].lookups[l].fresh = false;
+			callback = qrtr_ports[p].lookups[l].callback;
+			service = qrtr_ports[p].lookups[l].service;
+			instance = qrtr_ports[p].lookups[l].instance;
+			context = qrtr_ports[p].context;
+			lck_mtx_unlock(&qrtr_lock);
+			for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+				if (qrtr_matches(service, instance, i)) {
+					callback(context, true, qrtr_servers[i].node, qrtr_servers[i].port);
+				}
+			}
+		}
+	}
+}
+
+struct redwood_qrtr_port *
+redwood_qrtr_open(redwood_qrtr_receive_t receive, void *context)
+{
+	struct redwood_qrtr_port *port = NULL;
+
+	lck_mtx_lock(&qrtr_lock);
+	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]) && port == NULL; p++) {
+		if (qrtr_ports[p].number == 0) {
+			port = &qrtr_ports[p];
+			bzero(port, sizeof(*port));
+			port->number = qrtr_next_port++;
+			port->receive = receive;
+			port->context = context;
+		}
+	}
+	lck_mtx_unlock(&qrtr_lock);
+	return port;
+}
+
+int
+redwood_qrtr_send(struct redwood_qrtr_port *port, uint32_t node, uint32_t to, const void *data, size_t length)
+{
+	if (port == NULL || port->number == 0 || length > REDWOOD_QRTR_MAX) {
+		return EINVAL;
+	}
+	return qrtr_out_packet(QRTR_DATA, port->number, node, to, data, (uint32_t)length);
+}
+
+int
+redwood_qrtr_lookup(struct redwood_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance,
+    redwood_qrtr_service_t callback)
+{
+	int error = ENOSPC;
+
+	lck_mtx_lock(&qrtr_lock);
+	for (unsigned l = 0; l < 4 && error != 0 && port != NULL && port->number != 0; l++) {
+		if (port->lookups[l].callback == NULL) {
+			port->lookups[l].service = service;
+			port->lookups[l].instance = instance != 0 ? (version & 0xff) | instance << 8 : 0;
+			port->lookups[l].callback = callback;
+			port->lookups[l].fresh = true;
+			error = 0;
+		}
+	}
+	lck_mtx_unlock(&qrtr_lock);
+	return error;
+}
+
+void
+redwood_qrtr_close(struct redwood_qrtr_port *port)
+{
+	struct qrtr_control gone = { .command = QRTR_DEL_CLIENT, .words = { QRTR_US, port ? port->number : 0 } };
+	bool outside = current_thread() != link_thread_is;
+
+	if (port == NULL || port->number == 0) {
+		return;
+	}
+	if (outside) {
+		lck_mtx_lock(&qrtr_calling);            /* (a callback of the port's that is running ends first) */
+	}
+	lck_mtx_lock(&qrtr_lock);
+	port->number = 0;
+	lck_mtx_unlock(&qrtr_lock);
+	if (outside) {
+		lck_mtx_unlock(&qrtr_calling);
+	}
+	if (qrtr_peer != 0) {
+		qrtr_out_packet(QRTR_DEL_CLIENT, gone.words[1], qrtr_peer, QRTR_CONTROL, &gone, sizeof(gone));
+	}
+}
+
+/* ---- the link's thread -------------------------------------------------------------------------------- */
+
+static volatile bool link_wanted, link_runs;
+/*
+ * Until the DSP may have said something. Nothing tells us today, so: a millisecond. This is the
+ * one function to change when the doorbells' interrupt can be taken (the end of this file): it
+ * then blocks until the handler has seen a ring of the DSP's.
+ */
+static void
+link_wait(void)
+{
+	sleep_us(1000);
+}
+
+/* Everything the DSP says once it runs: its SMP2P item, its queue, and from that the datagrams, handed on from here. */
+static void
+link_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	struct smp2p words, last;
+	struct glink_packet *packet;
+	bool gave_up = false;
+
+	bzero(&last, sizeof(last));
+	dsp_words(&last);
+	while (link_wanted) {
+		link_wait();
+		doorbells();
+		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
+			last = words;
+			dsp_listen(&words);
+			if ((dsp_state(&words) & DSP_FATAL) && !gave_up) {
+				gave_up = true;
+				printf("wifi: link: THE WI-FI DSP SAYS IT HAS GIVEN UP (\"slave-kernel\" = %#x)\n", dsp_state(&words));
+				show_crash_reason();
+			}
+		}
+		for (;;) {
+			lck_mtx_lock(&glink_lock);
+			glink_pump();
+			packet = glink.first;
+			if (packet != NULL) {
+				glink.first = packet->next;
+				glink.last = glink.first == NULL ? NULL : glink.last;
+			}
+			lck_mtx_unlock(&glink_lock);
+			if (packet == NULL) {
+				break;
+			}
+			lck_mtx_lock(&qrtr_calling);
+			qrtr_input(packet->data, packet->length);
+			lck_mtx_unlock(&qrtr_calling);
+			kfree_data(packet, sizeof(*packet) + packet->length);
+		}
+		lck_mtx_lock(&qrtr_calling);
+		qrtr_fresh();
+		lck_mtx_unlock(&qrtr_calling);
+	}
+	link_runs = false;
+	thread_terminate(current_thread());
+}
+
+/* The link given up, before the DSP is stopped: Linux too takes GLINK down first and tells the DSP nothing of it. */
+static void
+link_stop(void)
+{
+	struct glink_packet *packet;
+
+	if (link_runs) {
+		link_wanted = false;
+		for (unsigned ms = 0; ms < 2000 && link_runs; ms++) {
+			sleep_ms(1);
+		}
+		printf("wifi: link: %s; GLINK said %u and heard %u messages, QRTR sent %u and received %u datagrams; doorbells heard: "
+		    "GLINK %u, SMP2P %u, the mailbox %u, others %u\n", link_runs ? "THE THREAD DOES NOT END" : "down", glink.said,
+		    glink.heard, qrtr_out, qrtr_in, doorbell.glink, doorbell.smp2p, doorbell.mailbox, doorbell.other);
+	}
+	lck_mtx_lock(&glink_lock);
+	glink.up = glink.open = false;
+	while ((packet = glink.first) != NULL) {
+		glink.first = packet->next;
+		kfree_data(packet, sizeof(*packet) + packet->length);
+	}
+	glink.last = NULL;
+	lck_mtx_unlock(&glink_lock);
+	lck_mtx_lock(&qrtr_lock);
+	bzero(qrtr_servers, sizeof(qrtr_servers));
+	qrtr_peer = 0;
+	lck_mtx_unlock(&qrtr_lock);
+}
+
+/* ---- step 12: GLINK's queues, looked at --------------------------------------------------------------- */
+
+static bool
+step_queues(void)
+{
+	struct glink_message message;
+	uint32_t head, tail;
+
+	announce("find GLINK's descriptor and the two queues in the shared memory, and read what the DSP has put into its own "
+	    "(nothing is taken out)");
+	if (!glink_find()) {
+		printf("wifi: %u: GLINK's items are not all there, or not of a shape this knows (descriptor %#x, ours %#x of %u bytes, "
+		    "the DSP's %#x of %u)\n", step, glink.descriptor, glink.ours, glink.ours_size, glink.theirs, glink.theirs_size);
+		return false;
+	}
+	head = smem_word(glink.descriptor + GLINK_THEIR_HEAD);
+	tail = smem_word(glink.descriptor + GLINK_THEIR_TAIL);
+	printf("wifi: %u: our queue: %u bytes at %#lx, written to %#x, read by the DSP to %#x; the DSP's: %u bytes at %#lx, written "
+	    "to %#x, read by us to %#x\n", step, glink.ours_size, SMEM_PHYS + glink.ours, smem_word(glink.descriptor + GLINK_OUR_HEAD),
+	    smem_word(glink.descriptor + GLINK_OUR_TAIL), glink.theirs_size, SMEM_PHYS + glink.theirs, head, tail);
+	for (uint32_t at = 0, shown = 0; at + sizeof(message) <= head && head < glink.theirs_size && tail == 0 && shown < 8; shown++) {
+		char name[33] = "";
+		uint32_t length = sizeof(message);
+
+		glink_peek(&message, at, sizeof(message));
+		if (message.command == GLINK_OPEN) {
+			glink_peek(name, at + 8, message.param2 < 32 ? message.param2 : 32);
+			length += message.param2;
+		}
+		printf("wifi: %u:   in the DSP's queue at %#x: %s %u %#x %s\n", step, at, glink_name(message.command), message.param1,
+		    message.param2, name);
+		if (message.command != GLINK_VERSION && message.command != GLINK_OPEN) {
+			break;                                  /* (how long the others are, the reading below knows) */
+		}
+		at += (length + 7) & ~7u;
+	}
+	return true;
+}
+
+/* ---- step 13: GLINK, spoken ---------------------------------------------------------------------------- */
+
+static bool
+step_link(void)
+{
+	thread_t thread;
+	uint64_t began;
+
+	if (!dsp_started || glink.descriptor == 0) {
+		return false;
+	}
+	announce("take up GLINK with the DSP: our version into our queue and its doorbell, then whatever its messages call for "
+	    "(writes: our queue, our two marks in the descriptor, the doorbell); a thread of ours listens from here on, "
+	    "every millisecond");
+	snprintf(last_write, sizeof(last_write), "step %u took up GLINK", step);
+	lck_mtx_lock(&glink_lock);
+	glink.features = GLINK_INTENT_REUSE;
+	glink.agreed = glink.asked = glink.acknowledged = glink.open = glink.broken = false;
+	glink.their_channel = glink.our_intent_count = glink.said = glink.heard = 0;
+	bzero(glink.their_intents, sizeof(glink.their_intents));
+	glink.trace = 60;
+	glink.up = true;
+	qrtr_hellos = qrtr_in = qrtr_out = 0;
+	doorbell.since = began = now_us();
+	glink_say(GLINK_VERSION, GLINK_VERSION_1, glink.features, NULL, 0);
+	lck_mtx_unlock(&glink_lock);
+	link_wanted = link_runs = true;
+	if (kernel_thread_start(link_thread, NULL, &thread) != KERN_SUCCESS) {
+		link_wanted = link_runs = false;
+		printf("wifi: %u: no thread\n", step);
+		return false;
+	}
+	link_thread_is = thread;
+	thread_deallocate(thread);
+	for (unsigned ms = 0; ms < 5000 && !glink.open && !glink.broken; ms++) {
+		sleep_ms(1);
+	}
+	sleep_ms(50);                                   /* (for the intents each side tells the other of, to be in the log) */
+	printf("wifi: %u: %llu ms after our version: versions %s (features %#x); the channel \"%s\" is %s\n", step,
+	    (now_us() - began) / 1000, glink.agreed ? "agreed" : "NOT AGREED", glink.features, GLINK_CHANNEL, glink.open ?
+	    "OPEN" : "NOT OPEN");
+	return glink.open;
+}
+
+/* ---- step 14: QRTR ------------------------------------------------------------------------------------- */
+
+#define SERVICE_WLFW            0x45            /* the Wi-Fi firmware's service, the one the radio's driver talks to */
+
+static uint32_t wlfw_node, wlfw_port;
+static volatile uint32_t wlfw_answer;           /* bytes of an answer received; 0: none */
+static uint8_t wlfw_answer_bytes[64];
+
+static void
+wlfw_service(__unused void *context, bool arrived, uint32_t node, uint32_t port)
+{
+	printf("wifi: qrtr: THE WI-FI FIRMWARE'S SERVICE (%#x) %s node %u port %u\n", SERVICE_WLFW, arrived ? "IS AT" : "has left",
+	    node, port);
+	wlfw_node = arrived ? node : 0;
+	wlfw_port = arrived ? port : 0;
+}
+
+static void
+wlfw_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	printf("wifi: qrtr: a datagram of %lu bytes from node %u port %u\n", (unsigned long)length, node, port);
+	memcpy(wlfw_answer_bytes, data, length < sizeof(wlfw_answer_bytes) ? length : sizeof(wlfw_answer_bytes));
+	wlfw_answer = (uint32_t)length;
+}
+
+static bool
+step_qrtr(void)
+{
+	struct redwood_qrtr_port *port;
+	uint32_t ask = 0, seconds = 3, services = 0;
+
+	if (!glink.open) {
+		return false;
+	}
+	PE_parse_boot_argn("wifi_listen", &seconds, sizeof(seconds));
+	announce("listen for QRTR on the channel: the DSP's hello is answered with ours, its services are written down; and a "
+	    "port of ours looks the Wi-Fi firmware's service up, as the radio's driver will");
+	port = redwood_qrtr_open(wlfw_receive, NULL);
+	if (port == NULL || redwood_qrtr_lookup(port, SERVICE_WLFW, 1, 0, wlfw_service) != 0) {
+		printf("wifi: %u: no port\n", step);
+		return false;
+	}
+	for (unsigned ms = 0; ms < seconds * 1000 && !(wlfw_port != 0 && ms >= 500); ms++) {
+		sleep_ms(1);
+	}
+	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+		services += qrtr_servers[i].there;
+	}
+	printf("wifi: %u: QRTR: the DSP is node %u; hellos from it %u; datagrams received %u, sent %u; services it has told of: "
+	    "%u; the Wi-Fi firmware's service: %s\n", step, qrtr_peer, qrtr_hellos, qrtr_in, qrtr_out, services, wlfw_port != 0 ?
+	    "THERE" : "NOT THERE");
+	if (wlfw_port != 0 && PE_parse_boot_argn("wifi_ask", &ask, sizeof(ask)) && ask) {
+		/*
+		 * A question the service answers without having been told anything first? A QMI request is
+		 * seven bytes before its content: 0 for "request", a number of ours for the exchange, the
+		 * message's number, the content's length. 0x24 is "capabilities" and has no content.
+		 */
+		static const uint8_t question[7] = { 0, 0x01, 0x00, 0x24, 0x00, 0x00, 0x00 };
+		int error;
+
+		announce("ask the Wi-Fi firmware's service for its capabilities (QMI message 0x24, seven bytes) and wait a second "
+		    "for an answer");
+		wlfw_answer = 0;
+		error = redwood_qrtr_send(port, wlfw_node, wlfw_port, question, sizeof(question));
+		for (unsigned ms = 0; ms < 1000 && error == 0 && wlfw_answer == 0; ms++) {
+			sleep_ms(1);
+		}
+		if (error != 0 || wlfw_answer == 0) {
+			printf("wifi: %u: %s\n", step, error != 0 ? "THE QUESTION COULD NOT BE SENT" : "no answer within a second");
+		} else {
+			char text[3 * 48 + 1] = "";
+
+			for (uint32_t i = 0; i < wlfw_answer && i < 48; i++) {
+				snprintf(text + 3 * i, 4, " %02x", wlfw_answer_bytes[i]);
+			}
+			printf("wifi: %u: THE SERVICE ANSWERS: %u bytes, beginning%s\n", step, wlfw_answer, text);
+		}
+	}
+	redwood_qrtr_close(port);
+	return qrtr_hellos != 0 && qrtr_out != 0;
 }
 
 /* ---- beside the steps: the radio's stream in the SMMU (boot-arg wifi_smmu=1) ------------------------------ */
@@ -2019,7 +3164,7 @@ smmu_look(void)
 
 static bool(*const steps[])(void) = {
 	step_smem, step_mailbox, step_rpmh, step_rails, step_pins, step_firmware, step_mailbox_open, step_header, step_image,
-	step_our_item, step_start,
+	step_our_item, step_start, step_queues, step_link, step_qrtr,
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 
@@ -2086,9 +3231,12 @@ redwood_wifi_init(void)
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started && dirty) {
 		printf("wifi: THE DSP IS LEFT RUNNING (wifi_dirty), as a kernel that died would leave it\n");
+	} else if (dsp_started && PE_parse_boot_argn("wifi_keep", &back, sizeof(back)) && back) {
+		printf("wifi: THE DSP STAYS ON while the system runs (wifi_keep)%s\n", link_runs ? ", and the link with it" : "");
 	} else if (dsp_started) {
 		dsp_shutdown("the steps are over");
 	}
+	back = 0;
 	lck_mtx_unlock(&dsp_lock);
 	printf("wifi: over after step %u; %s\n", done, last_write);
 	if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) {
@@ -2122,13 +3270,19 @@ redwood_wifi_init(void)
  *
  * Ours, given that:
  *   - The doorbells have one line for everything rung at the application processor: SPI 229,
- *     level, high (dt: qcom,ipcc@408000). Per doorbell, IPCC wants to be told that it is
- *     listened for: client << 16 | signal written to IPCC_ENABLE. (Without that a ring is still
- *     recorded: IPCC_RECEIVED showed the DSP's GLINK ring, never enabled, across kernels.) The
- *     handler reads IPCC_RECEIVED until it says nobody, writes each word it gets to IPCC_CLEAR,
- *     and passes it on: client 0 signal 0 is the always-on processor's mailbox (every wait in
- *     mailbox_wait() above), client 24 signal 2 the Wi-Fi DSP's SMP2P item (the watch of step
- *     11, the wait in dsp_ask_to_stop()), client 24 signal 0 its GLINK.
+ *     level, high (dt: qcom,ipcc@408000). What IPCC is seen to do: it keeps one mark per
+ *     doorbell (a client and a signal), not a count -- 46 GLINK messages from the DSP were five
+ *     rings heard. A doorbell is recorded only if IPCC has been told that it is listened for
+ *     (client << 16 | signal written to IPCC_ENABLE): the boot chain leaves the DSP's GLINK
+ *     doorbell so and no other, and the DSP's SMP2P rings left no trace until step 11 enabled
+ *     them. IPCC_RECEIVED names one recorded doorbell at a time, the same one until that word
+ *     is written to IPCC_CLEAR, then the next, then "nobody". So a handler reads IPCC_RECEIVED
+ *     until it says nobody, writes each word it gets to IPCC_CLEAR, and passes it on (this is
+ *     doorbells() above, called from a loop today): client 0 signal 0 is the always-on
+ *     processor's mailbox (every wait in mailbox_wait()), client 24 signal 2 the Wi-Fi DSP's
+ *     SMP2P item (the watch of step 11, the wait in dsp_ask_to_stop()), client 24 signal 0 its
+ *     GLINK. Since a mark is not a count, whoever is woken looks until there is nothing left:
+ *     the link's thread does. With that, link_wait() is the one function to change.
  *   - The DSP's watchdog has a line of its own (SPI 587), raised when its firmware hangs
  *     without managing to say so in the shared memory.
  *   - The radio itself, later, raises 32 more (SPI 768 to 799, edge), by writing their numbers
