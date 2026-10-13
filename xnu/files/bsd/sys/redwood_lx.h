@@ -54,11 +54,26 @@ int	 lx_os_firmware(const char *name, const void **data, unsigned long *size);
 int	 lx_os_rproc_boot(void);
 /* the radio's own address (six bytes), if the machine has one for it: 1, or 0 and nothing written */
 int	 lx_os_radio_address(unsigned char *address);
+/*
+ * The network the radio is to join, if the machine was given one: its name and its passphrase,
+ * into buffers whose sizes come in and whose contents' lengths go out. 1, or 0.
+ */
+int	 lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *passphrase, unsigned *passphrase_length);
+
+/* ---- frames: the radio as what carries the machine's network interface ---- */
+void	 lx_os_net_attach(const unsigned char *address);	/* there is a radio, and this is its address */
+void	 lx_os_net_link(int up);				/* frames can pass now (a network is joined) / no longer */
+void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an Ethernet frame has arrived */
 
 /*
- * ---- the one name the object shows the kernel: bring the driver up on the radio and go as far
- * as what is built goes. 0, or an errno. Returns when that is over, or has failed.
+ * ---- the names the object shows the kernel. lx_start(): bring the driver up on the radio and
+ * do what the kernel's options ask (scan; join a network). 0, or an errno. Returns when that is
+ * over or has failed; with a network joined the driver stays up, lx_transmit() sends an
+ * Ethernet frame through it (0, or an errno), and lx_stop() leaves the network and takes the
+ * driver down in order (and does nothing if it is not up).
  */
 int	 lx_start(void);
+void	 lx_stop(void);
+int	 lx_transmit(const unsigned char *frame, unsigned long length);
 
 #endif

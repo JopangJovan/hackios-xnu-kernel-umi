@@ -25,6 +25,7 @@
 #include <sys/random.h>
 #include <sys/redwood_input.h>
 #include <sys/redwood_lx.h>
+#include <sys/redwood_net.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
@@ -232,6 +233,62 @@ lx_os_radio_address(unsigned char *address)
 	return redwood_wifi_radio_address(address);
 }
 
+int
+lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *passphrase, unsigned *passphrase_length)
+{
+	return redwood_wifi_network(name, name_length, passphrase, passphrase_length);
+}
+
+/* ---- frames: the radio as the link behind en0 (sys/redwood_net.h) ------------------------------------ */
+
+static bool lx_link_attached;
+
+/* (called by one thread at a time: the frame is put together in one place) */
+static bool
+lx_link_transmit(mbuf_t packet, size_t length)
+{
+	static uint8_t frame[REDWOOD_NET_FRAME_MAX];
+
+	if (length > sizeof(frame) || mbuf_copydata(packet, 0, length, frame) != 0) {
+		return false;
+	}
+	return lx_transmit(frame, length) == 0;
+}
+
+static struct redwood_net_link lx_link = {
+	.name = "the phone's radio (ath11k)",
+	.wireless = true,
+	.transmit = lx_link_transmit,
+};
+
+void
+lx_os_net_attach(const unsigned char *address)
+{
+	if (lx_link_attached) {
+		return;
+	}
+	memcpy(lx_link.address, address, sizeof(lx_link.address));
+	lx_link_attached = redwood_net_attach(&lx_link);
+	say("lx: %s\n", lx_link_attached ? "the radio is the link behind en0" : "EN0 HAS A LINK ALREADY: the radio's frames go "
+	    "nowhere");
+}
+
+void
+lx_os_net_link(int up)
+{
+	if (lx_link_attached) {
+		redwood_net_link_state(up != 0);
+	}
+}
+
+void
+lx_os_net_input(const unsigned char *frame, unsigned long length)
+{
+	if (lx_link_attached && length <= REDWOOD_NET_FRAME_MAX) {
+		redwood_net_input(frame, length);
+	}
+}
+
 /* ---- the driver ---------------------------------------------------------------------------------------- */
 
 /* The object has its own; this is the one of a kernel built without it. */
@@ -243,8 +300,25 @@ lx_start(void)
 	return ENXIO;
 }
 
+__attribute__((weak)) void
+lx_stop(void)
+{
+}
+
+__attribute__((weak)) int
+lx_transmit(__unused const unsigned char *frame, __unused unsigned long length)
+{
+	return ENXIO;
+}
+
 int
 redwood_lx_start(void)
 {
 	return lx_start();
+}
+
+void
+redwood_lx_stop(void)
+{
+	lx_stop();
 }

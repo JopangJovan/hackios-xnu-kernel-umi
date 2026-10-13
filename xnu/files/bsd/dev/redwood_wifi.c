@@ -111,6 +111,10 @@
  *                      made and the radio scans, listening only; what it heard goes to the log
  *                      (other people's networks by name and address: the log is not for
  *                      passing on)
+ *   wifi_join=1        with wifi_lx=2: the station joins the network named in fw/network of
+ *                      the small image (redwood_wifi_network() below) and the driver stays
+ *                      up as the link behind en0; with wifi_keep=1 while the system runs,
+ *                      else until the steps are over (wifi_hold=S: S seconds longer)
  *   wifi_lx_step=MS    the driver's start says each stub it comes to and waits MS there: for
  *                      a run that ends without a word (follow it with XL_FOLLOW=2)
  *   wifi_lx=1          step 15 is ath11k's own instead of the stand-in (redwood_lx.c), with
@@ -1650,6 +1654,7 @@ dsp_shutdown(const char *why)
 
 	printf("wifi: %u: %s: the DSP is asked to stop, then TrustZone to shut it down\n", step, why);
 	if (!leaving) {
+		redwood_lx_stop();                      /* (the driver, if it stayed up: it leaves its network and goes down in order) */
 		redwood_wlfw_stop(step);                /* (what the stand-in of step 15 has to say first, while there is a link) */
 		link_stop();
 	}
@@ -3161,6 +3166,21 @@ static void radio_space_faults(void);
  * the interface is removed, the radio stopped, and the driver's own removal runs to its end.
  * The data path is still stubs: the firmware scans without it.
  *
+ * With the data path built (dp.c and its neighbours: 18 of the driver's files, no stubs) and
+ * wifi_join=1 (the same day): the rings of the data path are set up -- 636 words into the
+ * radio's registers before the bus is started, 44 MB of ours shown to the radio -- and HTC
+ * connects the data service besides WMI. The station asks for the network it was given by
+ * name in a scan (1.9 s), finds its access point (channel 36, -53 dBm; WPA2 with a passphrase,
+ * CCMP), authenticates, associates (20 MHz, HT and VHT, two streams) and answers the access
+ * point's handshake; 130 ms after the association both keys are with the firmware and frames
+ * pass. With wifi_keep=1 and the system started on top, configd's DHCP has an address in 4 to
+ * 6 s, names resolve, and pages are fetched over HTTPS: iOS on the network through the
+ * phone's own radio. 20 MB come down in 10.5 s (15 Mbit/s) with one processor, the rings
+ * looked at by a thread and the radio's buffers not behind the processor's cache; what of
+ * that holds the rate down was not taken apart. With four processors the network works as
+ * well. At the run's end the network is left, the driver removes itself and the DSP stops
+ * when asked.
+ *
  * A PHONE THAT RESETS WITHOUT A WORD: twice on the way, two seconds after calibration. The
  * driver's registration failed (the hash table peer.c needs was a stub that fails), and where
  * its start fails that late core.c asks for the mode "off" before it stops the bus; our thread
@@ -3440,7 +3460,7 @@ smmu_look(void)
  */
 #define RADIO_ADDRESSES         0xa0000000ull
 #define RADIO_ADDRESSES_SIZE    0x10000000u
-#define RADIO_TABLES            16              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
+#define RADIO_TABLES            32              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
 #define RADIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11) /* a page; for requests of either
 	                                                                                  * privilege; shared, accessed, not
 	                                                                                  * global: Linux's for a device */
@@ -3825,6 +3845,49 @@ redwood_wifi_radio_address(uint8_t *address)
 		memcpy(address, bytes, sizeof(bytes));
 	}
 	return good;
+}
+
+/*
+ * The network the radio is to join: the file "network" among the firmware in the small image,
+ * the name on its first line, the passphrase on its second (userland/build.sh takes it from
+ * fw-wifi/network, which is in no repository). Not a boot argument: those are echoed by the
+ * loader and printed with a panic. The log says how long the two are, and nothing else of them.
+ */
+bool
+redwood_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length)
+{
+	uint64_t size = 0;
+	const uint8_t *file = image_file("network", &size), *end = file + size, *line = file;
+	unsigned lengths[2] = { 0, 0 }, sizes[2] = { *name_length, *passphrase_length };
+	uint8_t *where[2] = { name, passphrase };
+
+	if (file == NULL) {
+		printf("wifi: %u: the driver asks which network to join: none was given (fw/network of the small image)\n", step);
+		return false;
+	}
+	for (unsigned n = 0; n < 2 && line < end; n++) {
+		const uint8_t *stop = line;
+
+		while (stop < end && *stop != '\n') {
+			stop++;
+		}
+		lengths[n] = (unsigned)(stop - line) - (stop > line && stop[-1] == '\r' ? 1 : 0);
+		if (lengths[n] > sizes[n]) {
+			lengths[n] = 0;
+		} else {
+			memcpy(where[n], line, lengths[n]);
+		}
+		line = stop + 1;
+	}
+	printf("wifi: %u: the driver asks which network to join: a name of %u bytes and a passphrase of %u bytes were given%s\n", step,
+	    lengths[0], lengths[1], lengths[0] == 0 || lengths[1] < 8 || lengths[1] > 63 ? ": NOT A NAME OF 1 TO 32 BYTES AND A "
+	    "PASSPHRASE OF 8 TO 63" : "");
+	if (lengths[0] == 0 || lengths[1] < 8 || lengths[1] > 63) {
+		return false;
+	}
+	*name_length = lengths[0];
+	*passphrase_length = lengths[1];
+	return true;
 }
 
 /* ---- all of it together ---------------------------------------------------------------------------- */
