@@ -64,7 +64,7 @@ xnu-deps/setup.sh        # ~30 с: исходники зависимостей, 
 | `bsd/dev/redwood_cpufreq.c` | частота процессора (Qualcomm EPSS) |
 | `bsd/dev/redwood_net.c`, `bsd/sys/redwood_net.h`, `redwood_virtio_net.c` | сетевой интерфейс `en0` через сетевой KPI ядра (без IONetworkingFamily) и граница между ним и тем, что носит кадры («линк»: три функции в `redwood_net.h`); первый линк — virtio-net для QEMU |
 | `bsd/dev/redwood_adreno.c`, `iokit/Kernel/RedwoodGPU.cpp` | GPU телефона (Adreno 642L): пошаговое включение (`adreno=N`: питание, GMU, zap-шейдер, микрокод), буферы и очередь команд; клиент IOKit с подмножеством msm DRM для Mesa |
-| `bsd/dev/redwood_wifi.c` | Wi-Fi телефона (WCN6750), начало пути (`wifi=N`): чтение общей памяти процессоров Qualcomm (SMEM, SMP2P), почтовый ящик процессора питания, загрузка прошивки процессора Wi-Fi и его запуск и остановка через TrustZone |
+| `bsd/dev/redwood_wifi.c` | Wi-Fi телефона (WCN6750), начало пути (`wifi=N`): общая память процессоров Qualcomm (SMEM: чтение и выделение под её замком), сигнальные биты между нами и процессором Wi-Fi (SMP2P, обе стороны), почтовый ящик процессора питания, загрузка прошивки процессора Wi-Fi, его запуск через TrustZone и остановка по просьбе |
 | `bsd/pthread/pthread_kext_static.c` | pthread kext, слинкованный в ядро |
 
 Патч, помимо врезок под всё это, чинит то, что мешает собрать и запустить открытый XNU вне Apple: makefile'ы под
