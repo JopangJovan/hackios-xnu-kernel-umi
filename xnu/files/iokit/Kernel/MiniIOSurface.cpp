@@ -21,6 +21,7 @@
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
+#include <kern/thread_call.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
 
@@ -83,6 +84,9 @@ static uint32_t         gSurfaceNext = 1;
 static uint32_t         gSurfaceCount;
 static uint64_t         gSurfaceBytes;
 static uint32_t         gSurfaceUnheld;         /* surfaces around client memory that could not be made (said a few times) */
+/* what making surfaces and taking them away has cost since it was last asked (MiniIOSurfaceCost()) */
+static uint64_t         gSurfaceMaking, gSurfaceFreeing;
+static uint32_t         gSurfacesMade, gSurfacesFreed;
 static uint64_t         gSurfaceLogged[2];                      /* selectors already complained about */
 /* Boot-arg surftrace=N: log the first N surfaces created (default 24). */
 static TUNABLE(uint32_t, gSurfaceTrace, "surftrace", 24);
@@ -92,9 +96,128 @@ static uint32_t         gSurfaceTraced;                         /* (a tunable is
 
 OSDefineMetaClassAndStructors(MiniIOSurface, OSObject);
 
+/*
+ * The memory of the big surfaces is kept when they go, a few pieces of it, and given to the
+ * next surface of the same size. CoreAnimation makes a surface of the whole display for every
+ * frame and frees one: 14 MB got, cleared, entered into the kernel's map and taken out of it
+ * again, sixty times a second -- 2.8 ms to make and 2 ms to free each, a quarter of the time
+ * there is for a frame, on the thread that draws it. A piece that is kept is cleared again
+ * before it is given out: a new surface is all zeroes, whoever makes it. The clearing is done
+ * by the display's driver between two frames (MiniIOSurfaceClearKept(): while it copies a
+ * frame to the panel the memory is busy enough, and the copy took half as long again when
+ * this ran beside it), or a moment later by a thread of this file's if no frames are going
+ * out, or by whoever asks for the memory if that comes first.
+ */
+#define SURFACE_KEEP_FROM       (4u << 20)      /* bytes: smaller ones are not worth it */
+#define SURFACE_KEPT            4
+#define SURFACE_CLEAR_MS        40              /* kept memory is cleared this long after, if the display's driver has not done it */
+
+static struct {
+	IOBufferMemoryDescriptor *      memory;
+	bool                            clear;          /* cleared since it was last a surface's */
+	bool                            busy;           /* being cleared right now */
+} gSurfaceKept[SURFACE_KEPT];
+static IOLock *         gSurfaceKeptLock;
+static thread_call_t    gSurfaceClearing;
+static uint32_t         gSurfacesGivenAgain;    /* for MiniIOSurfaceCost() */
+/* boot-arg surf_clear=0: kept memory is given out as it is (to see what the clearing costs; a surface is then not all zeroes) */
+static TUNABLE(uint32_t, gSurfaceClear, "surf_clear", 1);
+
+void
+MiniIOSurfaceClearKept(void)
+{
+	if (gSurfaceKeptLock == NULL || !gSurfaceClear) {
+		return;
+	}
+	IOLockLock(gSurfaceKeptLock);
+	for (unsigned i = 0; i < SURFACE_KEPT; i++) {
+		IOBufferMemoryDescriptor * memory = gSurfaceKept[i].memory;
+
+		if (memory == NULL || gSurfaceKept[i].clear || gSurfaceKept[i].busy) {
+			continue;
+		}
+		gSurfaceKept[i].busy = true;
+		IOLockUnlock(gSurfaceKeptLock);
+		bzero(memory->getBytesNoCopy(), memory->getCapacity());
+		IOLockLock(gSurfaceKeptLock);
+		gSurfaceKept[i].busy = false;
+		gSurfaceKept[i].clear = true;
+	}
+	IOLockUnlock(gSurfaceKeptLock);
+}
+
+static void
+surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unused1 __unused)
+{
+	MiniIOSurfaceClearKept();
+}
+
+/* Memory for a surface: the state page and `bytes` after it, all zeroes. */
+static IOBufferMemoryDescriptor *
+surfaceMemory(vm_size_t bytes)
+{
+	IOBufferMemoryDescriptor * memory = NULL;
+	bool clear = false;
+
+	if (bytes >= SURFACE_KEEP_FROM && gSurfaceKeptLock != NULL) {
+		IOLockLock(gSurfaceKeptLock);
+		for (int pass = 0; pass < 2 && memory == NULL; pass++) {
+			/* one that is clear already, if there is one */
+			for (unsigned i = 0; i < SURFACE_KEPT && memory == NULL; i++) {
+				if (gSurfaceKept[i].memory != NULL && !gSurfaceKept[i].busy && (pass == 1 || gSurfaceKept[i].clear) &&
+				    gSurfaceKept[i].memory->getCapacity() == bytes) {
+					memory = gSurfaceKept[i].memory;
+					clear = gSurfaceKept[i].clear;
+					gSurfaceKept[i].memory = NULL;
+				}
+			}
+		}
+		gSurfacesGivenAgain += memory != NULL;
+		IOLockUnlock(gSurfaceKeptLock);
+		if (memory != NULL && !clear) {
+			bzero(memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
+		}
+	}
+	if (memory == NULL) {
+		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, bytes,
+		    PAGE_SIZE);
+	}
+	return memory;
+}
+
+/* A surface is gone: its memory is kept for the next, if it is big and nobody else has it. */
+static void
+surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
+{
+	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() == 1 && gSurfaceKeptLock != NULL) {
+		IOLockLock(gSurfaceKeptLock);
+		for (unsigned i = 0; i < SURFACE_KEPT; i++) {
+			if (gSurfaceKept[i].memory == NULL) {
+				gSurfaceKept[i].memory = memory;
+				gSurfaceKept[i].clear = gSurfaceKept[i].busy = false;
+				memory = NULL;
+				break;
+			}
+		}
+		IOLockUnlock(gSurfaceKeptLock);
+		if (memory == NULL) {
+			if (gSurfaceClear) {
+				AbsoluteTime deadline;
+
+				clock_interval_to_deadline(SURFACE_CLEAR_MS, kMillisecondScale, &deadline);
+				thread_call_enter_delayed(gSurfaceClearing, deadline);
+			}
+			return;
+		}
+	}
+	memory->release();
+}
+
 void
 MiniIOSurface::free(void)
 {
+	uint64_t began = mach_absolute_time();
+
 	OSSafeReleaseNULL(values);
 	OSSafeReleaseNULL(clientMap);
 	if (client != NULL) {
@@ -102,8 +225,30 @@ MiniIOSurface::free(void)
 		client->release();
 		client = NULL;
 	}
-	OSSafeReleaseNULL(memory);
+	if (memory != NULL) {
+		surfaceMemoryBack(memory);
+		memory = NULL;
+	}
 	OSObject::free();
+	OSAddAtomic64((SInt64) (mach_absolute_time() - began), (SInt64 *) &gSurfaceFreeing);
+	OSIncrementAtomic(&gSurfacesFreed);
+}
+
+/* How many surfaces were made and freed since this was last asked, and the microseconds each took on average. */
+void
+MiniIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t * freed, uint64_t * freeing, uint32_t * again)
+{
+	uint64_t nanos;
+
+	*again = OSBitAndAtomic(0, &gSurfacesGivenAgain);
+
+	*made = OSBitAndAtomic(0, &gSurfacesMade);
+	*freed = OSBitAndAtomic(0, &gSurfacesFreed);
+	absolutetime_to_nanoseconds(gSurfaceMaking, &nanos);
+	*making = *made ? nanos / NSEC_PER_USEC / *made : 0;
+	absolutetime_to_nanoseconds(gSurfaceFreeing, &nanos);
+	*freeing = *freed ? nanos / NSEC_PER_USEC / *freed : 0;
+	gSurfaceMaking = gSurfaceFreeing = 0;
 }
 
 /* The values changed: a new seed, and how much room a client needs to fetch them. */
@@ -402,8 +547,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		alloc = dictNumber(props, "IOSurfaceAllocSize", (uint32_t) needed);
 	}
 
-	s->memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-	    kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc), PAGE_SIZE);
+	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
@@ -632,6 +776,8 @@ MiniIOSurfaceStart(IOService * provider)
 	IOCoreSurfaceRoot * root;
 
 	gSurfaceLock = IOLockAlloc();
+	gSurfaceKeptLock = IOLockAlloc();
+	gSurfaceClearing = thread_call_allocate(surfaceMemoryClear, NULL);
 	root = OSTypeAlloc(IOCoreSurfaceRoot);
 	if (root == NULL || !root->init() || !root->attach(provider)) {
 		OSSafeReleaseNULL(root);
@@ -905,6 +1051,7 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 	OSDictionary * props;
 	MiniIOSurface * s;
 	struct minisurf_client_ref * ref;
+	uint64_t began = mach_absolute_time();
 
 	if (args->scalarInputCount >= 1 && args->scalarInput[0] != 0) {
 		IOLog("MiniIOSurface: child surfaces are not supported (parent %llu)\n", args->scalarInput[0]);
@@ -953,6 +1100,8 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 	}
 	surfaceUnhold(s);                       /* the creator's hold; the client's own is in the ref */
 	IOLockUnlock(gSurfaceLock);
+	OSAddAtomic64((SInt64) (mach_absolute_time() - began), (SInt64 *) &gSurfaceMaking);
+	OSIncrementAtomic(&gSurfacesMade);
 	return ret;
 }
 

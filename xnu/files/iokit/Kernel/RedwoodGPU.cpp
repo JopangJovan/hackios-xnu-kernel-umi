@@ -209,6 +209,20 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 	return false;
 }
 
+bool
+MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
+{
+	uint32_t fence = surface->drawn;
+	bool done = true;
+
+	if (fence != 0 && gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		done = !redwood_gpu_ready() || gpuWait(fence, milliseconds);
+		IOLockUnlock(gGPULock);
+	}
+	return done;
+}
+
 /* How long from now a time of msm's is, in milliseconds; 0: now or past. */
 static uint64_t
 millisecondsUntil(const struct msm_timespec * when)
@@ -311,7 +325,23 @@ struct gpu_buffer {
 	uint32_t                        seed;           /* the surface's when it was last pushed out of the cache, */
 	uint64_t                        pushed;         /* ... and when that was */
 	bool                            seen;           /* by the program: mapped, and from then on written by it */
+	uint32_t                        fence;          /* the last submission that names it (0: none has) */
 };
+
+/*
+ * A buffer given back while the GPU is still at it: its memory and its place in the GPU's
+ * address space are kept until the submission is done, and nobody waits for that. (A window
+ * server that makes a surface for every frame gives the last frame's back while the GPU draws
+ * this one: waiting there, for all the GPU had been given, cost it some five milliseconds a
+ * frame.)
+ */
+struct gpu_left {
+	IOMemoryDescriptor *            memory;
+	MiniIOSurface *                 surface;
+	uint64_t                        address, size;
+	uint32_t                        fence;
+};
+#define GPU_LEFT                64
 
 class RedwoodGPUUserClient : public IOUserClient
 {
@@ -325,10 +355,13 @@ class RedwoodGPUUserClient : public IOUserClient
 	uint64_t                fBufferBytes;
 	uint32_t                fSubmits;
 	uint32_t                fStrangers;             /* requests that named a buffer the client does not have */
+	struct gpu_left         fLeft[GPU_LEFT];
+	uint32_t                fLeftCount;
 
 	struct gpu_buffer * buffer(uint32_t handle);
 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
-	void freeBuffer(struct gpu_buffer * b, bool idle);
+	void freeBuffer(struct gpu_buffer * b);
+	void reap(void);
 	IOReturn gemNew(struct msm_gem_new * request);
 	IOReturn surfaceBuffer(struct redwood_surface * request);
 	IOReturn gemInfo(struct msm_gem_info * request);
@@ -373,31 +406,69 @@ RedwoodGPUUserClient::start(IOService * provider)
  * written, and must not be somebody else's by then.
  */
 void
-RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b, bool idle)
+RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
 {
-	if (!idle) {
-		static uint32_t said;
+	bool busy = redwood_gpu_ready() && b->fence != 0 && !redwood_gpu_done(b->fence);
 
-		if (b->surface == NULL) {
-			b->memory->retain();
-		} else {
-			b->surface->memory->retain();
-		}
-		if (said++ < 8) {
-			IOLog("RedwoodGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
-		}
-	} else if (redwood_gpu_ready()) {
-		redwood_gpu_unmap(b->address, b->size);
-		redwood_gpu_address_free(b->address, b->size);
+	if (busy && fLeftCount == GPU_LEFT) {
+		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
 	}
-	b->memory->release();
+	if (busy && fLeftCount < GPU_LEFT) {
+		struct gpu_left * left = &fLeft[fLeftCount++];
+
+		left->memory = b->memory;
+		left->surface = b->surface;
+		left->address = b->address;
+		left->size = b->size;
+		left->fence = b->fence;
+	} else {
+		if (busy) {
+			static uint32_t said;
+
+			if (b->surface == NULL) {
+				b->memory->retain();
+			} else {
+				b->surface->memory->retain();
+			}
+			if (said++ < 8) {
+				IOLog("RedwoodGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
+			}
+		} else if (redwood_gpu_ready()) {
+			redwood_gpu_unmap(b->address, b->size);
+			redwood_gpu_address_free(b->address, b->size);
+		}
+		b->memory->release();
+		if (b->surface != NULL) {
+			MiniIOSurfaceDrop(b->surface);
+		}
+	}
 	b->memory = NULL;
-	if (b->surface != NULL) {
-		MiniIOSurfaceDrop(b->surface);
-		b->surface = NULL;
-	}
+	b->surface = NULL;
 	fBufferCount--;
 	fBufferBytes -= b->size;
+}
+
+/* The buffers that were given back early and that the GPU is done with now: freed. With the lock held. */
+void
+RedwoodGPUUserClient::reap(void)
+{
+	for (uint32_t i = 0; i < fLeftCount;) {
+		struct gpu_left * left = &fLeft[i];
+
+		if (redwood_gpu_ready() && !redwood_gpu_done(left->fence)) {
+			i++;
+			continue;
+		}
+		if (redwood_gpu_ready()) {
+			redwood_gpu_unmap(left->address, left->size);
+			redwood_gpu_address_free(left->address, left->size);
+		}
+		left->memory->release();
+		if (left->surface != NULL) {
+			MiniIOSurfaceDrop(left->surface);
+		}
+		*left = fLeft[--fLeftCount];
+	}
 }
 
 IOReturn
@@ -406,12 +477,17 @@ RedwoodGPUUserClient::clientClose(void)
 	if (fBuffers != NULL) {
 		IOLockLock(gGPULock);
 		/* what the client had the GPU do last may still be going on, in these buffers */
-		bool idle = !redwood_gpu_ready() || gpuWait(redwood_gpu_last(), 1000);
-
+		if (redwood_gpu_ready()) {
+			gpuWait(redwood_gpu_last(), 1000);
+		}
 		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
 			if (fBuffers[i].memory != NULL) {
-				freeBuffer(&fBuffers[i], idle);
+				freeBuffer(&fBuffers[i]);
 			}
+		}
+		reap();
+		if (fLeftCount != 0) {
+			IOLog("RedwoodGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
 		}
 		IOLockUnlock(gGPULock);
 	}
@@ -486,6 +562,7 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
 	b->seed = 0;
 	b->pushed = 0;
 	b->seen = false;
+	b->fence = 0;
 	b->surface = NULL;
 	fBufferCount++;
 	fBufferBytes += size;
@@ -704,6 +781,23 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
 		request->fence_fd = -1;
 	}
+	/*
+	 * The surfaces named are being drawn into, or read, until this submission is done: the
+	 * display's driver waits for that before it puts one on the panel (MiniIOSurfaceDrawn()).
+	 * (freedreno names every buffer for reading and writing alike, so which it is cannot be
+	 * told; the last submission of a frame names the surface the frame is drawn into.)
+	 */
+	for (uint32_t i = 0; request->fence != 0 && i < request->nr_bos; i++) {
+		struct gpu_buffer * b = buffer(bos[i].handle);
+
+		if (b != NULL) {
+			b->fence = request->fence;
+			if (b->surface != NULL) {
+				b->surface->drawn = request->fence;
+			}
+		}
+	}
+	reap();
 	if (request->fence == 0 && !gGPUReported) {
 		gGPUReported = true;
 		redwood_gpu_report("the ring is full");
@@ -883,7 +977,8 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		if (b == NULL) {
 			ret = kIOReturnBadArgument;
 		} else {
-			freeBuffer(b, gpuWait(redwood_gpu_last(), 1000));
+			freeBuffer(b);
+			reap();
 		}
 		IOLockUnlock(gGPULock);
 		break;

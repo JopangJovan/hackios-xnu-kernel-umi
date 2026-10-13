@@ -3608,19 +3608,32 @@ display_probe(void)
 		announce("turn the bus clock of the display's clock controller on (gcc 0x127004 bit 0: THE ONE WRITE)");
 		put(&gcc, "disp_ahb_cbcr", GCC_DISP_AHB_CBCR, rd(gcc.base + GCC_DISP_AHB_CBCR) | CBCR_ENABLE);
 		sleep_ms(10);
-		if (get(&gcc, "disp_ahb_cbcr", GCC_DISP_AHB_CBCR) & CBCR_OFF) {
-			printf("adreno: 0: the display's clock controller has no bus clock, and does not get one: nothing more is read\n");
-			goto out;
-		}
+	}
+	/*
+	 * Turned on, the register still says the clock is off (seen: 0x8000000b). Its bit 1 is
+	 * set as the firmware left it: the clock is gated by the hardware itself while nobody
+	 * talks to the block, and that is what "off" then means. Linux turns the clock on the same
+	 * way, never looks at this bit and reads the clock controller next; so does this, if the
+	 * clock is at least asked for.
+	 */
+	if (!(get(&gcc, "disp_ahb_cbcr", GCC_DISP_AHB_CBCR) & CBCR_ENABLE)) {
+		printf("adreno: 0: the display's clock controller has no bus clock, and does not get one: nothing more is read\n");
+		goto out;
 	}
 	announce("the display block's power switch and clocks, in its clock controller (0xaf00000: NOT READ BEFORE)");
+	get(&dispcc, "mdss_mdp_cbcr", DISPCC_MDSS_MDP_CBCR);
+	get(&dispcc, "mdss_pclk0_cbcr", DISPCC_MDSS_PCLK0_CBCR);
 	if (!(get(&dispcc, "mdss_core_gdscr", DISPCC_MDSS_CORE_GDSCR) & GDSC_POWER_ON) ||
 	    (get(&dispcc, "mdss_ahb_cbcr", DISPCC_MDSS_AHB_CBCR) & CBCR_OFF)) {
+		/*
+		 * (Seen: the power switch on, the display's own clock and the pixel clock running, and
+		 * the bus clock of its registers off: the firmware set the panel going and took the
+		 * clock it had spoken to the block with away. To read the timing that clock would have
+		 * to be turned on: a write to the display's clock controller, which this does not do.)
+		 */
 		printf("adreno: 0: the display block is without power or without its bus clock: nothing more is read\n");
 		goto out;
 	}
-	get(&dispcc, "mdss_mdp_cbcr", DISPCC_MDSS_MDP_CBCR);
-	get(&dispcc, "mdss_pclk0_cbcr", DISPCC_MDSS_PCLK0_CBCR);
 	announce("the timing of the interface the panel hangs on (0xae36000: NOT READ BEFORE)");
 	get(&disp_intf, "timing_engine_en", INTF_TIMING_ENGINE_EN);
 	line = get(&disp_intf, "hsync_ctl", INTF_HSYNC_CTL) >> 16;
@@ -3641,6 +3654,15 @@ display_probe(void)
 	}
 	printf("adreno: 0: the interface's counters (%s, frame_line_count_en %#x): frames %u then %u a second later, "
 	    "lines %u then %u\n", (counting & 1) ? "counting" : "not counting", counting, frames[0], frames[1], lines[0], lines[1]);
+	/* where the scan is, read eight times a millisecond and a bit apart: how fast it goes down the panel */
+	for (int i = 0; i < 8; i++) {
+		uint64_t nanos;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &nanos);
+		printf("adreno: 0: the scan: at %llu us line %u of frame %u\n", nanos / 1000 % 1000000, rd(disp_intf.base + INTF_LINE_COUNT),
+		    rd(disp_intf.base + INTF_FRAME_COUNT));
+		sleep_us(1300);
+	}
 out:
 	fine = saved_fine;
 	newest_step = 0;
