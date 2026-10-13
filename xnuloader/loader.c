@@ -781,6 +781,8 @@ struct kernel_live {
 	uint64_t log_head, log_ring;    /* the log: this much from the start of the boot, then a ring this big */
 	uint64_t recording;             /* (a virtual address too) { physical address, bytes } of a screen recording */
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
+	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
+	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
 };
 
 /*
@@ -844,6 +846,10 @@ static int charger_enabled;
 /* The screen recording the last kernel left in memory, if it made one ("oem recording" stages it). */
 static const char *recording_data;
 static uint64_t recording_len;
+/* ... and the recording of the sound ("oem sound"). */
+static const char *sound_data;
+static uint64_t sound_len;
+#define KERNEL_LIVE_MAGIC2      0x324556494c554e58ULL
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
@@ -2124,6 +2130,18 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			print("the kernel left a screen recording: %d bytes at %x\n", recording_len, recording[0]);
 		}
 	}
+	sound_data = NULL;
+	sound_len = 0;
+	if (kernel_live != NULL && kernel_live->magic2 == KERNEL_LIVE_MAGIC2 && kernel_live->sound != 0 &&
+	    checkpoint != CHECKPOINT_SELFTEST) {
+		const uint64_t *sound = (const uint64_t *)(kernel_live->sound + slide);
+
+		if (sound[0] != 0 && sound[1] > 24 && sound[1] <= (1ULL << 30)) {
+			sound_data = (const char *)sound[0];
+			sound_len = sound[1];
+			print("the kernel left a sound recording: %d bytes at %x\n", sound_len, sound[0]);
+		}
+	}
 	const char *klog = (const char *)loader_ctx[CTX_LOG_PA];
 	uint64_t klog_len = loader_ctx[CTX_LOG_LEN];
 	uint64_t reason = loader_ctx[CTX_REASON];
@@ -2352,7 +2370,7 @@ fb_command(char *cmd)
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
-		    starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
+		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
@@ -2459,6 +2477,15 @@ fb_command(char *cmd)
 			}
 			staged_data = recording_data;
 			staged_len = recording_len;
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem sound")) {
+			/* stage what the kernel recorded of the sound (boot-arg rec_sound) */
+			if (sound_data == NULL) {
+				fb_reply("FAIL", "no sound recording");
+				return;
+			}
+			staged_data = sound_data;
+			staged_len = sound_len;
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem clearscreen")) {
 			if (SCREEN.base != 0) {

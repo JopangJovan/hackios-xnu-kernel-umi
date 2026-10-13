@@ -81,6 +81,12 @@ SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra
                HEALTH + 'Assets/FitnessUIAssets.bundle/') + \
     tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
+# sound, outside the directories above: the virtual audio device, a plug-in that all of mediaserverd's
+# audio goes through, with its tunings (signal processing chains) for this model and for any, and the
+# system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.
+AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
+         'System/Library/Audio/UISounds/')
+SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
 KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
 
 
@@ -124,6 +130,8 @@ def wanted_file(path, size):
     lproj = re.search(r'/([^/]+)\.lproj/', path)
     if lproj and lproj.group(1) not in KEEP_LANG:
         return False
+    if path.startswith(AUDIO):
+        return not path.startswith(SKIP_AUDIO) and '.espresso.' not in path
     if path.startswith(SKIP_PREFIX):
         return False
     if path.startswith('System/Library/Fonts/'):

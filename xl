@@ -10,6 +10,8 @@
 #                       works during a run too (from another terminal)
 #   xl recording [F]    fetch the screen recording the last run made (rec_secs=N among XL_CMDLINE) and
 #                       make a video of it (default logs/recording.mp4)
+#   xl sound [F]        fetch the sound the last run recorded (rec_sound=N among XL_CMDLINE: the first N
+#                       seconds of what iOS played) and make a WAV file of it (default logs/sound.wav)
 #   xl selftest         exercise only the kernel->loader return path
 #   xl log              fetch the loader's current log; during a run, the kernel's log so far as well
 #   xl stop             end the run in progress now (the kernel returns as when its time is up)
@@ -161,6 +163,14 @@ recording() { # recording [file.mp4]
 	tools/recording.py logs/recording.raw "$out" && { [ -n "$XL_REC_KEEP" ] || rm -f logs/recording.raw; }
 }
 
+sound() { # sound [file.wav]
+	enter || return 1
+	local out=${1:-logs/sound.wav}
+	fb oem sound | grep -q OKAY || { echo "xl: the last run left no sound recording (boot-arg rec_sound=N)"; return 1; }
+	FB_TIMEOUT=120 fb get_staged logs/sound.raw >/dev/null
+	tools/sound.py logs/sound.raw "$out" && rm -f logs/sound.raw
+}
+
 ramdisk() { # ramdisk [<file>|none]
 	enter || return 1
 	if [ "$1" = none ]; then fb oem ramdisk none >/dev/null; echo "xl: resident ramdisk dropped"; return; fi
@@ -220,6 +230,7 @@ case "$1" in
 enter) enter && echo "xl: loader is up" ;;
 screenshot) screenshot "$2" ;;
 recording) recording "$2" ;;
+sound) sound "$2" ;;
 ramdisk) ramdisk "$2" ;;
 run) run "oem run $2" "run${2:+-cp$2}" ;;
 selftest) run "oem selftest" selftest ;;

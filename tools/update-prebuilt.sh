@@ -10,7 +10,8 @@ mkdir -p prebuilt/userland prebuilt/uefi
 cp $K prebuilt/mach.development.bcm2837
 cp xnuloader/loader.efi prebuilt/loader.efi
 cp userland/hello prebuilt/userland/
-for f in init child stage0 hello_dyn svc_test surf_test rwtouch mg_test cpu_test libredwood.dylib libredwood-sb.dylib libredwood-media.dylib; do
+for f in init child stage0 hello_dyn svc_test surf_test rwtouch mg_test cpu_test sound_test libredwood.dylib libredwood-sb.dylib \
+	libredwood-media.dylib RedwoodAudio; do
 	cp userland/obj/$f prebuilt/userland/
 done
 if [ -f $MU/Build/redwoodPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd ]; then

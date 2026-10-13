@@ -1,0 +1,255 @@
+/*
+ * sound_test: make iOS play something, the way a program would.
+ *
+ * usage: sound_test STEP...
+ *   wait SECONDS
+ *   springboard                        wait until SpringBoard is up and has said that the ringer is on (at
+ *                                      most ten minutes): until then system sounds are "played" in silence,
+ *                                      as on an iPhone with its switch on silent
+ *   tone SECONDS [LEFT_HZ RIGHT_HZ]    a sine wave in each channel (default 1000 and 440 Hz) at half of
+ *                                      full scale, through an audio queue: what a music player does
+ *   system ID                          a system sound by its number (1100 is the lock sound,
+ *                                      1104 a keyboard click), as SpringBoard plays them
+ *   file PATH                          a sound file, played as a system sound
+ *   route                              where iOS says its sound goes: the audio session's outputs and volume,
+ *                                      and the devices of the system's output context
+ *   restart                            kill the audio server (launchd starts it again when it is next asked for):
+ *                                      what every program then sees as "media services were reset"
+ *
+ * The samples come out of /dev/redwood-audio (see sys/redwood_audio.h); a tone is something one
+ * can recognize there without ears: two peaks in the spectrum, where they were put.
+ */
+#include <AudioToolbox/AudioToolbox.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <errno.h>
+#include <math.h>
+#include <notify.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define RATE            48000
+#define BUFFER_FRAMES   4096
+
+static double frequency[2] = { 1000, 440 };
+static uint64_t frame, frames_wanted;
+
+static void
+fill(__unused void *context, AudioQueueRef queue, AudioQueueBufferRef buffer)
+{
+	int16_t *samples = buffer->mAudioData;
+	uint32_t count = 0;
+
+	for (; count < BUFFER_FRAMES && frame < frames_wanted; count++, frame++) {
+		/* a hundredth of a second to come in and to go out: no click */
+		double edge = frame < RATE / 100 ? frame / (RATE / 100.0) :
+		    frames_wanted - frame < RATE / 100 ? (frames_wanted - frame) / (RATE / 100.0) : 1;
+
+		for (int channel = 0; channel < 2; channel++) {
+			samples[2 * count + channel] = (int16_t)(16384 * edge * sin(2 * M_PI * frequency[channel] * frame / RATE));
+		}
+	}
+	if (count == 0) {
+		AudioQueueStop(queue, false);
+		return;
+	}
+	buffer->mAudioDataByteSize = count * 4;
+	AudioQueueEnqueueBuffer(queue, buffer, 0, NULL);
+}
+
+static int
+tone(double seconds)
+{
+	AudioStreamBasicDescription format = {
+		.mSampleRate = RATE, .mFormatID = kAudioFormatLinearPCM,
+		.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+		.mBytesPerPacket = 4, .mFramesPerPacket = 1, .mBytesPerFrame = 4, .mChannelsPerFrame = 2, .mBitsPerChannel = 16,
+	};
+	AudioQueueRef queue;
+	OSStatus status;
+
+	frame = 0;
+	frames_wanted = (uint64_t)(seconds * RATE);
+	/* no run loop given: the queue asks for more on a thread of its own, also while we are busy talking */
+	status = AudioQueueNewOutput(&format, fill, NULL, NULL, NULL, 0, &queue);
+	if (status != 0) {
+		printf("sound_test: AudioQueueNewOutput: %d\n", (int)status);
+		return 1;
+	}
+	for (int i = 0; i < 3; i++) {
+		AudioQueueBufferRef buffer;
+
+		status = AudioQueueAllocateBuffer(queue, BUFFER_FRAMES * 4, &buffer);
+		if (status != 0) {
+			printf("sound_test: AudioQueueAllocateBuffer: %d\n", (int)status);
+			return 1;
+		}
+		fill(NULL, queue, buffer);
+	}
+	status = AudioQueueStart(queue, NULL);
+	printf("sound_test: a tone of %.0f and %.0f Hz for %.1f s: AudioQueueStart: %d\n", frequency[0], frequency[1], seconds,
+	    (int)status);
+	if (status == 0) {
+		/* a slow machine may take its time: wait for the end, three times as long as it should take at most */
+		for (int tenths = 0; frame < frames_wanted && tenths < 30 * seconds + 100; tenths++) {
+			usleep(100000);
+		}
+		usleep(1500000);                /* the last buffers are still to be played */
+		printf("sound_test: %llu of %llu frames handed over\n", frame, frames_wanted);
+	}
+	AudioQueueDispose(queue, true);
+	return status != 0 || frame < frames_wanted;
+}
+
+static void
+played(SystemSoundID sound, __unused void *context)
+{
+	printf("sound_test: system sound %u has been played\n", (unsigned)sound);
+	CFRunLoopStop(CFRunLoopGetCurrent());
+}
+
+static int
+system_sound(SystemSoundID sound)
+{
+	AudioServicesAddSystemSoundCompletion(sound, CFRunLoopGetCurrent(), kCFRunLoopCommonModes, played, NULL);
+	printf("sound_test: system sound %u\n", (unsigned)sound);
+	AudioServicesPlaySystemSound(sound);
+	if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 15, false) == kCFRunLoopRunTimedOut) {
+		printf("sound_test: system sound %u: no word of its end in 15 s\n", (unsigned)sound);
+		return 1;
+	}
+	return 0;
+}
+
+/* SpringBoard keeps the state of the ringer switch (1: ring, 0: silent) in a notification of this name. */
+static void
+wait_for_ringer(void)
+{
+	uint64_t state = 0;
+	int token, seconds;
+
+	if (notify_register_check("com.apple.springboard.ringerstate", &token) != NOTIFY_STATUS_OK) {
+		return;
+	}
+	for (seconds = 0; seconds < 600 && (notify_get_state(token, &state) != NOTIFY_STATUS_OK || state == 0); seconds++) {
+		sleep(1);
+	}
+	printf("sound_test: the ringer is %s after %d s\n", state ? "on" : "still off", seconds);
+	notify_cancel(token);
+}
+
+/* [object selector] for methods without arguments that return an object. */
+static id
+send(id object, const char *selector)
+{
+	return object ? ((id (*)(id, SEL))objc_msgSend)(object, sel_registerName(selector)) : NULL;
+}
+
+static const char *
+text(id string)
+{
+	const char *utf8 = string ? ((const char *(*)(id, SEL))objc_msgSend)(string, sel_registerName("UTF8String")) : NULL;
+
+	return utf8 ? utf8 : "(none)";
+}
+
+/*
+ * What the audio session of this program says of the route (AVAudioSession, as an application would
+ * ask), and what the system's output context holds (AVOutputContext: what Control Center goes by).
+ */
+static void
+route(void)
+{
+	id session = send((id)objc_getClass("AVAudioSession"), "sharedInstance");
+	id outputs = send(send(session, "currentRoute"), "outputs");
+	id context = send((id)objc_getClass("AVOutputContext"), "sharedSystemAudioContext");
+	id devices = send(context, "outputDevices");
+	unsigned long count = outputs ? ((unsigned long (*)(id, SEL))objc_msgSend)(outputs, sel_registerName("count")) : 0;
+
+	printf("sound_test: route: %lu output%s, volume %.2f\n", count, count == 1 ? "" : "s",
+	    session ? ((float (*)(id, SEL))objc_msgSend)(session, sel_registerName("outputVolume")) : -1.0f);
+	for (unsigned long i = 0; i < count; i++) {
+		id port = ((id (*)(id, SEL, unsigned long))objc_msgSend)(outputs, sel_registerName("objectAtIndex:"), i);
+
+		printf("sound_test: route:   %s \"%s\" (%s)\n", text(send(port, "portType")), text(send(port, "portName")),
+		    text(send(port, "UID")));
+	}
+	count = devices ? ((unsigned long (*)(id, SEL))objc_msgSend)(devices, sel_registerName("count")) : 0;
+	printf("sound_test: route: the system's output context %s, %lu device%s\n", context ? "is there" : "is missing", count,
+	    count == 1 ? "" : "s");
+	for (unsigned long i = 0; i < count; i++) {
+		id device = ((id (*)(id, SEL, unsigned long))objc_msgSend)(devices, sel_registerName("objectAtIndex:"), i);
+
+		printf("sound_test: route:   \"%s\" (%s)\n", text(send(device, "name")), text(send(device, "ID")));
+	}
+}
+
+extern int proc_listallpids(void *buffer, int size);
+extern int proc_name(int pid, void *buffer, uint32_t size);
+
+static void
+restart(void)
+{
+	static int pids[2048];
+	int count = proc_listallpids(pids, sizeof(pids));
+	char name[64];
+
+	for (int i = 0; i < count; i++) {
+		if (proc_name(pids[i], name, sizeof(name)) > 0 && strcmp(name, "mediaserverd") == 0) {
+			printf("sound_test: restart: killing mediaserverd[%d]: %s\n", pids[i],
+			    kill(pids[i], SIGKILL) == 0 ? "done" : strerror(errno));
+			return;
+		}
+	}
+	printf("sound_test: restart: no mediaserverd is running\n");
+}
+
+int
+main(int argc, char **argv)
+{
+	int failed = 0;
+
+	setvbuf(stdout, NULL, _IONBF, 0);
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "wait") == 0 && i + 1 < argc) {
+			usleep((useconds_t)(atof(argv[++i]) * 1e6));
+		} else if (strcmp(argv[i], "springboard") == 0) {
+			wait_for_ringer();
+		} else if (strcmp(argv[i], "route") == 0) {
+			route();
+		} else if (strcmp(argv[i], "restart") == 0) {
+			restart();
+		} else if (strcmp(argv[i], "tone") == 0 && i + 1 < argc) {
+			double seconds = atof(argv[++i]);
+
+			if (i + 2 < argc && atof(argv[i + 1]) > 0 && atof(argv[i + 2]) > 0) {
+				frequency[0] = atof(argv[++i]);
+				frequency[1] = atof(argv[++i]);
+			}
+			failed |= tone(seconds);
+		} else if (strcmp(argv[i], "system") == 0 && i + 1 < argc) {
+			failed |= system_sound((SystemSoundID)atoi(argv[++i]));
+		} else if (strcmp(argv[i], "file") == 0 && i + 1 < argc) {
+			CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)argv[i + 1],
+			    (CFIndex)strlen(argv[i + 1]), false);
+			SystemSoundID sound = 0;
+			OSStatus status = AudioServicesCreateSystemSoundID(url, &sound);
+
+			i++;
+			if (status != 0) {
+				printf("sound_test: %s: AudioServicesCreateSystemSoundID: %d\n", argv[i], (int)status);
+				failed = 1;
+			} else {
+				failed |= system_sound(sound);
+			}
+		} else {
+			printf("sound_test: what is \"%s\"?\n", argv[i]);
+			return 2;
+		}
+	}
+	return failed;
+}

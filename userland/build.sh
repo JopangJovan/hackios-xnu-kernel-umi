@@ -106,6 +106,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -o obj/svc_test src/svc_test.c
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/surf_test.c
 		$DYN -o obj/rwtouch src/rwtouch.c
+		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
 		$DYN -o obj/cpu_test src/cpu_test.c
 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
@@ -126,6 +127,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood-sb.dylib src/inject_sb.c
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -lobjc \
 			-o obj/libredwood-media.dylib src/inject_media.c
+		# the output device of the audio server: a plug-in for CoreAudio's HAL
+		$DYN -bundle -framework CoreFoundation -o obj/RedwoodAudio src/audio_plugin.c
 		if [ -n "$GL" ]; then
 			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
 			# (Mesa says beside the library what it was built from: one from other patches is built again)
@@ -147,10 +150,16 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
+	[ -f obj/sound_test ] && cp obj/sound_test root/bin/
 	for f in $EXTRA; do cp "$f" root/bin/; done
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
+	if [ -f obj/RedwoodAudio ]; then
+		mkdir -p root/lib/RedwoodAudio.driver
+		cp obj/RedwoodAudio root/lib/RedwoodAudio.driver/
+		cp src/audio_plugin.plist root/lib/RedwoodAudio.driver/Info.plist
+	fi
 	if [ -n "$GL" ]; then
 		cp obj/libOSMesa.8.dylib root/lib/
 		cp obj/gl_test root/bin/
@@ -218,6 +227,9 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	fi
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.ios
 	cp obj/stage0 sysroot/sbin/launchd
+	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
+	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
+	ln -s /redwood/lib/RedwoodAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
 	# the OS cryptex: on a device a separate volume grafted at /System/Cryptexes/OS. It holds the dyld
 	# shared cache (dyld looks there first) and a few libraries and resources outside the cache.
 	mkdir -p sysroot/System/Cryptexes

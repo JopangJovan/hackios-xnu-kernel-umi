@@ -11,6 +11,9 @@
 #                          (it hands out an address by DHCP, answers DNS and passes connections on to
 #                          this machine's network; no privileges needed). The kernel makes en0 of it
 #                          (boot-arg virtio_net=1, added here); see userland/src/net_test.m for the rest.
+#      AUDIO=<where>       what plays the sound of iOS: a QEMU audio back end (pipewire, pa, alsa, sdl: each
+#                          needs its QEMU module, e.g. the package qemu-audio-pipewire) or FILE.wav to
+#                          write it into a file instead. Default: nowhere (the guest plays all the same).
 #      QEMU_INSTANCE=<n>   to run several at once: each number has its own monitor and QMP ports
 #                          (4444 + 10n, 4445 + 10n); the file qemu/instance sets it for a working copy.
 #                          touch.py, screendump.sh and stop.sh follow the same rule.
@@ -58,11 +61,21 @@ if [ -n "$QEMU_NET" ] && [ "$QEMU_NET" != 0 ]; then
 	NET=(-netdev user,id=net0 -device virtio-net-device,netdev=net0)
 	CMDLINE="virtio_net=1 $CMDLINE"
 fi
+# the sound device (QEMU 8.2 or newer has one for this machine): the kernel's sink for /dev/redwood-audio
+SOUND=()
+if qemu-system-aarch64 -device help 2>/dev/null | grep -q '"virtio-sound-device"'; then
+	case "${AUDIO:-none}" in
+	*.wav) SOUND=(-audiodev "wav,id=snd,path=$(readlink -f "$AUDIO")") ;;
+	*) SOUND=(-audiodev "${AUDIO:-none},id=snd") ;;
+	esac
+	SOUND+=(-device virtio-sound-device,audiodev=snd,streams=1)   # one stream: output, no microphone of the host
+	CMDLINE="virtio_sound=1 $CMDLINE"
+fi
 xnuloader/mkpayload.py -o qemu/payload.bin kernel=$K ramdisk=$ROOT --rdres "$(printf '%x' "$(stat -c %s "$IMG")")" \
 	--cmdline "loader_return_after=$SECS epoch=$(date +%s) virtio_input=1 $CMDLINE" >/dev/null || exit 1
 QEMU_MEM=${RAM_GB}G exec qemu/run.sh $((SECS + 40)) \
 	-object memory-backend-file,id=ram,size=$RAM_SIZE,mem-path="$PWD/qemu/ram.img",share=off \
 	-machine memory-backend=ram \
-	-global virtio-mmio.force-legacy=false -device virtio-tablet-device -device virtio-keyboard-device "${NET[@]}" \
+	-global virtio-mmio.force-legacy=false -device virtio-tablet-device -device virtio-keyboard-device "${NET[@]}" "${SOUND[@]}" \
 	-device ramfb -monitor tcp:127.0.0.1:$((4444 + 10 * INSTANCE)),server,nowait \
 	-qmp tcp:127.0.0.1:$((4445 + 10 * INSTANCE)),server,nowait "$@"
