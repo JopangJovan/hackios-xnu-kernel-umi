@@ -15,6 +15,9 @@
  *                         system's trust store and trustd as well
  *   reach NAME            what SCNetworkReachability says: the question applications ask first
  *   wait SECONDS
+ *   wifi                  what the job com.redwood.wifi runs in every image: if the kernel was
+ *                         started with wifi=1, wait for the radio's interface (en0) to appear
+ *                         and ask for it to be configured by DHCP ("dhcp en0"); else nothing
  *
  * The interface (en0, bsd/dev/redwood_net.c) has no IOKit object behind it, and configd makes
  * its network services out of those. But the plugin that does the configuring keeps its own list
@@ -32,6 +35,7 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #include <mach/mach_time.h>
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -336,6 +340,40 @@ reach(const char *name)
 	}
 }
 
+/*
+ * The radio's interface is made by the kernel when its driver is up, a quarter of a minute into
+ * the system's start, and nothing in iOS configures an interface that has no IOKit object: with
+ * wifi=1 among the kernel's arguments this waits for en0 and makes the one call that does. From
+ * then on configd's own machinery has it: DHCP when the link comes up, again when it comes back.
+ */
+static void
+wifi(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	double start = seconds();
+	bool wanted = false, there = false;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	for (const char *word = strtok(arguments, " "); word != NULL; word = strtok(NULL, " ")) {
+		wanted |= strcmp(word, "wifi=1") == 0;
+	}
+	if (!wanted) {
+		return;
+	}
+	while (!(there = if_nametoindex("en0") != 0) && seconds() - start < 120) {
+		usleep(500000);
+	}
+	if (!there) {
+		printf("net_test: wifi: no en0 after %.0f s: the radio has not come up\n", seconds() - start);
+		return;
+	}
+	printf("net_test: wifi: en0 is there after %.1f s\n", seconds() - start);
+	dhcp("en0");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -371,6 +409,8 @@ main(int argc, char **argv)
 				reach(argv[++i]);
 			} else if (strcmp(step, "wait") == 0 && i + 1 < argc) {
 				usleep((useconds_t)(atof(argv[++i]) * 1e6));
+			} else if (strcmp(step, "wifi") == 0) {
+				wifi();
 			} else {
 				fprintf(stderr, "net_test: bad step \"%s\"\n", step);
 				return 1;

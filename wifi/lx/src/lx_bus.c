@@ -81,13 +81,23 @@ ath11k_info(struct ath11k_base *ab, const char *format, ...)
 	va_end(list);
 }
 
+/* (the driver's warnings and errors are said whatever happens to the rest) */
+static void
+driver_complains(const char *kind, const char *format, va_list list)
+{
+	char line[320];
+
+	vsnprintf(line, sizeof(line), format, list);
+	lx_tell("ath11k %s: %s%s", kind, line, line[0] != 0 && line[strlen(line) - 1] == '\n' ? "" : "\n");
+}
+
 void
 ath11k_warn(struct ath11k_base *ab, const char *format, ...)
 {
 	va_list list;
 
 	va_start(list, format);
-	driver_says(" WARNS", format, list);
+	driver_complains("WARNS", format, list);
 	va_end(list);
 }
 
@@ -97,7 +107,7 @@ ath11k_err(struct ath11k_base *ab, const char *format, ...)
 	va_list list;
 
 	va_start(list, format);
-	driver_says(" ERROR", format, list);
+	driver_complains("ERROR", format, list);
 	va_end(list);
 }
 
@@ -155,7 +165,7 @@ refused(struct ath11k_base *ab, u32 offset)
 		return (false);
 	}
 	if (bus.refused++ < 8) {
-		printf("lx: the chip's %#x is reached for %s: NOT DONE\n", offset, !known ? "which no window shows" : bus.closed ?
+		lx_tell("lx: the chip's %#x is reached for %s: NOT DONE\n", offset, !known ? "which no window shows" : bus.closed ?
 		    "after the bus was stopped" : "while the firmware is not in mission mode");
 	}
 	return (true);
@@ -261,10 +271,17 @@ static void
 bus_looks(void *argument)
 {
 	struct ath11k_base *ab = argument;
+	unsigned long long said = lx_os_nanoseconds();
 
 	bus.looks = true;
 	while (bus.looking) {
 		bool more = false;
+
+		if (lx_os_nanoseconds() - said > 300000000000ull) {	/* every five minutes: how the station and memory stand */
+			said = lx_os_nanoseconds();
+			lx_station_say();
+			lx_memory_say();
+		}
 
 		for (unsigned i = 0; i < ab->hw_params.ce_count; i++) {
 			ath11k_ce_per_engine_service(ab, i);
@@ -318,6 +335,7 @@ lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi
 			bus_quiet();
 		}
 		bus.mission = mode == ATH11K_FIRMWARE_MODE_NORMAL;
+		lx_tell("lx: the firmware is asked for mode %u (0: mission, 4: off, 7: calibration)\n", mode);
 	}
 	return (qmi_send_request(qmi, sq, txn, msg_id, largest, ei, structure));
 }
@@ -332,6 +350,7 @@ bus_start(struct ath11k_base *ab)
 	    ab->qmi.ce_cfg.shadow_reg_v2_len);
 	ath11k_ce_rx_post_buf(ab);
 	say_repeats();
+	lx_tell("lx: the rings are set up and the copy engines have their buffers: the bus is started\n");
 	bus.looking = true;
 	if (lx_os_thread("wifi-rings", bus_looks, ab) != 0) {
 		bus.looking = false;
@@ -503,11 +522,17 @@ lx_start(void)
 	int ret;
 
 	bus.how = lx_os_option("wifi_lx");
-	if (lx_base_init() != 0 || lx_pool_init() != 0) {
-		printf("lx: no thread, or no memory the radio can be given\n");
+	if (lx_prepare() != 0) {
+		lx_tell("lx: no thread, or no memory the radio can be given\n");
 		return (ENOMEM);
 	}
-	ath11k_debug_mask = ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_AHB | ATH11K_DBG_WMI | ATH11K_DBG_REG | ATH11K_DBG_MAC;
+	/* what the driver has to say while it is being looked into; not in a session that just uses the radio */
+	if (lx_os_option("wifi_quiet")) {
+		ath11k_debug_mask = 0;
+		bus.said = SAID_FIRST;
+	} else {
+		ath11k_debug_mask = ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_AHB | ATH11K_DBG_WMI | ATH11K_DBG_REG | ATH11K_DBG_MAC;
+	}
 	/*
 	 * The driver's parameter "frame_mode": Ethernet. The firmware then puts frames into 802.11
 	 * and takes them out of it, and ciphers them: what passes between the driver and the layer
@@ -526,7 +551,7 @@ lx_start(void)
 	ab->hw_rev = ATH11K_HW_WCN6750_HW10;
 	ab->fw_mode = ATH11K_FIRMWARE_MODE_NORMAL;
 	if ((ret = ath11k_core_pre_init(ab)) != 0 || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
-		printf("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
+		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
 		return (-ret);
 	}
 	ab->qmi.ce_cfg.tgt_ce_len = ab->hw_params.target_ce_count;
@@ -537,7 +562,7 @@ lx_start(void)
 	printf("lx: the driver (\"%s\") is set up; its exchange with the firmware begins (registers: %s)\n", ab->hw_params.name,
 	    bus.how >= 2 ? "for real" : "NOT TOUCHED, wifi_lx=1");
 	if ((ret = ath11k_core_init(ab)) != 0) {
-		printf("lx: the driver's start fails: %d\n", ret);
+		lx_tell("lx: the driver's start fails: %d\n", ret);
 		return (-ret);
 	}
 
@@ -552,7 +577,7 @@ lx_start(void)
 		lx_pause_ms(10);
 	}
 	up = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) && bus.looks;
-	printf("lx: %llu ms after its start the driver %s; its flags: %#lx\n", (lx_os_nanoseconds() - began) / 1000000ull,
+	lx_tell("lx: %llu ms after its start the driver %s; its flags: %#lx\n", (lx_os_nanoseconds() - began) / 1000000ull,
 	    up ? "IS UP as far as it is built: the firmware has said \"unified ready\"" : test_bit(ATH11K_FLAG_REGISTERED,
 	    &ab->dev_flags) ? "HAS GIVEN UP on the way and wound itself down" : "HAS NOT GOT THROUGH its exchange with the firmware",
 	    ab->dev_flags);
@@ -580,6 +605,13 @@ lx_start(void)
 	return (ret);
 }
 
+/* The thread that counts the ticks, and the memory the radio is shown: once. 0, or an errno. */
+int
+lx_prepare(void)
+{
+	return (lx_base_init() != 0 || lx_pool_init() != 0 ? ENOMEM : 0);
+}
+
 /* The network left, and the driver down as its own removal does it (the copy engines are let go of on the way: bus_quiet()). */
 void
 lx_stop(void)
@@ -592,7 +624,7 @@ lx_stop(void)
 	driver = NULL;
 	lx_station_leave();
 	ath11k_core_deinit(ab);
-	printf("lx: the driver is down again\n");
+	lx_tell("lx: the driver is down again\n");
 }
 
 int

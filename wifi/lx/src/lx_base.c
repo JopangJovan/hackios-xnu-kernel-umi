@@ -60,6 +60,19 @@ printf(const char *format, ...)
 	return (0);
 }
 
+/* A line that is said whatever the kernel does with the others (lx_os_tell()): outcomes, and what has gone wrong. */
+void
+lx_tell(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	lx_os_tell(line);
+}
+
 /* A function of a part of the driver that is not built yet (out/stubs.s): its name, a few times; the answer is 0. */
 long
 lx_stub(const char *name)
@@ -189,20 +202,31 @@ local_bh_enable(void)
 {
 }
 
-/* (What Linux guards with RCU is guarded here by the locks around it, or was never shared.) */
-void
-linux_synchronize_rcu(unsigned type)
-{
-}
+/*
+ * RCU, as far as the driver needs it: readers say when they begin and end to look at something
+ * shared, and whoever is about to free such a thing waits until nobody is looking any more
+ * (which is more than Linux asks: it waits only for those who were looking already).
+ */
+static volatile int rcu_readers;
 
 void
 linux_rcu_read_lock(unsigned type)
 {
+	__sync_fetch_and_add(&rcu_readers, 1);
 }
 
 void
 linux_rcu_read_unlock(unsigned type)
 {
+	__sync_fetch_and_sub(&rcu_readers, 1);
+}
+
+void
+linux_synchronize_rcu(unsigned type)
+{
+	for (unsigned ms = 0; rcu_readers != 0 && ms < 1000; ms++) {
+		lx_pause_ms(1);
+	}
 }
 
 /* A thousand ticks a second, counted by a thread that also runs the timers that have come due. */
@@ -683,6 +707,8 @@ linux_work_fn(void *context, int pending)
 /* ---- memory ------------------------------------------------------------------------------------- */
 
 /* kmalloc(): the size goes in front, because kfree() is not told it. */
+static volatile long allocations, allocated;	/* pieces out now, and their bytes: for lx_memory_say() */
+
 void *
 lkpi_kmalloc(size_t size, gfp_t flags)
 {
@@ -692,6 +718,8 @@ lkpi_kmalloc(size_t size, gfp_t flags)
 		return (NULL);
 	}
 	block[0] = size + 16;
+	__sync_fetch_and_add(&allocations, 1);
+	__sync_fetch_and_add(&allocated, (long)(size + 16));
 	return (block + 2);
 }
 
@@ -701,6 +729,8 @@ lkpi_kfree(const void *memory)
 	size_t *block = (size_t *)(uintptr_t)memory - 2;
 
 	if (memory != NULL) {
+		__sync_fetch_and_sub(&allocations, 1);
+		__sync_fetch_and_sub(&allocated, (long)block[0]);
 		lx_os_free(block, block[0]);
 	}
 }
@@ -740,6 +770,9 @@ static struct {
 int
 lx_pool_init(void)
 {
+	if (pool.memory != NULL) {
+		return (0);
+	}
 	pool.memory = lx_os_radio_memory(POOL_SIZE, &pool.address);
 	if (pool.memory == NULL) {
 		return (ENOMEM);
@@ -1181,8 +1214,22 @@ linux_dmi_first_match(const struct dmi_system_id *list)
 	return (NULL);				/* (no table of the machine's maker here) */
 }
 
+/* What the layer holds of the kernel's memory right now: a number that keeps growing is a leak. */
+void
+lx_memory_say(void)
+{
+	lx_tell("lx: memory: %ld pieces of the kernel's out, %ld KB; of the radio's %u MB: %u KB of rings, %u of %u buffers out\n",
+	    allocations, allocated >> 10, POOL_SIZE >> 20, pool.rings_used >> 10, POOL_SLOTS - pool.free_count, POOL_SLOTS);
+}
+
 int
 lx_base_init(void)
 {
+	static bool begun;
+
+	if (begun) {
+		return (0);
+	}
+	begun = true;
 	return (lx_os_thread("wifi-ticks", ticker, NULL));
 }

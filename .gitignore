@@ -42,7 +42,7 @@ __pycache__/
 !/userland/build.sh
 !/userland/*.py
 !/userland/rc.*
-!/userland/com.redwood.demo.plist
+!/userland/com.redwood.*.plist
 !/userland/src/
 !/userland/libmini/
 !/userland/var/

@@ -105,7 +105,8 @@ struct lx_radio {
 	struct work_struct group_work;		/* a new group key, later on */
 	struct ieee80211_key_conf *pairwise_key, *group_key;
 	volatile bool joined;			/* keys set: frames pass */
-	unsigned sent, sent_lost, received, received_group, eapol;
+	unsigned sent, sent_lost, received, received_group, eapol, rekeys;
+	unsigned long long joined_at;		/* nanoseconds */
 };
 
 static struct lx_radio *the_radio;
@@ -821,7 +822,7 @@ management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
 	} else if (f[0] == 0xc0 || f[0] == 0xa0) {	/* the access point shows us the door: with a reason */
 		status = f[24] | f[25] << 8;
 		answer = ANSWER_GONE;
-		printf("lx: THE ACCESS POINT %s US, reason %u\n", f[0] == 0xc0 ? "DEAUTHENTICATES" : "DISASSOCIATES", status);
+		lx_tell("lx: THE ACCESS POINT %s US, reason %u\n", f[0] == 0xc0 ? "DEAUTHENTICATES" : "DISASSOCIATES", status);
 		if (radio->joined) {
 			radio->joined = false;
 			lx_os_net_link(0);
@@ -877,7 +878,7 @@ station_up(struct lx_radio *radio)
 		return (0);
 	}
 	if (is_zero_ether_addr(hw->wiphy->perm_addr)) {
-		printf("lx: THE RADIO HAS NO ADDRESS (the kernel was given none, and the firmware has none): no interface is made\n");
+		lx_tell("lx: THE RADIO HAS NO ADDRESS (the kernel was given none, and the firmware has none): no interface is made\n");
 		return (EADDRNOTAVAIL);
 	}
 	radio->vif_memory = kzalloc(64 + sizeof(*vif) + hw->vif_data_size, GFP_KERNEL);
@@ -1275,8 +1276,9 @@ group_rekey(struct work_struct *work)
 	struct ieee80211_key_conf *old = radio->group_key;
 	int error = 0;
 
+	radio->rekeys++;
 	radio->group_key = key_set(radio, radio->wpa.group, radio->wpa.group_index, false, &error);
-	printf("lx: the group's new key (number %u) is given to the driver: %d\n", radio->wpa.group_index, error);
+	lx_tell("lx: the group's new key (number %u) is given to the driver: %d\n", radio->wpa.group_index, error);
 	key_drop(radio, &old, false);
 }
 
@@ -1387,7 +1389,7 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		station_scan(radio, name, name_length);
 	}
 	if (!target->found) {
-		printf("lx: THE NETWORK THAT IS WANTED WAS NOT HEARD (a name of %u bytes), in three scans\n", name_length);
+		lx_tell("lx: THE NETWORK THAT IS WANTED WAS NOT HEARD (a name of %u bytes), in three scans\n", name_length);
 		return (ENOENT);
 	}
 	channel = linuxkpi_ieee80211_get_channel(hw->wiphy, target->frequency);
@@ -1397,7 +1399,7 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		channel = linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band));
 	}
 	obstacle = protection(target, &group_cipher);
-	printf("lx: the network that is wanted: an access point on channel %u (%u MHz) at %d dBm, capabilities %#x, beacons every "
+	lx_tell("lx: the network that is wanted: an access point on channel %u (%u MHz) at %d dBm, capabilities %#x, beacons every "
 	    "%u units; HT %s, VHT %s, WMM %s; %s%s\n", channel != NULL ? channel_of(channel->center_freq) : 0, channel != NULL ?
 	    channel->center_freq : 0, target->signal, target->capability, target->interval, element(target->elements,
 	    target->elements_length, 45) ? "yes" : "no", element(target->elements, target->elements_length, 191) ? "yes" : "no",
@@ -1484,7 +1486,7 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		frame_send(radio, skb);
 		answer = answer_wait(radio, 500);
 	}
-	printf("lx: AUTHENTICATION: %s (status %u)\n", answer == ANSWER_AUTHENTICATED ? "the access point accepts" : answer ==
+	lx_tell("lx: AUTHENTICATION: %s (status %u)\n", answer == ANSWER_AUTHENTICATED ? "the access point accepts" : answer ==
 	    ANSWER_NONE ? "NO ANSWER from the access point to three requests" : "THE ACCESS POINT REFUSES", radio->answer_status);
 	if (answer != ANSWER_AUTHENTICATED || (ret = station_state(radio, IEEE80211_STA_NONE, IEEE80211_STA_AUTH)) != 0) {
 		error = answer == ANSWER_NONE ? ETIMEDOUT : ECONNREFUSED;
@@ -1510,7 +1512,7 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		frame_send(radio, skb);
 		answer = answer_wait(radio, 500);
 	}
-	printf("lx: ASSOCIATION: %s (status %u); we are its station number %u; its answer has %u bytes of elements\n", answer ==
+	lx_tell("lx: ASSOCIATION: %s (status %u); we are its station number %u; its answer has %u bytes of elements\n", answer ==
 	    ANSWER_ASSOCIATED ? "THE ACCESS POINT ACCEPTS" : answer == ANSWER_NONE ? "NO ANSWER from the access point to three "
 	    "requests" : "THE ACCESS POINT REFUSES", radio->answer_status, radio->aid, radio->answer_length);
 	if (answer != ANSWER_ASSOCIATED) {
@@ -1556,7 +1558,7 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 	}
 	lx_os_unlock();
 	if (radio->handshake != LX_WPA_KEYS) {
-		printf("lx: THE HANDSHAKE DID NOT COME THROUGH in %llu ms: %s%s (%u of its messages came)\n", (lx_os_nanoseconds() - began) /
+		lx_tell("lx: THE HANDSHAKE DID NOT COME THROUGH in %llu ms: %s%s (%u of its messages came)\n", (lx_os_nanoseconds() - began) /
 		    1000000ull, radio->answer == ANSWER_GONE ? "the access point has shown us the door (a wrong passphrase gives this)" :
 		    radio->handshake == LX_WPA_BAD ? "a message was not good: " : radio->handshake == LX_WPA_ANSWER ? "our message 2 was "
 		    "not answered (a wrong passphrase gives this)" : "the access point did not begin it", radio->handshake == LX_WPA_BAD ?
@@ -1569,7 +1571,7 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 	if (ret == 0) {
 		radio->group_key = key_set(radio, radio->wpa.group, radio->wpa.group_index, false, &ret);
 	}
-	printf("lx: THE KEYS ARE GIVEN TO THE DRIVER, %llu ms after the association: ours with the access point, and the group's "
+	lx_tell("lx: THE KEYS ARE GIVEN TO THE DRIVER, %llu ms after the association: ours with the access point, and the group's "
 	    "(number %u, %u bytes): %d\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->wpa.group_index,
 	    radio->wpa.group_length, ret);
 	if (ret != 0 || (ret = station_state(radio, IEEE80211_STA_ASSOC, IEEE80211_STA_AUTHORIZED)) != 0) {
@@ -1577,10 +1579,11 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		goto out;
 	}
 	state = IEEE80211_STA_AUTHORIZED;
-	radio->sent = radio->sent_lost = radio->received = radio->received_group = 0;
+	radio->sent = radio->sent_lost = radio->received = radio->received_group = radio->rekeys = 0;
+	radio->joined_at = lx_os_nanoseconds();
 	radio->joined = true;
 	lx_os_net_link(1);
-	printf("lx: THE NETWORK IS JOINED: frames can pass\n");
+	lx_tell("lx: THE NETWORK IS JOINED: frames can pass\n");
 	return (0);
 out:
 	station_leave(radio, state);
@@ -1599,7 +1602,7 @@ lx_station_join(void)
 	int error;
 
 	if (radio == NULL || !radio->registered) {
-		printf("lx: no radio is registered: nothing to join with\n");
+		lx_tell("lx: no radio is registered: nothing to join with\n");
 		return (ENXIO);
 	}
 	if (!lx_os_network(name, &name_length, passphrase, &passphrase_length)) {
@@ -1618,9 +1621,10 @@ lx_station_say(void)
 	struct lx_radio *radio = the_radio;
 
 	if (radio != NULL) {
-		printf("lx: the network is %s: %u frames sent (%u could not be), %u received for us and %u sent to everybody; %u "
-		    "messages of the handshake\n", radio->joined ? "joined" : "NOT joined", radio->sent, radio->sent_lost, radio->received,
-		    radio->received_group, radio->eapol);
+		lx_tell("lx: the network is %s, %llu s after it was joined: %u frames sent (%u could not be), %u received for us and "
+		    "%u sent to everybody; %u messages of the handshake, the group's key changed %u times\n", radio->joined ? "joined" :
+		    "NOT joined", radio->joined_at != 0 ? (lx_os_nanoseconds() - radio->joined_at) / 1000000000ull : 0, radio->sent,
+		    radio->sent_lost, radio->received, radio->received_group, radio->eapol, radio->rekeys);
 	}
 }
 
@@ -1636,7 +1640,7 @@ lx_station_leave(void)
 	lx_station_say();
 	if (radio->sta != NULL) {
 		station_leave(radio, radio->joined ? IEEE80211_STA_AUTHORIZED : IEEE80211_STA_ASSOC);
-		printf("lx: the network is left\n");
+		lx_tell("lx: the network is left\n");
 	}
 	station_down(radio);
 }

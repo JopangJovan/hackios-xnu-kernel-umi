@@ -156,7 +156,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
 	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory)
-	cp com.redwood.demo.plist root/LaunchDaemons/
+	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu

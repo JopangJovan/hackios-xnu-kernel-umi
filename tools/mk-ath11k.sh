@@ -177,8 +177,8 @@ for s in $(cat out/undefined.txt); do
 done
 [ -z "$missing" ] || exit 1
 $CC -c out/stubs.s -o out/stubs.o
-# three names are shown: where the kernel enters (lx_start(), lx_stop() and lx_transmit() of redwood_lx.h)
-printf '_lx_start\n_lx_stop\n_lx_transmit\n' > out/exported.txt
+# four names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop() and lx_transmit() of redwood_lx.h)
+printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n' > out/exported.txt
 $LD -r -arch arm64 -exported_symbols_list out/exported.txt out/all.o out/stubs.o -o out/ath11k.o 2> out/ld.err ||
 	{ cat out/ld.err; exit 1; }
 rm -f out/all.o
