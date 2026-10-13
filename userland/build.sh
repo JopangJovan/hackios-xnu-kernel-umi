@@ -165,6 +165,12 @@ if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
 fi
+# ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
+# (bsd/dev/redwood_wifi.c; 7.6 MB)
+if [ -f ../fw-wifi/wpss.mdt ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-wifi/wpss.mdt ../fw-wifi/wpss.b0[2-9] root/fw/
+fi
 ../mkpackfs.py -o root.packfs root
 
 # --- the system image -----------------------------------------------------------------------------
