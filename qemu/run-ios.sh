@@ -7,6 +7,10 @@
 #      QEMU_RAM_GB=<n>     the guest's RAM, default 7: memory then ends where the phone's does and the
 #                          kernel gets the same 4.2 GB window (the system image included) as on the phone.
 #                          The host needs about 2.5 GB per running instance.
+#      QEMU_NET=1          with a network: a virtio network device, behind it QEMU's own "user" network
+#                          (it hands out an address by DHCP, answers DNS and passes connections on to
+#                          this machine's network; no privileges needed). The kernel makes en0 of it
+#                          (boot-arg virtio_net=1, added here); see userland/src/net_test.m for the rest.
 #      QEMU_INSTANCE=<n>   to run several at once: each number has its own monitor and QMP ports
 #                          (4444 + 10n, 4445 + 10n); the file qemu/instance sets it for a working copy.
 #                          touch.py, screendump.sh and stop.sh follow the same rule.
@@ -49,11 +53,16 @@ while done < total:
     done += os.copy_file_range(src, dst, total - done, done, offset + done)
 PY
 fi
+NET=()
+if [ -n "$QEMU_NET" ] && [ "$QEMU_NET" != 0 ]; then
+	NET=(-netdev user,id=net0 -device virtio-net-device,netdev=net0)
+	CMDLINE="virtio_net=1 $CMDLINE"
+fi
 xnuloader/mkpayload.py -o qemu/payload.bin kernel=$K ramdisk=$ROOT --rdres "$(printf '%x' "$(stat -c %s "$IMG")")" \
 	--cmdline "loader_return_after=$SECS epoch=$(date +%s) virtio_input=1 $CMDLINE" >/dev/null || exit 1
 QEMU_MEM=${RAM_GB}G exec qemu/run.sh $((SECS + 40)) \
 	-object memory-backend-file,id=ram,size=$RAM_SIZE,mem-path="$PWD/qemu/ram.img",share=off \
 	-machine memory-backend=ram \
-	-global virtio-mmio.force-legacy=false -device virtio-tablet-device -device virtio-keyboard-device \
+	-global virtio-mmio.force-legacy=false -device virtio-tablet-device -device virtio-keyboard-device "${NET[@]}" \
 	-device ramfb -monitor tcp:127.0.0.1:$((4444 + 10 * INSTANCE)),server,nowait \
 	-qmp tcp:127.0.0.1:$((4445 + 10 * INSTANCE)),server,nowait "$@"
