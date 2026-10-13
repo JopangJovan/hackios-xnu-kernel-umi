@@ -12,10 +12,14 @@
 четырёх ядрах. Отрисовка самим Adreno телефона уже работает в опытном виде — см. раздел «GPU».
 
 <p>
-<img src="docs/lockscreen.png" width="230" alt="Экран блокировки">
-<img src="docs/homescreen.png" width="230" alt="Домашний экран">
-<img src="docs/settings.png" width="230" alt="Настройки → Об этом устройстве">
+<img src="docs/lockscreen.jpg" width="200" alt="Экран блокировки">
+<img src="docs/homescreen.jpg" width="200" alt="Домашний экран: обои iOS 16 и виджеты">
+<img src="docs/control-center.jpg" width="200" alt="Пункт управления">
+<img src="docs/settings.jpg" width="200" alt="Настройки">
 </p>
+
+Снимки сняты с телефона 13 октября 2026 г. (рисует Adreno, `gpu=1`); остальные — в разделе
+[«Снимки экрана»](#снимки-экрана).
 
 ## Что работает и чего нет
 
@@ -196,6 +200,41 @@ CoreAnimation; если GPU не запустился, в журнале одн�
 Прерываний нет (ожидание опросом). GPU выключается при любом штатном конце сеанса (таймер, `./xl stop`, пять
 пальцев); после паники следующий запуск сам останавливает его и запускает заново. Приложения, использующие Metal
 сами, от этого ничего не получают.
+
+## Снимки экрана
+
+Всё снято с экрана телефона за один сеанс: образ `GL=1 REST=1`, запуск с `gpu=1`, касания подаёт сценарий
+(`rwtouch`). Приложения открываются впервые, поэтому у многих на снимке приветственный лист.
+
+<p>
+<img src="docs/lockscreen.jpg" width="180" alt="Экран блокировки">
+<img src="docs/homescreen.jpg" width="180" alt="Домашний экран">
+<img src="docs/homescreen-2.jpg" width="180" alt="Вторая страница домашнего экрана">
+<img src="docs/control-center.jpg" width="180" alt="Пункт управления">
+<img src="docs/search.jpg" width="180" alt="Поиск и клавиатура">
+</p>
+<p>
+<img src="docs/settings.jpg" width="180" alt="Настройки">
+<img src="docs/settings-general.jpg" width="180" alt="Настройки → Основные">
+<img src="docs/calendar.jpg" width="180" alt="Календарь">
+<img src="docs/clock.jpg" width="180" alt="Часы">
+<img src="docs/phone.jpg" width="180" alt="Телефон">
+</p>
+<p>
+<img src="docs/wallet.jpg" width="180" alt="Wallet">
+<img src="docs/messages.jpg" width="180" alt="Сообщения">
+<img src="docs/health.jpg" width="180" alt="Здоровье">
+<img src="docs/news.jpg" width="180" alt="News">
+<img src="docs/reminders.jpg" width="180" alt="Напоминания">
+</p>
+<p>
+<img src="docs/music.jpg" width="180" alt="Музыка">
+<img src="docs/maps.jpg" width="180" alt="Карты">
+</p>
+
+Что на них не так: на экране блокировки поверх обоев красная пелена (слои часов рисуются неверно, в работе);
+виджет «Погода» и магазины пусты, потому что нет сети. `docs/settings-about-qemu.png` — более старый снимок
+«Об этом устройстве» из QEMU.
 
 ## Сборка из исходников
 
