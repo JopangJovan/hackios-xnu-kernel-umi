@@ -62,6 +62,7 @@ xnu-deps/setup.sh        # ~30 с: исходники зависимостей, 
 | `bsd/kern/kern_minimac.c`, `libkern/amfi/` | заглушки AMFI и Sandbox (MAC-политики), права из подписи программы |
 | `bsd/dev/redwood_input.c`, `redwood_goodix.c`, `redwood_virtio_input.c` | ввод: `/dev/redwood-touch`, драйвер Goodix GT9916 (SPI бит-бангом по GPIO), virtio-input для QEMU |
 | `bsd/dev/redwood_cpufreq.c` | частота процессора (Qualcomm EPSS) |
+| `bsd/dev/redwood_net.c`, `bsd/sys/redwood_net.h`, `redwood_virtio_net.c` | сетевой интерфейс `en0` через сетевой KPI ядра (без IONetworkingFamily) и граница между ним и тем, что носит кадры («линк»: три функции в `redwood_net.h`); первый линк — virtio-net для QEMU |
 | `bsd/dev/redwood_adreno.c`, `iokit/Kernel/RedwoodGPU.cpp` | GPU телефона (Adreno 642L): пошаговое включение (`adreno=N`: питание, GMU, zap-шейдер, микрокод), буферы и очередь команд; клиент IOKit с подмножеством msm DRM для Mesa |
 | `bsd/pthread/pthread_kext_static.c` | pthread kext, слинкованный в ядро |
 
