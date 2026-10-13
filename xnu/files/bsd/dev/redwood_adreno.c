@@ -1,14 +1,19 @@
 /*
  * The GPU of the POCO X5 Pro (redwood), an Adreno 642L, woken step by step up to a picture that
- * it fills and the panel shows. Only with boot-arg adreno=N: every address below belongs to this
- * phone.
+ * it fills and the panel shows. Every address below belongs to this phone, and nothing here is
+ * touched unless a boot-arg asks for it.
  *
- * Nothing in this system uses the GPU yet, and how much of it a kernel under Qualcomm's
- * hypervisor may reach is not known: an access the hypervisor does not like ends the run, at
- * once or a quarter of a minute later, and often without a word. So this finds out in small
- * steps. adreno=N performs steps 1 to N and stops; a step says what it is about to touch before
- * it touches it and what it found after, reads come before writes, and a step that does not find
- * what it needs ends the sequence instead of going on blind.
+ * Boot-arg gpu=1, on the phone and with the GPU's firmware in the small image: the GPU is
+ * started while the system starts and kept for the window server to draw with (the service
+ * RedwoodGPU; "the GPU kept on" below). Should a step fail, one line says which, and the system
+ * draws in software as it does without the boot-arg.
+ *
+ * The steps are how this was found out, and they stay for looking: how much of the GPU a kernel
+ * under Qualcomm's hypervisor may reach was not known, and an access the hypervisor does not
+ * like ends the run, at once or a quarter of a minute later, and often without a word. adreno=N
+ * performs steps 1 to N and stops; a step says what it is about to touch before it touches it
+ * and what it found after, reads come before writes, and a step that does not find what it
+ * needs ends the sequence instead of going on blind.
  *
  *   1  reads   what feeds the GPU from outside: its clocks in the global clock controller, and
  *              the names RPMh knows its supplies by
@@ -38,8 +43,8 @@
  *              registers are then read
  *  18  writes  the 3D core's translation context, with its ring and its microcode
  *              (fw/a660_sqe.fw) in it
- *  19  asks    TrustZone to load the zap shader for good (once in the life of a started phone:
- *              adreno_zap=0 in the runs after)
+ *  19  asks    TrustZone to load the zap shader (and first to give up the one a kernel before
+ *              this one may have left; the stop at the end of a run asks for that too)
  *  20  writes  the 3D core's registers; starts its command processor and gives it its first
  *              command
  *  21  commands the 3D core out of secure mode, and to write a word into a page of ours
@@ -64,7 +69,6 @@
  *   adreno_keep=1      with adreno=21: the GPU is not stopped again but kept for the system to draw
  *                      with, through the service RedwoodGPU (see "the GPU kept on" below); it is
  *                      given back when the run ends (adreno_dirty=1: left as a panic leaves it)
- *   adreno_zap=0       step 19 has been done since the phone started: not again
  *   adreno_speed=N     step 17 asks the GMU for the 3D core's Nth speed: 1 315 MHz, 2 450 MHz,
  *                      3 550 MHz (the default: the most this phone's GPU is rated for)
  *   adreno_blind=1     step 20 starts the command processor with its microcode nowhere, and
@@ -75,7 +79,7 @@
  *                      the machine is still alive, and what was written last
  *   adreno_return=1    when all is over, go back to the loader instead of starting the system
  *   display_probe=1    before any step: read what the firmware left the display controller
- *                      doing (display_probe() below; one clock is turned on, nothing else written)
+ *                      doing (display_probe() below; two clocks are turned on, nothing else written)
  * The system does not go on starting until all of this is over, so that the end of the log is
  * ours; the touch screen driver's start would talk across it (leave touchscreen=1 out).
  *
@@ -1504,6 +1508,7 @@ space_off(struct gpu_space *space, uint32_t match)
 #define SCM_IS_CALL_AVAILABLE   SCM_CALL(6, 1)
 #define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
 #define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
+#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
 #define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
 #define SCM_ONE_VALUE           1                       /* the word describing the arguments: one, a plain number */
 #define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)            /* two: a number, and the address of memory it may read and write */
@@ -1621,6 +1626,8 @@ image_entry(const uint8_t *image, const struct packfs_super *super, const struct
  * the start that image is the root if there is no system image, and not mounted at all if there
  * is one (it is /dev/md1 then; see userland/src/stage0.c).
  */
+static bool image_asked_quietly;        /* image_file() says nothing: is the file there at all */
+
 static const uint8_t *
 image_file(const char *directory, const char *name, uint64_t *size)
 {
@@ -1646,14 +1653,18 @@ image_file(const char *directory, const char *name, uint64_t *size)
 		file = image_entry((const uint8_t *)base, super, file, name);
 		if (file != NULL && S_ISREG(file->pd_mode) && !(file->pd_flags & PACKFS_F_CHUNKED) &&
 		    file->pd_data + file->pd_size <= super->ps_image_size) {
-			printf("adreno: %u: %s/%s: %llu bytes in the image of /dev/md%d\n", step, directory, name, file->pd_size,
-			    disk);
+			if (!image_asked_quietly) {
+				printf("adreno: %u: %s/%s: %llu bytes in the image of /dev/md%d\n", step, directory, name, file->pd_size,
+				    disk);
+			}
 			*size = file->pd_size;
 			return (const uint8_t *)base + file->pd_data;
 		}
 	}
-	printf("adreno: %u: no %s/%s in the small image: put the phone's /vendor/firmware/%s into fw-gpu/ and run "
-	    "userland/build.sh\n", step, directory, name, name);
+	if (!image_asked_quietly) {
+		printf("adreno: %u: no %s/%s in the small image: put the phone's /vendor/firmware/%s into fw-gpu/ and run "
+		    "userland/build.sh\n", step, directory, name, name);
+	}
 	return NULL;
 }
 
@@ -2637,14 +2648,33 @@ step_core_space(void)
  * one segment (the file a660_zap.b02, relocatable: at the start of that memory) is put there,
  * and TrustZone is asked to authenticate it and run it. The vendor's driver does this before it
  * starts the 3D core's command processor (a6xx_rb_start: a6xx_microcode_load), Linux after;
- * this phone's own order is kept. It is done once in the life of a started phone: afterwards
- * the memory is TrustZone's, and nothing here can see whether that is so. Our kernels come and
- * go without the phone restarting: boot-arg adreno_zap=0 says an earlier run has done it.
+ * this phone's own order is kept. Once that is done the memory is TrustZone's, and nothing
+ * here can see whether it is so; to write there again would be the end of the run. Our kernels
+ * come and go without the phone restarting, so a kernel leaves no zap shader behind: when it
+ * gives the GPU back it has TrustZone take the shader away again (gpu_block_stop(); the
+ * vendor's driver does the same when it is unloaded: kgsl_zap_shader_unload), and the next one
+ * loads it as if the phone had just started. A kernel that did not end in order cannot have
+ * done that. So the same request is made here first: TrustZone answers it with success whether
+ * it had a shader or not, and hands the memory back cleared (it then reads as zeroes). Should
+ * it ever refuse, and then refuse the header or the place too, that is taken to mean that it
+ * has a zap shader from before and keeps it: it is used as it is, and nothing is written.
+ * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
+ * boot-arg adreno_zap=0 for the second and later runs of a started phone; nothing reads it now.
  */
 #define ZAP_MEMORY              0x8b71a000ull
 #define ZAP_MEMORY_SIZE         0x2000u
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
+
+/* TrustZone is to give the zap shader up, and its memory with it. */
+static bool
+zap_unload(void)
+{
+	uint64_t answer = ~0ull;
+
+	return scm("to give up the zap shader", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_GPU, 0, 0, &answer) == 0 &&
+	       answer == 0;
+}
 
 static bool
 step_zap_load(void)
@@ -2652,42 +2682,40 @@ step_zap_load(void)
 	const uint8_t *segment;
 	volatile uint8_t *memory;
 	uint64_t size = 0, header = 0, answer = ~0ull;
-	uint32_t load = 1;
 
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
-	PE_parse_boot_argn("adreno_zap", &load, sizeof(load));
-	if (!load) {
-		printf("adreno: %u: told that the zap shader is loaded already (adreno_zap=0)\n", step);
-		zap_is_loaded = true;
-		return true;
-	}
-	announce("find the zap shader's code, fw/a660_zap.b02, and look at the memory reserved for it (0x8b71a000: memory "
-	    "outside what this kernel was given; read only)");
+	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
+	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
+	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
 	segment = image_file("fw", "a660_zap.b02", &size);
 	if (segment == NULL || size == 0 || size > 0x1000) {
 		return false;
 	}
-	memory = (volatile uint8_t *)ml_io_map_wcomb(ZAP_MEMORY, ZAP_MEMORY_SIZE);
-	printf("adreno: %u: the reserved memory begins %02x %02x %02x %02x, the zap shader %02x %02x %02x %02x\n", step,
-	    memory[0], memory[1], memory[2], memory[3], segment[0], segment[1], segment[2], segment[3]);
-
-	announce("hand the zap shader's header to TrustZone, tell it where the image goes, put the image there (the first "
-	    "write to that memory), and ask TrustZone to authenticate and run it");
+	announce("hand the zap shader's header to TrustZone, tell it where the image goes, put the image there, and ask "
+	    "TrustZone to authenticate and run it");
 	if (!zap_header(&header)) {
 		return false;
 	}
 	if (scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
 	    header, 0, &answer) != 0 || answer != 0) {
-		printf("adreno: %u: TrustZone does not take the signature (%#llx)\n", step, answer);
-		return false;
+		printf("adreno: %u: TrustZone does not take the signature (%#llx): TAKEN TO MEAN THAT IT KEEPS A ZAP SHADER FROM "
+		    "BEFORE, which is used as it is\n", step, answer);
+		zap_is_loaded = true;
+		return true;
 	}
 	if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY, 0x1000,
 	    &answer) != 0 || answer != 0) {
-		printf("adreno: %u: TrustZone does not take the place (%#llx)\n", step, answer);
-		return false;
+		printf("adreno: %u: TrustZone does not take the place (%#llx): TAKEN TO MEAN THAT IT KEEPS A ZAP SHADER FROM "
+		    "BEFORE, which is used as it is\n", step, answer);
+		zap_is_loaded = true;
+		return true;
 	}
+	/* (the memory is looked at only now: TrustZone has just said that it is not its own) */
+	memory = (volatile uint8_t *)ml_io_map_wcomb(ZAP_MEMORY, ZAP_MEMORY_SIZE);
+	printf("adreno: %u: the reserved memory begins %02x %02x %02x %02x, the zap shader %02x %02x %02x %02x\n", step,
+	    memory[0], memory[1], memory[2], memory[3], segment[0], segment[1], segment[2], segment[3]);
 	printf("adreno: %u: about to write %llu bytes at %#llx\n", step, size, ZAP_MEMORY);
 	snprintf(last_write, sizeof(last_write), "step %u wrote the zap shader into memory at %#llx", step, ZAP_MEMORY);
 	hold(true);
@@ -3080,6 +3108,12 @@ gpu_block_stop(void)
 		put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
 		gmu_runs = false;
 		gx_off();                               /* (a GMU that has slumbered has done it itself) */
+	}
+	if (zap_is_loaded) {
+		/* the next kernel loads its own: see step_zap_load() */
+		printf("adreno: %u: the zap shader: %s\n", step, zap_unload() ? "TrustZone has given it up" :
+		    "TRUSTZONE DOES NOT GIVE IT UP; the next kernel will find it there");
+		zap_is_loaded = false;
 	}
 	/* vendor's a6xx_rscc_sleep_sequence: the GMU's votes in RPMh are dropped, by the always-on sequencer */
 	if (rsc_awake && rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0) {
@@ -3574,10 +3608,18 @@ redwood_adreno_minute(void)
  * registers, which nobody has touched since the firmware. This reads them. Each read is behind
  * a check that what it reads has its clock: the bus clock of the display's clock controller (by
  * GCC, which answers always; the firmware leaves it off, Linux keeps it on always, and so it is
- * turned on here: the one write), in that controller the display block's power switch and bus
- * clock, then the timing of the interface the panel hangs on (Linux's dpu_hw_intf.c has the
- * registers' meaning). Every access is announced and waited for (adreno_pause), as in the
- * newest step.
+ * turned on here: one write), in that controller the display block's power switch and the bus
+ * clock of its registers (the firmware set the panel going and took that clock away again; it
+ * is turned on here: the other write, and the last), then the timing of the interface the panel
+ * hangs on (Linux's dpu_hw_intf.c has the registers' meaning) and its two counters, read twice a
+ * known time apart: how many frames a second the panel is really sent. Neither clock is turned
+ * off again. Every access is announced and waited for (adreno_pause), as in the newest step.
+ *
+ * Seen: 476 clocks a line (360 of them picture: the panel takes it compressed three to one),
+ * 2432 lines a frame of which 2400 are shown, and 119.93 frames a second: the panel runs in
+ * its 120 Hz mode, whatever is put into the framebuffer 60 times a second. The two counters
+ * count although the register that enables them reads 0; the line counter goes from 0 to 2431,
+ * 429 lines in 1.47 ms. (The first clock is found off again by the next kernel.)
  */
 static struct block dispcc = { "dispcc", 0x0af00000, 0x2000 };          /* dt: clock-controller@af00000 */
 static struct block disp_intf = { "intf1", 0x0ae36000, 0x300 };         /* dt: mdss_dsi0's mdp_intf_base */
@@ -3599,7 +3641,8 @@ static struct block disp_intf = { "intf1", 0x0ae36000, 0x300 };         /* dt: m
 static void
 display_probe(void)
 {
-	uint32_t saved_fine = fine, line, frame, shown, counting, frames[2], lines[2];
+	uint32_t saved_fine = fine, line, frame, shown, counting, frames[2], lines[2], bus;
+	uint64_t times[2];
 
 	step = newest_step = 0;
 	fine = 1;
@@ -3623,15 +3666,21 @@ display_probe(void)
 	announce("the display block's power switch and clocks, in its clock controller (0xaf00000: NOT READ BEFORE)");
 	get(&dispcc, "mdss_mdp_cbcr", DISPCC_MDSS_MDP_CBCR);
 	get(&dispcc, "mdss_pclk0_cbcr", DISPCC_MDSS_PCLK0_CBCR);
-	if (!(get(&dispcc, "mdss_core_gdscr", DISPCC_MDSS_CORE_GDSCR) & GDSC_POWER_ON) ||
-	    (get(&dispcc, "mdss_ahb_cbcr", DISPCC_MDSS_AHB_CBCR) & CBCR_OFF)) {
-		/*
-		 * (Seen: the power switch on, the display's own clock and the pixel clock running, and
-		 * the bus clock of its registers off: the firmware set the panel going and took the
-		 * clock it had spoken to the block with away. To read the timing that clock would have
-		 * to be turned on: a write to the display's clock controller, which this does not do.)
-		 */
-		printf("adreno: 0: the display block is without power or without its bus clock: nothing more is read\n");
+	if (!(get(&dispcc, "mdss_core_gdscr", DISPCC_MDSS_CORE_GDSCR) & GDSC_POWER_ON)) {
+		printf("adreno: 0: the display block is without power: nothing more is read\n");
+		goto out;
+	}
+	bus = get(&dispcc, "mdss_ahb_cbcr", DISPCC_MDSS_AHB_CBCR);
+	if (bus & CBCR_OFF) {
+		/* (seen: the power switch on, the display's own clock and the pixel clock running, this one off: 0x80000000) */
+		announce("turn the bus clock of the display block's registers on (dispcc 0xaf01050 bit 0: THE ONE WRITE THERE)");
+		put(&dispcc, "mdss_ahb_cbcr", DISPCC_MDSS_AHB_CBCR, bus | CBCR_ENABLE);
+		sleep_ms(10);
+		bus = get(&dispcc, "mdss_ahb_cbcr", DISPCC_MDSS_AHB_CBCR);
+	}
+	if (bus & CBCR_OFF) {
+		/* (Linux waits for this bit to go, and gives up if it does not: there is no clock to read the block with) */
+		printf("adreno: 0: the bus clock of the display block's registers does not run (%#x): nothing more is read\n", bus);
 		goto out;
 	}
 	announce("the timing of the interface the panel hangs on (0xae36000: NOT READ BEFORE)");
@@ -3643,17 +3692,36 @@ display_probe(void)
 	counting = get(&disp_intf, "frame_line_count_en", INTF_FRAME_LINE_COUNT_EN);
 	frames[0] = get(&disp_intf, "frame_count", INTF_FRAME_COUNT);
 	lines[0] = get(&disp_intf, "line_count", INTF_LINE_COUNT);
+	/* the two counters together, twice, a second apart by our own clock */
 	quiet = true;
-	sleep_ms(1000);
-	frames[1] = get(&disp_intf, "frame_count", INTF_FRAME_COUNT);
-	lines[1] = get(&disp_intf, "line_count", INTF_LINE_COUNT);
+	for (int i = 0; i < 2; i++) {
+		frames[i] = rd(disp_intf.base + INTF_FRAME_COUNT);
+		lines[i] = rd(disp_intf.base + INTF_LINE_COUNT);
+		absolutetime_to_nanoseconds(mach_absolute_time(), &times[i]);
+		if (rd(disp_intf.base + INTF_FRAME_COUNT) != frames[i]) {
+			i--;                            /* (a frame began between the two reads: once more) */
+			continue;
+		}
+		if (i == 0) {
+			sleep_ms(1000);
+		}
+	}
 	quiet = false;
 	if (line != 0) {
 		printf("adreno: 0: THE DISPLAY: %u lines a frame, of which %u shown, %u clocks a line (the device tree's timing "
 		    "for 120 frames a second has 2432 lines; for 60, about twice that)\n", frame / line, (shown + 1) / line, line);
 	}
-	printf("adreno: 0: the interface's counters (%s, frame_line_count_en %#x): frames %u then %u a second later, "
-	    "lines %u then %u\n", (counting & 1) ? "counting" : "not counting", counting, frames[0], frames[1], lines[0], lines[1]);
+	printf("adreno: 0: the interface's counters (frame_line_count_en %#x): frame %u line %u, then frame %u line %u %llu us "
+	    "later\n", counting, frames[0], lines[0], frames[1], lines[1], (times[1] - times[0]) / 1000);
+	if (line != 0 && frame >= line && frames[1] != frames[0] && times[1] > times[0]) {
+		/* in thousandths of a frame a second: the frames gone by, and the part of one that the lines say */
+		uint64_t per_frame = frame / line;
+		uint64_t gone = (uint64_t)(frames[1] - frames[0]) * per_frame + lines[1] - lines[0];
+		uint64_t rate = gone * 1000000000ull / per_frame * 1000 / (times[1] - times[0]);
+
+		printf("adreno: 0: THE PANEL IS SENT %llu.%03llu FRAMES A SECOND (%llu lines in that time)\n", rate / 1000, rate % 1000,
+		    gone);
+	}
 	/* where the scan is, read eight times a millisecond and a bit apart: how fast it goes down the panel */
 	for (int i = 0; i < 8; i++) {
 		uint64_t nanos;
@@ -3669,6 +3737,43 @@ out:
 }
 
 /*
+ * Boot-arg gpu=1: is this the phone, and is its GPU's firmware in the small image? Then the
+ * GPU is started and kept for the system to draw with, which is what
+ * "adreno=21 adreno_skip=0x1c00 adreno_pause=0 adreno_keep=1" asks for at length: the steps
+ * that only look (10 to 12) left out, no pauses, no watch. Anywhere else -- QEMU, whose machine
+ * has its peripherals elsewhere -- not one register of the above is touched.
+ */
+#define REDWOOD_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin (its "redwood") */
+
+extern vm_offset_t pe_arm_get_soc_base_phys(void);
+
+static bool
+start_by_itself(void)
+{
+	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+	const char *missing = NULL;
+	uint64_t size;
+
+	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
+		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phone, and this is not it\n");
+		return false;
+	}
+	image_asked_quietly = true;
+	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]) && missing == NULL; i++) {
+		if (image_file("fw", files[i], &size) == NULL) {
+			missing = files[i];
+		}
+	}
+	image_asked_quietly = false;
+	if (missing != NULL) {
+		printf("adreno: THE GPU IS NOT STARTED: the small image has no fw/%s (the phone's /vendor/firmware/%s goes into "
+		    "fw-gpu/); the system draws with its software renderer\n", missing, missing);
+		return false;
+	}
+	return true;
+}
+
+/*
  * Called while the system starts, before there is a root file system, and the start waits: for
  * as long as the steps and the watch after them last, nothing else writes to the log, so that
  * its end -- all that the loader's notes keep -- is about what is being done here.
@@ -3676,9 +3781,29 @@ out:
 void
 redwood_adreno_init(void)
 {
-	uint32_t only = 0, done = 0;
+	static const char *const what[] = {
+		"", "the clocks outside", "the fuses", "the clock controller", "the CX half's power", "the clocks", "the first words",
+		"the GMU's RPMh sequencer", "the SMMU", "an SMMU context", "the GMU's memory", "TrustZone", "the zap shader's header",
+		"the GMU's address space", "the GMU's firmware", "the GMU's start", "the GMU's message queues", "the 3D core's power",
+		"the 3D core's address space", "the zap shader", "the 3D core's start", "the 3D core's first commands", "a frame"
+	};
+	uint32_t only = 0, done = 0, failed = 0, keep = 0;
+	bool by_itself = false;
 
-	PE_parse_boot_argn("adreno", &last_step, sizeof(last_step));
+	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
+		display_probe();
+	}
+	if (!PE_parse_boot_argn("adreno", &last_step, sizeof(last_step))) {
+		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) || !start_by_itself()) {
+			return;
+		}
+		by_itself = true;
+		last_step = 21;
+		skip_steps = 1u << 10 | 1u << 11 | 1u << 12;
+		pause_ms = 0;
+		watch_seconds = 0;
+		keep = 1;
+	}
 	PE_parse_boot_argn("adreno_skip", &skip_steps, sizeof(skip_steps));
 	if (PE_parse_boot_argn("adreno_only", &only, sizeof(only)) && only > 0 && only <= STEPS) {
 		last_step = only;
@@ -3686,11 +3811,8 @@ redwood_adreno_init(void)
 	}
 	PE_parse_boot_argn("adreno_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("adreno_fine", &fine, sizeof(fine));
-	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
-		display_probe();
-	}
 	if (last_step == 0) {
-		return;
+		return;                                 /* (adreno=0: the GPU is left alone) */
 	}
 	if (last_step > STEPS) {
 		last_step = STEPS;
@@ -3707,12 +3829,14 @@ redwood_adreno_init(void)
 		}
 		if (!steps[step - 1]()) {
 			printf("adreno: step %u: FAILED; the steps after it are not attempted\n", step);
+			failed = step;
 			break;
 		}
 		printf("adreno: step %u: done\n", step);
 		done = step;
 	}
-	if (PE_parse_boot_argn("adreno_keep", &only, sizeof(only)) && only) {
+	PE_parse_boot_argn("adreno_keep", &keep, sizeof(keep));
+	if (keep) {
 		if (done >= 21 && core_runs) {
 			gpu_free[0].start = GPU_ADDRESSES_START;
 			gpu_free[0].size = GPU_ADDRESSES_SIZE;
@@ -3722,11 +3846,18 @@ redwood_adreno_init(void)
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
 			gpu_kept = true;
 			quiet = true;
-			printf("adreno: THE GPU STAYS ON for the system to draw with (adreno_keep): the service RedwoodGPU\n");
+			printf("adreno: THE GPU STAYS ON for the system to draw with: the service RedwoodGPU\n");
 			RedwoodGPUStart();
 			return;
 		}
-		printf("adreno: not kept: the steps did not get as far as a 3D core that takes commands\n");
+		if (!by_itself) {
+			printf("adreno: not kept: the steps did not get as far as a 3D core that takes commands\n");
+		}
+	}
+	if (by_itself) {
+		/* (one line for whoever wonders why the picture is drawn slowly; the steps' own lines are above it) */
+		printf("adreno: THE GPU IS NOT STARTED: step %u (%s) failed; the system draws with its software renderer\n",
+		    failed != 0 ? failed : 21, what[failed != 0 && failed <= STEPS ? failed : 21]);
 	}
 	/*
 	 * Punishment for a write may come late (a reset some 17 seconds after it has been seen):
