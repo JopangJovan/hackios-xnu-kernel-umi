@@ -344,13 +344,26 @@ packfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx
 		vol_capabilities_attr_t *cap = &fsap->f_capabilities;
 
 		bzero(cap, sizeof(*cap));
+		/*
+		 * A node's number is its place in the image and never changes, and packfs_vget()
+		 * finds a node by it, with its name and parent: that is "persistent object IDs"
+		 * and "path from ID". The second is not a nicety. It is what makes the VFS layer
+		 * answer fsgetpath(2) and /.vol paths for this volume, and without it
+		 * CoreFoundation has no file ID to give for any file here (_NSURLFileIDKey).
+		 * LaunchServices takes a file without one for unreachable: it then never reads
+		 * a program to see which platform it is built for, registers every application
+		 * and extension as of platform 0, and no extension belongs to an extension point
+		 * any more (pkd: "Candidate plugin count from LaunchServices: 0").
+		 */
 		cap->capabilities[VOL_CAPABILITIES_FORMAT] =
+		    VOL_CAP_FMT_PERSISTENTOBJECTIDS |
 		    VOL_CAP_FMT_SYMBOLICLINKS |
 		    VOL_CAP_FMT_NO_ROOT_TIMES |
 		    VOL_CAP_FMT_CASE_SENSITIVE |
 		    VOL_CAP_FMT_CASE_PRESERVING |
 		    VOL_CAP_FMT_FAST_STATFS |
-		    VOL_CAP_FMT_2TB_FILESIZE;
+		    VOL_CAP_FMT_2TB_FILESIZE |
+		    VOL_CAP_FMT_PATH_FROM_ID;
 		cap->capabilities[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_ADVLOCK |
 		    VOL_CAP_INT_FLOCK;
