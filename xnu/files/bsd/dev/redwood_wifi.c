@@ -102,6 +102,12 @@
  *   wifi_return=1      when all is over, go back to the loader instead of starting the system
  *   wifi_smmu=1        before any step: read what the boot chain has set up in the SMMU for the
  *                      radio's stream (smmu_look() below; nothing is written)
+ *   wifi_smmu=2        ... and give that stream a context of the SMMU with page tables of ours,
+ *                      so that the radio can be shown memory (radio_space_on() below: THE
+ *                      SMMU IS WRITTEN); taken back when the DSP is stopped
+ *   wifi_lx=1          step 15 is ath11k's own instead of the stand-in (redwood_lx.c), with
+ *                      the radio's registers neither read nor written; 2: for real (which
+ *                      wants wifi_smmu=2: the radio is given addresses of its rings)
  * The system does not go on starting until all of this is over, so that the end of the log is
  * ours.
  *
@@ -1626,6 +1632,8 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
  * (it takes the image's memory back, cleared), and the always-on processor to know that the
  * image is gone: it was told of one by us, or by the kernel that left the DSP running.
  */
+static void radio_space_off(void);
+
 static bool
 dsp_shutdown(const char *why)
 {
@@ -1648,6 +1656,7 @@ dsp_shutdown(const char *why)
 	doorbells();
 	dsp_started = false;
 	mailbox_send("{class: image, res: load_state, name: wpss, val: off}");
+	radio_space_off();                      /* (nobody is left to use the radio's stream) */
 	return true;
 }
 
@@ -3102,11 +3111,52 @@ redwood_wifi_file(const char *name, uint64_t *size)
 	return image_file(name, size);
 }
 
+static void radio_space_faults(void);
+
+/*
+ * With wifi_lx: ath11k itself in place of the stand-in. Its qmi.c has the exchange, core.c asks
+ * for mission mode with the configuration ce.c and hal.c work out (the shadow registers), has
+ * them set the copy engines' rings up in the radio's registers and waits for the firmware's
+ * first message over a copy engine; how far the parts built so far go from there, and what is
+ * in their place meanwhile, is wifi/lx/src/lx_bus.c's to say. wifi_lx=2 IS WHERE THE RADIO'S
+ * REGISTERS ARE WRITTEN.
+ *
+ * What the phone said (13 October, ath11k of Linux 7.0.14: core.c, hal.c, qmi.c, ce.c, hw.c,
+ * fw.c): with wifi_lx=1 the driver's own exchange runs to the end in 9 s -- capabilities, the
+ * regulatory database in 4 pieces and the board's file in 10, cold-boot calibration (7 s),
+ * "ready", the configuration with the 30 shadow registers the driver works out, mission mode
+ * -- and the mode "off" when the driver winds down. With wifi_lx=2 and wifi_smmu=2, 100 words
+ * of ring set-up go into the registers of copy engines 0, 1, 2, 3, 4, 5 and 7 without an
+ * abort, 510 buffers are posted on each of the three receiving rings, and 9 ms later the
+ * firmware's first message is in a buffer of copy engine 2: HTC's "ready" (2 credits of 2176
+ * bytes, 5 endpoints). The SMMU records no fault. No interrupt is involved: the rings are
+ * looked at every millisecond.
+ */
+static bool
+step_driver(uint32_t how)
+{
+	int error;
+
+	announce(how >= 2 ? "hand the radio to ath11k itself: its exchange with the firmware up to mission mode, then THE RADIO'S "
+	    "REGISTERS ARE WRITTEN, by ce.c and hal.c: the copy engines' rings (every write is said as it is made)" :
+	    "hand the firmware to ath11k itself: its own exchange up to mission mode; the radio's registers are neither read "
+	    "nor written (wifi_lx=1), and nothing is written but datagrams");
+	error = redwood_lx_start();
+	radio_space_faults();
+	printf("wifi: %u: the driver's start returns %d\n", step, error);
+	return error == 0;
+}
+
 static bool
 step_exchange(void)
 {
+	uint32_t driver = 0;
+
 	if (!glink.open) {
 		return false;
+	}
+	if (PE_parse_boot_argn("wifi_lx", &driver, sizeof(driver)) && driver) {
+		return step_driver(driver);
 	}
 	announce("have the exchange a WCN6750's driver has with the Wi-Fi firmware's service before it touches the radio, by "
 	    "hand in ath11k's order (redwood_wlfw.c): indications, capabilities both ways, the regulatory database and the "
@@ -3280,7 +3330,8 @@ step_qrtr(void)
  * its stream match registers cover that stream. Nothing is written.
  */
 static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
-#define SMMU_SCR0               0x000           /* bit 0: the whole SMMU off; bit 10: a stream nobody matches faults */
+#define SMMU_SCR0               0x000           /* bit 0: the whole SMMU off; bit 10: a stream nobody matches faults; bit 3:
+	                                         * streams are numbered with 16 bits */
 #define SMMU_IDR0               0x020           /* [7:0] stream match registers */
 #define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */
 #define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
@@ -3306,8 +3357,8 @@ smmu_look(void)
 	    matches, idr1 & 0xff, scr0 & 1u << 10 ? "faults" : "passes untranslated");
 	for (uint32_t n = 0; n < matches && 0x800 + 4 * n < 0xc00; n++) {
 		uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n)), s2cr = rd(apps_smmu.base + SMMU_S2CR(n));
-		/* with 16-bit stream numbers switched on (scr0 bit 15) "valid" moves from bit 31 of the one to bit 10 of the other */
-		uint32_t wide = scr0 & 1u << 15, stream = smr & (wide ? 0xffff : 0x7fff), mask = (smr >> 16) & (wide ? 0xffff : 0x7fff);
+		/* with 16-bit stream numbers switched on "valid" moves from bit 31 of the one to bit 10 of the other */
+		uint32_t wide = scr0 & 1u << 3, stream = smr & (wide ? 0xffff : 0x7fff), mask = (smr >> 16) & (wide ? 0xffff : 0x7fff);
 
 		if (!(wide ? s2cr & 1u << 10 : smr >> 31)) {
 			continue;
@@ -3322,6 +3373,373 @@ smmu_look(void)
 	}
 	printf("wifi: 0: %u of the %u match registers are in use; %u cover stream %#x%s\n", valid, matches, covering, RADIO_STREAM,
 	    covering ? "" : ": THE BOOT CHAIN HAS SET NOTHING UP FOR THE RADIO'S STREAM");
+}
+
+/* ---- beside the steps: the radio's view of memory (boot-arg wifi_smmu=2) ----------------------------- */
+
+/*
+ * The boot chain sets nothing up for the radio's stream, and a stream nobody matches faults
+ * (smmu_look()): before the radio can be given the address of a ring, the stream needs a match
+ * register, a translation context and page tables, as redwood_adreno.c makes them in the GPU's
+ * own SMMU -- there are the formats and the order of programming, and what the hypervisor does
+ * with the global registers. Here they are found rather than known: the first match register
+ * that is not valid, and the lowest context that no valid match register sends a stream
+ * through and that is not switched on (Linux, too, takes the lowest free ones, on top of what
+ * the boot chain left: dt "qcom,skip-init").
+ *
+ * The radio's addresses are where Android's tree puts them (dt: qcom,iommu-dma-addr-pool of
+ * qcom,wcn6750: 256 MB from 0xa0000000), handed out upwards and never taken back; its faults
+ * are recorded and do not stop it (dt: qcom,iommu-faults "stall-disable", "HUPCF"), and nobody
+ * takes their interrupt: radio_space_faults() looks.
+ *
+ * Everything written is put back when the DSP has been stopped, and on the way back to the
+ * loader after a panic (radio_space_off()).
+ *
+ * What the phone said (13 October): the hypervisor grants it. The boot chain uses match
+ * registers 0 to 7 and contexts 0 to 6; register 8 and context 7 (at 0x15087000) were taken,
+ * everything read back as written (but two bits that the SMMU does not keep), and the radio
+ * then read and wrote the memory it was shown without a fault.
+ */
+#define RADIO_ADDRESSES         0xa0000000ull
+#define RADIO_ADDRESSES_SIZE    0x10000000u
+#define RADIO_TABLES            16              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
+#define RADIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11) /* a page; for requests of either
+	                                                                                  * privilege; shared, accessed, not
+	                                                                                  * global: Linux's for a device */
+#define PTE_ADDRESS             0x0000fffffffff000ull
+#define SMMU_SGFSR              0x048           /* what the SMMU as a whole has refused ... */
+#define SMMU_SGFSYNR0           0x050
+#define SMMU_SGFSYNR1           0x054           /* ... and of which stream */
+#define SMMU_CBAR(n)            (4 * (n))       /* in the second page; [17:16] kind of context */
+#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)       /* our tables alone decide; weakest defaults */
+#define SMMU_CBA2R(n)           (0x800 + 4 * (n))
+#define SMMU_CBA2R_64_BIT       1
+#define SMMU_CB_SCTLR           0x00            /* a context's own page: bit 0 = translation on */
+#define SMMU_CB_TCR2            0x10
+#define SMMU_CB_TTBR0           0x20
+#define SMMU_CB_TTBR1           0x28
+#define SMMU_CB_TCR             0x30
+#define SMMU_CB_MAIR0           0x38
+#define SMMU_CB_MAIR1           0x3c
+#define SMMU_CB_FSR             0x58
+#define SMMU_CB_FAR             0x60
+#define SMMU_CB_FSYNR0          0x68
+#define SMMU_CB_TLBIASID        0x610
+#define SMMU_CB_TLBSYNC         0x7f0
+#define SMMU_CB_TLBSTATUS       0x7f4
+/* on; faults recorded, no interrupt, and a fault does not hold up the requests after it */
+#define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 8 | 1u << 12)
+#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)   /* one table of 4K pages, cached walks */
+#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)       /* 36 bits of physical address, 16 of context tag */
+#define SMMU_MAIR0              0xf404ff44      /* Linux's: 0 uncached, 1 cached, 2 device */
+#define SMMU_FSR_ALL            0xc00001fe      /* every kind of fault, and "several" */
+
+static struct {
+	uint32_t wanted;                /* wifi_smmu */
+	bool found, on;
+	uint32_t page, pages;           /* of the SMMU's registers: a page's size, and how many before the contexts' */
+	uint32_t match, context;        /* the stream match register and the context taken for the radio */
+	uint32_t old_smr, old_s2cr, old_sctlr;
+	vm_offset_t tables;             /* RADIO_TABLES of them, the root first */
+	uint32_t table_count;
+	uint64_t next;                  /* of the radio's addresses, the first not handed out (from RADIO_ADDRESSES) */
+} radio_space;
+static struct block apps_smmu_second = { "apps smmu", 0, 0x1000 };              /* the second page: a word per context */
+static struct block apps_smmu_context = { "apps smmu, the radio's context", 0, 0x1000 };
+
+static uint64_t *
+radio_table(uint32_t n)
+{
+	return (uint64_t *)(radio_space.tables + 4096 * n);
+}
+
+/* The table an entry of a higher table leads to; made if the entry is empty. */
+static uint64_t *
+radio_next(uint64_t *entry)
+{
+	uint64_t *table;
+
+	if (*entry & 1) {
+		for (uint32_t i = 0; i < radio_space.table_count; i++) {
+			if (kvtophys((vm_offset_t)radio_table(i)) == (*entry & PTE_ADDRESS)) {
+				return radio_table(i);
+			}
+		}
+		return NULL;
+	}
+	if (radio_space.table_count == RADIO_TABLES) {
+		return NULL;
+	}
+	table = radio_table(radio_space.table_count++);
+	*entry = kvtophys((vm_offset_t)table) | 3;
+	return table;
+}
+
+/* Our memory at `physical` behind the radio's addresses from `address` on; the SMMU reads the tables from memory. */
+static bool
+radio_enter(uint64_t address, uint64_t physical, uint64_t size)
+{
+	if (radio_space.tables == 0) {
+		if (kmem_alloc(kernel_map, &radio_space.tables, round_page(4096 * RADIO_TABLES), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			return false;
+		}
+		radio_space.table_count = 1;
+	}
+	for (uint64_t offset = 0; offset < size; offset += 4096) {
+		uint64_t at = address + offset, *level2 = radio_next(&radio_table(0)[at >> 30 & 0x1ff]);
+		uint64_t *level3 = level2 == NULL ? NULL : radio_next(&level2[at >> 21 & 0x1ff]);
+
+		if (level3 == NULL) {
+			printf("wifi: %u: no page table left for the radio's %#llx\n", step, at);
+			return false;
+		}
+		level3[at >> 12 & 0x1ff] = (physical + offset) | RADIO_PTE;
+	}
+	for (vm_offset_t line = radio_space.tables; line < radio_space.tables + 4096 * RADIO_TABLES; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	settle();
+	return true;
+}
+
+/* Which match register and which context are free; nothing is written. */
+static bool
+radio_space_find(void)
+{
+	bool used[256] = { false };
+	uint32_t scr0 = get(&apps_smmu, "scr0", SMMU_SCR0), idr0 = get(&apps_smmu, "idr0", SMMU_IDR0);
+	uint32_t idr1 = get(&apps_smmu, "idr1", SMMU_IDR1), matches = idr0 & 0xff, contexts = idr1 & 0xff;
+
+	if (scr0 & 1u << 3) {
+		printf("wifi: %u: this SMMU numbers its streams with 16 bits, which nothing here is written for\n", step);
+		return false;
+	}
+	radio_space.page = idr1 >> 31 ? 0x10000 : 0x1000;
+	radio_space.pages = 2u << (idr1 >> 28 & 7);
+	if (2 * radio_space.pages * radio_space.page != 0x100000) {    /* dt: "reg" of apps-smmu */
+		printf("wifi: %u: the SMMU says it has 2 x %u pages of %#x bytes, which is not the megabyte the device tree gives "
+		    "it: its contexts are not looked for\n", step, radio_space.pages, radio_space.page);
+		return false;
+	}
+	radio_space.match = ~0u;
+	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
+		uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n)), s2cr = rd(apps_smmu.base + SMMU_S2CR(n));
+
+		if (smr >> 31) {
+			printf("wifi: %u: match register %u is in use: stream %#x mask %#x, s2cr %#x\n", step, n, smr & 0x7fff,
+			    smr >> 16 & 0x7fff, s2cr);
+			used[s2cr & 0xff] = true;
+		} else if (radio_space.match == ~0u) {
+			radio_space.match = n;
+			radio_space.old_smr = smr;
+			radio_space.old_s2cr = s2cr;
+		}
+	}
+	for (radio_space.context = 0; radio_space.context < contexts && used[radio_space.context]; radio_space.context++) {
+	}
+	if (radio_space.match == ~0u || radio_space.context >= contexts) {
+		printf("wifi: %u: the SMMU has no match register or no context left\n", step);
+		return false;
+	}
+	apps_smmu_second.phys = apps_smmu.phys + radio_space.page;
+	apps_smmu_context.phys = apps_smmu.phys + (radio_space.pages + radio_space.context) * radio_space.page;
+	printf("wifi: %u: free: match register %u (smr %#x, s2cr %#x) and context %u, whose registers are at %#x; the SMMU's "
+	    "pages are of %#x bytes, %u before the contexts'\n", step, radio_space.match, radio_space.old_smr,
+	    radio_space.old_s2cr, radio_space.context, apps_smmu_context.phys, radio_space.page, radio_space.pages);
+	get(&apps_smmu_second, "cbar", SMMU_CBAR(radio_space.context));
+	get(&apps_smmu_second, "cba2r", SMMU_CBA2R(radio_space.context));
+	radio_space.old_sctlr = get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR);
+	get(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0);
+	get(&apps_smmu_context, "fsr", SMMU_CB_FSR);
+	if (radio_space.old_sctlr & 1) {
+		printf("wifi: %u: CONTEXT %u IS SWITCHED ON although no stream is sent through it: it is somebody's, and is left "
+		    "alone\n", step, radio_space.context);
+		return false;
+	}
+	radio_space.found = true;
+	return true;
+}
+
+/* What the SMMU has recorded of requests of the radio's that it could not serve. */
+static void
+radio_space_faults(void)
+{
+	uint32_t status, global;
+
+	if (!radio_space.on) {
+		return;
+	}
+	status = rd(apps_smmu_context.base + SMMU_CB_FSR);
+	global = rd(apps_smmu.base + SMMU_SGFSR);
+	if ((status & SMMU_FSR_ALL) == 0 && global == 0) {
+		printf("wifi: %u: the SMMU has refused the radio nothing (context %u: fsr %#x; sgfsr 0)\n", step, radio_space.context,
+		    status);
+		return;
+	}
+	printf("wifi: %u: THE SMMU HAS REFUSED A REQUEST: context %u: status %#x, address %#llx, syndrome %#x; the SMMU as a whole: "
+	    "status %#x, syndromes %#x %#x (the second names the stream)\n", step, radio_space.context, status,
+	    (uint64_t)rd(apps_smmu_context.base + SMMU_CB_FAR + 4) << 32 | rd(apps_smmu_context.base + SMMU_CB_FAR),
+	    rd(apps_smmu_context.base + SMMU_CB_FSYNR0), global, rd(apps_smmu.base + SMMU_SGFSYNR0),
+	    rd(apps_smmu.base + SMMU_SGFSYNR1));
+}
+
+/* The radio's stream through a context with our tables. */
+static bool
+radio_space_on(void)
+{
+	uint32_t smr = SMMU_SMR(radio_space.match), s2cr = SMMU_S2CR(radio_space.match), sees = 1u << 31 | RADIO_STREAM_MASK << 16 |
+	    RADIO_STREAM;
+	uint64_t root = kvtophys(radio_space.tables) | (uint64_t)radio_space.context << 48;     /* tagged with the context's number */
+
+	printf("wifi: %u: THE SMMU IS ABOUT TO BE WRITTEN: context %u gets page tables of ours (root %#llx) and is switched on, and "
+	    "match register %u sends stream %#x mask %#x through it; before: smr %#x, s2cr %#x, the context's sctlr %#x\n", step,
+	    radio_space.context, root & PTE_ADDRESS, radio_space.match, RADIO_STREAM, RADIO_STREAM_MASK, radio_space.old_smr,
+	    radio_space.old_s2cr, radio_space.old_sctlr);
+	sleep_ms(pause_ms);
+	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, 0);
+	put(&apps_smmu_second, "cba2r", SMMU_CBA2R(radio_space.context), SMMU_CBA2R_64_BIT);
+	put(&apps_smmu_second, "cbar", SMMU_CBAR(radio_space.context), SMMU_CBAR_STAGE_1);
+	put(&apps_smmu_context, "tcr2", SMMU_CB_TCR2, SMMU_TCR2);
+	put(&apps_smmu_context, "tcr", SMMU_CB_TCR, SMMU_TCR_39_BITS);
+	put(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0, (uint32_t)root);
+	put(&apps_smmu_context, "ttbr0, high", SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32));
+	put(&apps_smmu_context, "ttbr1, low", SMMU_CB_TTBR1, 0);
+	put(&apps_smmu_context, "ttbr1, high", SMMU_CB_TTBR1 + 4, 0);
+	put(&apps_smmu_context, "mair0", SMMU_CB_MAIR0, SMMU_MAIR0);
+	put(&apps_smmu_context, "mair1", SMMU_CB_MAIR1, 0);
+	put(&apps_smmu_context, "fsr", SMMU_CB_FSR, SMMU_FSR_ALL);
+	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, radio_space.context);
+	put(&apps_smmu_context, "tlbsync", SMMU_CB_TLBSYNC, 1);
+	for (unsigned ms = 0; rd(apps_smmu_context.base + SMMU_CB_TLBSTATUS) & 1; ms++) {
+		if (ms == 100) {
+			printf("wifi: %u: the SMMU does not finish forgetting old translations\n", step);
+			return false;
+		}
+		sleep_ms(1);
+	}
+	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, SMMU_SCTLR_ON);
+	radio_space.on = true;                  /* (from here on there is something to take back) */
+	put(&apps_smmu, "s2cr", s2cr, radio_space.context);
+	put(&apps_smmu, "smr", smr, sees);
+
+	/* the global ones are the hypervisor's to grant: see what it made of them */
+	if (get(&apps_smmu, "smr", smr) != sees || (get(&apps_smmu, "s2cr", s2cr) & 0x300ff) != radio_space.context ||
+	    (get(&apps_smmu_second, "cbar", SMMU_CBAR(radio_space.context)) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
+	    !(get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR) & 1) ||
+	    get(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0) != (uint32_t)root ||
+	    get(&apps_smmu_context, "ttbr0, high", SMMU_CB_TTBR0 + 4) != (uint32_t)(root >> 32)) {
+		printf("wifi: %u: THE SMMU DID NOT TAKE WHAT WAS WRITTEN: stream %#x is not going through context %u\n", step,
+		    RADIO_STREAM, radio_space.context);
+		return false;
+	}
+	get(&apps_smmu_context, "tcr", SMMU_CB_TCR);
+	get(&apps_smmu_context, "tcr2", SMMU_CB_TCR2);
+	get(&apps_smmu_second, "cba2r", SMMU_CBA2R(radio_space.context));
+	get(&apps_smmu, "sgfsr", SMMU_SGFSR);
+	printf("wifi: %u: THE RADIO'S STREAM GOES THROUGH CONTEXT %u of the SMMU, with our page tables\n", step, radio_space.context);
+	radio_space_faults();
+	return true;
+}
+
+/* The stream goes nowhere again, and the context translates nothing: as they were found. */
+static void
+radio_space_off(void)
+{
+	if (!radio_space.on) {
+		return;
+	}
+	radio_space_faults();
+	printf("wifi: %u: the radio's stream and context %u of the SMMU are put back as they were found\n", step, radio_space.context);
+	put(&apps_smmu, "smr", SMMU_SMR(radio_space.match), radio_space.old_smr);
+	put(&apps_smmu, "s2cr", SMMU_S2CR(radio_space.match), radio_space.old_s2cr);
+	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, radio_space.old_sctlr);
+	get(&apps_smmu, "smr", SMMU_SMR(radio_space.match));
+	get(&apps_smmu, "s2cr", SMMU_S2CR(radio_space.match));
+	get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR);
+	radio_space.on = false;
+}
+
+/*
+ * For the driver (redwood_lx.c): memory of ours that the radio is to see, at the address
+ * returned. Without wifi_smmu=2 it has an address and the radio is shown nothing.
+ */
+bool
+redwood_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address)
+{
+	size = (size + 4095) & ~4095ull;
+	if (radio_space.next + size > RADIO_ADDRESSES_SIZE) {
+		return false;
+	}
+	*address = RADIO_ADDRESSES + radio_space.next;
+	radio_space.next += size;
+	if (radio_space.wanted != 2) {
+		printf("wifi: %u: THE RADIO IS NOT SHOWN the %llu KB of ours at %#llx that the driver will know as %#llx: that takes "
+		    "a context of the SMMU (wifi_smmu=2)\n", step, size >> 10, physical, *address);
+		return true;
+	}
+	if ((!radio_space.found && !radio_space_find()) || !radio_enter(*address, physical, size)) {
+		return false;
+	}
+	printf("wifi: %u: the radio is to see %llu KB of ours (%#llx) at %#llx\n", step, size >> 10, physical, *address);
+	if (!radio_space.on) {
+		return radio_space_on();
+	}
+	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, radio_space.context);
+	put(&apps_smmu_context, "tlbsync", SMMU_CB_TLBSYNC, 1);
+	return true;
+}
+
+/*
+ * wifi_smmu=2 in a run that does not get as far as the driver: the context is set up with empty
+ * tables, so that whatever the stream asked for would be refused as it is now, and taken back.
+ * This is the first write to this SMMU, and to see whether the hypervisor grants it.
+ */
+static void
+radio_space_try(void)
+{
+	bool as_found;
+
+	if (!radio_space_find() || !radio_enter(RADIO_ADDRESSES, 0, 0)) {
+		return;
+	}
+	as_found = radio_space_on();
+	sleep_ms(pause_ms);
+	radio_space_off();
+	printf("wifi: %u: %s\n", step, as_found ? "THE SMMU TOOK A CONTEXT FOR THE RADIO'S STREAM, and it has been taken back" :
+	    "THE SMMU DID NOT TAKE A CONTEXT FOR THE RADIO'S STREAM");
+}
+
+/* ---- for the driver (redwood_lx.c): the firmware's processor, and files ------------------------------- */
+
+bool
+redwood_wifi_dsp_is_up(void)
+{
+	printf("wifi: %u: the driver asks for the firmware's processor: it %s\n", step, dsp_started && glink.open ? "has been up "
+	    "since step 11, with the link of step 13" : "IS NOT UP");
+	return dsp_started && glink.open;
+}
+
+/*
+ * ath11k asks for files by the names Linux's firmware tree has ("ath11k/WCN6750/hw1.0/board.bin");
+ * this phone has what Android's driver loads (fw-wifi/, see userland/build.sh): its board's own
+ * data file and regulatory database, which are what the two names below stand for. The others
+ * it asks for first and can do without (a container of several boards' data, a table of the
+ * firmware's features) are not there.
+ */
+const uint8_t *
+redwood_wifi_driver_file(const char *name, uint64_t *size)
+{
+	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	const char *last = strrchr(name, '/');
+
+	last = last == NULL ? name : last + 1;
+	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+		if (strcmp(last, files[i][0]) == 0) {
+			return image_file(files[i][1], size);
+		}
+	}
+	return NULL;
 }
 
 /* ---- all of it together ---------------------------------------------------------------------------- */
@@ -3382,7 +3800,14 @@ redwood_wifi_init(void)
 		return;
 	}
 	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
-		printf("wifi: wifi=N is for the phone, and this is not it\n");
+		if (PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {
+			/* a check of what is under the driver: it gets as far as finding no firmware to talk to */
+			printf("wifi: this is not the phone; with wifi_lx the driver is started all the same, for what it does before "
+			    "it needs a radio\n");
+			printf("wifi: the driver's start returns %d\n", redwood_lx_start());
+		} else {
+			printf("wifi: wifi=N is for the phone, and this is not it\n");
+		}
 		return;
 	}
 	if (last_step > STEPS) {
@@ -3398,10 +3823,16 @@ redwood_wifi_init(void)
 
 	printf("wifi: steps up to %u; those from %u on are new and wait %u ms %s\n", last_step, new_from, pause_ms,
 	    fine ? "before every write and call" : "after each announcement");
-	if (PE_parse_boot_argn("wifi_smmu", &back, sizeof(back)) && back) {
+	if (PE_parse_boot_argn("wifi_smmu", &radio_space.wanted, sizeof(radio_space.wanted)) && radio_space.wanted) {
 		smmu_look();
+		if (radio_space.wanted == 2 && last_step < 15) {
+			uint32_t known_from = new_from;
+
+			new_from = 0;                   /* (this is new: it waits as a new step does) */
+			radio_space_try();
+			new_from = known_from;
+		}
 	}
-	back = 0;
 	for (step = 1; step <= last_step; step++) {
 		if (!steps[step - 1]()) {
 			printf("wifi: step %u: FAILED; the steps after it are not attempted\n", step);
@@ -3421,6 +3852,9 @@ redwood_wifi_init(void)
 		dsp_shutdown("the steps are over");
 	}
 	back = 0;
+	if (!dsp_started) {
+		radio_space_off();              /* (if the DSP could not be shut down in order: all the same) */
+	}
 	lck_mtx_unlock(&dsp_lock);
 	printf("wifi: over after step %u; %s\n", done, last_write);
 	if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) {
