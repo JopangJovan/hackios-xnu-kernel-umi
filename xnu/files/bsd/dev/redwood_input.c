@@ -170,5 +170,6 @@ redwood_input_init(void)
 	redwood_cpufreq_init();
 	redwood_virtio_input_init();
 	redwood_goodix_init();
+	redwood_buttons_init();
 	redwood_adreno_init();
 }

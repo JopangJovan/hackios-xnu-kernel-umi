@@ -20,6 +20,8 @@
  *     snapshot_output_format().
  *   - Where CoreAnimation draws with its software renderer (QEMU; the phone without gpu=1) the
  *     "vibrant" views draw their content as it is: see plain_vibrancy().
+ *   - A press of the side button that is long over is not taken for a long press (Siri) because
+ *     SpringBoard was busy waking the display: see lock_long_press().
  *   - Darwin notifications as a remote control, for scripts (rwtouch notify NAME):
  *       com.redwood.unlock      what the lock screen does after "swipe up to open"
  *       com.redwood.layers      write down the layers SpringBoard has on the screen: see layers()
@@ -31,6 +33,7 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -192,6 +195,63 @@ plain_vibrancy(void)
 	}
 	CFPreferencesSetAppValue(CFSTR("BSUIVibrancyEffectViewDisabled"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
 	say("redwood: SpringBoard: no GPU draws, vibrant views are plain (the lock screen's clock is white)\n");
+}
+
+/* ---- the side button's long press ---------------------------------------------------------------- */
+
+/*
+ * -[SBLockHardwareButton longPress:] is what the side button's long press recognizer calls: Siri
+ * (here, its "turn on Siri" sheet, nobody having turned it on). The recognizer is a timer of
+ * SpringBoard's own: started when the main thread sees the press, stopped when it sees the release
+ * -- and a release it has not got round to is no release. A press of the side button with the
+ * display off wakes the display from inside the handling of that very press, which on an iPhone
+ * takes no time. Here it takes as long as the software renderer needs for the first picture of the
+ * lock screen: a tenth of a second on the phone, a second under QEMU. That is longer than a long
+ * press, so there every wake by the button (and by a tap, which is a press of that button made in
+ * inject.c) ended with Siri's sheet over the lock screen, however short the press had been.
+ * Where the button's events come from -- inject.c, in backboardd -- it is known whether the button
+ * is still held; a long press of a button that is not is dropped here.
+ */
+#define GESTURE_BEGAN                   1       /* UIGestureRecognizerState */
+#define GESTURE_ENDED                   3       /* and cancelled, failed after it */
+
+static void (*original_lock_long_press)(id self, SEL selector, id recognizer);
+
+static bool
+lock_button_held(void)
+{
+	static int token = NOTIFY_TOKEN_INVALID;
+	uint64_t state = 0;
+
+	if (token == NOTIFY_TOKEN_INVALID && notify_register_check("com.redwood.button.lock", &token) != NOTIFY_STATUS_OK) {
+		token = NOTIFY_TOKEN_INVALID;
+		return true;
+	}
+	/* 1 = released; held, or not known: as SpringBoard has it */
+	return notify_get_state(token, &state) != NOTIFY_STATUS_OK || state != 1;
+}
+
+static void
+lock_long_press(id self, SEL selector, id recognizer)
+{
+	static bool dropping;
+	SEL state_selector = sel_registerName("state");
+	long state = recognizer != NULL && class_getInstanceMethod(object_getClass(recognizer), state_selector) != NULL ?
+	    ((long (*)(id, SEL))objc_msgSend)(recognizer, state_selector) : 0;
+
+	if (state == GESTURE_BEGAN) {
+		dropping = !lock_button_held();
+		if (dropping) {
+			say("redwood: SpringBoard: a long press of the side button, which was released long ago: dropped\n");
+		}
+	}
+	if (dropping) {
+		if (state >= GESTURE_ENDED) {
+			dropping = false;
+		}
+		return;
+	}
+	original_lock_long_press(self, selector, recognizer);
 }
 
 /* ---- remote control ------------------------------------------------------------------------------ */
@@ -389,9 +449,11 @@ redwood_springboard_init(void)
 	snapshot_format = replace_method_of_kind('+', "XBApplicationSnapshotManifestImpl", "_outputFormatForSnapshot:",
 	    0x1f1c91480UL, (IMP)snapshot_output_format);
 	plain_vibrancy();
-	say("redwood: SpringBoard: activation %s, setup assistant %s, application snapshots %s\n",
+	original_lock_long_press = (void (*)(id, SEL, id))replace_method("SBLockHardwareButton", "longPress:", 0x1c4f6ab44UL,
+	    (IMP)lock_long_press);
+	say("redwood: SpringBoard: activation %s, setup assistant %s, application snapshots %s, the side button's long press %s\n",
 	    activation ? "answered here" : "NOT replaced", original_set_setup_required_reason ? "refused" : "NOT replaced",
-	    snapshot_format ? "as JPEG" : "NOT changed");
+	    snapshot_format ? "as JPEG" : "NOT changed", original_lock_long_press ? "checked" : "NOT checked");
 	{
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
