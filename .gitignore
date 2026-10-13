@@ -19,6 +19,7 @@
 !/xnu-deps/
 !/uefi/
 !/prebuilt/
+!/wifi/
 
 __pycache__/
 *~
