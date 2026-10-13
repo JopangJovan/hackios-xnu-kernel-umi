@@ -82,6 +82,7 @@ static MiniIOSurface *  gSurfaceTable[MINISURF_TABLE_SIZE];     /* index = surfa
 static uint32_t         gSurfaceNext = 1;
 static uint32_t         gSurfaceCount;
 static uint64_t         gSurfaceBytes;
+static uint32_t         gSurfaceUnheld;         /* surfaces around client memory that could not be made (said a few times) */
 static uint64_t         gSurfaceLogged[2];                      /* selectors already complained about */
 /* Boot-arg surftrace=N: log the first N surfaces created (default 24). */
 static TUNABLE(uint32_t, gSurfaceTrace, "surftrace", 24);
@@ -95,6 +96,12 @@ void
 MiniIOSurface::free(void)
 {
 	OSSafeReleaseNULL(values);
+	OSSafeReleaseNULL(clientMap);
+	if (client != NULL) {
+		client->complete();
+		client->release();
+		client = NULL;
+	}
 	OSSafeReleaseNULL(memory);
 	OSObject::free();
 }
@@ -274,9 +281,10 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	}
 	/*
 	 * A surface around memory the client has already: CoreAnimation's OpenGL ES renderer makes
-	 * them around pictures it has in memory (an application's icon), to hand them to the GPU as
-	 * they are. Here the surface is one of our own with a copy of that memory in it, made now:
-	 * good for a picture that does not change, which is what these are.
+	 * them around pictures it has in memory (an application's icon, a layer's contents as the
+	 * application has drawn them), to hand them to the GPU as they are. The surface's pixels
+	 * are that memory itself, not a copy: the picture goes on being drawn into after the
+	 * surface is made, and whoever looks at the surface is to see what is there now.
 	 */
 	wrapped = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
 
@@ -387,10 +395,15 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		s->release();
 		return NULL;
 	}
-	alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
+	if (wrapped == NULL) {
+		alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
+	} else {
+		/* (the memory is as big as its owner says, and not a byte of ours is added to it) */
+		alloc = dictNumber(props, "IOSurfaceAllocSize", (uint32_t) needed);
+	}
 
 	s->memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-	    kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t) PAGE_SIZE + alloc, PAGE_SIZE);
+	    kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc), PAGE_SIZE);
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
@@ -400,15 +413,34 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	}
 	s->kbase = (uint8_t *) s->memory->getBytesNoCopy();
 	s->values = OSDictionary::withCapacity(4);
+	s->kpixels = s->kbase + PAGE_SIZE;
 	if (wrapped != NULL) {
-		uint32_t given = dictNumber(props, "IOSurfaceAllocSize", alloc);
+		s->clientTask = current_task();
+		s->clientAddress = wrapped->unsigned64BitValue();
+		IOReturn held = kIOReturnNoMemory;
 
-		if (copyin((user_addr_t) wrapped->unsigned64BitValue(), s->kbase + PAGE_SIZE, given < alloc ? given : alloc) != 0) {
-			IOLog("MiniIOSurface: the memory to make a surface around cannot be read\n");
+		/* (held for writing if it can be written, which a picture that is only shown need not be) */
+		for (unsigned attempt = 0; attempt < 2 && held != kIOReturnSuccess; attempt++) {
+			OSSafeReleaseNULL(s->client);
+			s->client = IOMemoryDescriptor::withAddressRange(s->clientAddress, alloc,
+			    attempt == 0 ? kIODirectionInOut : kIODirectionOut, s->clientTask);
+			held = s->client != NULL ? s->client->prepare() : kIOReturnNoMemory;
+		}
+		if (held == kIOReturnSuccess) {
+			s->clientMap = s->client->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
+		} else {
+			OSSafeReleaseNULL(s->client);
+		}
+		if (s->clientMap == NULL) {
+			if (gSurfaceUnheld++ < 8) {
+				IOLog("MiniIOSurface: the memory to make a surface around (%u bytes at %#llx) cannot be %s (%#x)\n", alloc,
+				    s->clientAddress, held == kIOReturnSuccess ? "seen from here" : "held", held);
+			}
 			s->release();
 			*error = kIOReturnVMError;
 			return NULL;
 		}
+		s->kpixels = (uint8_t *) s->clientMap->getVirtualAddress();
 	}
 
 	info->allocSize = alloc;
@@ -619,6 +651,7 @@ MiniIOSurfaceStart(IOService * provider)
 struct minisurf_client_ref {
 	MiniIOSurface * surface;                /* held */
 	IOMemoryMap *   map;                    /* the whole of it in the client's address space */
+	IOMemoryMap *   pixelMap;               /* ... the pixels, where those are another client's memory */
 	uint32_t        use[2];                 /* what this client added to the use counts */
 	bool            detached;               /* the client let go of it and will release shortly */
 };
@@ -770,6 +803,9 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 	bzero(ref, sizeof(*ref));
 	ref->surface = surface;
 	ref->map = map;
+	if (surface->client != NULL && surface->clientTask != fTask) {
+		ref->pixelMap = surface->client->createMappingInTask(fTask, 0, kIOMapAnywhere);
+	}
 	surfaceHold(surface);
 	return ref;
 }
@@ -784,6 +820,7 @@ IOSurfaceRootUserClient::dropRef(struct minisurf_client_ref * ref)
 	}
 	s->shared()->useCount = (uint64_t) s->useCount[1] << 32 | s->useCount[0];
 	OSSafeReleaseNULL(ref->map);
+	OSSafeReleaseNULL(ref->pixelMap);
 	*ref = fRefs[--fRefCount];
 	surfaceUnhold(s);
 }
@@ -812,7 +849,8 @@ IOSurfaceRootUserClient::returnSurface(struct minisurf_client_ref * ref, bool kn
 	memcpy(r + 1, s->planes, size - sizeof(*r));
 	r->shared = address;
 	r->aux = address + MINISURF_AUX_OFFSET;
-	r->base = known ? ~0ULL : address + PAGE_SIZE;
+	r->base = known ? ~0ULL : s->client == NULL ? address + PAGE_SIZE :
+	    ref->pixelMap != NULL ? ref->pixelMap->getAddress() : s->clientAddress;
 	args->structureOutputSize = size;
 	return kIOReturnSuccess;
 }

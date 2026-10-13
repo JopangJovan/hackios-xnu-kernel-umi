@@ -46,6 +46,7 @@ void loader_log_putc(char c);
 void loader_return(void);
 extern void redwood_adreno_quiesce(void);
 extern void redwood_adreno_stop(void);
+extern void redwood_adreno_minute(void);
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -474,6 +475,7 @@ memory_report(void)
 	    MB(memorystatus_available_pages),
 	    MB(memorystatus_available_pages_critical), MB(memorystatus_available_pages_critical_base));
 #undef MB
+	redwood_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
 }
 
 /* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */

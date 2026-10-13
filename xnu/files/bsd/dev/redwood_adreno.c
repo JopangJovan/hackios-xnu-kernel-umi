@@ -65,8 +65,8 @@
  *                      with, through the service RedwoodGPU (see "the GPU kept on" below); it is
  *                      given back when the run ends (adreno_dirty=1: left as a panic leaves it)
  *   adreno_zap=0       step 19 has been done since the phone started: not again
- *   adreno_speed=N     step 17 asks the GMU for the 3D core's Nth speed instead of the first:
- *                      1 315 MHz, 2 450 MHz, 3 550 MHz (the most this phone's GPU is rated for)
+ *   adreno_speed=N     step 17 asks the GMU for the 3D core's Nth speed: 1 315 MHz, 2 450 MHz,
+ *                      3 550 MHz (the default: the most this phone's GPU is rated for)
  *   adreno_blind=1     step 20 starts the command processor with its microcode nowhere, and
  *   adreno_stream1=N   step 18 leaves the core's second stream out (0) or gives it an empty
  *                      context of its own (2): what the SMMU then records shows what the core
@@ -75,7 +75,7 @@
  *                      the machine is still alive, and what was written last
  *   adreno_return=1    when all is over, go back to the loader instead of starting the system
  *   display_probe=1    before any step: read what the firmware left the display controller
- *                      doing (display_probe() below; nothing is written)
+ *                      doing (display_probe() below; one clock is turned on, nothing else written)
  * The system does not go on starting until all of this is over, so that the end of the log is
  * ours; the touch screen driver's start would talk across it (leave touchscreen=1 out).
  *
@@ -587,6 +587,18 @@ step_cx_power(void)
 		return false;
 	}
 	printf("adreno: %u: CX is on\n", step);
+	if (rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON) {
+		/*
+		 * The 3D core kept its power while the rest of the block lost it: an ending that went
+		 * wrong (a GMU that did not answer, before gpu_block_stop() switched the core off
+		 * itself). Such a core is where it was, in the middle of things, and does not take the
+		 * steps' commands (seen: step 21); switching it off from here has hung the whole phone
+		 * (seen once). Left alone: no GPU until the phone has been restarted.
+		 */
+		printf("adreno: %u: THE 3D CORE HAS POWER ALREADY, left on by an earlier kernel: not usable until the phone is "
+		    "restarted\n", step);
+		return false;
+	}
 	return true;
 }
 
@@ -2305,7 +2317,7 @@ step_core_power(void)
 	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
-	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 1, HFI_NO_INDEX }, granted = 0, speed = 1;
+	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
 	uint16_t gfx[16], cx[16], mx[16];
 	unsigned gfx_levels, cx_levels, mx_levels;
 
@@ -2954,22 +2966,32 @@ step_frame(void)
  * core given back, the GMU told to drop its votes ("slumber") and stopped, its RPMh channel put
  * to sleep; then the processor into reset and its stream sent nowhere.
  */
-/* What step 4 does when it finds the GPU block running: see there. Nothing here has been set up by this kernel. */
+/*
+ * The 3D core's own power switch is the GMU's to operate. Where the GMU is gone and has left it
+ * on (it is in reset; it did not answer when told to slumber), the switch is turned off from
+ * here (vendor's a6xx_gmu_suspend): a core that keeps its power while the rest of the block
+ * loses it is found by the next start as the last one left it, in the middle of things.
+ */
 static void
-stale_stop(void)
+gx_off(void)
 {
-	uint32_t gx;
+	uint32_t gx = get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
 
-	need(&gmu);
-	need(&rscc);
-	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
-	gx = get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
 	if (gx & GDSC_POWER_ON) {
-		/* the 3D core's switch is the GMU's to operate, and the GMU is gone: vendor's a6xx_gmu_suspend */
 		put(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR, gx | GDSC_SW_COLLAPSE);
 		wait_for(&gpucc, GPUCC_GX_GDSCR, GDSC_POWER_ON, 0, 100);
 		get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
 	}
+}
+
+/* What step 4 does when it finds the GPU block running: see there. Nothing here has been set up by this kernel. */
+static void
+stale_stop(void)
+{
+	need(&gmu);
+	need(&rscc);
+	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
+	gx_off();
 	if (rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0 && !(rd(rscc.base + RSCC_RSC_STATUS0_DRV0) & RSCC_ASLEEP)) {
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
 		wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 100);
@@ -2991,6 +3013,38 @@ stale_stop(void)
 	get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
 }
 
+/*
+ * The GPU block's bus interface is told to let what is under way finish and to start nothing
+ * more (Linux's a6xx_bus_clear_pending_transactions). (Without it, a core whose SMMU context is
+ * taken away under a draw leaves the SMMU waiting for good, and the CX half cannot be switched
+ * off any more: only a restart of the phone gets the GPU back.)
+ * `for_good`: the 3D core may be in the middle of a frame and nobody will tell it to stop (a
+ * panic; a core that does not come to rest): its own side is halted too, and all of it stays
+ * halted, so that nothing of it reaches memory after this, whatever becomes of its tables.
+ * Otherwise the halt is lifted again at once, as Linux does: the GMU reaches its memory through
+ * the same interface, and one that cannot read its messages does not answer "slumber".
+ */
+static void
+core_bus_halt(bool for_good)
+{
+	if (for_good) {
+		wr(gpu.base + RBBM_GBIF_HALT, 1);
+		for (int i = 0; i < 100000 && !(rd(gpu.base + RBBM_GBIF_HALT_ACK) & 1); i++) {
+		}
+	}
+	wr(gbif.base + GBIF_HALT, 1);
+	for (int i = 0; i < 100000 && !(rd(gbif.base + GBIF_HALT_ACK) & 1); i++) {
+	}
+	wr(gbif.base + GBIF_HALT, 2);
+	for (int i = 0; i < 100000 && !(rd(gbif.base + GBIF_HALT_ACK) & 2); i++) {
+	}
+	if (!for_good) {
+		wr(gbif.base + GBIF_HALT, 0);
+	}
+}
+
+static bool core_stuck;                 /* the 3D core has not finished what it was given, and is not waited for */
+
 static void
 gpu_block_stop(void)
 {
@@ -2999,6 +3053,16 @@ gpu_block_stop(void)
 
 	step = 0;
 	newest_step = ~0u;
+	if (core_runs && core_is_on) {
+		/* (what the core looks like when it is given back: a GMU that then does not answer may have its reasons here) */
+		printf("adreno: %u: the 3D core before it is stopped: status %#x, interrupts %#x, ring read up to %u of %u; the GMU "
+		    "sees it busy: %#x\n", step, rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS),
+		    rd(gpu.base + CP_RB_RPTR), ring_at, rd(gmu.base + GMU_AO_GPU_CX_BUSY_STATUS));
+		core_bus_halt(core_stuck);
+		printf("adreno: %u: the GPU block's bus has been halted%s (rbbm_gbif_halt_ack %#x, gbif halt_ack %#x)\n", step,
+		    core_stuck ? ", the 3D core's side too, and stays so" : " and let go again", rd(gpu.base + RBBM_GBIF_HALT_ACK),
+		    rd(gbif.base + GBIF_HALT_ACK));
+	}
 	if (core_is_on) {
 		put(&gmu, "host2gmu_intr_set", GMU_HOST2GMU_INTR_SET, 1u << 31);
 		core_is_on = false;
@@ -3015,6 +3079,7 @@ gpu_block_stop(void)
 	if (gmu_runs) {
 		put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
 		gmu_runs = false;
+		gx_off();                               /* (a GMU that has slumbered has done it itself) */
 	}
 	/* vendor's a6xx_rscc_sleep_sequence: the GMU's votes in RPMh are dropped, by the always-on sequencer */
 	if (rsc_awake && rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0) {
@@ -3079,21 +3144,7 @@ redwood_adreno_quiesce(void)
 		gmu_runs = false;
 	}
 	if (core_runs) {
-		/*
-		 * The 3D core may be in the middle of a frame. Its bus interface is told to let what
-		 * is under way finish and to start nothing more (Linux's
-		 * a6xx_bus_clear_pending_transactions), and stays so: nothing of it reaches memory
-		 * after this, whatever becomes of its tables.
-		 */
-		wr(gpu.base + RBBM_GBIF_HALT, 1);
-		for (int i = 0; i < 100000 && !(rd(gpu.base + RBBM_GBIF_HALT_ACK) & 1); i++) {
-		}
-		wr(gbif.base + GBIF_HALT, 1);
-		for (int i = 0; i < 100000 && !(rd(gbif.base + GBIF_HALT_ACK) & 1); i++) {
-		}
-		wr(gbif.base + GBIF_HALT, 2);
-		for (int i = 0; i < 100000 && !(rd(gbif.base + GBIF_HALT_ACK) & 2); i++) {
-		}
+		core_bus_halt(true);
 		core_runs = false;
 	}
 	if (gmu_space_is_on) {
@@ -3143,6 +3194,7 @@ static uint32_t gpu_fence;              /* the number of the last submission */
 static uint32_t gpu_timed;              /* ... of the last whose times have been added up */
 static uint64_t gpu_ticks;              /* how long the core has worked on the submissions added up */
 static uint32_t gpu_timed_count;
+static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
 static struct {
 	uint64_t start, size;
@@ -3166,9 +3218,22 @@ void
 redwood_gpu_stop(void)
 {
 	if (gpu_kept) {
-		gpu_kept = false;
+		uint32_t waited = 0;
+
+		gpu_kept = false;                       /* (nothing more is taken) */
 		quiet = false;
-		printf("adreno: the run is about to end: the GPU is given back\n");
+		/*
+		 * What the core has been given, it finishes first: told to slumber in the middle of a
+		 * frame, the GMU may not answer. Half a second at the most; then its bus is halted
+		 * for good, and its power switched off from here.
+		 */
+		while (!redwood_gpu_done(gpu_fence) && waited < 5000) {
+			sleep_us(100);
+			waited++;
+		}
+		core_stuck = !redwood_gpu_done(gpu_fence);
+		printf("adreno: the run is about to end: the GPU is given back (%s after %u us)\n",
+		    core_stuck ? "STILL AT WORK" : "it had finished what it was given", 100 * waited);
 		gpu_block_stop();
 	}
 }
@@ -3352,19 +3417,32 @@ gpu_times(void)
 		uint32_t slot = ++gpu_timed % GPU_TIMES;
 
 		if (gpu_timed != 0 && times[2 * slot + 1] > times[2 * slot]) {
-			gpu_ticks += times[2 * slot + 1] - times[2 * slot];
+			static const uint32_t under[6] = { 1920, 4800, 9600, 19200, 38400, 76800 };     /* (19.2 ticks a microsecond) */
+			uint64_t ticks = times[2 * slot + 1] - times[2 * slot];
+			unsigned by = 0;
+
+			while (by < 6 && ticks >= under[by]) {
+				by++;
+			}
+			gpu_timed_by[by]++;
+			gpu_ticks += ticks;
 			gpu_timed_count++;
 		}
 	}
 }
 
-/* How long the 3D core has worked since this was last asked, and on how many submissions. */
+/*
+ * How long the 3D core has worked since this was last asked, on how many submissions, and how
+ * many of those took it under 0.1, 0.25, 0.5, 1, 2, 4 milliseconds and longer.
+ */
 void
-redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions)
+redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 {
 	gpu_times();
 	*microseconds = gpu_ticks * 10 / 192;
 	*submissions = gpu_timed_count;
+	memcpy(by, gpu_timed_by, sizeof(gpu_timed_by));
+	bzero(gpu_timed_by, sizeof(gpu_timed_by));
 	gpu_ticks = 0;
 	gpu_timed_count = 0;
 }
@@ -3448,23 +3526,58 @@ static bool(*const steps[])(void) = {
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 
+/* ---- beside the steps: how warm the GPU is ------------------------------------------------------------------ */
+
 /*
- * Called while the system starts, before there is a root file system, and the start waits: for
- * as long as the steps and the watch after them last, nothing else writes to the log, so that
- * its end -- all that the loader's notes keep -- is about what is being done here.
+ * The SoC's temperature sensors report by themselves, in a block that is always on (dt: tsens1,
+ * whose readings are at 0xc265000; Linux's tsens-v2.c): a status word a sensor, the last reading
+ * in its low 12 bits, signed, in tenths of a degree, and bit 21 when there is one. Sensors 1 and
+ * 2 sit at the GPU (dt: gpuss-0, gpuss-1). Read, never written: once a minute while the GPU is
+ * kept, for the line beside the kernel's line about memory (osfmk/arm64/loader_return.c). A
+ * sensor caught between two readings has none for a moment and is asked again; one that still
+ * has none is put down as -273.0.
  */
+static struct block tsens = { "tsens1", 0x0c265000, 0x200 };
+#define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
+#define TSENS_VALID             (1u << 21)
+
+void
+redwood_adreno_minute(void)
+{
+	int32_t tenths[2];
+
+	if (!gpu_kept) {
+		return;
+	}
+	need(&tsens);
+	for (unsigned i = 0; i < 2; i++) {
+		tenths[i] = -2730;
+		for (unsigned again = 0; again < 16 && tenths[i] == -2730; again++) {
+			uint32_t status = rd(tsens.base + TSENS_STATUS(1 + i));
+
+			if (status & TSENS_VALID) {
+				tenths[i] = (int32_t)(status << 20) >> 20;
+			}
+		}
+	}
+	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz\n", tenths[0] / 10,
+	    tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
+	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, core_khz / 1000);
+}
+
 /* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */
 
 /*
  * The panel is a DSI video panel (dt: qcom,mdss_dsi_m20_36_02_0a_dsc_vid: 1080 x 2400 at 120
  * frames a second, 2432 lines with the porches; or at 60 with a longer vertical front porch):
  * the display controller sends it the framebuffer over and over at the rate of its timing
- * registers, which nobody has touched since the firmware. This reads them, and nothing is
- * written. Each read is behind a check that what it reads has its clock: the bus clock of the
- * display's clock controller (by GCC, which answers always), in that controller the display
- * block's power switch and bus clock, then the timing of the interface the panel hangs on
- * (Linux's dpu_hw_intf.c has the registers' meaning). Every read is announced and waited for
- * (adreno_pause), as in the newest step.
+ * registers, which nobody has touched since the firmware. This reads them. Each read is behind
+ * a check that what it reads has its clock: the bus clock of the display's clock controller (by
+ * GCC, which answers always; the firmware leaves it off, Linux keeps it on always, and so it is
+ * turned on here: the one write), in that controller the display block's power switch and bus
+ * clock, then the timing of the interface the panel hangs on (Linux's dpu_hw_intf.c has the
+ * registers' meaning). Every access is announced and waited for (adreno_pause), as in the
+ * newest step.
  */
 static struct block dispcc = { "dispcc", 0x0af00000, 0x2000 };          /* dt: clock-controller@af00000 */
 static struct block disp_intf = { "intf1", 0x0ae36000, 0x300 };         /* dt: mdss_dsi0's mdp_intf_base */
@@ -3492,8 +3605,13 @@ display_probe(void)
 	fine = 1;
 	announce("the display: has its clock controller its bus clock (gcc 0x127004; GCC answers always)");
 	if (get(&gcc, "disp_ahb_cbcr", GCC_DISP_AHB_CBCR) & CBCR_OFF) {
-		printf("adreno: 0: the display's clock controller has no bus clock: nothing more is read\n");
-		goto out;
+		announce("turn the bus clock of the display's clock controller on (gcc 0x127004 bit 0: THE ONE WRITE)");
+		put(&gcc, "disp_ahb_cbcr", GCC_DISP_AHB_CBCR, rd(gcc.base + GCC_DISP_AHB_CBCR) | CBCR_ENABLE);
+		sleep_ms(10);
+		if (get(&gcc, "disp_ahb_cbcr", GCC_DISP_AHB_CBCR) & CBCR_OFF) {
+			printf("adreno: 0: the display's clock controller has no bus clock, and does not get one: nothing more is read\n");
+			goto out;
+		}
 	}
 	announce("the display block's power switch and clocks, in its clock controller (0xaf00000: NOT READ BEFORE)");
 	if (!(get(&dispcc, "mdss_core_gdscr", DISPCC_MDSS_CORE_GDSCR) & GDSC_POWER_ON) ||
@@ -3528,6 +3646,11 @@ out:
 	newest_step = 0;
 }
 
+/*
+ * Called while the system starts, before there is a root file system, and the start waits: for
+ * as long as the steps and the watch after them last, nothing else writes to the log, so that
+ * its end -- all that the loader's notes keep -- is about what is being done here.
+ */
 void
 redwood_adreno_init(void)
 {

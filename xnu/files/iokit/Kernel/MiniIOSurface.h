@@ -107,6 +107,16 @@ public:
 	uint32_t                        holders;        /* clients, send rights, kernel users */
 	IOBufferMemoryDescriptor *      memory;         /* one page of shared state, then the pixels */
 	uint8_t *                       kbase;          /* the same, in the kernel */
+	/*
+	 * ... unless the surface was made around memory its maker has already (IOSurfaceAddress):
+	 * then the pixels are that memory, held in place and seen from the kernel as well, and
+	 * `memory` is the page of shared state alone.
+	 */
+	IOMemoryDescriptor *            client;
+	IOMemoryMap *                   clientMap;
+	task_t                          clientTask;     /* whose memory it is (not held: only compared) */
+	mach_vm_address_t               clientAddress;  /* ... and where it is there */
+	uint8_t *                       kpixels;        /* where the pixel memory starts in the kernel, either way */
 	struct minisurf_result          info;           /* addresses not filled in */
 	struct minisurf_plane           planes[MINISURF_MAX_PLANES];
 	OSDictionary *                  values;
@@ -134,7 +144,7 @@ public:
 	uint8_t *
 	pixels(void) const
 	{
-		return kbase + PAGE_SIZE + info.offset;
+		return kpixels + info.offset;
 	}
 	void updateValuesState(void);
 };

@@ -45,6 +45,7 @@ void redwood_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's proce
 void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
+void redwood_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
 
 /*
  * The GPU kept on (boot-arg adreno_keep=1), for iokit/Kernel/RedwoodGPU.cpp: see "the GPU kept on"
@@ -61,7 +62,7 @@ void redwood_gpu_to_memory(void *start, uint64_t size);
 uint32_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
 bool redwood_gpu_done(uint32_t fence);
 uint32_t redwood_gpu_last(void);
-void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions);
+void redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
 void redwood_gpu_report(const char *why);
 void redwood_gpu_stop(void);
 #endif
