@@ -52,6 +52,8 @@ unsigned lx_os_option(const char *name);
 int	 lx_os_firmware(const char *name, const void **data, unsigned long *size);
 /* the processor that runs the radio's firmware: started, and up when this returns; 0 or an errno */
 int	 lx_os_rproc_boot(void);
+/* the radio's own address (six bytes), if the machine has one for it: 1, or 0 and nothing written */
+int	 lx_os_radio_address(unsigned char *address);
 
 /*
  * ---- the one name the object shows the kernel: bring the driver up on the radio and go as far

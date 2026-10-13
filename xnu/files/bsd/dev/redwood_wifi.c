@@ -105,6 +105,14 @@
  *   wifi_smmu=2        ... and give that stream a context of the SMMU with page tables of ours,
  *                      so that the radio can be shown memory (radio_space_on() below: THE
  *                      SMMU IS WRITTEN); taken back when the DSP is stopped
+ *   wifi_mac=A         the radio's own address for the driver (redwood_wifi_radio_address()
+ *                      below; xl takes it from a file that is not in the repository)
+ *   wifi_scan=1        with wifi_lx=2: once the driver is up, an interface in station mode is
+ *                      made and the radio scans, listening only; what it heard goes to the log
+ *                      (other people's networks by name and address: the log is not for
+ *                      passing on)
+ *   wifi_lx_step=MS    the driver's start says each stub it comes to and waits MS there: for
+ *                      a run that ends without a word (follow it with XL_FOLLOW=2)
  *   wifi_lx=1          step 15 is ath11k's own instead of the stand-in (redwood_lx.c), with
  *                      the radio's registers neither read nor written; 2: for real (which
  *                      wants wifi_smmu=2: the radio is given addresses of its rings)
@@ -3141,6 +3149,26 @@ static void radio_space_faults(void);
  * for 6 GHz); the rules of the regulatory domain it starts in (CN: 2402..2482, 5170..5330,
  * 5735..5835 MHz); and no address of its own (all zeros: the tree's "use-nv-mac" has Android
  * give it one). Then the driver is taken down in order, mode "off" included.
+ *
+ * With mac.c, reg.c and peer.c built, and with wifi_scan=1 (the same day): the driver registers
+ * its radio with what stands in for mac80211 (wifi/lx/src/lx_80211.c) -- 14 channels at
+ * 2.4 GHz, 28 at 5, 60 at 6, of which the firmware's regulatory domain allows 13, 13 and none
+ * --, takes the address it was given, starts the radio, makes an interface in station mode
+ * and has the firmware scan those 26 channels, listening only. The scan takes 4.1 s (150 ms a
+ * channel), and what the radio heard is in the log: 5 to 7 access points in three runs, at
+ * 2.4 and at 5 GHz, the strongest at -40 dBm, the weakest at -84, noise at -108 to -111. The
+ * firmware works a country out of what it hears and the driver sets it (after the scan). Then
+ * the interface is removed, the radio stopped, and the driver's own removal runs to its end.
+ * The data path is still stubs: the firmware scans without it.
+ *
+ * A PHONE THAT RESETS WITHOUT A WORD: twice on the way, two seconds after calibration. The
+ * driver's registration failed (the hash table peer.c needs was a stub that fails), and where
+ * its start fails that late core.c asks for the mode "off" before it stops the bus; our thread
+ * was then still writing ring pointers into registers that had stopped answering. The read at
+ * step 16 outside mission mode was a bus error and a panic; this was neither, and the loader
+ * went with it. The cause was not seen in a log (there was none): it is what the code does,
+ * and with a hash table that works and the copy engines let go of before any request for a
+ * mode other than mission (lx_bus.c: lx_qmi_send_request()) it has not happened again.
  */
 static bool
 step_driver(uint32_t how)
@@ -3750,6 +3778,53 @@ redwood_wifi_driver_file(const char *name, uint64_t *size)
 		}
 	}
 	return NULL;
+}
+
+/*
+ * The radio's own address. Its firmware has none (it says zeros): Android keeps the phone's in
+ * its storage and hands it to the radio's driver (dt: "use-nv-mac"). Here it is given to the
+ * kernel when that is started -- boot-arg wifi_mac, six bytes in hexadecimal with colons
+ * between -- and is nowhere in these sources. The log says that one was given and how long it
+ * was, not which.
+ */
+bool
+redwood_wifi_radio_address(uint8_t *address)
+{
+	char text[32] = "";
+	uint8_t bytes[6];
+	unsigned count = 0, digits = 0, value = 0;
+	bool good;
+
+	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
+		printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac)\n", step);
+		return false;
+	}
+	good = true;
+	for (const char *c = text;; c++) {
+		int digit = *c >= '0' && *c <= '9' ? *c - '0' : *c >= 'a' && *c <= 'f' ? *c - 'a' + 10 : *c >= 'A' && *c <= 'F' ?
+		    *c - 'A' + 10 : -1;
+
+		if (digit >= 0 && digits < 2) {
+			value = value << 4 | (unsigned)digit;
+			digits++;
+		} else if ((*c == ':' || *c == 0) && digits != 0 && count < 6) {
+			bytes[count++] = (uint8_t)value;
+			digits = value = 0;
+		} else {
+			good = false;
+		}
+		if (*c == 0 || !good) {
+			break;
+		}
+	}
+	good = good && count == 6 && !(bytes[0] & 1) && (bytes[0] | bytes[1] | bytes[2] | bytes[3] | bytes[4] | bytes[5]) != 0;
+	printf("wifi: %u: the driver asks for the radio's address: one was given, %lu characters, %s\n", step,
+	    (unsigned long)strlen(text), good ? "six bytes: it is the radio's for this run" : "WHICH IS NOT A STATION'S ADDRESS: "
+	    "not used");
+	if (good) {
+		memcpy(address, bytes, sizeof(bytes));
+	}
+	return good;
 }
 
 /* ---- all of it together ---------------------------------------------------------------------------- */

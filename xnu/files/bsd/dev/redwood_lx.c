@@ -226,6 +226,12 @@ lx_os_rproc_boot(void)
 	return redwood_wifi_dsp_is_up() ? 0 : ENXIO;
 }
 
+int
+lx_os_radio_address(unsigned char *address)
+{
+	return redwood_wifi_radio_address(address);
+}
+
 /* ---- the driver ---------------------------------------------------------------------------------------- */
 
 /* The object has its own; this is the one of a kernel built without it. */
