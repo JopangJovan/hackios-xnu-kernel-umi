@@ -168,8 +168,19 @@ local_bh_enable(void)
 {
 }
 
+/* (What Linux guards with RCU is guarded here by the locks around it, or was never shared.) */
 void
 linux_synchronize_rcu(unsigned type)
+{
+}
+
+void
+linux_rcu_read_lock(unsigned type)
+{
+}
+
+void
+linux_rcu_read_unlock(unsigned type)
 {
 }
 
@@ -352,6 +363,12 @@ linux_complete_common(struct completion *c, int all)
 	}
 	lx_os_wakeup(c);
 	lx_os_unlock();
+}
+
+int
+linux_completion_done(struct completion *c)
+{
+	return (c->done != 0);
 }
 
 /* What is left of the time when the completion comes (at least 1), or 0 if it does not. */
@@ -790,6 +807,15 @@ linuxkpi_release_firmware(const struct linuxkpi_firmware *fw)
 
 /* ---- what the files built so far name and do not get to --------------------------------------------- */
 
+/*
+ * Numbered things (Linux's "idr": the driver numbers the frames it has handed to the firmware
+ * and finds them again by number). Here a table that grows, hung where FreeBSD's keeps its tree.
+ */
+struct lx_ids {
+	int size;
+	void *things[];
+};
+
 void
 idr_init(struct idr *idr)
 {
@@ -799,12 +825,116 @@ idr_init(struct idr *idr)
 void
 idr_destroy(struct idr *idr)
 {
+	struct lx_ids *ids = (struct lx_ids *)idr->top;
+
+	if (ids != NULL) {
+		lx_os_free(ids, sizeof(*ids) + ids->size * sizeof(void *));
+	}
+	idr->top = NULL;
+}
+
+/* The lowest free number from `start` up to but not `end` (0 or less: no limit), or -ENOSPC. */
+int
+idr_alloc(struct idr *idr, void *thing, int start, int end, gfp_t gfp)
+{
+	struct lx_ids *ids, *more;
+	int id, size;
+
+	lx_os_lock();
+	ids = (struct lx_ids *)idr->top;
+	for (id = start < 0 ? 0 : start; ids != NULL && id < ids->size && ids->things[id] != NULL; id++) {
+	}
+	if (end > 0 && id >= end) {
+		lx_os_unlock();
+		return (-ENOSPC);
+	}
+	if (ids == NULL || id >= ids->size) {
+		size = id + 64;
+		lx_os_unlock();
+		more = lx_os_alloc(sizeof(*more) + size * sizeof(void *));
+		if (more == NULL) {
+			return (-ENOMEM);
+		}
+		lx_os_lock();
+		ids = (struct lx_ids *)idr->top;
+		if (ids != NULL && ids->size >= size) {		/* (somebody else has made it grow meanwhile) */
+			lx_os_unlock();
+			lx_os_free(more, sizeof(*more) + size * sizeof(void *));
+			return (idr_alloc(idr, thing, start, end, gfp));
+		}
+		more->size = size;
+		if (ids != NULL) {
+			memcpy(more->things, ids->things, ids->size * sizeof(void *));
+		}
+		idr->top = (struct idr_layer *)more;
+		lx_os_unlock();
+		if (ids != NULL) {
+			lx_os_free(ids, sizeof(*ids) + ids->size * sizeof(void *));
+		}
+		return (idr_alloc(idr, thing, start, end, gfp));
+	}
+	ids->things[id] = thing;
+	lx_os_unlock();
+	return (id);
+}
+
+void *
+idr_find(struct idr *idr, int id)
+{
+	struct lx_ids *ids;
+	void *thing;
+
+	lx_os_lock();
+	ids = (struct lx_ids *)idr->top;
+	thing = ids != NULL && id >= 0 && id < ids->size ? ids->things[id] : NULL;
+	lx_os_unlock();
+	return (thing);
+}
+
+void *
+idr_remove(struct idr *idr, int id)
+{
+	struct lx_ids *ids;
+	void *thing = NULL;
+
+	lx_os_lock();
+	ids = (struct lx_ids *)idr->top;
+	if (ids != NULL && id >= 0 && id < ids->size) {
+		thing = ids->things[id];
+		ids->things[id] = NULL;
+	}
+	lx_os_unlock();
+	return (thing);
 }
 
 int
 idr_for_each(struct idr *idr, int (*function)(int id, void *p, void *data), void *data)
 {
-	return (0);
+	int answer = 0;
+
+	for (int id = 0; answer == 0; id++) {
+		struct lx_ids *ids;
+		void *thing;
+
+		lx_os_lock();
+		ids = (struct lx_ids *)idr->top;
+		if (ids == NULL || id >= ids->size) {
+			lx_os_unlock();
+			break;
+		}
+		thing = ids->things[id];
+		lx_os_unlock();
+		if (thing != NULL) {
+			answer = function(id, thing, data);
+		}
+	}
+	return (answer);
+}
+
+void
+arc4random_buf(void *buffer, size_t size)
+{
+	lx_os_random(buffer, size);
 }
 
 const struct dmi_system_id *

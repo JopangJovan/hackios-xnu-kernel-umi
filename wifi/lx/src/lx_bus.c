@@ -2,22 +2,24 @@
  * The radio's bus, for as long as ath11k's own (ahb.c, pcic.c) is not built: what stands between
  * the driver's core and this phone's WCN6750. It does what ahb.c's probe does for this chip, in
  * its order, with what the files built so far need of it -- the chip's registers through the
- * three fixed windows, no interrupts (the copy engines are looked at instead) -- and it is where
- * the driver's first calls into the parts not yet built are given something to do.
+ * three fixed windows, and a thread that looks at the copy engines every millisecond where the
+ * driver would have their interrupts -- and it is where the driver's calls into the parts not
+ * yet built are given something to do.
  *
- * Where this stage ends: the driver's qmi.c has its exchange with the firmware, core.c goes on
- * to start the firmware in mission mode and has ce.c and hal.c set up the copy engines' rings,
- * and then waits for the firmware's first message over a copy engine (ath11k_htc_wait_target()
- * of htc.c, which is not built: the one here looks at the copy engines until a message comes,
- * says what it was, and then fails on purpose, so that core.c winds everything down again).
+ * Where this stage ends: qmi.c has its exchange with the firmware, core.c starts the firmware
+ * in mission mode and has ce.c and hal.c set up the copy engines' rings, htc.c connects its
+ * services over them and wmi.c has the firmware say what the radio is ("service ready") and,
+ * given the driver's configuration, that it is ready for commands ("unified ready"). What the
+ * firmware said is then put in the log, and the driver is taken down again the way its own
+ * removal does it (ath11k_core_deinit()): mac.c and the data path are not built.
  *
  * The kernel's boot-arg wifi_lx says how far the radio's registers are touched: 1, not at all
  * (every write is said and dropped, every read is 0: the driver's own exchange and nothing
  * else); 2, for real.
  *
- * What the phone said, 13 October: all of the above happens, and the first message comes 9 ms
- * after the buffers are posted, on copy engine 2: HTC's "ready" (bsd/dev/redwood_wifi.c,
- * step_driver(), has the account). Looking at the rings once a millisecond was enough.
+ * What the phone said, 13 October: all of that happens, 270 ms from the start of the bus to
+ * "unified ready", with the copy engines looked at once a millisecond (bsd/dev/redwood_wifi.c,
+ * step_driver(), has the account).
  */
 #include <linux/kernel.h>
 #include <linux/device.h>
@@ -44,10 +46,10 @@ static struct {
 	unsigned reads, writes, said, refused;
 	u32 last, last_value;			/* the register written last, and with what ... */
 	unsigned again;				/* ... and how many writes to it in a row have not been said */
-	bool waiting;				/* ath11k_htc_wait_target() is looking at the copy engines ... */
-	unsigned same;				/* ... and has written a pointer what it held so many times */
-	volatile int messages;			/* received over the copy engines */
-	volatile int waited;			/* ath11k_htc_wait_target() has been reached, and is over */
+	volatile bool looking;			/* the thread that looks at the copy engines is wanted ... */
+	volatile bool looks;			/* ... and runs */
+	unsigned same;				/* it has written a ring's pointer what it held so many times */
+	unsigned data_path;			/* messages for the data path, which is not built */
 } bus;
 
 /* ---- what the driver says ---------------------------------------------------------------------- */
@@ -56,9 +58,12 @@ static void
 driver_says(const char *kind, const char *format, va_list list)
 {
 	char line[320];
+	size_t length;
 
 	vsnprintf(line, sizeof(line), format, list);
-	printf("ath11k%s: %s", kind, line);
+	length = strlen(line);
+	/* (Linux ends a line for whoever has not) */
+	printf("ath11k%s: %s%s", kind, line, length != 0 && line[length - 1] == '\n' ? "" : "\n");
 }
 
 void
@@ -168,10 +173,10 @@ said_write(u32 offset, u32 value)
 {
 	static struct {
 		u32 offset, value;
-	} pointers[16];				/* while the copy engines are looked at: what each pointer was moved to last */
+	} pointers[24];				/* while the copy engines are looked at: what each pointer was moved to last */
 	static unsigned row;
 
-	if (bus.waiting) {
+	if (bus.looks) {
 		for (unsigned i = 0; i < nitems(pointers); i++) {
 			if (pointers[i].offset == offset || pointers[i].offset == 0) {
 				bool moved = pointers[i].offset == 0 || pointers[i].value != value;
@@ -233,7 +238,44 @@ bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
 	}
 }
 
-/* pcic.c: ath11k_pcic_start(), without the interrupts */
+/*
+ * In place of the copy engines' interrupts: each engine is looked at as its interrupt would have
+ * ath11k do (ce.c: ath11k_ce_per_engine_service(), which takes what has been received to its
+ * owner and posts fresh buffers), once a millisecond, from the bus's start to its stop.
+ */
+static void
+bus_looks(void *argument)
+{
+	struct ath11k_base *ab = argument;
+
+	bus.looks = true;
+	while (bus.looking) {
+		for (unsigned i = 0; i < ab->hw_params.ce_count; i++) {
+			ath11k_ce_per_engine_service(ab, i);
+		}
+		lx_pause_ms(1);
+	}
+	bus.looks = false;
+}
+
+/*
+ * The copy engines are looked at no more, and no register is touched from here on. This is what
+ * the driver's "interrupts off" comes to here, and it comes in time: on its way down the driver
+ * says that after its last word to the firmware over a copy engine and before it asks for the
+ * mode "off".
+ */
+static void
+bus_quiet(void)
+{
+	bus.looking = false;
+	while (bus.looks) {
+		lx_pause_ms(1);
+	}
+	say_repeats();
+	bus.closed = true;
+}
+
+/* pcic.c: ath11k_pcic_start(), with the thread above where it enables the interrupts */
 static int
 bus_start(struct ath11k_base *ab)
 {
@@ -242,6 +284,12 @@ bus_start(struct ath11k_base *ab)
 	    "registers so far; the configuration the firmware was sent named %u shadow registers)\n", bus.reads, bus.writes,
 	    ab->qmi.ce_cfg.shadow_reg_v2_len);
 	ath11k_ce_rx_post_buf(ab);
+	say_repeats();
+	bus.looking = true;
+	if (lx_os_thread("wifi-rings", bus_looks, ab) != 0) {
+		bus.looking = false;
+		return (-ENOMEM);
+	}
 	return (0);
 }
 
@@ -249,11 +297,36 @@ bus_start(struct ath11k_base *ab)
 static void
 bus_stop(struct ath11k_base *ab)
 {
-	say_repeats();
-	bus.closed = true;
+	bus_quiet();
 	timer_delete_sync(&ab->rx_replenish_retry);
 	ath11k_ce_cleanup_pipes(ab);
-	printf("lx: the driver stops the bus (%u reads and %u writes of the chip's registers in all)\n", bus.reads, bus.writes);
+	printf("lx: the driver stops the bus (%u reads and %u writes of the chip's registers in all, %u of the writes a ring's "
+	    "pointer written what it held)\n", bus.reads, bus.writes, bus.same);
+}
+
+/* pcic.c: ath11k_pcic_map_service_to_pipe(): which copy engines carry a service, by the chip's table */
+static int
+bus_map_service_to_pipe(struct ath11k_base *ab, u16 service, u8 *up, u8 *down)
+{
+	bool has_up = false, has_down = false;
+
+	for (u32 i = 0; i < ab->hw_params.svc_to_ce_map_len; i++) {
+		const struct service_to_pipe *entry = &ab->hw_params.svc_to_ce_map[i];
+		u32 direction = __le32_to_cpu(entry->pipedir);
+
+		if (__le32_to_cpu(entry->service_id) != service) {
+			continue;
+		}
+		if (direction == PIPEDIR_IN || direction == PIPEDIR_INOUT) {
+			*down = (u8)__le32_to_cpu(entry->pipenum);
+			has_down = true;
+		}
+		if (direction == PIPEDIR_OUT || direction == PIPEDIR_INOUT) {
+			*up = (u8)__le32_to_cpu(entry->pipenum);
+			has_up = true;
+		}
+	}
+	return (has_up && has_down ? 0 : -ENOENT);
 }
 
 static int
@@ -268,17 +341,25 @@ bus_power_down(struct ath11k_base *ab, bool is_suspend)
 }
 
 static void
-bus_nothing(struct ath11k_base *ab)
+bus_irq_enable(struct ath11k_base *ab)
 {
+	/* (the data path's interrupts, when there is a data path) */
+}
+
+static void
+bus_irq_disable(struct ath11k_base *ab)
+{
+	bus_quiet();
 }
 
 static const struct ath11k_hif_ops bus_ops = {
 	.read32 = bus_read32,
 	.write32 = bus_write32,
-	.irq_enable = bus_nothing,
-	.irq_disable = bus_nothing,
+	.irq_enable = bus_irq_enable,
+	.irq_disable = bus_irq_disable,
 	.start = bus_start,
 	.stop = bus_stop,
+	.map_service_to_pipe = bus_map_service_to_pipe,
 	.power_up = bus_power_up,
 	.power_down = bus_power_down,
 	/* (no interrupt vectors are offered: the rings are then set up without any, see ce.c) */
@@ -286,76 +367,19 @@ static const struct ath11k_hif_ops bus_ops = {
 
 /* ---- the first things the driver does with parts that are not built -------------------------------- */
 
-static void
-first_bytes(const char *what, struct sk_buff *skb)
-{
-	char text[3 * 32 + 1] = "";
-
-	for (unsigned i = 0; i < skb->len && i < 32; i++) {
-		snprintf(text + 3 * i, 4, " %02x", skb->data[i]);
-	}
-	printf("lx: A MESSAGE FROM THE FIRMWARE OVER A COPY ENGINE (%s): %u bytes, beginning%s\n", what, skb->len, text);
-}
-
-/* htc.c's: what a copy engine has received for the control and WMI endpoints */
-void
-ath11k_htc_rx_completion_handler(struct ath11k_base *ab, struct sk_buff *skb)
-{
-	if (bus.messages++ < 4) {
-		first_bytes("for HTC", skb);
-	}
-	dev_kfree_skb_any(skb);
-}
-
-/* dp_rx.c's: ... for the data path */
+/* dp_rx.c's: what a copy engine has received for the data path */
 void
 ath11k_dp_htt_htc_t2h_msg_handler(struct ath11k_base *ab, struct sk_buff *skb)
 {
-	if (bus.messages++ < 4) {
-		first_bytes("for the data path", skb);
+	if (bus.data_path++ < 4) {
+		char text[3 * 32 + 1] = "";
+
+		for (unsigned i = 0; i < skb->len && i < 32; i++) {
+			snprintf(text + 3 * i, 4, " %02x", skb->data[i]);
+		}
+		printf("lx: a message for the data path, which is not built: %u bytes, beginning%s\n", skb->len, text);
 	}
 	dev_kfree_skb_any(skb);
-}
-
-void
-ath11k_htc_tx_completion_handler(struct ath11k_base *ab, struct sk_buff *skb)
-{
-	dev_kfree_skb_any(skb);
-}
-
-/*
- * htc.c's: wait for the firmware's "ready" over copy engine 1. Here: look at every copy engine,
- * as its interrupt would have ath11k do, for five seconds or until something has come; then
- * fail, which is where this stage ends (see the top).
- */
-int
-ath11k_htc_wait_target(struct ath11k_htc *htc)
-{
-	struct ath11k_base *ab = container_of(htc, struct ath11k_base, htc);	/* (htc.c would have filled in htc->ab) */
-	unsigned long long began = lx_os_nanoseconds(), limit = bus.how >= 2 ? 5000000000ull : 500000000ull;
-	unsigned long long first = 0;
-
-	say_repeats();
-	printf("lx: the driver waits for the firmware's first message: looking at the %u copy engines%s\n", ab->hw_params.ce_count,
-	    bus.how >= 2 ? "" : " (which were told of no ring, wifi_lx=1: none can come)");
-	bus.waiting = true;
-	/* (and for a little longer after the first, to see what follows it) */
-	while (lx_os_nanoseconds() - began < limit && (first == 0 || lx_os_nanoseconds() - first < 200000000ull)) {
-		for (unsigned i = 0; i < ab->hw_params.ce_count; i++) {
-			ath11k_ce_per_engine_service(ab, i);
-		}
-		if (bus.messages != 0 && first == 0) {
-			first = lx_os_nanoseconds();
-			printf("lx: THE FIRST MESSAGE HAS COME, %llu ms after the buffers were posted\n", (first - began) / 1000000ull);
-		}
-		lx_pause_ms(1);
-	}
-	bus.waiting = false;
-	printf("lx: %d message(s) from the firmware in %llu ms (%u reads and %u writes of the chip's registers in all, %u of "
-	    "the writes a ring's pointer written what it held); the driver is told to give up here: htc.c is not built\n",
-	    bus.messages, (lx_os_nanoseconds() - began) / 1000000ull, bus.reads, bus.writes, bus.same);
-	bus.waited = 1;
-	return (-ETIMEDOUT);
 }
 
 /* ---- the device tree, of which there is none ------------------------------------------------------ */
@@ -378,15 +402,43 @@ of_reserved_mem_region_to_resource(const struct device_node *np, unsigned int in
 	return (-ENODEV);
 }
 
-/* (mac80211's, named in core.c's recovery, which nothing here reaches) */
-void
-linuxkpi_ieee80211_restart_hw(struct ieee80211_hw *hw)
-{
-}
+/* ---- what the firmware has said of the radio ------------------------------------------------------- */
 
-void
-linuxkpi_ieee80211_stop_queues(struct ieee80211_hw *hw)
+/* After "unified ready": what wmi.c has kept of the firmware's two announcements. */
+static void
+say_radio(struct ath11k_base *ab)
 {
+	const struct ath11k_targ_cap *t = &ab->target_caps;
+
+	printf("lx: THE FIRMWARE SAYS OF THE RADIO: %u radio(s); %u chains (mask %#x); up to %u channels in a scan, %u MACs; "
+	    "transmit power %d..%d; phy %#x, HT %#x, VHT %#x (MCS %#x), system %#x\n", ab->num_radios, t->num_rf_chains,
+	    t->txrx_chainmask, t->max_num_scan_channels, t->max_supported_macs, (int)t->hw_min_tx_power, (int)t->hw_max_tx_power,
+	    t->phy_capability, t->ht_cap_info, t->vht_cap_info, t->vht_supp_mcs, t->sys_cap_info);
+	/* (the second number is from the same structure of "ready" as the address: it shows that was read) */
+	printf("lx: its address, by the firmware: %02x:%02x:%02x:%02x:%02x:%02x (and its check sum of the packet log's "
+	    "definitions: %#x)\n", ab->mac_addr[0], ab->mac_addr[1], ab->mac_addr[2], ab->mac_addr[3], ab->mac_addr[4],
+	    ab->mac_addr[5], ab->pktlog_defs_checksum);
+	for (unsigned i = 0; i < ab->num_radios && i < MAX_RADIOS; i++) {
+		const struct ath11k_hal_reg_capabilities_ext *r = &ab->hal_reg_cap[i];
+		const struct ath11k_pdev_cap *c = &ab->pdevs[i].cap;
+
+		printf("lx: radio %u (pdev %u, phy %u): bands%s%s (%#x); 2.4 GHz %u..%u MHz, 5 GHz and up %u..%u MHz; regulatory "
+		    "domain %#x, wireless modes %#x; chains tx %#x rx %#x; VHT %#x, A-MPDU density %u\n", i, ab->pdevs[i].pdev_id,
+		    r->phy_id, c->supported_bands & WMI_HOST_WLAN_2G_CAP ? " 2.4 GHz" : "", c->supported_bands &
+		    WMI_HOST_WLAN_5G_CAP ? " 5 GHz" : "", c->supported_bands, r->low_2ghz_chan, r->high_2ghz_chan, r->low_5ghz_chan,
+		    r->high_5ghz_chan, r->eeprom_reg_domain, r->wireless_modes, c->tx_chain_mask, c->rx_chain_mask, c->vht_cap,
+		    c->ampdu_density);
+		for (unsigned band = 0; band < NUM_NL80211_BANDS; band++) {
+			const struct ath11k_band_cap *b = &c->band[band];
+
+			if (b->max_bw_supported == 0 && b->ht_cap_info == 0 && b->he_cap_info[0] == 0) {
+				continue;
+			}
+			printf("lx: radio %u, band %u (0: 2.4 GHz, 1: 5 GHz, 3: 6 GHz): widest channel code %u, HT %#x, HE %#x %#x "
+			    "(MCS %#x), HE at 6 GHz %#x\n", i, band, b->max_bw_supported, b->ht_cap_info, b->he_cap_info[0],
+			    b->he_cap_info[1], b->he_mcs, b->he_6ghz_capa);
+		}
+	}
 }
 
 /* ---- the entry ------------------------------------------------------------------------------------ */
@@ -398,6 +450,7 @@ lx_start(void)
 	static struct device_node node;
 	struct ath11k_base *ab;
 	unsigned long long began;
+	bool up;
 	int ret;
 
 	bus.how = lx_os_option("wifi_lx");
@@ -405,7 +458,7 @@ lx_start(void)
 		printf("lx: no thread, or no memory the radio can be given\n");
 		return (ENOMEM);
 	}
-	ath11k_debug_mask = ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_AHB;
+	ath11k_debug_mask = ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_AHB | ATH11K_DBG_HTC | ATH11K_DBG_WMI | ATH11K_DBG_REG;
 	device.of_node = &node;
 	device.kobj.name = "wifi";
 
@@ -433,16 +486,39 @@ lx_start(void)
 		return (-ret);
 	}
 
-	/* the rest happens on the driver's own threads: until it has waited for the first message, or has failed */
+	/*
+	 * The rest happens on the driver's own threads, until core.c has been through its start (it
+	 * says so with the flag below, whether that went well or not) or the exchange has failed.
+	 * It went well if the bus is still up: core.c stops it where it gives up.
+	 */
 	began = lx_os_nanoseconds();
-	while (!bus.waited && !test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) && lx_os_nanoseconds() - began < 45000000000ull) {
+	while (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) && !test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) &&
+	    lx_os_nanoseconds() - began < 60000000000ull) {
 		lx_pause_ms(10);
 	}
-	lx_pause_ms(600);		/* (for core.c to have wound down: the mode "off") */
-	printf("lx: over after %llu ms: %s; the driver's flags: %#lx\n", (lx_os_nanoseconds() - began) / 1000000ull, bus.messages ?
-	    "A MESSAGE CAME OVER A COPY ENGINE" : bus.waited ? "the driver got as far as waiting for the first message" :
-	    "THE DRIVER DID NOT GET AS FAR AS WAITING FOR THE FIRST MESSAGE", ab->dev_flags);
+	up = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) && bus.looks;
+	printf("lx: %llu ms after its start the driver %s; its flags: %#lx\n", (lx_os_nanoseconds() - began) / 1000000ull,
+	    up ? "IS UP as far as it is built: the firmware has said \"unified ready\"" : test_bit(ATH11K_FLAG_REGISTERED,
+	    &ab->dev_flags) ? "HAS GIVEN UP on the way and wound itself down" : "HAS NOT GOT THROUGH its exchange with the firmware",
+	    ab->dev_flags);
+	if (!up) {
+		lx_pause_ms(600);		/* (for core.c to have wound down: the mode "off") */
+		ath11k_qmi_deinit_service(ab);
+		return (test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) ? ETIMEDOUT : EIO);
+	}
+	lx_pause_ms(1000);			/* (for what the firmware says unasked once it is ready) */
+	say_radio(ab);
+
+	/*
+	 * Down again, in the order of the driver's own removal (core.c: ath11k_core_deinit()), by
+	 * hand: that function first has every radio's interface told to suspend, and there is no
+	 * such interface until mac.c makes one.
+	 */
+	bus_quiet();
+	ath11k_qmi_firmware_stop(ab);
+	bus_stop(ab);
+	ath11k_wmi_detach(ab);
 	ath11k_qmi_deinit_service(ab);
-	/* as far as this stage can go: a message with the registers for real, the wait without them */
-	return (bus.messages ? 0 : !bus.waited ? EIO : bus.how >= 2 ? ETIMEDOUT : 0);
+	printf("lx: the driver is down again\n");
+	return (0);
 }
