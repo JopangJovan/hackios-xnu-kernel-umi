@@ -40,9 +40,12 @@
  *   8  asks    TrustZone to take the image's header and check its signature (image 6), and
  *              tells it where the image will be
  *   9  writes  the image into the DSP's memory, and reads it back
- *  10  writes  "the image is loaded" to the always-on processor, asks TrustZone to authenticate
+ *  10  writes  our SMP2P item into the shared memory: allocated there, under the SoC's lock for
+ *              that, unless a kernel before this one has made it; filled in afresh either way
+ *  11  writes  "the image is loaded" to the always-on processor, asks TrustZone to authenticate
  *              the image and let the DSP out of reset, and watches the shared memory and our
- *              doorbell for the DSP's first words
+ *              doorbell for the DSP's first words, answering in our item what SMP2P's rules
+ *              have us answer
  * Steps 1 to 5 are the survey; they write to nothing but the arbiter's command word.
  *
  * What is started is stopped: when the steps are over, and wherever a run ends in order while
@@ -53,14 +56,15 @@
  * and only if the DSP has run since the phone was started: when step 8 finds it, TrustZone is
  * first asked for the shutdown. On a phone just started nothing is asked that is not needed.
  *
- * AND THERE IT ENDS, FOR NOW: THE DSP STARTS ONCE BETWEEN TWO STARTS OF THE PHONE. Twice a
- * second start was tried, after a shutdown that TrustZone had answered with success, with the
- * same image written and read back again: both times the phone reset without a word at the
- * request to authenticate and start it, or within two seconds of it. Why is not known. What
- * Linux does at that point and this does not: it holds CX and MX at level 384 and the crystal
- * while the DSP starts and again around the shutdown, and before the shutdown it asks the DSP
- * to stop and waits for its word. So step 8, having shut down a DSP from before, goes no
- * further unless told to (wifi_again=1).
+ * The DSP is asked to stop before TrustZone shuts it down (Linux's order; dsp_ask_to_stop()),
+ * and that matters: a DSP shut down by TrustZone alone -- as the first version of this did,
+ * having no SMP2P item to ask with, so that the DSP never got as far as saying it was up --
+ * could not be started again before the phone was restarted. Twice that was tried, with the
+ * same image written and read back again and accepted by TrustZone again, and both times the
+ * phone reset without a word at the request to authenticate and start, or within two seconds
+ * of it. Asked first, and having acknowledged, it starts again. So step 8, having had a DSP
+ * shut down that did not say it had stopped, goes no further unless told to (wifi_again=1).
+ * (Whether the asking cures it or the DSP's having come up fully before, was not told apart.)
  *
  * Nothing here switches a supply rail or changes a pin.
  *
@@ -70,11 +74,11 @@
  *                      (default 2200: the loader, watching from another core, notes the end of
  *                      our log every two seconds, and after a silent reset that is all there is)
  *   wifi_fine=1        such a step waits like that before every single write and call
- *   wifi_wait=S        how long step 10 watches for the DSP to say that it is up (default 10)
+ *   wifi_wait=S        how long step 11 watches for the DSP to say that it is up (default 10)
  *   wifi_watch=S       ... and how long it goes on watching once it has (default 3)
  *   wifi_dirty=1       the DSP is not stopped: left as a kernel that died leaves it
- *   wifi_again=1       start the DSP although it has been started since the phone was: SO FAR
- *                      THAT HAS RESET THE PHONE
+ *   wifi_again=1       start the DSP although the one before it was shut down without having
+ *                      acknowledged a stop: THAT HAS RESET THE PHONE, twice of two
  *   wifi_return=1      when all is over, go back to the loader instead of starting the system
  *   wifi_smmu=1        before any step: read what the boot chain has set up in the SMMU for the
  *                      radio's stream (smmu_look() below; nothing is written)
@@ -309,6 +313,13 @@ smem_peek(uint64_t offset, void *to, uint32_t size)
 	return true;
 }
 
+/* A word of the area, written in one store: other processors read there while we write. */
+static void
+smem_poke(uint32_t offset, uint32_t value)
+{
+	wr((vm_offset_t)smem + offset, value);
+}
+
 /* The partition of two processors: where it begins in the area, and how its entries are aligned. 0: there is none. */
 static uint32_t
 smem_partition(uint16_t one, uint16_t other, uint32_t *cacheline, uint32_t *size)
@@ -423,6 +434,17 @@ struct smp2p {
 	} entry[16];
 };
 #define SMP2P_MAGIC             0x504d5324
+#define SMP2P_VERSION           1
+#define SMP2P_RESTART_ACKS      1u              /* the feature: a side that restarts says so in its flags, the other answers in its own */
+#define SMP2P_RESTART_DONE      (1u << 0)       /* flags: toggled by the side that has restarted */
+#define SMP2P_RESTART_ACK       (1u << 1)       /* ... and made equal to it by the other */
+/* where the words of an item are, for writing them one at a time */
+#define SMP2P_AT_VERSION        4
+#define SMP2P_AT_PROCESSORS     8
+#define SMP2P_AT_COUNTS         12              /* entries there is room for; << 16: entries that are valid */
+#define SMP2P_AT_FLAGS          16
+#define SMP2P_AT_NAME(i)        (20 + 20 * (i))
+#define SMP2P_AT_VALUE(i)       (36 + 20 * (i))
 
 /* The bits of the DSP's entry "slave-kernel" (dt: the interrupts of qcom,wpss@8a00000). */
 #define DSP_FATAL               (1u << 0)       /* "err-fatal": it has given up */
@@ -448,16 +470,25 @@ dsp_words(struct smp2p *words)
 	return smem_peek(at, words, sizeof(*words)) && words->magic == SMP2P_MAGIC;
 }
 
+/* Which of an item's entries has that name; -1: none. */
+static int
+smp2p_entry(const struct smp2p *words, const char *name)
+{
+	for (unsigned i = 0; i < words->valid && i < 16; i++) {
+		if (strncmp(words->entry[i].name, name, sizeof(words->entry[i].name)) == 0) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
 /* The word of the DSP's entry "slave-kernel". */
 static uint32_t
 dsp_state(const struct smp2p *words)
 {
-	for (unsigned i = 0; i < words->valid && i < 16; i++) {
-		if (strncmp(words->entry[i].name, "slave-kernel", sizeof(words->entry[i].name)) == 0) {
-			return words->entry[i].value;
-		}
-	}
-	return 0;
+	int entry = smp2p_entry(words, "slave-kernel");
+
+	return entry < 0 ? 0 : words->entry[entry].value;
 }
 
 static void
@@ -607,6 +638,7 @@ static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 #define IPCC_NOBODY             0xffffffffu
 #define IPCC_AOP                0u
 #define IPCC_WPSS               24u
+#define IPCC_SMP2P              2u              /* the signal */
 
 static bool
 step_mailbox(void)
@@ -1314,6 +1346,130 @@ mailbox_send(const char *text)
 	return true;
 }
 
+/* ---- SMP2P, our half ----------------------------------------------------------------------------------- */
+
+/*
+ * Our item (616) is made by step 10, in our partition with the DSP, and like everything in the
+ * shared memory it then stays until the phone is restarted: a kernel after this one finds it.
+ * Our entries in it (dt: the children of qcom,smp2p-wpss that are not interrupt controllers):
+ * "master-kernel", whose bit 0 asks the DSP to stop (dt: "qcom,force-stop" of qcom,wpss@8a00000),
+ * and "wlan", whose bit 0 is the radio driver's to tell the firmware that we sleep. A change is
+ * followed by a ring of the DSP's SMP2P doorbell.
+ */
+#define OUR_ENTRY_STOP          "master-kernel"
+#define OUR_ENTRY_RADIO         "wlan"
+#define DSP_STOP                (1u << 0)       /* of "master-kernel" */
+
+static uint32_t our_item;               /* where our SMP2P item is in the area; 0: not looked for, or not there */
+static bool smp2p_agreed;               /* the DSP's item and ours have the same version: what follows applies */
+static bool smp2p_restart_acks;         /* ... and both sides have the feature */
+static bool smp2p_restart_acked;        /* the DSP's "restart done" as we have last answered it */
+
+static uint32_t
+our_item_find(void)
+{
+	uint32_t size = 0, at = smem_item(ITEM_SMP2P_OURS, &size);
+
+	return at != 0 && size >= sizeof(struct smp2p) ? at : 0;
+}
+
+/*
+ * What Linux does when the DSP rings for SMP2P (smp2p.c: qcom_smp2p_intr), done instead whenever
+ * the DSP's item is seen to have changed: agree on the features once, and answer a restart.
+ */
+static void
+dsp_listen(const struct smp2p *theirs)
+{
+	struct smp2p ours;
+
+	if (our_item == 0 || !smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC) {
+		return;
+	}
+	if (!smp2p_agreed) {
+		uint32_t features = (ours.version >> 8) & (theirs->version >> 8);
+
+		if ((theirs->version & 0xff) != (ours.version & 0xff)) {
+			return;
+		}
+		if (features != ours.version >> 8) {
+			printf("wifi: %u: about to write our item's features at %#lx: %#x (what both sides have)\n", step,
+			    SMEM_PHYS + our_item + SMP2P_AT_VERSION, features);
+			smem_poke(our_item + SMP2P_AT_VERSION, features << 8 | (ours.version & 0xff));
+		}
+		smp2p_restart_acks = features & SMP2P_RESTART_ACKS;
+		smp2p_agreed = true;
+		printf("wifi: %u: the DSP and we agree on SMP2P: version %u, features %#x\n", step, ours.version & 0xff, features);
+	}
+	if (smp2p_restart_acks && ((theirs->flags & SMP2P_RESTART_DONE) != 0) != smp2p_restart_acked) {
+		smp2p_restart_acked = !smp2p_restart_acked;
+		printf("wifi: %u: the DSP's flags say it has restarted (%#x): about to answer in our flags at %#lx (bit 1 = %u) and ring "
+		    "its SMP2P doorbell\n", step, theirs->flags, SMEM_PHYS + our_item + SMP2P_AT_FLAGS, smp2p_restart_acked);
+		smem_poke(our_item + SMP2P_AT_FLAGS, (ours.flags & ~SMP2P_RESTART_ACK) | (smp2p_restart_acked ? SMP2P_RESTART_ACK : 0));
+		settle();
+		wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
+	}
+}
+
+/*
+ * Linux's qcom_q6v5_request_stop(): our bit "stop" set, the DSP's "stop ack" waited for (five
+ * seconds there too), our bit taken back. It is asked of a DSP that says it is up and has said
+ * neither that it has given up nor that it has stopped, through whatever item of ours is in the
+ * shared memory -- this kernel's or, for a DSP left running by a kernel before, that kernel's.
+ * True: the DSP has stopped by its own word, now or (its entry still says so) before.
+ */
+static bool
+dsp_ask_to_stop(void)
+{
+	struct smp2p ours, theirs;
+	uint32_t at = our_item_find(), state, value_at;
+	uint64_t asked, now;
+	int entry = -1;
+
+	if (at == 0 || !smem_peek(at, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC || (ours.version & 0xff) != SMP2P_VERSION ||
+	    (entry = smp2p_entry(&ours, OUR_ENTRY_STOP)) < 0) {
+		printf("wifi: %u: the DSP is not asked to stop first: there is no SMP2P item of ours to ask it with\n", step);
+		return false;
+	}
+	if (!dsp_words(&theirs) || smp2p_entry(&theirs, "slave-kernel") < 0) {
+		printf("wifi: %u: the DSP is not asked to stop first: its item has no entry to answer in\n", step);
+		return false;
+	}
+	state = dsp_state(&theirs);
+	if (state & DSP_STOP_ACK) {
+		printf("wifi: %u: the DSP is not asked to stop: its entry says %#x, that it has stopped when asked before\n", step, state);
+		return true;
+	}
+	if (!(state & DSP_READY) || (state & DSP_FATAL)) {
+		printf("wifi: %u: the DSP is not asked to stop first: its entry says %#x, not \"up\"\n", step, state);
+		return false;
+	}
+	value_at = at + SMP2P_AT_VALUE((uint32_t)entry);
+	printf("wifi: %u: about to ask the DSP to stop: bit 0 of our entry \"%s\" at %#lx (it holds %#x), and its SMP2P doorbell\n",
+	    step, OUR_ENTRY_STOP, SMEM_PHYS + value_at, ours.entry[entry].value);
+	snprintf(last_write, sizeof(last_write), "step %u asked the DSP to stop", step);
+	hold(true);
+	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
+	settle();
+	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
+	asked = now = now_us();
+	while (now - asked < 5 * 1000000ull) {
+		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
+			break;
+		}
+		sleep_us(200);
+		now = now_us();
+	}
+	state = dsp_words(&theirs) ? dsp_state(&theirs) : 0;
+	printf("wifi: %u: %s after %llu.%03llu ms; its entry says %#x, its flags %#x\n", step, state & DSP_STOP_ACK ?
+	    "THE DSP ACKNOWLEDGES THE STOP" : "THE DSP DOES NOT ACKNOWLEDGE THE STOP", (now - asked) / 1000, (now - asked) % 1000, state,
+	    theirs.flags);
+	/* (taken back, as Linux does, before TrustZone is asked) */
+	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
+	settle();
+	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
+	return (state & DSP_STOP_ACK) != 0;
+}
+
 /* ---- step 8: TrustZone takes the header ---------------------------------------------------------------- */
 
 /* The calls, as in redwood_adreno.c (qcom_scm.c: qcom_scm_pas_*; convention: qcom_scm-smc.c). */
@@ -1332,6 +1488,7 @@ mailbox_send(const char *text)
 static LCK_GRP_DECLARE(wifi_lock_group, "redwood-wifi");
 static LCK_MTX_DECLARE(dsp_lock, &wifi_lock_group);     /* the DSP being started or stopped */
 static bool dsp_started;                /* TrustZone has let it out of reset, and has not shut it down since */
+static bool stopped_by_its_word;        /* the shutdown last asked for was of a DSP that had acknowledged a stop */
 static uint32_t dirty;
 
 /* One call, as Linux makes these: one that may be preempted. What TrustZone returns: 0 or an error of its own, and a word of answer. */
@@ -1369,9 +1526,9 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 }
 
 /*
- * TrustZone is to shut the DSP down (it takes the image's memory back, cleared), and the
- * always-on processor to know that the image is gone: it was told of one by us, or by the
- * kernel that left the DSP running.
+ * The DSP is asked to stop, if it can be; then, whatever it says, TrustZone is to shut it down
+ * (it takes the image's memory back, cleared), and the always-on processor to know that the
+ * image is gone: it was told of one by us, or by the kernel that left the DSP running.
  */
 static bool
 dsp_shutdown(const char *why)
@@ -1379,7 +1536,8 @@ dsp_shutdown(const char *why)
 	uint64_t answer = ~0ull;
 	int32_t result;
 
-	printf("wifi: %u: %s: TrustZone is asked to shut the DSP down\n", step, why);
+	printf("wifi: %u: %s: the DSP is asked to stop, then TrustZone to shut it down\n", step, why);
+	stopped_by_its_word = dsp_ask_to_stop();
 	result = scm("to shut the Wi-Fi DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_WPSS, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("wifi: %u: TRUSTZONE DOES NOT SHUT THE DSP DOWN: the call returns %d, its answer is %#llx\n", step, result, answer);
@@ -1410,9 +1568,9 @@ step_header(void)
 		if (!dsp_shutdown("it may be running")) {
 			return false;
 		}
-		if (!(PE_parse_boot_argn("wifi_again", &again, sizeof(again)) && again)) {
-			printf("wifi: %u: THE DSP IS NOT STARTED AGAIN: it has been started once since the phone was, and a second start "
-			    "has so far reset the phone (see the top of redwood_wifi.c; wifi_again=1 to try all the same)\n", step);
+		if (!stopped_by_its_word && !(PE_parse_boot_argn("wifi_again", &again, sizeof(again)) && again)) {
+			printf("wifi: %u: THE DSP IS NOT STARTED AGAIN: it was shut down without having acknowledged a stop, and a start "
+			    "after that has reset the phone (see the top of redwood_wifi.c; wifi_again=1 to try all the same)\n", step);
 			return false;
 		}
 	} else {
@@ -1515,7 +1673,156 @@ step_image(void)
 	return image_written;
 }
 
-/* ---- step 10: the DSP, started ------------------------------------------------------------------------- */
+/* ---- step 10: our SMP2P item --------------------------------------------------------------------------- */
+
+/*
+ * The SoC's lock for allocating in the shared memory: dt: syscon@1f40000 and the hwlock
+ * "qcom,tcsr-mutex" on it (0x1000 a lock), of which qcom,smem has the fourth ("hwlocks": 3). A
+ * register that takes the number of whoever writes it while it holds zero, and keeps it until
+ * zero is written (qcom_hwspinlock.c). The application processor's number is 1. It is held
+ * around the allocation only, and released on every way out; Linux waits a second for it,
+ * and so does this: a lock that somebody keeps is said, not waited for.
+ */
+static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
+#define LOCK_OWNER              0x000
+#define LOCK_US                 1u
+
+/* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one. False, and why said: not made. */
+static bool
+our_item_make(uint32_t partition)
+{
+	struct smem_partition header;
+	struct smem_entry entry;
+	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need = sizeof(entry) + item_size;
+	uint32_t owner = ~0u, at;
+	bool made = false;
+
+	owner = get(&smem_lock, "owner", LOCK_OWNER);
+	printf("wifi: %u: about to take the lock (write %u at %#x, until it reads back so, for a second at most), write an entry "
+	    "of %u bytes for item %u with %u bytes behind it where the partition's items from the bottom end, move the "
+	    "partition's mark by %u, and release the lock (write 0)\n", step, LOCK_US, smem_lock.phys + LOCK_OWNER,
+	    (uint32_t)sizeof(entry), ITEM_SMP2P_OURS, item_size, need);
+	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
+	hold(true);
+	for (uint32_t ms = 0; ms <= 1000; ms++) {
+		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
+		owner = rd(smem_lock.base + LOCK_OWNER);
+		if (owner == LOCK_US) {
+			break;
+		}
+		sleep_ms(1);
+	}
+	if (owner != LOCK_US) {
+		printf("wifi: %u: THE LOCK IS HELD BY PROCESSOR %u AND STAYS SO FOR A SECOND: nothing is written\n", step, owner);
+		return false;
+	}
+	/* under the lock: the partition as it is now, every entry in it from the bottom, and the room left */
+	if (!smem_peek(partition, &header, sizeof(header)) || header.free_uncached > header.free_cached ||
+	    header.free_cached > header.size) {
+		printf("wifi: %u: the partition's marks make no sense: nothing is written\n", step);
+		goto out;
+	}
+	for (at = sizeof(header); at < header.free_uncached;) {
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
+		    entry.size > header.size) {
+			break;
+		}
+		at += sizeof(entry) + entry.padding_header + entry.size;
+	}
+	if (at != header.free_uncached) {
+		printf("wifi: %u: the partition's entries do not end at its mark (+%#x, the mark is +%#x), or the item has appeared: "
+		    "nothing is written\n", step, at, header.free_uncached);
+		goto out;
+	}
+	if (at + need > header.free_cached) {
+		printf("wifi: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need, header.free_cached - at);
+		goto out;
+	}
+	/* the entry first, whole; only then the mark, in one store: nobody sees half of either */
+	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
+	smem_poke(partition + at + 4, item_size);
+	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));     /* padding behind the item; none in front */
+	smem_poke(partition + at + 12, 0);
+	settle();
+	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need);
+	settle();
+	made = true;
+out:
+	wr(smem_lock.base + LOCK_OWNER, 0);
+	printf("wifi: %u: the lock is released (it reads %u)%s\n", step, rd(smem_lock.base + LOCK_OWNER), made ? "; the entry is at "
+	    "the old mark, the mark moved" : "");
+	return made;
+}
+
+static bool
+step_our_item(void)
+{
+	static const char *const names[] = { OUR_ENTRY_STOP, OUR_ENTRY_RADIO };
+	struct smem_partition header;
+	struct smp2p ours;
+	uint32_t cacheline = 0, size = 0, partition;
+
+	announce("look at our partition with the DSP in the shared memory, and for an SMP2P item of ours (616) in it");
+	partition = smem_partition(SMEM_US, SMEM_WPSS, &cacheline, &size);
+	if (partition == 0 || !smem_peek(partition, &header, sizeof(header))) {
+		printf("wifi: %u: there is no such partition\n", step);
+		return false;
+	}
+	show_partition("us and the Wi-Fi DSP (0 and 13)", SMEM_US, SMEM_WPSS);
+	printf("wifi: %u: its items from the bottom end at +%#x, those from the top begin at +%#x\n", step, header.free_uncached,
+	    header.free_cached);
+	our_item = our_item_find();
+	if (our_item != 0) {
+		printf("wifi: %u: item %u is there, at %#lx: a kernel before this one made it, and it is used again\n", step,
+		    ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
+	} else {
+		announce("make the item: the SoC's lock for the shared memory (0x1f43000: the first access to that block) around it");
+		if (!our_item_make(partition)) {
+			return false;
+		}
+		our_item = our_item_find();
+		if (our_item == 0) {
+			printf("wifi: %u: THE ITEM IS NOT FOUND where it was just made\n", step);
+			return false;
+		}
+		printf("wifi: %u: item %u made, at %#lx\n", step, ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
+		show_partition("us and the Wi-Fi DSP (0 and 13)", SMEM_US, SMEM_WPSS);
+	}
+
+	announce("fill our item in (340 bytes at the address above): zeroes, then from processor 0 to 13, room for 16 entries, "
+	    "the entries \"master-kernel\" and \"wlan\" at zero, feature bit 0, and last the version, which makes it valid; "
+	    "then the DSP's SMP2P doorbell, as Linux rings it");
+	snprintf(last_write, sizeof(last_write), "step %u filled in our SMP2P item", step);
+	for (uint32_t at = 0; at < sizeof(ours); at += 4) {
+		smem_poke(our_item + at, 0);
+	}
+	settle();
+	smem_poke(our_item, SMP2P_MAGIC);
+	smem_poke(our_item + SMP2P_AT_PROCESSORS, SMEM_US | SMEM_WPSS << 16);
+	for (uint32_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		uint32_t name[4] = { 0 };
+
+		strlcpy((char *)name, names[i], sizeof(name));
+		for (uint32_t word = 0; word < 4; word++) {
+			smem_poke(our_item + SMP2P_AT_NAME(i) + 4 * word, name[word]);
+		}
+	}
+	smem_poke(our_item + SMP2P_AT_COUNTS, 16 | (uint32_t)(sizeof(names) / sizeof(names[0])) << 16);
+	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
+	settle();
+	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
+	settle();
+	smp2p_agreed = smp2p_restart_acks = smp2p_restart_acked = false;
+	ring(IPCC_WPSS, IPCC_SMP2P, "the DSP's SMP2P doorbell");
+	if (!smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC || smp2p_entry(&ours, OUR_ENTRY_STOP) < 0) {
+		printf("wifi: %u: OUR ITEM DOES NOT READ BACK AS WRITTEN\n", step);
+		return false;
+	}
+	show_words("our item reads back", &ours);
+	return true;
+}
+
+/* ---- step 11: the DSP, started ------------------------------------------------------------------------- */
 
 /*
  * Linux's order (qcom_q6v5_pas.c: adsp_start): the always-on processor is told, then TrustZone
@@ -1523,15 +1830,18 @@ step_image(void)
  * it has asked for its own power ("proxy" requests, dt: qcom,proxy-reg-names); that is not done
  * here -- no supply is touched from this file --, and the DSP starts on what the boot loader
  * left: level 256 for both (step 3). Then the shared memory and our doorbell are watched, every
- * 200 microseconds: for the DSP's item to appear, for every change in it, for a ring.
+ * 200 microseconds: for the DSP's item to appear, for every change in it, for a ring; and what
+ * SMP2P's rules have us answer is answered (dsp_listen()).
  *
- * What has been seen (the phone's first start of it from this kernel): 9 ms after TrustZone
- * returns the DSP rings our doorbell for GLINK, and 35 ms after, its SMP2P item is there --
- * version 1, feature bit 0, from processor 13 to 0 -- with no entries, and stays so. By
- * SMP2P's rules a side names its entries once the two have agreed on a version, for which it
- * must have seen the other's item: the DSP is waiting for ours (616), which this file does not
- * make yet. So "it is up" here means that it runs and speaks, not yet that it has said the word
- * Linux waits for (bit 1 of its entry "slave-kernel").
+ * What has been seen: 6.5 ms after TrustZone returns the DSP rings our doorbell for GLINK. At
+ * 32.5 ms its SMP2P item is there (on a later start in the same session of the phone: is
+ * written afresh, with "restart done" in its flags, which we answer) -- version 1, feature bit
+ * 0, from processor 13 to 0, the entries "smp2p", "slave-kernel" and soon "wlan". At 50 to 60 ms
+ * "slave-kernel" says 6: it is up, and has asked for its own power (Android's kernel sees the
+ * same word 39 ms after its start). Without an item of ours -- before step 10 existed -- the
+ * DSP's item stayed without entries for as long as it was watched.
+ * Asked to stop, the DSP answers within 13 ms: "slave-kernel" becomes 0x10e, bit 3 the
+ * acknowledgement.
  */
 static bool
 step_start(void)
@@ -1540,7 +1850,7 @@ step_start(void)
 	uint64_t answer = ~0ull, started, now, ready_at = 0, limit;
 	uint32_t state = 0, rang, changes = 0, wait_seconds = 10;
 	int32_t result;
-	bool have, spoke = false;
+	bool have, spoke = false, handed_over = false;
 
 	if (!image_written || our_box == 0) {
 		printf("wifi: %u: the image is not in place, or the mailbox not open\n", step);
@@ -1550,7 +1860,7 @@ step_start(void)
 	bzero(&last, sizeof(last));
 	have = dsp_words(&last);
 	if (have) {
-		show_words("before the start, the DSP's item says", &last);
+		show_words("before the start, the DSP's item says (from its last run; believed again once it changes)", &last);
 	}
 	announce("tell the doorbells that rings from before this kernel have been heard, tell the always-on processor that the "
 	    "image is loaded, and ask TrustZone to authenticate it and let the DSP out of reset");
@@ -1604,12 +1914,18 @@ step_start(void)
 			last = words;
 			have = true;
 			spoke = true;
+			dsp_listen(&words);
 			state = dsp_state(&words);
 			if ((state & DSP_READY) && ready_at == 0) {
 				ready_at = now;
 				limit = now + watch_seconds * 1000000ull;
 				printf("wifi: %u: THE WI-FI DSP SAYS IT IS UP: its entry \"slave-kernel\" says %#x (bit 1: \"error ready\"), "
 				    "%llu.%03llu ms after TrustZone started it\n", step, state, (now - started) / 1000, (now - started) % 1000);
+			}
+			if ((state & DSP_HANDOVER) && !handed_over) {
+				handed_over = true;
+				printf("wifi: %u: the DSP says it has asked for its own power (bit 2), %llu.%03llu ms after the start\n", step,
+				    (now - started) / 1000, (now - started) % 1000);
 			}
 			if (state & DSP_FATAL) {
 				printf("wifi: %u: THE WI-FI DSP SAYS IT HAS GIVEN UP (bit 0 of \"slave-kernel\")\n", step);
@@ -1622,18 +1938,20 @@ step_start(void)
 	if (have) {
 		show_words("at the end of the watch the DSP's item says", &last);
 	}
+	if (our_item != 0 && smem_peek(our_item, &words, sizeof(words))) {
+		show_words("and ours", &words);
+	}
 	printf("wifi: %u: the watch is over after %llu ms; the doorbells say %#x\n", step, (now_us() - started) / 1000,
 	    rd(ipcc.base + IPCC_RECEIVED));
 	if (state & DSP_FATAL) {
 		return false;
 	}
 	if (ready_at != 0) {
-		printf("wifi: %u: the DSP said it was up%s\n", step, state & DSP_HANDOVER ? ", and that it has asked for its own power "
-		    "(bit 2)" : "");
+		printf("wifi: %u: the DSP said it was up%s\n", step, handed_over ? ", and that it has asked for its own power" : "");
 	} else if (spoke) {
-		printf("wifi: %u: THE WI-FI DSP RUNS: it has %s%s. Its SMP2P item has %u entries: it names them once it has seen an "
-		    "item of ours, and we make none yet\n", step, rang != IPCC_NOBODY ? "rung our doorbell" : "", have ? (rang !=
-		    IPCC_NOBODY ? " and has its item in the shared memory" : "its item in the shared memory") : "", last.valid);
+		printf("wifi: %u: THE WI-FI DSP RUNS BUT HAS NOT SAID \"UP\": it has %s%s, with %u entries\n", step, rang != IPCC_NOBODY ?
+		    "rung our doorbell" : "", have ? (rang != IPCC_NOBODY ? " and has its item in the shared memory" :
+		    "its item in the shared memory") : "", last.valid);
 	} else {
 		printf("wifi: %u: NOT A WORD FROM THE DSP: no ring, and %s\n", step, have ? "its item in the shared memory is as a "
 		    "kernel before this one left it" : "no item of its in the shared memory");
@@ -1701,15 +2019,13 @@ smmu_look(void)
 
 static bool(*const steps[])(void) = {
 	step_smem, step_mailbox, step_rpmh, step_rails, step_pins, step_firmware, step_mailbox_open, step_header, step_image,
-	step_start,
+	step_our_item, step_start,
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 
 /*
  * Where a run ends in order while the DSP runs (the run's time is up, the host asks for its
- * end), and when the steps are over: the DSP is stopped. Linux first asks the DSP itself to
- * stop, through our SMP2P item, and waits for its acknowledgement; we have no such item yet,
- * and do what Linux does when no acknowledgement comes.
+ * end), and when the steps are over: the DSP is stopped (dsp_shutdown()).
  */
 void
 redwood_wifi_stop(void)
@@ -1812,7 +2128,7 @@ redwood_wifi_init(void)
  *     handler reads IPCC_RECEIVED until it says nobody, writes each word it gets to IPCC_CLEAR,
  *     and passes it on: client 0 signal 0 is the always-on processor's mailbox (every wait in
  *     mailbox_wait() above), client 24 signal 2 the Wi-Fi DSP's SMP2P item (the watch of step
- *     10), client 24 signal 0 its GLINK.
+ *     11, the wait in dsp_ask_to_stop()), client 24 signal 0 its GLINK.
  *   - The DSP's watchdog has a line of its own (SPI 587), raised when its firmware hangs
  *     without managing to say so in the shared memory.
  *   - The radio itself, later, raises 32 more (SPI 768 to 799, edge), by writing their numbers
