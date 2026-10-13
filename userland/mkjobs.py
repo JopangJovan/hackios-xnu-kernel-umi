@@ -26,11 +26,12 @@ import os
 import plistlib
 import sys
 
-# substrings of labels
+# substrings of labels. (mediaserverd is not among them, for all that there is neither sound nor a camera:
+# it is where VideoToolbox decodes for every other process, a HEIC picture included; see src/inject_media.c.)
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'locationd', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
-        'osanalytics', 'lockdown', 'mediaserverd', 'audio', 'jetsamproperties', 'mobileactivationd',
+        'osanalytics', 'lockdown', 'audio', 'jetsamproperties', 'mobileactivationd',
         'installcoordinationd', 'purplebuddy', 'restore', 'usb', 'accessoryd',
         'mobileassetd', 'nsurlsessiond', 'apsd', 'itunesstored', 'appstored', 'cloudd', 'bird',
         # these start, crash and are asked for again, over and over
