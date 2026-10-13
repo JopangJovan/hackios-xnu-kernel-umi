@@ -39,8 +39,9 @@
  * "gl:"; with each draw what it is made of -- the texture, the first corners -- and after it a
  * pixel or two of the framebuffer; gltrace_lit=1: and how much of the framebuffer is not black);
  * gltrace_at=SECONDS does so for the first frame that long after the window server started,
- * gltrace_draws=N for the first frame after one of N draws, gltrace_frames=N for N frames from
- * either on; gltrace_place=X0,Y0,X1,Y1 writes down, of those frames, only the draws whose corners
+ * gltrace_draws=N for the first frame after one of N draws, gltrace_function=N[,K] for the frame
+ * after the Kth draw CoreAnimation makes of its function N with no program, gltrace_frames=N for
+ * N frames from any of them on; gltrace_place=X0,Y0,X1,Y1 writes down, of those frames, only the draws whose corners
  * reach into that rectangle, a line each (lines "gl-at:"; writing everything down is slow, and a
  * window server that is slow draws other frames), gltrace_look=1 adds the pixel each of them
  * left in the middle of itself; glcensus=1 keeps count of the draws CoreAnimation makes with no
@@ -49,7 +50,7 @@
  * draws without a program alone, glcopy=1 copies every IOSurface as if the library could not
  * share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
  * wait_for_frames), glfetch=0 keeps EXT_shader_framebuffer_fetch from CoreAnimation (see
- * fetch_offered), glenv=NAME=VALUE puts that into the environment for the library to find
+ * fetch_offered), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: FD_MESA_DEBUG=sysmem, say).
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -223,6 +224,12 @@ struct eagl {
 	int blended;                    /* blending is off for such a draw, to be put back after it */
 	bool no_vibrant;                /* the first of the two could not be made */
 	GLint vibrant_matrix, vibrant_colours, masking_matrix, masking_colours;
+	GLbitfield unclear;             /* a glClear put off until the next draw (clear_now()), and what it was to be made with */
+	GLint unclear_box[4];
+	GLfloat unclear_colour[4];
+	GLboolean unclear_boxed;
+	GLuint box;                     /* and one that makes a picture eight times smaller */
+	GLint box_matrix, box_places;
 	unsigned unit;                  /* the texture unit being spoken of */
 	GLuint bound[8];                /* the 2D texture bound to each of the first units */
 	const GLfloat *matrix;          /* where CoreAnimation keeps the matrix it gives its programs */
@@ -250,6 +257,8 @@ static uint64_t trace_at;                       /* ... or the first frame from t
 static unsigned trace_draws;                    /* ... or the first frame after one of so many draws */
 static unsigned trace_frames = 1, trace_left;   /* ... and how many frames from there on */
 static int trace_lit;                           /* boot-arg gltrace_lit=1: count the lit pixels after every traced draw (slow) */
+static int trace_function = -1, trace_function_after = 1;       /* boot-arg gltrace_function=N[,K]: the frames after the Kth draw ... */
+static int trace_function_met;                                  /* ... CoreAnimation makes of its function N with no program */
 static float trace_place[4];                    /* boot-arg gltrace_place=X0,Y0,X1,Y1: of those frames, only the draws that touch this */
 static int trace_placed, trace_placing;         /* ... is set; ... and this frame is one of them */
 static int trace_look;                          /* boot-arg gltrace_look=1: ... and what each of them left in the middle of itself */
@@ -284,8 +293,13 @@ static int wait_for_frames = 1;
  */
 static int fetch_offered = 1;
 
+#define GL_SCISSOR_TEST                 0x0c11
+#define GL_SCISSOR_BOX                  0x0c10
+#define GL_COLOR_CLEAR_VALUE            0x0c22
+
 static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
+static void clear_now(struct eagl *e);
 
 static void
 eagl_enter(struct eagl *e, unsigned offset)
@@ -703,10 +717,12 @@ frame_begin(struct eagl *e)
 	e->in_frame = true;
 	e->began = now_us();
 	eagl_tracing = e->frames + 1 >= trace_first && e->frames + 1 <= trace_last;
-	if ((trace_at != 0 && e->began >= trace_at) || (trace_draws != 0 && e->last_draws == trace_draws)) {
+	if ((trace_at != 0 && e->began >= trace_at) || (trace_draws != 0 && e->last_draws == trace_draws) || trace_function_met) {
 		trace_left = trace_frames;      /* (once) */
 		trace_at = 0;
 		trace_draws = 0;
+		trace_function_met = 0;
+		trace_function = -1;
 	}
 	trace_placing = 0;
 	if (trace_left != 0) {
@@ -743,9 +759,11 @@ static void
 frame_end(struct eagl *e, bool finished)
 {
 	static unsigned unfollowed;
-	uint64_t before = now_us(), waited, after;
+	uint64_t before, waited, after;
 	unsigned copied = 0, in_place = 0;
 
+	clear_now(e);
+	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
 			in_place++;
@@ -856,7 +874,16 @@ my_glClear(void *context, GLbitfield mask)
 	if (eagl_tracing) {
 		eagl_trace("glClear(%#x)\n", mask);
 	}
-	glClear(mask);
+	clear_now(e);
+	if (e->program == 0 && e->colour != 0 && e->colour == e->bound[0]) {
+		/* what is about to be cleared may be what the next draw reads: see reads_what_it_writes() */
+		e->unclear = mask;
+		e->unclear_boxed = glIsEnabled(GL_SCISSOR_TEST);
+		glGetIntegerv(GL_SCISSOR_BOX, e->unclear_box);
+		glGetFloatv(GL_COLOR_CLEAR_VALUE, e->unclear_colour);
+	} else {
+		glClear(mask);
+	}
 	EAGL_LEAVE(e, 0x58);
 }
 
@@ -962,8 +989,6 @@ trace_draw(struct eagl *e, GLenum type, const void *indices, GLint first, GLsize
 }
 
 #define GL_BLEND                        0x0be2
-#define GL_SCISSOR_TEST                 0x0c11
-#define GL_SCISSOR_BOX                  0x0c10
 #define GL_BLEND_DST_RGB                0x80c8
 #define GL_BLEND_SRC_RGB                0x80c9
 #define GL_HALF_FLOAT                   0x140b
@@ -1183,6 +1208,8 @@ static const char table_fragment[] =
  *   are that mask; drawn as they were, they stayed white.
  */
 #define FUNCTION_MATRIX_PREMULTIPLIED   20
+#define FUNCTION_DOWNSAMPLE_8           28
+#define FUNCTION_VARIABLE_DOWNSAMPLE    38
 #define FUNCTION_VIBRANT_MATRIX         45
 
 static const char vibrant_fragment[] =
@@ -1214,6 +1241,32 @@ static const char masking_fragment[] =
     "  result = clamp(s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4], 0., 1.);\n"
     "}\n";
 
+/*
+ *   "ds8" (28): a picture made eight times smaller in one go, the first step of a blur of what is
+ *   behind a layer (capture_backdrop()). Its numbers are four places, one and three pixels of the
+ *   picture away each way: with the four of them mirrored in both directions, sixteen samples of
+ *   four pixels each, they are the sixty-four pixels that become one. (CoreAnimation's own shaders
+ *   for four and for six samples are of that kind; for this one the OpenGL ES renderer has none.)
+ *   Drawn as it was given, one sample in the middle, four pixels of the sixty-four made the one:
+ *   what is blurred after that shimmers when it moves.
+ */
+static const char box_fragment[] =
+    "#version 300 es\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform highp vec2 places[4];\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "out lowp vec4 result;\n"
+    "void main() {\n"
+    "  highp vec2 middle = texcoord / vec2(textureSize(texture0, 0));\n"
+    "  highp vec4 sum = vec4(0.);\n"
+    "  for (int i = 0; i < 4; i++) {\n"
+    "    sum += texture(texture0, middle + places[i]) + texture(texture0, middle - places[i]);\n"
+    "    sum += texture(texture0, middle + places[i] * vec2(1., -1.)) + texture(texture0, middle + places[i] * vec2(-1., 1.));\n"
+    "  }\n"
+    "  result = color * sum * .0625;\n"
+    "}\n";
+
 static void *ca_context;                /* CoreAnimation's GLContext */
 static GLfloat function_values[90][20];
 static uint8_t function_given[90];
@@ -1239,6 +1292,56 @@ redwood_gl_function_values(void *context, unsigned function, unsigned index, siz
 
 /* boot-arg glplain=0: leave such draws as they are; 2: also those without a texture; 3: the two with a colour matrix drawn plainly too */
 static int plain_draws = 1;
+
+/*
+ * The blur whose radius varies over the picture (the filter variableBlur with a mask: the strip
+ * under the status bar in Search, through which what scrolls up fades into a blur) is made of two
+ * functions, "vrd" (38) and "vrb" (39): the first, four times over, is to make of a picture its
+ * smaller copies, each from the one before, and the second reads among them by the mask. In the
+ * Metal renderer the copies are the levels of one texture. The OpenGL ES renderer has neither
+ * shader, and nothing that says which level is drawn into: what it does, four times, is to clear
+ * the texture and draw into it with that same texture as the source. What that leaves is the
+ * driver's to decide (here now the picture, now nothing: the strip came out black after one
+ * route to Search and right after another).
+ * A picture is not drawn from itself here, nor cleared for it: the one level stays what it was,
+ * and "vrb" then copies it out plainly -- the strip unblurred, which under a status bar over a
+ * blurred wallpaper is not seen. What scrolls under it stays sharp where it should fade.
+ *
+ * Which function a draw is can be asked of CoreAnimation's context only while it draws (between
+ * frames the place it is read from may be gone: the window server died of being asked at a
+ * glClear). So a clear of the texture that is also the one bound to be read is put off, with
+ * the scissor and the colour it was to be made with, until the next draw says what it is: that
+ * function, and the clear is dropped with the draw; anything else, and it is made first.
+ */
+static bool
+reads_what_it_writes(struct eagl *e)
+{
+	return e->program == 0 && e->colour != 0 && e->colour == e->bound[0] && ca_context != NULL &&
+	       *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10) == FUNCTION_VARIABLE_DOWNSAMPLE;
+}
+
+static void
+clear_now(struct eagl *e)
+{
+	GLint box[4] = { 0, 0, 0, 0 };
+	GLfloat colour[4] = { 0, 0, 0, 0 };
+	GLboolean boxed;
+
+	if (e->unclear == 0) {
+		return;
+	}
+	boxed = glIsEnabled(GL_SCISSOR_TEST);
+	glGetIntegerv(GL_SCISSOR_BOX, box);
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, colour);
+	(e->unclear_boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	glScissor(e->unclear_box[0], e->unclear_box[1], e->unclear_box[2], e->unclear_box[3]);
+	glClearColor(e->unclear_colour[0], e->unclear_colour[1], e->unclear_colour[2], e->unclear_colour[3]);
+	glClear(e->unclear);
+	e->unclear = 0;
+	(boxed ? glEnable : glDisable)(GL_SCISSOR_TEST);
+	glScissor(box[0], box[1], box[2], box[3]);
+	glClearColor(colour[0], colour[1], colour[2], colour[3]);
+}
 
 /* One of our programs, made: CoreAnimation's own vertex arrays go in at the places it has them. */
 static GLuint
@@ -1277,11 +1380,12 @@ plain_program(const char *fragment, const char *what)
  * in those seconds (which is what tells the screens of a scenario apart); and with that the
  * count of each since the start.
  */
-enum { CENSUS_NOT_DRAWN, CENSUS_PLAIN, CENSUS_TABLE, CENSUS_VIBRANT, CENSUS_MASKING, CENSUS_KINDS };
+enum { CENSUS_NOT_DRAWN, CENSUS_PLAIN, CENSUS_TABLE, CENSUS_VIBRANT, CENSUS_MASKING, CENSUS_BOX, CENSUS_KINDS };
 static const char *const census_kinds[CENSUS_KINDS] = {
-	"NOT DRAWN (no program, and no texture or nothing of ours to draw it with)", "drawn as the picture it is given (colour times texture)",
+	"NOT DRAWN (no program, and no texture, or nothing of ours to draw it with, or it would read what it writes)", "drawn as the picture it is given (colour times texture)",
 	"drawn through a table (ours, for the home indicator)", "drawn with our program for a colour matrix over what is behind",
 	"drawn with our program for a colour matrix over premultiplied pixels",
+	"drawn with our program that makes a picture eight times smaller",
 };
 static int census_on;
 static struct census {
@@ -1419,16 +1523,23 @@ plain_draw_begin(struct eagl *e, GLint enabled[3])
 	GLint rows = 0;
 	GLuint program;
 
+	if (e->unclear != 0 && reads_what_it_writes(e)) {
+		e->unclear = 0;
+	}
+	clear_now(e);
 	if (e->program != 0) {
 		return false;
 	}
-	if (!plain_draws || (plain_draws == 1 && e->bound[0] == 0)) {
+	if (!plain_draws || (plain_draws == 1 && e->bound[0] == 0) || reads_what_it_writes(e)) {
 		census_draw(e, function, CENSUS_NOT_DRAWN);
 		return false;
 	}
 	if (function < 90 && !said[function]) {
 		said[function] = 1;
 		say("redwood-gl: a draw with no program is CoreAnimation's function %u (\"%s\")\n", function, census_name(function));
+	}
+	if ((int)function == trace_function && --trace_function_after == 0) {
+		trace_function_met = 1;
 	}
 	e->blended = 0;
 	if (e->bound[0] != 0 && plain_draws != 3 && function < 90 && ((function == FUNCTION_VIBRANT_MATRIX && fetch_offered) ||
@@ -1461,6 +1572,24 @@ plain_draw_begin(struct eagl *e, GLint enabled[3])
 			e->blended = 1;                 /* the program has blended already */
 			glDisable(GL_BLEND);
 		}
+		for (GLuint i = 0; i < 3; i++) {
+			glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+			if (!enabled[i]) {
+				glEnableVertexAttribArray(i);
+			}
+		}
+		return true;
+	}
+	if (e->bound[0] != 0 && plain_draws != 3 && function == FUNCTION_DOWNSAMPLE_8 && function_given[function] == 8) {
+		if (e->box == 0) {
+			e->box = plain_program(box_fragment, "eight times smaller, sixteen samples");
+			e->box_matrix = glGetUniformLocation(e->box, "vertex_matrix");
+			e->box_places = glGetUniformLocation(e->box, "places");
+		}
+		census_draw(e, function, CENSUS_BOX);
+		glUseProgram(e->box);
+		glUniformMatrix4fv(e->box_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
+		glUniform2fv(e->box_places, 4, function_values[function]);
 		for (GLuint i = 0; i < 3; i++) {
 			glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
 			if (!enabled[i]) {
@@ -1810,6 +1939,7 @@ my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
 	if (eagl_tracing) {
 		eagl_trace("glBindFramebuffer(%#x, %u)\n", target, framebuffer);
 	}
+	clear_now(e);                   /* (a clear put off is of what was drawn into until now) */
 	glBindFramebuffer(target, framebuffer);
 	if (target == GL_READ_FRAMEBUFFER) {
 		EAGL_LEAVE(e, 0x1508);
@@ -1912,6 +2042,21 @@ my_glPopGroupMarkerEXT(void *context)
  * version that 3.00 dropped are defined back, and texture2DRect() divides by textureSize().
  * (All of a program's shaders must be of one version, so all are treated alike.)
  */
+/*
+ * CoreAnimation's shaders say "lowp" and "mediump" for nearly everything, as shaders written for
+ * Apple's GPUs do. On an Adreno mediump is a float of sixteen bits, eleven of them the number: a
+ * place in a texture of 1024 rows worked out so is right to half a row, and the table CoreAnimation
+ * looks a gradient's colours up in (32 x 1024, a cube of colour laid out flat; its fragment shader
+ * with "c_st") then gives sixty-odd shades where it has thousands. The Weather widget's sky was
+ * drawn in horizontal bands by that. Everything is computed in full precision instead (the two
+ * words are defined away, in vertex shaders as well: a uniform must be the same in both).
+ * Boot-arg glprecision=0: as the shaders say.
+ */
+static int full_precision = 1;
+static const char all_highp[] =
+    "#define lowp highp\n"
+    "#define mediump highp\n";
+
 static const char fragment_start[] =
     "#define varying in\n"
     "#define texture2D texture\n"
@@ -1975,7 +2120,8 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 {
 	struct eagl *e = context;
 	bool fragment = e->fragment[shader % 64], fetch;
-	const GLchar *parts[5] = { "#version 300 es\n", fragment ? fragment_start : vertex_start, "", NULL, "" };
+	const GLchar *parts[6] = { "#version 300 es\n", fragment ? fragment_start : vertex_start, "", NULL, "",
+		                   full_precision ? all_highp : "" };
 	size_t size = 1, extensions = 0;
 	char *text, *line, *head;
 
@@ -2010,7 +2156,7 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	}
 	free((void *)e->sources[shader % 64]);
 	e->sources[shader % 64] = text;
-	glShaderSource(shader, 5, parts, NULL);
+	glShaderSource(shader, 6, (const GLchar *const[6]){ parts[0], parts[5], parts[1], parts[2], parts[3], parts[4] }, NULL);
 	EAGL_LEAVE(e, 0x12a0);
 }
 
@@ -2338,6 +2484,10 @@ install(void)
 		if ((argument = strstr(arguments, "gltrace_draws=")) != NULL) {
 			trace_draws = (unsigned)strtoul(argument + 14, NULL, 10);
 		}
+		if ((argument = strstr(arguments, "gltrace_function=")) != NULL) {
+			trace_function = (int)strtoul(argument + 17, (char **)&argument, 10);
+			trace_function_after = *argument == ',' ? (int)strtoul(argument + 1, NULL, 10) : 1;
+		}
 		if ((argument = strstr(arguments, "gltrace_frames=")) != NULL) {
 			trace_frames = (unsigned)strtoul(argument + 15, NULL, 10);
 		}
@@ -2355,6 +2505,7 @@ install(void)
 		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
+		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
 			plain_draws = (int)strtoul(argument + 8, NULL, 10);
 		}
