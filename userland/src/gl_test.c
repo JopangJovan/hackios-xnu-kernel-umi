@@ -6,6 +6,9 @@
  *
  *   gl_test [SECONDS [WIDTH HEIGHT]]   keep the picture on the panel for so long (default 6: the
  *                                      window server draws over it with its next frame)
+ *   gl_test fill [WIDTH HEIGHT]        no picture: how long the GPU takes over a frame of that size
+ *                                      (default 1125 x 2436, what the window server draws), by what
+ *                                      is in it -- see fill()
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -50,6 +53,12 @@ extern void glVertexAttribPointer(unsigned index, int size, unsigned type, unsig
 extern void glEnableVertexAttribArray(unsigned index);
 extern void glDrawArrays(unsigned mode, int first, int count);
 extern void glFinish(void);
+extern void glEnable(unsigned what);
+extern void glDisable(unsigned what);
+extern void glBlendFunc(unsigned source, unsigned destination);
+extern int glGetUniformLocation(unsigned program, const char *name);
+extern void glUniform1i(int location, int value);
+extern void glUniform4f(int location, float x, float y, float z, float w);
 extern void glReadPixels(int x, int y, int width, int height, unsigned format, unsigned type, void *pixels);
 
 #define OSMESA_RGBA                     0x1908
@@ -58,6 +67,11 @@ extern void glReadPixels(int x, int y, int width, int height, unsigned format, u
 #define OSMESA_CONTEXT_MAJOR_VERSION    0x36
 #define OSMESA_ES_PROFILE               0x38
 #define GL_TRIANGLES                    0x0004
+#define GL_TRIANGLE_STRIP               0x0005
+#define GL_ONE                          1
+#define GL_ONE_MINUS_SRC_ALPHA          0x0303
+#define GL_BLEND                        0x0be2
+#define GL_LINEAR                       0x2601
 #define GL_TEXTURE_2D                   0x0de1
 #define GL_UNSIGNED_BYTE                0x1401
 #define GL_FLOAT                        0x1406
@@ -84,6 +98,17 @@ struct show {
 };
 
 static uint64_t
+now_us(void)
+{
+	static mach_timebase_info_data_t base;
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	return mach_absolute_time() * base.numer / base.denom / 1000;
+}
+
+static uint64_t
 now_ms(void)
 {
 	static mach_timebase_info_data_t base;
@@ -107,6 +132,117 @@ shader(unsigned type, const char *text)
 		printf("gl_test: a shader does not compile\n");
 	}
 	return name;
+}
+
+/*
+ * What a frame costs by what is in it. Each kind of frame is drawn sixteen times into a texture
+ * of the size given, each time waited for (glFinish), and the shortest time is the one told:
+ * the window server draws its own frames meanwhile, and they are in the way of some.
+ *   - nothing but a clear: what a frame costs before anything is drawn in it (the GPU draws a
+ *     picture of this size in pieces, in memory of its own, and writes each piece out);
+ *   - no clear, one small rectangle: the same, and the picture as it was has to be read in first;
+ *   - a clear and 1, 2, 4, 8 rectangles over all of it, in one colour: what covering every pixel
+ *     once costs;
+ *   - the same with a texture of the same size and blending, which is what a layer of the
+ *     window server's is.
+ * From these it can be told what a slow frame is slow at: the pieces written to memory and read
+ * from it, or the pixels drawn.
+ */
+static void
+fill(int width, int height)
+{
+	static const float all[] = { -1, -1, 1, -1, -1, 1, 1, 1 }, some[] = { -0.1f, -0.1f, 0.1f, -0.1f, -0.1f, 0.1f, 0.1f, 0.1f };
+	static const struct {
+		const char *what;
+		int clear, layers, textured, small;
+	} kinds[] = {
+		{ "a clear and nothing else", 1, 0, 0, 0 },
+		{ "no clear, one small rectangle", 0, 1, 0, 1 },
+		{ "a clear, 1 rectangle over all of it", 1, 1, 0, 0 },
+		{ "a clear, 2 rectangles", 1, 2, 0, 0 },
+		{ "a clear, 4 rectangles", 1, 4, 0, 0 },
+		{ "a clear, 8 rectangles", 1, 8, 0, 0 },
+		{ "a clear, 1 rectangle with a texture, blended", 1, 1, 1, 0 },
+		{ "a clear, 2 such", 1, 2, 1, 0 },
+		{ "a clear, 4 such", 1, 4, 1, 0 },
+		{ "a clear, 8 such", 1, 8, 1, 0 },
+	};
+	unsigned target = 0, source = 0, framebuffer = 0, program;
+	uint32_t *pixels = malloc((size_t)width * (size_t)height * 4);
+	int textured, colour, good = 0;
+
+	if (pixels == NULL) {
+		return;
+	}
+	for (size_t i = 0; i < (size_t)width * (size_t)height; i++) {
+		pixels[i] = 0x80404040u + ((uint32_t)i * 2654435761u >> 28);
+	}
+	glGenTextures(1, &source);
+	glBindTexture(GL_TEXTURE_2D, source);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+	free(pixels);
+	glGenTextures(1, &target);
+	glBindTexture(GL_TEXTURE_2D, target);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glGenFramebuffers(1, &framebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
+	program = glCreateProgram();
+	glAttachShader(program, shader(GL_VERTEX_SHADER,
+	    "attribute vec2 where; varying vec2 at;\n"
+	    "void main() { gl_Position = vec4(where, 0.0, 1.0); at = where * 0.5 + 0.5; }\n"));
+	glAttachShader(program, shader(GL_FRAGMENT_SHADER,
+	    "precision mediump float; varying vec2 at; uniform sampler2D picture; uniform int textured; uniform vec4 colour;\n"
+	    "void main() { gl_FragColor = textured != 0 ? texture2D(picture, at) * colour : colour; }\n"));
+	glBindAttribLocation(program, 0, "where");
+	glLinkProgram(program);
+	glGetProgramiv(program, GL_LINK_STATUS, &good);
+	if (!good || glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		printf("gl_test: fill: no program or no framebuffer\n");
+		return;
+	}
+	glUseProgram(program);
+	textured = glGetUniformLocation(program, "textured");
+	colour = glGetUniformLocation(program, "colour");
+	glUniform1i(glGetUniformLocation(program, "picture"), 0);
+	glBindTexture(GL_TEXTURE_2D, source);
+	glViewport(0, 0, width, height);
+	glEnableVertexAttribArray(0);
+	glClearColor(0.1f, 0.1f, 0.2f, 1.0f);
+	printf("gl_test: fill: frames of %d x %d (%d KB), the shortest of 16 each:\n", width, height, width * height / 256);
+	for (unsigned k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+		uint64_t least = ~0ull, most = 0;
+
+		glUniform1i(textured, kinds[k].textured);
+		if (kinds[k].textured) {
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		} else {
+			glDisable(GL_BLEND);
+		}
+		glVertexAttribPointer(0, 2, GL_FLOAT, 0, 0, kinds[k].small ? some : all);
+		for (int frame = 0; frame < 16; frame++) {
+			uint64_t began = now_us(), took;
+
+			if (kinds[k].clear) {
+				glClear(GL_COLOR_BUFFER_BIT);
+			}
+			for (int layer = 0; layer < kinds[k].layers; layer++) {
+				glUniform4f(colour, 0.2f + 0.1f * (float)layer, 0.5f, 0.3f, 0.5f);
+				glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+			}
+			glFinish();
+			took = now_us() - began;
+			least = took < least ? took : least;
+			most = took > most ? took : most;
+		}
+		printf("gl_test: fill: %-46s %5llu us (the longest %llu)\n", kinds[k].what, least, most);
+	}
+	printf("gl_test: fill: error %#x\n", glGetError());
 }
 
 int
@@ -138,6 +274,10 @@ main(int argc, char **argv)
 	}
 	printf("gl_test: %s; %s; %s\n", (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER),
 	    (const char *)glGetString(GL_VERSION));
+	if (argc > 1 && strcmp(argv[1], "fill") == 0) {
+		fill(argc > 3 ? atoi(argv[2]) : 1125, argc > 3 ? atoi(argv[3]) : 2436);
+		return 0;
+	}
 
 	began = now_ms();
 	glGenTextures(1, &texture);

@@ -42,13 +42,16 @@
  * gltrace_draws=N for the first frame after one of N draws, gltrace_frames=N for N frames from
  * either on; gltrace_place=X0,Y0,X1,Y1 writes down, of those frames, only the draws whose corners
  * reach into that rectangle, a line each (lines "gl-at:"; writing everything down is slow, and a
- * window server that is slow draws other frames); glshaders=1 writes down the text of every
+ * window server that is slow draws other frames), gltrace_look=1 adds the pixel each of them
+ * left in the middle of itself; glshaders=1 writes down the text of every
  * shader, glshow=TEXTURE puts that texture over the corner of the picture, glplain=0 leaves the
  * draws without a program alone, glcopy=1 copies every IOSurface as if the library could not
- * share one, glenv=NAME=VALUE puts that into the environment for the library to find (its own
- * switches: FD_MESA_DEBUG=sysmem, say).
+ * share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
+ * wait_for_frames), glenv=NAME=VALUE puts that into the environment for the library to find
+ * (its own switches: FD_MESA_DEBUG=sysmem, say).
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
@@ -243,12 +246,23 @@ static unsigned trace_frames = 1, trace_left;   /* ... and how many frames from 
 static int trace_lit;                           /* boot-arg gltrace_lit=1: count the lit pixels after every traced draw (slow) */
 static float trace_place[4];                    /* boot-arg gltrace_place=X0,Y0,X1,Y1: of those frames, only the draws that touch this */
 static int trace_placed, trace_placing;         /* ... is set; ... and this frame is one of them */
+static int trace_look;                          /* boot-arg gltrace_look=1: ... and what each of them left in the middle of itself */
+static float trace_middle[2];                   /* ... which is here, as CoreAnimation counts */
+static int trace_listed;                        /* the draw at hand is one of them */
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
 static __thread struct eagl *current;
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
+/*
+ * A frame that is handed to the display must have been drawn. The display's driver waits for
+ * the GPU itself before it puts a surface on the panel, on a thread of its own, and says so in
+ * the registry ("RedwoodWaitsForGPU"); the window server is then at its next frame meanwhile.
+ * With a driver that does not, the frame is waited for here (glFinish). Boot-arg glwait=1:
+ * here in any case; glwait=0: nowhere, to see what the waiting costs (and frames half drawn).
+ */
+static int wait_for_frames = 1;
 
 static const char *eagl_slot_name(unsigned offset);
 
@@ -544,7 +558,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	    image->format, image->type, base);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
-	if (trace_placed) {
+	if (trace_placing) {
 		size_t set[4] = { 0, 0, 0, 0 }, size = row * (size_t)(image->height - 1) + (size_t)image->width * pixel;
 
 		for (size_t at = 0; at < size; at++) {
@@ -557,6 +571,17 @@ surface_to_texture(struct eagl *e, struct image *image)
 		    (unsigned)IOSurfaceGetPixelFormat(surface), image->width, image->height, row,
 		    IOSurfaceGetBytesPerElement(surface), pixel, image->internal, image->format, image->type, size, set[0], set[1],
 		    set[2], set[3]);
+		if (image->height == 1 && pixel == 2 && image->width >= 16) {
+			char entries[200] = "";
+			size_t used = 0;
+
+			for (int i = 0; i < 16; i++) {
+				size_t at = (size_t)(i * (image->width - 1) / 15) * 2;
+
+				used += (size_t)snprintf(entries + used, sizeof(entries) - used, " %u/%u", base[at], base[at + 1]);
+			}
+			say("gl-at:     a table; sixteen of its entries, first to last:%s\n", entries);
+		}
 	}
 	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	free(flipped);
@@ -705,7 +730,7 @@ frame_end(struct eagl *e, bool finished)
 			in_place++;
 		}
 	}
-	if (in_place != 0 && !finished) {
+	if (in_place != 0 && !finished && wait_for_frames) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
 	}
 	waited = now_us();
@@ -972,6 +997,9 @@ trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices,
 	if (low[0] > trace_place[2] || high[0] < trace_place[0] || low[1] > trace_place[3] || high[1] < trace_place[1]) {
 		return;
 	}
+	trace_listed = 1;
+	trace_middle[0] = (low[0] + high[0]) / 2;
+	trace_middle[1] = (low[1] + high[1]) / 2;
 	for (unsigned unit = 0; unit < 4; unit++) {
 		GLint width = 0, height = 0, format = 0;
 		struct image *image;
@@ -992,12 +1020,37 @@ trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices,
 	glGetIntegerv(GL_BLEND_SRC_RGB, &blend[0]);
 	glGetIntegerv(GL_BLEND_DST_RGB, &blend[1]);
 	glGetIntegerv(GL_SCISSOR_BOX, scissor);
-	say("gl-at: frame %u draw %u into %u: %s of %d from %g,%g to %g,%g; program %u; textures%s; colour %g %g %g %g; in the "
-	    "texture at %g,%g; blend %s %#x %#x; scissor %s %d,%d %dx%d\n", e->frames + 1, e->draws, e->framebuffer,
-	    mode == GL_TRIANGLES ? "triangles" : mode == 1 ? "lines" : "strips", count, (double)low[0], (double)low[1],
+	say("gl-at: frame %u draw %u into %u (texture %u): %s of %d from %g,%g to %g,%g; program %u; textures%s; colour %g %g %g "
+	    "%g; in the texture at %g,%g; blend %s %#x %#x; scissor %s %d,%d %dx%d\n", e->frames + 1, e->draws, e->framebuffer,
+	    e->colour, mode == GL_TRIANGLES ? "triangles" : mode == 1 ? "lines" : "strips", count, (double)low[0], (double)low[1],
 	    (double)high[0], (double)high[1], e->program, textures, (double)colour[0], (double)colour[1], (double)colour[2],
 	    (double)colour[3], (double)where[0], (double)where[1], glIsEnabled(GL_BLEND) ? "on" : "off", blend[0], blend[1],
 	    glIsEnabled(GL_SCISSOR_TEST) ? "on" : "off", scissor[0], scissor[1], scissor[2], scissor[3]);
+}
+
+/* gltrace_look: the pixel a listed draw has left in the middle of itself (the matrix is CoreAnimation's, the last it gave). */
+static void
+trace_placed_look(struct eagl *e)
+{
+	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	const GLfloat *m = e->matrix != NULL ? e->matrix : identity;
+	float x = m[0] * trace_middle[0] + m[4] * trace_middle[1] + m[12];
+	float y = m[1] * trace_middle[0] + m[5] * trace_middle[1] + m[13];
+	float w = m[3] * trace_middle[0] + m[7] * trace_middle[1] + m[15];
+	GLint view[4] = { 0, 0, 0, 0 };
+	uint8_t pixel[4] = { 0, 0, 0, 0 };
+	int px, py;
+
+	trace_listed = 0;
+	if (!trace_look || w == 0) {
+		return;
+	}
+	glGetIntegerv(GL_VIEWPORT, view);
+	px = view[0] + (int)((x / w + 1) / 2 * (float)view[2]);
+	py = view[1] + (int)((y / w + 1) / 2 * (float)view[3]);
+	glReadPixels(px, py, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+	say("gl-at:     it left %u %u %u %u (red green blue alpha) at %d,%d of the framebuffer%s\n", pixel[0], pixel[1], pixel[2],
+	    pixel[3], px, py, glGetError() ? " (not readable)" : "");
 }
 
 static unsigned
@@ -1053,10 +1106,17 @@ static const char plain_fragment[] =
 /*
  * One kind of them has a second texture, on the second unit: a table, one row of pixels (seen:
  * 256 of two parts, brightness and opacity). What is drawn so is the home indicator, the bar at
- * the bottom of the screen that is light over dark pictures and dark over light ones: the first
- * texture is what is behind it, and the table says what the bar is to be for each brightness
- * of that, opacity already multiplied in. So that is what this program does (over black the
- * software renderer's bar is 153 of 255, and so is this one).
+ * the bottom of the screen that is light over dark pictures and dark over light ones. It is a
+ * filter of CoreAnimation's own, "homeAffordanceBase", which its OpenGL ES renderer has no
+ * program for: it binds what is behind the bar and the table, and draws with none; the filter's
+ * three numbers (inputAddWhite, inputAmount, inputOverlayOpacity) it hands to no one. What the
+ * filter does is CoreAnimation's software renderer's to say, and this is the same arithmetic:
+ *   the table's entry for the brightness of what is behind, plus the white added, times the
+ *   amount; that over what is behind; and the result laid over itself in "overlay" mode at the
+ *   overlay's opacity.
+ * The three numbers are the ones with which this gives the software renderer's bar on the
+ * phone, 153 of 255 over black and 63 over white: 0.284, 1 and 0.31. (MaterialKit's defaults
+ * for its "thin" bar would be 0.373, 0.31 and 0.4, and give neither.)
  */
 static const char table_fragment[] =
     "#version 300 es\n"
@@ -1065,10 +1125,18 @@ static const char table_fragment[] =
     "in lowp vec4 color;\n"
     "in highp vec2 texcoord;\n"
     "out lowp vec4 result;\n"
+    "const mediump float white = .284, amount = 1., overlay = .31;\n"
     "void main() {\n"
-    "  lowp vec4 behind = texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
-    "  lowp vec4 entry = texture(table, vec2(dot(behind.rgb, vec3(.2125, .7154, .0721)), .5));\n"
-    "  result = entry;\n"
+    "  mediump vec4 behind = texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+    "  mediump vec4 entry = texture(table, vec2(dot(behind.rgb, vec3(.2125, .7154, .0721)), .5));\n"
+    "  mediump vec4 bar = clamp(entry + vec4(vec3(white), 1.), 0., 1.) * amount;\n"
+    "  mediump vec4 under = behind * (1. - bar.a) + bar;\n"
+    "  mediump vec4 over = under * overlay;\n"
+    "  mediump vec3 dark = 2. * under.rgb * over.rgb;\n"
+    "  mediump vec3 light = over.a * under.a - 2. * (under.a - under.rgb) * (over.a - over.rgb);\n"
+    "  mediump vec3 both = mix(dark, light, step(under.a * .5, under.rgb));\n"
+    "  mediump float opacity = over.a + under.a * (1. - over.a);\n"
+    "  result = vec4(clamp(both + over.rgb * (1. - under.a) + under.rgb * (1. - over.a), 0., opacity), opacity);\n"
     "}\n";
 
 static int plain_draws = 1;             /* boot-arg glplain=0: leave such draws as they are; 2: also those without a texture */
@@ -1252,6 +1320,9 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	if (plain) {
 		plain_draw_end(e, enabled);
 	}
+	if (trace_listed) {
+		trace_placed_look(e);
+	}
 	EAGL_LEAVE(e, 0x210);
 	if (eagl_tracing) {
 		trace_pixels(e);
@@ -1280,6 +1351,9 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	glDrawElements(mode, count, type, indices);
 	if (plain) {
 		plain_draw_end(e, enabled);
+	}
+	if (trace_listed) {
+		trace_placed_look(e);
 	}
 	EAGL_LEAVE(e, 0x220);
 	if (eagl_tracing) {
@@ -1897,6 +1971,26 @@ my_dealloc(id self, SEL selector)
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
 }
 
+/* Does the display's driver wait for the GPU before it shows a surface (iokit/Kernel/MiniIOMobileFramebuffer.cpp)? */
+static bool
+display_waits(void)
+{
+	io_service_t display = IOServiceGetMatchingService(0, IOServiceMatching("IOMobileFramebuffer"));
+	CFTypeRef says;
+	bool waits;
+
+	if (display == 0) {
+		return false;
+	}
+	says = IORegistryEntryCreateCFProperty(display, CFSTR("RedwoodWaitsForGPU"), kCFAllocatorDefault, 0);
+	waits = says == kCFBooleanTrue;
+	if (says != NULL) {
+		CFRelease(says);
+	}
+	IOObjectRelease(display);
+	return waits;
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -1936,6 +2030,7 @@ install(void)
 			trace_frames = (unsigned)strtoul(argument + 15, NULL, 10);
 		}
 		trace_lit = strstr(arguments, "gltrace_lit=1") != NULL;
+		trace_look = strstr(arguments, "gltrace_look=1") != NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;
 
@@ -1953,6 +2048,11 @@ install(void)
 			shown_texture = (GLuint)strtoul(argument + 7, NULL, 10);
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
+			wait_for_frames = 0;
+		}
+		say("redwood-gl: a frame is waited for %s\n", wait_for_frames ? "here, before it is handed to the display" :
+		    "by the display's driver, not here");
 		for (argument = arguments; (argument = strstr(argument, "glenv=")) != NULL; argument += 6) {
 			char setting[128];
 			size_t length = strcspn(argument + 6, " ");
