@@ -20,7 +20,7 @@
 # (out/stubs.txt lists them), unless wifi/lx/src has one that does more.
 #
 # Everything is compiled as FreeBSD kernel code for an Apple arm64 kernel and tied into one
-# object that shows nothing but its entry point; the kernel links it when it is there
+# object that shows nothing but its entry points; the kernel links it when it is there
 # (xnu-build.sh).
 #
 #   VERSION   of Linux. 7.0.14: LinuxKPI's 802.11 headers follow the mac80211 of Linux 7.0, and
@@ -114,7 +114,7 @@ if [ ! -d gen ]; then
 fi
 
 # --- compile: the driver's files that are built so far, and ours
-DRIVER="core hal qmi ce hw fw htc wmi mac reg peer"
+DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p"
 CC="clang -target arm64-apple-ios16.5"
 LD=$ROOT/xnu-deps/host/bin/ld64
 CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing
@@ -177,8 +177,8 @@ for s in $(cat out/undefined.txt); do
 done
 [ -z "$missing" ] || exit 1
 $CC -c out/stubs.s -o out/stubs.o
-# one name is shown: where the kernel enters (lx_start() of redwood_lx.h)
-echo _lx_start > out/exported.txt
+# three names are shown: where the kernel enters (lx_start(), lx_stop() and lx_transmit() of redwood_lx.h)
+printf '_lx_start\n_lx_stop\n_lx_transmit\n' > out/exported.txt
 $LD -r -arch arm64 -exported_symbols_list out/exported.txt out/all.o out/stubs.o -o out/ath11k.o 2> out/ld.err ||
 	{ cat out/ld.err; exit 1; }
 rm -f out/all.o

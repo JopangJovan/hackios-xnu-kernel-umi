@@ -725,8 +725,8 @@ iounmap(void *address)
  * or the other way round. The first part of it is handed out for good, a stretch at a time
  * (rings); the rest is slots of one size, taken and given back (buffers).
  */
-#define POOL_SIZE	(12u << 20)
-#define POOL_RINGS	(2u << 20)
+#define POOL_SIZE	(44u << 20)
+#define POOL_RINGS	(12u << 20)		/* (the data path's rings and link descriptors come to about 6 MB) */
 #define POOL_SLOT	4096u
 #define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
 
@@ -782,6 +782,22 @@ void
 kmem_free(void *address, vm_size_t size)
 {
 	/* (dma_free_coherent() ends here: rings are not given back) */
+}
+
+/*
+ * Linux's memory for a device that need not be coherent: the same piece. (The data path takes a
+ * few kilobytes of it for every traffic class of a station it meets, and gives them back when
+ * the station goes: here they stay taken, like the rings.)
+ */
+void *
+dma_alloc_noncoherent(struct device *dev, size_t size, dma_addr_t *handle, enum dma_data_direction direction, gfp_t gfp)
+{
+	return (linux_dma_alloc_coherent(dev, size, handle, gfp));
+}
+
+void
+dma_free_noncoherent(struct device *dev, size_t size, void *memory, dma_addr_t handle, enum dma_data_direction direction)
+{
 }
 
 /*
@@ -1112,6 +1128,45 @@ rhashtable_remove_fast(struct rhashtable *table, struct rhash_head *head, const 
 	}
 	lx_os_unlock();
 	return (error);
+}
+
+/* The numbered thing with the lowest number from *id on, and that number; or NULL. */
+void *
+idr_get_next(struct idr *idr, int *id)
+{
+	struct lx_ids *ids;
+	void *thing = NULL;
+
+	lx_os_lock();
+	ids = (struct lx_ids *)idr->top;
+	for (int i = *id < 0 ? 0 : *id; ids != NULL && i < ids->size; i++) {
+		if (ids->things[i] != NULL) {
+			thing = ids->things[i];
+			*id = i;
+			break;
+		}
+	}
+	lx_os_unlock();
+	return (thing);
+}
+
+void
+explicit_bzero(void *memory, size_t size)
+{
+	bzero(memory, size);
+}
+
+/* FreeBSD's kernel log, which LinuxKPI's rate-limited messages go to. */
+void
+log(int level, const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	lx_os_print(line);
 }
 
 void

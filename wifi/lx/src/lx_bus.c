@@ -10,10 +10,11 @@
  * in mission mode and has ce.c and hal.c set up the copy engines' rings, htc.c connects its
  * services over them and wmi.c has the firmware say what the radio is ("service ready") and,
  * given the driver's configuration, that it is ready for commands ("unified ready"); mac.c
- * registers the radio with what stands in for mac80211 (lx_80211.c). What the firmware said is
- * then put in the log, with the boot-arg wifi_scan=1 the station of lx_80211.c has the radio
- * scan, and the driver is taken down again the way its own removal does it
- * (ath11k_core_deinit()). The data path is not built.
+ * registers the radio with what stands in for mac80211 (lx_80211.c) and sets the data path's
+ * rings up. What the firmware said is then put in the log. With the boot-arg wifi_scan=1 the
+ * station of lx_80211.c has the radio scan, and the driver is taken down again the way its own
+ * removal does it (ath11k_core_deinit()); with wifi_join=1 the station joins the network the
+ * kernel was given, and the driver stays up, carrying the kernel's frames, until lx_stop().
  *
  * The kernel's boot-arg wifi_lx says how far the radio's registers are touched: 1, not at all
  * (every write is said and dropped, every read is 0: the driver's own exchange and nothing
@@ -52,8 +53,8 @@ static struct {
 	unsigned again;				/* ... and how many writes to it in a row have not been said */
 	volatile bool looking;			/* the thread that looks at the copy engines is wanted ... */
 	volatile bool looks;			/* ... and runs */
+	volatile bool data;			/* ... and looks at the data path's rings as well */
 	unsigned same;				/* it has written a ring's pointer what it held so many times */
-	unsigned data_path;			/* messages for the data path, which is not built */
 } bus;
 
 /* ---- what the driver says ---------------------------------------------------------------------- */
@@ -246,10 +247,16 @@ bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
 }
 
 /*
- * In place of the copy engines' interrupts: each engine is looked at as its interrupt would have
+ * In place of the radio's interrupts: each copy engine is looked at as its interrupt would have
  * ath11k do (ce.c: ath11k_ce_per_engine_service(), which takes what has been received to its
- * owner and posts fresh buffers), once a millisecond, from the bus's start to its stop.
+ * owner and posts fresh buffers), and once the driver has "enabled the data path's interrupts"
+ * so is each of the groups its rings are in (dp.c: ath11k_dp_service_srng(), which is what the
+ * driver's NAPI poll calls: frames received, frames that have been sent, errors, the reorder
+ * block's answers). Once a millisecond while nothing comes; again at once while a group has
+ * used up what it was allowed in one go.
  */
+#define DATA_BUDGET	64
+
 static void
 bus_looks(void *argument)
 {
@@ -257,10 +264,17 @@ bus_looks(void *argument)
 
 	bus.looks = true;
 	while (bus.looking) {
+		bool more = false;
+
 		for (unsigned i = 0; i < ab->hw_params.ce_count; i++) {
 			ath11k_ce_per_engine_service(ab, i);
 		}
-		lx_pause_ms(1);
+		for (unsigned i = 0; bus.data && i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+			more |= ath11k_dp_service_srng(ab, &ab->ext_irq_grp[i], DATA_BUDGET) >= DATA_BUDGET;
+		}
+		if (!more) {
+			lx_pause_ms(1);
+		}
 	}
 	bus.looks = false;
 }
@@ -274,6 +288,7 @@ bus_looks(void *argument)
 static void
 bus_quiet(void)
 {
+	bus.data = false;
 	bus.looking = false;
 	while (bus.looks) {
 		lx_pause_ms(1);
@@ -373,10 +388,15 @@ bus_power_down(struct ath11k_base *ab, bool is_suspend)
 {
 }
 
+/* pcic.c: ath11k_pcic_ext_irq_enable(): the data path's rings are set up, and are looked at from here on */
 static void
 bus_irq_enable(struct ath11k_base *ab)
 {
-	/* (the data path's interrupts, when there is a data path) */
+	for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+		ab->ext_irq_grp[i].ab = ab;
+		ab->ext_irq_grp[i].grp_id = i;
+	}
+	bus.data = true;
 }
 
 static void
@@ -397,23 +417,6 @@ static const struct ath11k_hif_ops bus_ops = {
 	.power_down = bus_power_down,
 	/* (no interrupt vectors are offered: the rings are then set up without any, see ce.c) */
 };
-
-/* ---- the first things the driver does with parts that are not built -------------------------------- */
-
-/* dp_rx.c's: what a copy engine has received for the data path */
-void
-ath11k_dp_htt_htc_t2h_msg_handler(struct ath11k_base *ab, struct sk_buff *skb)
-{
-	if (bus.data_path++ < 4) {
-		char text[3 * 32 + 1] = "";
-
-		for (unsigned i = 0; i < skb->len && i < 32; i++) {
-			snprintf(text + 3 * i, 4, " %02x", skb->data[i]);
-		}
-		printf("lx: a message for the data path, which is not built: %u bytes, beginning%s\n", skb->len, text);
-	}
-	dev_kfree_skb_any(skb);
-}
 
 /* ---- the device tree, of which there is none ------------------------------------------------------ */
 
@@ -485,7 +488,9 @@ say_radio(struct ath11k_base *ab)
 	}
 }
 
-/* ---- the entry ------------------------------------------------------------------------------------ */
+/* ---- the entries ---------------------------------------------------------------------------------- */
+
+static struct ath11k_base *volatile driver;	/* the driver, while it is up: between lx_start() and lx_stop() */
 
 int
 lx_start(void)
@@ -502,7 +507,13 @@ lx_start(void)
 		printf("lx: no thread, or no memory the radio can be given\n");
 		return (ENOMEM);
 	}
-	ath11k_debug_mask = ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_AHB | ATH11K_DBG_HTC | ATH11K_DBG_WMI | ATH11K_DBG_REG;
+	ath11k_debug_mask = ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_AHB | ATH11K_DBG_WMI | ATH11K_DBG_REG | ATH11K_DBG_MAC;
+	/*
+	 * The driver's parameter "frame_mode": Ethernet. The firmware then puts frames into 802.11
+	 * and takes them out of it, and ciphers them: what passes between the driver and the layer
+	 * above is what goes over a cable.
+	 */
+	ath11k_frame_mode = ATH11K_HW_TXRX_ETHERNET;
 	device.of_node = &node;
 	device.kobj.name = "wifi";
 
@@ -553,10 +564,39 @@ lx_start(void)
 	lx_pause_ms(1000);			/* (for what the firmware says unasked once it is ready) */
 	say_radio(ab);
 
-	ret = lx_os_option("wifi_scan") ? lx_station_scan() : 0;
+	driver = ab;
+	if (lx_os_option("wifi_join")) {
+		if ((ret = lx_station_join()) == 0) {
+			if (lx_os_option("wifi_hold")) {	/* (seconds to stay before returning: to see frames pass) */
+				lx_pause_ms(1000 * lx_os_option("wifi_hold"));
+				lx_station_say();
+			}
+			return (0);			/* the network is joined, and the driver stays up until lx_stop() */
+		}
+	} else {
+		ret = lx_os_option("wifi_scan") ? lx_station_scan() : 0;
+	}
+	lx_stop();
+	return (ret);
+}
 
-	/* Down again, as the driver's removal does it (the copy engines are let go of on the way: bus_quiet()). */
+/* The network left, and the driver down as its own removal does it (the copy engines are let go of on the way: bus_quiet()). */
+void
+lx_stop(void)
+{
+	struct ath11k_base *ab = driver;
+
+	if (ab == NULL) {
+		return;
+	}
+	driver = NULL;
+	lx_station_leave();
 	ath11k_core_deinit(ab);
 	printf("lx: the driver is down again\n");
-	return (ret);
+}
+
+int
+lx_transmit(const unsigned char *frame, unsigned long length)
+{
+	return (driver != NULL ? lx_station_send(frame, length) : ENETDOWN);
 }

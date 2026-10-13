@@ -174,6 +174,10 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	for f in bd_m20gl.elf regdb_xiaomi.bin; do
 		[ -f ../fw-wifi/qca6750/$f ] && install -m 0644 ../fw-wifi/qca6750/$f root/fw/
 	done
+	# the network the radio is to join: its name on the first line, its passphrase on the second. Yours, and
+	# so not in the repository; it goes where the firmware goes and the kernel reads it there (wifi_join=1)
+	rm -f root/fw/network
+	[ -f ../fw-wifi/network ] && install -m 0600 ../fw-wifi/network root/fw/network
 fi
 ../mkpackfs.py -o root.packfs root
 
