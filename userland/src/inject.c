@@ -43,6 +43,7 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 
+#include "redwood_gl.h"
 #include "redwood_input.h"
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
@@ -214,20 +215,20 @@ my_render_update(void *server, void *update, unsigned *flags)
 #define VT_GLES_CONTEXT         0x1d5b3b540UL   /* vtable for CA::OGL::GLESContext */
 
 static int gl_loaded;                           /* CoreAnimation draws with OpenGL ES (opengl_es() below) */
+static void (*gl_function_refused)(unsigned function);  /* our OpenGL ES library keeps count (eagl.c, the census) */
 static int (*orig_function_supported)(void *context);
 
 static int
 my_function_supported(void *context)
 {
-	static const char names[] =
-	    "clr img ida cim cid mua m1a lrp lrc lra add spl s1a cma bds bco bim c33 c3b c4b c4p c3a c3x c4x bia grl ds4 ds6 "
-	    "ds8 ups db2 db4 nb7 n11 n15 n19 n23 n27 vrd vrb sb3 axl rad rac con vcm vdk vlt map mpc crv hue clm hom opa met "
-	    "srl ega sdr alt p3c edr hrm lut ovr ovl lub aup alm stl pc0 pc1 prc psl ps0 ps1 psm psr pcr pbl peo bib asg a75 "
-	    "a50 atc ipc apl 3dl cst ";
+	static const char names[] = REDWOOD_CA_FUNCTIONS;
 	static uint8_t said[256];
 	int supported = orig_function_supported(context);
 	uint8_t function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
 
+	if (!supported && gl_function_refused != NULL) {
+		gl_function_refused(function);
+	}
 	if (!supported && !said[function]) {
 		said[function] = 1;
 		say("redwood: CoreAnimation's OpenGL ES renderer has no function %u (\"%.3s\"): what needs it is not drawn\n",
@@ -784,6 +785,7 @@ opengl_es(void)
 	gl_loaded = 1;
 	gl_function_values = (void (*)(void *, unsigned, unsigned, size_t, size_t, const float *))dlsym(library,
 	    "redwood_gl_function_values");
+	gl_function_refused = (void (*)(unsigned))dlsym(library, "redwood_gl_function_refused");
 }
 
 __attribute__((constructor))

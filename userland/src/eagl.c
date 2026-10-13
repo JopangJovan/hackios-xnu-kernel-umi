@@ -43,8 +43,9 @@
  * either on; gltrace_place=X0,Y0,X1,Y1 writes down, of those frames, only the draws whose corners
  * reach into that rectangle, a line each (lines "gl-at:"; writing everything down is slow, and a
  * window server that is slow draws other frames), gltrace_look=1 adds the pixel each of them
- * left in the middle of itself; glshaders=1 writes down the text of every
- * shader, glshow=TEXTURE puts that texture over the corner of the picture, glplain=0 leaves the
+ * left in the middle of itself; glcensus=1 keeps count of the draws CoreAnimation makes with no
+ * program and of the functions it asks for in vain (see census_draw()); glshaders=1 writes down
+ * the text of every shader, glshow=TEXTURE puts that texture over the corner of the picture, glplain=0 leaves the
  * draws without a program alone, glcopy=1 copies every IOSurface as if the library could not
  * share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
  * wait_for_frames), glfetch=0 keeps EXT_shader_framebuffer_fetch from CoreAnimation (see
@@ -220,6 +221,7 @@ struct eagl {
 	GLint plain_matrix, plain_textured, lookup_matrix;
 	GLuint vibrant, masking;        /* two more: what a colour matrix does to what is behind, and to the layer */
 	int blended;                    /* blending is off for such a draw, to be put back after it */
+	bool no_vibrant;                /* the first of the two could not be made */
 	GLint vibrant_matrix, vibrant_colours, masking_matrix, masking_colours;
 	unsigned unit;                  /* the texture unit being spoken of */
 	GLuint bound[8];                /* the 2D texture bound to each of the first units */
@@ -283,6 +285,7 @@ static int wait_for_frames = 1;
 static int fetch_offered = 1;
 
 static const char *eagl_slot_name(unsigned offset);
+static void census_report(void);
 
 static void
 eagl_enter(struct eagl *e, unsigned offset)
@@ -797,6 +800,7 @@ frame_end(struct eagl *e, bool finished)
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
 	}
+	census_report();
 	if (e->frames == 600 && e->errors == 0) {
 		check_errors = 0;
 	}
@@ -1263,29 +1267,180 @@ plain_program(const char *fragment, const char *what)
 	return program;
 }
 
+/*
+ * A census (boot-arg glcensus=1) of what CoreAnimation's OpenGL ES renderer has no shader for and
+ * meets all the same: every draw it makes with no program, by function, and every time it asks
+ * for a function and is told there is none (it then draws the thing another way, or not at
+ * all). Written down: each case the first time it is met, with what it is made of -- where on
+ * which framebuffer, the textures, the blending, the numbers CoreAnimation has for the function
+ * (a filter's inputs) and how the draw is made here; every ten seconds, what there was of each
+ * in those seconds (which is what tells the screens of a scenario apart); and with that the
+ * count of each since the start.
+ */
+enum { CENSUS_NOT_DRAWN, CENSUS_PLAIN, CENSUS_TABLE, CENSUS_VIBRANT, CENSUS_MASKING, CENSUS_KINDS };
+static const char *const census_kinds[CENSUS_KINDS] = {
+	"NOT DRAWN (no program, and no texture or nothing of ours to draw it with)", "drawn as the picture it is given (colour times texture)",
+	"drawn through a table (ours, for the home indicator)", "drawn with our program for a colour matrix over what is behind",
+	"drawn with our program for a colour matrix over premultiplied pixels",
+};
+static int census_on;
+static struct census {
+	unsigned draws[CENSUS_KINDS], lately[CENSUS_KINDS];
+	unsigned refused, refused_lately;
+	uint8_t said;                   /* a bit for each kind met */
+} census[90];
+static uint64_t census_told;
+
+static const char *
+census_name(unsigned function)
+{
+	static const char names[] = REDWOOD_CA_FUNCTIONS;
+	static char name[4];
+
+	memcpy(name, function < 90 ? names + 4 * function : "?  ", 3);
+	return name;
+}
+
+/* From inject.c: CoreAnimation asked whether the function it is about to use exists, and was told no. */
+void
+redwood_gl_function_refused(unsigned function)
+{
+	if (census_on && function < 90) {
+		census[function].refused++;
+		census[function].refused_lately++;
+	}
+}
+
+static void
+census_draw(struct eagl *e, unsigned function, unsigned kind)
+{
+	char textures[200] = "", numbers[200] = "";
+	GLint source = 0, destination = 0, viewport[4] = { 0, 0, 0, 0 };
+	float low[2] = { 0, 0 }, high[2] = { 0, 0 };
+	size_t used = 0;
+
+	if (!census_on || function >= 90) {
+		return;
+	}
+	census[function].draws[kind]++;
+	census[function].lately[kind]++;
+	if (census[function].said & (1u << kind)) {
+		return;
+	}
+	census[function].said |= (uint8_t)(1u << kind);
+	for (unsigned unit = 0; unit < 4; unit++) {
+		GLint width = 0, height = 0, format = 0;
+
+		if (e->bound[unit] == 0) {
+			continue;
+		}
+		glActiveTexture(GL_TEXTURE0 + unit);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+		used += (size_t)snprintf(textures + used, sizeof(textures) - used, " [%u] %d x %d (%#x)", unit, width, height,
+		    (unsigned)format);
+	}
+	glActiveTexture(GL_TEXTURE0 + e->unit);
+	for (unsigned i = 0; i < 4 && e->arrays[0].pointer != NULL && e->arrays[0].type == GL_FLOAT && e->arrays[0].size >= 2; i++) {
+		float place[2];
+
+		memcpy(place, (const uint8_t *)e->arrays[0].pointer + i * (size_t)(e->arrays[0].stride ? e->arrays[0].stride :
+		    4 * e->arrays[0].size), sizeof(place));
+		for (unsigned c = 0; c < 2; c++) {
+			low[c] = i == 0 || place[c] < low[c] ? place[c] : low[c];
+			high[c] = i == 0 || place[c] > high[c] ? place[c] : high[c];
+		}
+	}
+	used = 0;
+	for (unsigned i = 0; i < function_given[function] && used < sizeof(numbers) - 16; i++) {
+		used += (size_t)snprintf(numbers + used, sizeof(numbers) - used, " %.3g", (double)function_values[function][i]);
+	}
+	glGetIntegerv(GL_BLEND_SRC_RGB, &source);
+	glGetIntegerv(GL_BLEND_DST_RGB, &destination);
+	glGetIntegerv(GL_VIEWPORT, viewport);
+	say("redwood-gl: census: function %u (\"%s\") with no program, %s: first at %g,%g to %g,%g of framebuffer %u (%d x %d); "
+	    "textures%s; blending %s (%#x, %#x); its numbers:%s\n", function, census_name(function), census_kinds[kind], (double)low[0],
+	    (double)low[1], (double)high[0], (double)high[1], e->framebuffer, viewport[2], viewport[3], textures[0] ? textures : " none",
+	    glIsEnabled(GL_BLEND) ? "on" : "off", (unsigned)source, (unsigned)destination, numbers[0] ? numbers : " none");
+}
+
+/* Every ten seconds: what there was since the last time, and in all. */
+static void
+census_report(void)
+{
+	char lately[900] = "", all[900] = "";
+	size_t used_lately = 0, used_all = 0;
+	uint64_t now = now_us();
+
+	if (!census_on || now - census_told < 10000000) {
+		return;
+	}
+	census_told = now;
+	for (unsigned f = 0; f < 90; f++) {
+		struct census *c = &census[f];
+		unsigned drawn = 0, drawn_lately = 0;
+
+		for (unsigned k = 0; k < CENSUS_KINDS; k++) {
+			drawn += c->draws[k];
+			drawn_lately += c->lately[k];
+			c->lately[k] = 0;
+		}
+		if ((drawn_lately != 0 || c->refused_lately != 0) && used_lately < sizeof(lately) - 40) {
+			used_lately += (size_t)snprintf(lately + used_lately, sizeof(lately) - used_lately, " %u %s x%u", f, census_name(f),
+			    drawn_lately);
+			if (c->refused_lately != 0) {
+				used_lately += (size_t)snprintf(lately + used_lately, sizeof(lately) - used_lately, " (refused x%u)", c->refused_lately);
+			}
+		}
+		if ((drawn != 0 || c->refused != 0) && used_all < sizeof(all) - 60) {
+			used_all += (size_t)snprintf(all + used_all, sizeof(all) - used_all, " %u %s x%u", f, census_name(f), drawn);
+			if (c->draws[CENSUS_NOT_DRAWN] != 0) {
+				used_all += (size_t)snprintf(all + used_all, sizeof(all) - used_all, " (x%u not drawn)", c->draws[CENSUS_NOT_DRAWN]);
+			}
+			if (c->refused != 0) {
+				used_all += (size_t)snprintf(all + used_all, sizeof(all) - used_all, " (refused x%u)", c->refused);
+			}
+		}
+		c->refused_lately = 0;
+	}
+	if (lately[0] != 0) {
+		say("redwood-gl: census: in the last ten seconds:%s\n", lately);
+		say("redwood-gl: census: since the start:%s\n", all);
+	}
+}
+
 static bool
 plain_draw_begin(struct eagl *e, GLint enabled[3])
 {
 	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	static uint8_t said[90];
-	unsigned function = ca_context != NULL ? *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10) : 0;
+	unsigned function = ca_context != NULL ? *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10) : 90;      /* (90: not known yet) */
 	GLint rows = 0;
 	GLuint program;
 
-	if (e->program != 0 || !plain_draws || (plain_draws == 1 && e->bound[0] == 0)) {
+	if (e->program != 0) {
+		return false;
+	}
+	if (!plain_draws || (plain_draws == 1 && e->bound[0] == 0)) {
+		census_draw(e, function, CENSUS_NOT_DRAWN);
 		return false;
 	}
 	if (function < 90 && !said[function]) {
 		said[function] = 1;
-		say("redwood-gl: a draw with no program is CoreAnimation's function %u\n", function);
+		say("redwood-gl: a draw with no program is CoreAnimation's function %u (\"%s\")\n", function, census_name(function));
 	}
 	e->blended = 0;
-	if (e->bound[0] != 0 && plain_draws != 3 && ((function == FUNCTION_VIBRANT_MATRIX && fetch_offered) ||
+	if (e->bound[0] != 0 && plain_draws != 3 && function < 90 && ((function == FUNCTION_VIBRANT_MATRIX && fetch_offered) ||
 	    function == FUNCTION_MATRIX_PREMULTIPLIED) && function_given[function] == 20) {
 		bool vibrant = function == FUNCTION_VIBRANT_MATRIX;
 
 		if (vibrant && e->vibrant == 0) {
+			GLint good = 0;
+
 			e->vibrant = plain_program(vibrant_fragment, "a colour matrix over what is behind");
+			glGetProgramiv(e->vibrant, GL_LINK_STATUS, &good);
+			e->no_vibrant = !good;                  /* (a library without the extension: Mesa's software one) */
 			e->vibrant_matrix = glGetUniformLocation(e->vibrant, "vertex_matrix");
 			e->vibrant_colours = glGetUniformLocation(e->vibrant, "colours");
 		} else if (!vibrant && e->masking == 0) {
@@ -1293,6 +1448,11 @@ plain_draw_begin(struct eagl *e, GLint enabled[3])
 			e->masking_matrix = glGetUniformLocation(e->masking, "vertex_matrix");
 			e->masking_colours = glGetUniformLocation(e->masking, "colours");
 		}
+		if (vibrant && e->no_vibrant) {
+			census_draw(e, function, CENSUS_NOT_DRAWN);     /* better nothing than the mask as a picture */
+			return false;
+		}
+		census_draw(e, function, vibrant ? CENSUS_VIBRANT : CENSUS_MASKING);
 		program = vibrant ? e->vibrant : e->masking;
 		glUseProgram(program);
 		glUniformMatrix4fv(vibrant ? e->vibrant_matrix : e->masking_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
@@ -1330,6 +1490,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[3])
 		}
 		program = e->plain;
 	}
+	census_draw(e, function, rows == 1 ? CENSUS_TABLE : CENSUS_PLAIN);
 	glUseProgram(program);
 	glUniformMatrix4fv(program == e->plain ? e->plain_matrix : e->lookup_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
 	if (program == e->plain) {
@@ -2193,6 +2354,7 @@ install(void)
 			trace_placed = 1;
 		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
+		census_on = strstr(arguments, "glcensus=1") != NULL;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
 			plain_draws = (int)strtoul(argument + 8, NULL, 10);
 		}
