@@ -47,7 +47,8 @@
  * shader, glshow=TEXTURE puts that texture over the corner of the picture, glplain=0 leaves the
  * draws without a program alone, glcopy=1 copies every IOSurface as if the library could not
  * share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
- * wait_for_frames), glenv=NAME=VALUE puts that into the environment for the library to find
+ * wait_for_frames), glfetch=1 lets CoreAnimation have EXT_shader_framebuffer_fetch (see
+ * fetch_offered), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: FD_MESA_DEBUG=sysmem, say).
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -263,6 +264,20 @@ static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
  * here in any case; glwait=0: nowhere, to see what the waiting costs (and frames half drawn).
  */
 static int wait_for_frames = 1;
+/*
+ * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
+ * what CoreAnimation draws a number of things with where the library offers it: the shadows
+ * under the home screen's labels, when they are of the kind that darkens only what is light,
+ * are quads that read the picture and write it back. Mesa's driver for this GPU has the
+ * extension, and with it the first triangle of each such quad came out with pixels from
+ * somewhere else whenever the picture was drawn in tiles: fragments of other icons under the
+ * icons of the first and the fourth row. (Flushing overlapping primitives, a constant layer and
+ * a constant sample for the read made no difference; drawn straight into memory the shadows
+ * were right and the Search field went white.) So the extension is not passed on: CoreAnimation
+ * then does the same with what OpenGL ES always has, and the picture is right. Boot-arg
+ * glfetch=1 passes it on, for whoever wants to see or mend that.
+ */
+static int fetch_offered;
 
 static const char *eagl_slot_name(unsigned offset);
 
@@ -1431,6 +1446,23 @@ my_glGetString(void *context, GLenum name)
 	EAGL_ENTER(e, 0x3b0);
 	/* 0x8a1e is no name of OpenGL ES's; iOS's library answers it (the constructor of CA::OGL::GLESContext asks) */
 	string = name == 0x8a1e ? (const GLubyte *)"" : glGetString(name);
+	if (name == GL_EXTENSIONS && string != NULL && !fetch_offered) {
+		static char without[8192];      /* (the list less that extension: see fetch_offered) */
+		size_t used = 0;
+
+		for (const char *word = (const char *)string; *word != 0;) {
+			size_t length = strcspn(word, " ");
+
+			if (strncmp(word, "GL_EXT_shader_framebuffer_fetch", 31) != 0 && used + length + 2 < sizeof(without)) {
+				memcpy(without + used, word, length);
+				used += length;
+				without[used++] = ' ';
+			}
+			word += length + (word[length] == ' ');
+		}
+		without[used] = 0;
+		string = (const GLubyte *)without;
+	}
 	say("redwood-gl: asked for string %#x: %.900s\n", name, string ? (const char *)string : "(none)");
 	EAGL_LEAVE(e, 0x3b0);
 	return string;
@@ -2031,6 +2063,7 @@ install(void)
 		}
 		trace_lit = strstr(arguments, "gltrace_lit=1") != NULL;
 		trace_look = strstr(arguments, "gltrace_look=1") != NULL;
+		fetch_offered = strstr(arguments, "glfetch=1") != NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;
 
