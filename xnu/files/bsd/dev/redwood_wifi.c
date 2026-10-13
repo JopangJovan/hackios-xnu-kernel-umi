@@ -53,12 +53,15 @@
  *              of ours looks the Wi-Fi firmware's service up (sys/redwood_qrtr.h)
  *  15  talks   to the Wi-Fi firmware's service, what a WCN6750's driver says to it before it
  *              touches the radio: a stand-in for ath11k's own code, see redwood_wlfw.c
+ *  16  reads   seven words of the radio's registers, where the firmware said they are: only
+ *              with wifi_radio_read=1, and only with the firmware in mission mode (outside
+ *              it a read there has ended the kernel)
  * Steps 1 to 5 are the survey; they write to nothing but the arbiter's command word.
  *
- * What is started is stopped: when the steps are over, and wherever a run ends in order while
- * the DSP runs, TrustZone is asked to shut the DSP down and the always-on processor is told
- * that the image is gone. A run that ends otherwise leaves the DSP running, and the kernel
- * after it cannot ask the hardware whether that is so. But the shared memory outlives our
+ * What is started is stopped: when the steps are over, wherever a run ends in order while the
+ * DSP runs, and on a panic's way back to the loader, TrustZone is asked to shut the DSP down
+ * and the always-on processor is told that the image is gone. A kernel that dies otherwise
+ * leaves the DSP running, and the kernel after it cannot ask the hardware whether that is so. But the shared memory outlives our
  * kernels (the phone is not restarted between them), and the DSP's own item in it is there if
  * and only if the DSP has run since the phone was started: when step 8 finds it, TrustZone is
  * first asked for the shutdown. On a phone just started nothing is asked that is not needed.
@@ -89,6 +92,8 @@
  *   wifi_cal=1         step 15 asks for cold-boot calibration as ath11k does when it is on, and
  *                      waits up to a minute for it; wifi_ready=S: how long it waits for
  *                      "firmware ready" otherwise (default 5)
+ *   wifi_mission=1     step 15 goes on to the configuration and the mode "mission"
+ *   wifi_radio_read=1  step 16 does read (2: whatever mode the firmware is in)
  *   wifi_keep=1        when the steps are over the DSP and the link stay up while the system
  *                      runs, for whoever uses sys/redwood_qrtr.h; stopped when the run ends
  *   wifi_dirty=1       the DSP is not stopped: left as a kernel that died leaves it
@@ -149,6 +154,7 @@ extern void loader_log_putc(char c);
 static int say(const char *format, ...) __printflike(1, 2);
 
 static LCK_MTX_DECLARE(say_lock, &wifi_lock_group);      /* two threads talk here: a line at a time */
+static bool leaving;                    /* on the way back to the loader after a panic: no lock is taken, nothing sleeps */
 
 static int
 say(const char *format, ...)
@@ -158,8 +164,14 @@ say(const char *format, ...)
 	int length;
 
 	va_start(list, format);
-	vsnprintf(line, sizeof(line), format, list);
+	length = vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
+	if (leaving) {
+		for (const char *c = line; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
+		return length;
+	}
 	lck_mtx_lock(&say_lock);
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
@@ -1503,7 +1515,7 @@ dsp_listen(const struct smp2p *theirs)
  * True: the DSP has stopped by its own word, now or (its entry still says so) before.
  */
 static bool
-dsp_ask_to_stop(void)
+dsp_ask_to_stop(uint32_t bound_ms)
 {
 	struct smp2p ours, theirs;
 	uint32_t at = our_item_find(), state, value_at;
@@ -1537,7 +1549,7 @@ dsp_ask_to_stop(void)
 	settle();
 	wr(ipcc.base + IPCC_SEND, IPCC_WPSS << 16 | IPCC_SMP2P);
 	asked = now = now_us();
-	while (now - asked < 5 * 1000000ull) {
+	while (now - asked < bound_ms * 1000ull) {
 		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
 			break;
 		}
@@ -1621,8 +1633,11 @@ dsp_shutdown(const char *why)
 	int32_t result;
 
 	printf("wifi: %u: %s: the DSP is asked to stop, then TrustZone to shut it down\n", step, why);
-	link_stop();
-	stopped_by_its_word = dsp_ask_to_stop();
+	if (!leaving) {
+		redwood_wlfw_stop(step);                /* (what the stand-in of step 15 has to say first, while there is a link) */
+		link_stop();
+	}
+	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
 	result = scm("to shut the Wi-Fi DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_WPSS, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("wifi: %u: TRUSTZONE DOES NOT SHUT THE DSP DOWN: the call returns %d, its answer is %#llx\n", step, result, answer);
@@ -3099,6 +3114,103 @@ step_exchange(void)
 	return redwood_wlfw_exchange(step);
 }
 
+/* ---- step 16: the radio's registers, looked at ------------------------------------------------------- */
+
+/*
+ * The firmware says where the radio's registers are (step 15: 0x61e00000, 2 MB), and ath11k
+ * maps that address as it is and reads and writes there: no SMMU is involved, it is the
+ * processor's own view (qmi.c: ath11k_qmi_request_device_info(), devm_ioremap()). In the
+ * phone's device tree the address is no device's: it lies in the memory window of the first
+ * PCIe controller (pcie@1c00000: "ranges" 0x60300000 + 0x3d00000), whose node the tree keeps
+ * for another use. Whether a kernel under this phone's hypervisor may read there is what this
+ * step asks, with four reads and no write.
+ *
+ * THE ANSWER: YES, ONCE THE FIRMWARE IS IN MISSION MODE, AND ONLY THEN. With the firmware
+ * calibrated and "ready" but in no mode, the first read ended the kernel with an asynchronous
+ * abort -- a bus error, where the DSP's clocks, which the hypervisor keeps to itself, gave a
+ * synchronous one -- and half a minute later the phone restarted by itself (the panic had left
+ * the DSP running; a panic's way back now stops it, and with that the phone stays up). After
+ * the configuration and the mode "mission" (step 15 with wifi_mission=1), which is when ath11k
+ * begins to use the registers, all seven words below read: the copy engines' rings at zero,
+ * copy engine 1's control 0x80, the reorder block's enable 0x3000150, and 0x40140110 where the
+ * chip's PCI siblings have their hardware version. ath11k has no wake-up to make before an
+ * access on this chip and no window register to write (ahb.c: the pci_ops for wcn6750 have
+ * neither, and the windows are fixed). So the step reads only in mission mode, and only when
+ * told to (wifi_radio_read=1; 2: in any state, which HAS ENDED THE KERNEL).
+ *
+ * The 2 MB are not the chip's registers one to one (ahb.c: ath11k_ahb_get_window_start_wcn6750()):
+ * the first 512K are, the second 512K show the chip's 512K at 0xa00000 (the data path), the
+ * third those at 0x1b80000 (the copy engines). The words read: the two ath11k itself reads
+ * first when it sets the chip up (hal.c: the control word of copy engine 1's destination ring;
+ * hw.c: the reorder block's "general enable"), the reorder ring's id word, and the word where
+ * this chip's PCI siblings have their hardware version (pci.c: TCSR_SOC_HW_VERSION), which this
+ * one may or may not have.
+ */
+#define RADIO_WINDOW            0x80000u
+#define RADIO_DATA_PATH         0x00a00000u     /* hal.h: HAL_SEQ_WCSS_UMAC_OFFSET */
+#define RADIO_COPY_ENGINES      0x01b80000u     /* hw.c: wcn6750_regs.hal_seq_wcss_umac_ce0_src_reg */
+
+static bool
+step_registers(void)
+{
+	/*
+	 * The first: the word ath11k touches first once the firmware is in mission mode (it writes
+	 * it: ce.c: ath11k_ce_init_pipes() begins with copy engine 0's source ring, and hal.c:
+	 * ath11k_hal_srng_src_hw_init() with that ring's interrupt address). The rest only if the
+	 * first answers: the ring's base and id, the first word ath11k reads (copy engine 1's
+	 * destination ring control), the reorder block's two, and the hardware version of this
+	 * chip's PCI siblings.
+	 */
+	static const struct {
+		uint32_t chip;                  /* the register's address in the chip */
+		const char *name;
+	} words[] = {
+		{ 0x01b80000 + 0x48, "copy engine 0, source ring, interrupt address (low)" },
+		{ 0x01b80000 + 0x00, "copy engine 0, source ring, base (low)" },
+		{ 0x01b80000 + 0x08, "copy engine 0, source ring, id" },
+		{ 0x01b83000 + 0xb0, "copy engine 1, destination ring control" },
+		{ 0x00a38000 + 0x000, "reorder block, general enable" },
+		{ 0x00a38000 + 0x1f4, "reorder ring 1, id" },
+		{ 0x00000224, "hardware version (if this chip has it where its siblings do)" },
+	};
+	static struct block radio = { "radio", 0, 0 };
+	uint64_t address = 0;
+	uint32_t size = 0, asked = 0;
+	bool mission = false;
+
+	if (!redwood_wlfw_registers(&address, &size, &mission) || address > 0xffffffffull || size < 3 * RADIO_WINDOW) {
+		printf("wifi: %u: the firmware has not said where the radio's registers are (step 15)\n", step);
+		return false;
+	}
+	PE_parse_boot_argn("wifi_radio_read", &asked, sizeof(asked));
+	if (asked == 0 || (!mission && asked < 2)) {
+		printf("wifi: %u: THE RADIO'S REGISTERS (%#llx) ARE NOT READ: %s (see the top of this step in redwood_wifi.c)\n", step,
+		    address, asked == 0 ? "not asked for (wifi_radio_read=1)" : "the firmware is not in mission mode (wifi_mission=1), "
+		    "and outside it a read there has ended the kernel with a bus error (wifi_radio_read=2 to read all the same)");
+		return false;
+	}
+	announce("read the radio's registers where the firmware says they are, the word ath11k touches first before any other; "
+	    "if nothing answers there the kernel ends at that read");
+	printf("wifi: %u: the registers: %#x bytes at %#llx; the firmware %s\n", step, size, address, mission ? "is in mission mode" :
+	    "IS NOT IN MISSION MODE (wifi_mission=1 gets it there): the state in which the read failed before");
+	radio.phys = (uint32_t)address;
+	radio.size = size;
+	radio.base = ml_io_map_unmappable(radio.phys, radio.size, VM_WIMG_IO);
+	for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		uint32_t chip = words[i].chip, at;
+
+		/* ahb.c: which of the three windows a register of the chip is seen through, and where in it */
+		at = chip < RADIO_WINDOW ? chip : (chip ^ RADIO_DATA_PATH) < RADIO_WINDOW ? RADIO_WINDOW + (chip & (RADIO_WINDOW - 1)) :
+		    2 * RADIO_WINDOW + (chip & (RADIO_WINDOW - 1));
+		printf("wifi: %u: about to read the radio's %s (the chip's %#x) at %#x\n", step, words[i].name, chip, radio.phys + at);
+		snprintf(last_write, sizeof(last_write), "step %u was reading the radio's registers at %#x", step, radio.phys + at);
+		sleep_ms(i == 0 ? pause_ms : 50);
+		printf("wifi: %u: THE RADIO'S %s (%#x) = %#x\n", step, words[i].name, radio.phys + at, rd(radio.base + at));
+	}
+	ml_io_unmap(radio.base, radio.size);
+	return true;
+}
+
 static bool
 step_qrtr(void)
 {
@@ -3216,7 +3328,7 @@ smmu_look(void)
 
 static bool(*const steps[])(void) = {
 	step_smem, step_mailbox, step_rpmh, step_rails, step_pins, step_firmware, step_mailbox_open, step_header, step_image,
-	step_our_item, step_start, step_queues, step_link, step_qrtr, step_exchange,
+	step_our_item, step_start, step_queues, step_link, step_qrtr, step_exchange, step_registers,
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 
@@ -3232,6 +3344,25 @@ redwood_wifi_stop(void)
 		dsp_shutdown("the run is about to end");
 	}
 	lck_mtx_unlock(&dsp_lock);
+}
+
+/*
+ * The same when the kernel goes back to the loader without having been through the above: after
+ * a panic. A DSP left running then is one that nobody listens to any more, and the next kernel
+ * has to find and stop it; better it is stopped now. One processor is left, with its interrupts
+ * off: nothing here takes a lock or sleeps (the waits are loops), and the link's thread is
+ * simply never run again. The DSP is asked first, for two seconds at most; whatever it says,
+ * TrustZone is asked to shut it down.
+ */
+void
+redwood_wifi_quiesce(void)
+{
+	if (!dsp_started || dirty) {
+		return;
+	}
+	leaving = true;
+	new_from = ~0u;                         /* (no pauses) */
+	dsp_shutdown("the kernel is on its way back to the loader");
 }
 
 #define REDWOOD_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin (its "redwood") */
