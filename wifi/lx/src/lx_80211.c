@@ -37,8 +37,8 @@
 
 int linuxkpi_debug_80211;			/* (which of the headers' own remarks are printed: none) */
 
-#define HEARD_MOST	160
-#define ELEMENTS_MOST	768
+#define HEARD_MOST	128
+#define ELEMENTS_MOST	REDWOOD_STA_ELEMENTS_MOST
 
 /* A network, as its beacons describe it. */
 struct lx_heard {
@@ -47,9 +47,12 @@ struct lx_heard {
 	uint16_t frequency;			/* MHz, of the channel it was heard on at its strongest */
 	uint8_t says_channel;			/* the channel it says it is on (0: it does not say) */
 	int8_t signal;				/* dBm, the strongest */
-	uint16_t capability;
+	uint16_t capability, interval;
 	bool protected;				/* it announces WPA2 or later (an RSN element) */
 	unsigned times;
+	unsigned long long last;		/* when it was last heard: nanoseconds */
+	uint16_t elements_length;		/* all it says of itself, as last heard (nothing, if that was too much to keep) */
+	uint8_t elements[ELEMENTS_MOST];
 };
 
 /* The access point of the wanted network that was heard best, with all it says of itself. */
@@ -105,6 +108,10 @@ struct lx_radio {
 	struct work_struct group_work;		/* a new group key, later on */
 	struct ieee80211_key_conf *pairwise_key, *group_key;
 	volatile bool joined;			/* keys set: frames pass */
+	volatile bool joining;
+	int reached;				/* how far the access point has come as the driver's station (IEEE80211_STA_...) */
+	int8_t signal;				/* dBm, of the last beacon of the network joined */
+	int last_error;
 	unsigned sent, sent_lost, received, received_group, eapol, rekeys;
 	unsigned long long joined_at;		/* nanoseconds */
 };
@@ -572,7 +579,16 @@ heard(struct lx_radio *radio, const uint8_t *frame, unsigned length, unsigned fr
 		network->signal = -128;
 	}
 	network->times++;
+	network->last = lx_os_nanoseconds();
+	network->interval = (uint16_t)(frame[32] | frame[33] << 8);
 	network->capability = (uint16_t)(frame[34] | frame[35] << 8);
+	if (length - 36 <= ELEMENTS_MOST) {
+		network->elements_length = (uint16_t)(length - 36);
+		memcpy(network->elements, elements, length - 36);
+	}
+	if (radio->sta != NULL && memcmp(radio->target.address, frame + 16, ETH_ALEN) == 0) {
+		radio->signal = (int8_t)signal;
+	}
 	if (signal > network->signal) {
 		network->signal = (int8_t)signal;
 		network->frequency = (uint16_t)frequency;
@@ -825,7 +841,9 @@ management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
 		lx_tell("lx: THE ACCESS POINT %s US, reason %u\n", f[0] == 0xc0 ? "DEAUTHENTICATES" : "DISASSOCIATES", status);
 		if (radio->joined) {
 			radio->joined = false;
+			radio->last_error = ECONNRESET;
 			lx_os_net_link(0);
+			lx_os_station_lost(ECONNRESET);
 		}
 	}
 	if (answer != ANSWER_NONE) {
@@ -938,12 +956,13 @@ station_down(struct lx_radio *radio)
 }
 
 /*
- * A scan of every channel the regulatory domain allows. With a name the radio asks for that
- * network on every channel where it may send (a probe request; and the access points that
- * hear it answer); without, it only listens. 0 when the driver has said the scan is over.
+ * A scan of every channel the regulatory domain allows, or of those `what` names. With a name
+ * the radio asks for that network on every channel where it may send (a probe request; and the
+ * access points that hear it answer); without one it asks for any network there, or, if it
+ * is to be `quiet`, only listens. 0 when the driver has said the scan is over.
  */
 static int
-station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length)
+station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length, bool quiet, const struct redwood_sta_scan *what)
 {
 	struct ieee80211_hw *hw = &radio->hw;
 	struct ieee80211_scan_request *request;
@@ -963,17 +982,29 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length)
 		struct ieee80211_supported_band *has = hw->wiphy->bands[band];
 
 		for (int i = 0; has != NULL && i < has->n_channels; i++) {
-			if (!(has->channels[i].flags & IEEE80211_CHAN_DISABLED)) {
+			bool wanted = what == NULL || what->frequency_count == 0;
+
+			for (unsigned k = 0; what != NULL && k < what->frequency_count && !wanted; k++) {
+				wanted = what->frequencies[k] == has->channels[i].center_freq;
+			}
+			if (wanted && !(has->channels[i].flags & IEEE80211_CHAN_DISABLED)) {
 				request->req.channels[request->req.n_channels++] = &has->channels[i];
 			}
 		}
 	}
-	if (name_length != 0) {
+	if (request->req.n_channels == 0) {
+		kfree(request);
+		return (EINVAL);
+	}
+	if (!quiet) {				/* (a name of no length asks for every network) */
 		bzero(&asked, sizeof(asked));
 		memcpy(asked.ssid, name, name_length);
 		asked.ssid_len = (uint8_t)name_length;
 		request->req.ssids = &asked;
 		request->req.n_ssids = 1;
+	}
+	if (what != NULL && what->dwell_ms != 0) {
+		request->req.duration = what->dwell_ms;
 	}
 	radio->scan = 1;
 	radio->frames = radio->others = radio->heard_count = radio->heard_lost = 0;
@@ -981,8 +1012,8 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length)
 	mutex_lock(&hw->wiphy->mtx);
 	ret = radio->ops->hw_scan(hw, radio->vif, request);
 	mutex_unlock(&hw->wiphy->mtx);
-	printf("lx: THE DRIVER IS ASKED TO SCAN %d channels, %s: %d\n", request->req.n_channels, name_length != 0 ?
-	    "asking for the network that is wanted where it may send" : "listening only", ret);
+	printf("lx: THE DRIVER IS ASKED TO SCAN %d channels, %s: %d\n", request->req.n_channels, quiet ? "listening only" :
+	    name_length != 0 ? "asking for one network by name where it may send" : "asking for any network where it may send", ret);
 	if (ret == 0) {
 		lx_os_lock();
 		while (radio->scan == 1 && lx_os_nanoseconds() - began < 40000000000ull) {
@@ -1014,7 +1045,7 @@ lx_station_scan(void)
 		return (ENXIO);
 	}
 	if ((error = station_up(radio)) == 0) {
-		error = station_scan(radio, NULL, 0);
+		error = station_scan(radio, NULL, 0, true, NULL);
 	}
 	station_down(radio);
 	return (error);
@@ -1304,10 +1335,11 @@ bss_changed(struct lx_radio *radio, u64 what)
 
 /* Everything a join has made, undone in mac80211's order; as far as it got. */
 static void
-station_leave(struct lx_radio *radio, int state)
+station_leave(struct lx_radio *radio)
 {
 	struct ieee80211_hw *hw = &radio->hw;
 	struct ieee80211_vif *vif = radio->vif;
+	int state = radio->reached;
 
 	if (radio->joined) {
 		radio->joined = false;
@@ -1352,6 +1384,7 @@ station_leave(struct lx_radio *radio, int state)
 	}
 	kfree(radio->sta_memory);
 	radio->sta_memory = radio->sta = NULL;
+	radio->reached = IEEE80211_STA_NOTEXIST;
 }
 
 /*
@@ -1359,12 +1392,15 @@ station_leave(struct lx_radio *radio, int state)
  * (net/mac80211/mlme.c of Linux: ieee80211_mgd_auth(), ieee80211_mgd_assoc(), and what the
  * supplicant does after them): the access point found by a scan that asks for the network; the
  * channel taken; the access point made a station the driver knows; authentication; association;
- * the handshake; the keys. 0 when frames can pass, or an errno with the reason said.
+ * the handshake; the keys. 0 when frames can pass, or an errno with the reason said. A network
+ * that was joined before is left first. The access point is the one a scan has heard best --
+ * the last scan, if that heard the network, or one made now.
  */
 static int
-station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, const uint8_t *passphrase,
-    unsigned passphrase_length)
+station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 {
+	const uint8_t *name = what->ssid;
+	unsigned name_length = what->ssid_length;
 	struct ieee80211_hw *hw = &radio->hw;
 	struct ieee80211_vif *vif;
 	struct linuxkpi_ieee80211_channel *channel;
@@ -1375,8 +1411,19 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 	const char *obstacle;
 	unsigned long long began;
 	unsigned group_cipher = 0, length;
-	int state = IEEE80211_STA_NOTEXIST, ret, error = 0, answer = ANSWER_NONE;
+	int ret, error = 0, answer = ANSWER_NONE;
 
+	if (name_length == 0 || name_length > sizeof(radio->want)) {
+		return (EINVAL);
+	}
+	if (what->security != REDWOOD_STA_WPA2_PSK) {
+		lx_tell("lx: a network without WPA2 and a passphrase is asked for: that is not built\n");
+		return (ENOTSUP);
+	}
+	if (radio->sta != NULL) {
+		station_leave(radio);
+		lx_tell("lx: the network joined before is left\n");
+	}
 	INIT_WORK(&radio->group_work, group_rekey);
 	memcpy(radio->want, name, name_length);
 	radio->want_length = (uint8_t)name_length;
@@ -1385,8 +1432,26 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		return (ret);
 	}
 	vif = radio->vif;
+	lx_os_lock();
+	for (unsigned i = 0; i < radio->heard_count; i++) {
+		const struct lx_heard *network = &radio->heard[i];
+
+		if (network->name_length == name_length && memcmp(network->name, name, name_length) == 0 && network->elements_length != 0 &&
+		    (is_zero_ether_addr(what->bssid) || memcmp(what->bssid, network->sender, ETH_ALEN) == 0) &&
+		    (!target->found || network->signal > target->signal)) {
+			target->found = true;
+			memcpy(target->address, network->sender, ETH_ALEN);
+			target->frequency = network->frequency;
+			target->interval = network->interval;
+			target->capability = network->capability;
+			target->signal = network->signal;
+			target->elements_length = network->elements_length;
+			memcpy(target->elements, network->elements, network->elements_length);
+		}
+	}
+	lx_os_unlock();
 	for (unsigned attempt = 0; attempt < 3 && !target->found; attempt++) {
-		station_scan(radio, name, name_length);
+		station_scan(radio, name, name_length, false, NULL);
 	}
 	if (!target->found) {
 		lx_tell("lx: THE NETWORK THAT IS WANTED WAS NOT HEARD (a name of %u bytes), in three scans\n", name_length);
@@ -1412,15 +1477,19 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 	/* the key of the name and the passphrase, and what the handshake needs besides */
 	began = lx_os_nanoseconds();
 	bzero(&radio->wpa, sizeof(radio->wpa));
-	lx_wpa_pmk(passphrase, passphrase_length, name, name_length, radio->wpa.pmk);
+	if (what->passphrase_length != 0) {
+		lx_wpa_pmk(what->passphrase, what->passphrase_length, name, name_length, radio->wpa.pmk);
+	} else {
+		memcpy(radio->wpa.pmk, what->pmk, sizeof(radio->wpa.pmk));
+	}
 	memcpy(radio->wpa.own, vif->addr, ETH_ALEN);
 	memcpy(radio->wpa.peer, target->address, ETH_ALEN);
 	get_random_bytes(radio->wpa.own_nonce, sizeof(radio->wpa.own_nonce));
 	radio->wpa.rsn = radio->rsn;
 	radio->wpa.rsn_length = 22;
 	radio->handshake = LX_WPA_NOTHING;
-	printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes) is made: %llu ms\n", name_length, passphrase_length,
-	    (lx_os_nanoseconds() - began) / 1000000ull);
+	printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: %llu ms\n",
+	    name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull);
 
 	/* the access point's address, and its channel, 20 MHz wide */
 	vif->bss_conf.bssid = target->address;
@@ -1473,7 +1542,7 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		error = -ret;
 		goto out;
 	}
-	state = IEEE80211_STA_NONE;
+	radio->reached = IEEE80211_STA_NONE;
 
 	/* authentication, of the kind that asks nothing ("open system": the passphrase is proved in the handshake) */
 	for (unsigned attempt = 0; attempt < 3 && answer == ANSWER_NONE; attempt++) {
@@ -1492,7 +1561,7 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		error = answer == ANSWER_NONE ? ETIMEDOUT : ECONNREFUSED;
 		goto out;
 	}
-	state = IEEE80211_STA_AUTH;
+	radio->reached = IEEE80211_STA_AUTH;
 
 	/* association: what we can do, and that we want its protection */
 	answer = ANSWER_NONE;
@@ -1525,7 +1594,7 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		error = -ret;
 		goto out;
 	}
-	state = IEEE80211_STA_ASSOC;
+	radio->reached = IEEE80211_STA_ASSOC;
 	vif->cfg.assoc = true;
 	vif->cfg.aid = radio->aid;
 	bss_changed(radio, BSS_CHANGED_ASSOC | BSS_CHANGED_BEACON_INT | BSS_CHANGED_ERP_SLOT | BSS_CHANGED_ERP_PREAMBLE |
@@ -1578,15 +1647,16 @@ station_join(struct lx_radio *radio, const uint8_t *name, unsigned name_length, 
 		error = -ret;
 		goto out;
 	}
-	state = IEEE80211_STA_AUTHORIZED;
+	radio->reached = IEEE80211_STA_AUTHORIZED;
 	radio->sent = radio->sent_lost = radio->received = radio->received_group = radio->rekeys = 0;
 	radio->joined_at = lx_os_nanoseconds();
+	radio->signal = target->signal;
 	radio->joined = true;
 	lx_os_net_link(1);
 	lx_tell("lx: THE NETWORK IS JOINED: frames can pass\n");
 	return (0);
 out:
-	station_leave(radio, state);
+	station_leave(radio);
 	return (error);
 }
 
@@ -1596,21 +1666,25 @@ out:
 int
 lx_station_join(void)
 {
-	static uint8_t name[32], passphrase[64];
+	static struct redwood_sta_join what;
 	struct lx_radio *radio = the_radio;
-	unsigned name_length = sizeof(name), passphrase_length = sizeof(passphrase);
+	unsigned name_length = sizeof(what.ssid), passphrase_length = sizeof(what.passphrase);
 	int error;
 
 	if (radio == NULL || !radio->registered) {
 		lx_tell("lx: no radio is registered: nothing to join with\n");
 		return (ENXIO);
 	}
-	if (!lx_os_network(name, &name_length, passphrase, &passphrase_length)) {
+	bzero(&what, sizeof(what));
+	if (!lx_os_network(what.ssid, &name_length, what.passphrase, &passphrase_length)) {
 		return (ENOENT);
 	}
+	what.ssid_length = (uint8_t)name_length;
+	what.passphrase_length = (uint8_t)passphrase_length;
+	what.security = REDWOOD_STA_WPA2_PSK;
 	lx_os_net_attach(radio->wiphy->perm_addr);
-	error = station_join(radio, name, name_length, passphrase, passphrase_length);
-	explicit_bzero(passphrase, sizeof(passphrase));
+	error = station_join(radio, &what);
+	explicit_bzero(&what, sizeof(what));
 	return (error);
 }
 
@@ -1639,7 +1713,7 @@ lx_station_leave(void)
 	}
 	lx_station_say();
 	if (radio->sta != NULL) {
-		station_leave(radio, radio->joined ? IEEE80211_STA_AUTHORIZED : IEEE80211_STA_ASSOC);
+		station_leave(radio);
 		lx_tell("lx: the network is left\n");
 	}
 	station_down(radio);
@@ -1655,4 +1729,197 @@ lx_station_send(const unsigned char *frame, unsigned long length)
 		return (ENETDOWN);
 	}
 	return (ethernet_send(radio, frame, (unsigned)length) ? 0 : ENOBUFS);
+}
+
+/* ---- the station boundary: what the kernel asks through sys/redwood_sta.h --------------------------------- */
+
+static int
+boundary_power(bool on)
+{
+	struct lx_radio *radio = the_radio;
+
+	if (radio == NULL || !radio->registered) {
+		return (ENXIO);
+	}
+	if (on) {
+		return (station_up(radio));
+	}
+	if (radio->sta != NULL) {
+		station_leave(radio);
+		lx_tell("lx: the network is left\n");
+	}
+	station_down(radio);
+	return (0);
+}
+
+static int
+boundary_scan(const struct redwood_sta_scan *what)
+{
+	static unsigned said;
+	struct lx_radio *radio = the_radio;
+	unsigned long long began;
+	int error;
+
+	if (radio == NULL || !radio->registered) {
+		return (ENXIO);
+	}
+	if ((error = station_up(radio)) != 0) {
+		return (error);
+	}
+	began = lx_os_nanoseconds();
+	error = station_scan(radio, what->ssid, what->ssid_length <= sizeof(what->ssid) ? what->ssid_length : 0, what->passive, what);
+	if (said < 24) {			/* (the first few are told: whoever asks goes on asking as long as the system runs) */
+		said++;
+		lx_tell("lx: a scan for the kernel: %u channels named (0: all), %s, %u ms on each (0: the radio's own): %d; %u access "
+		    "points heard, %u frames, in %llu ms\n", what->frequency_count, what->passive ? "listening" : "asking",
+		    what->dwell_ms, error, radio->heard_count, radio->frames, (lx_os_nanoseconds() - began) / 1000000ull);
+	}
+	return (error);
+}
+
+static void
+boundary_heard(void (*each)(const struct redwood_sta_bss *, void *), void *context)
+{
+	static struct redwood_sta_bss bss;	/* (one thread calls this) */
+	struct lx_radio *radio = the_radio;
+
+	for (unsigned i = 0; radio != NULL && i < radio->heard_count; i++) {
+		const struct lx_heard *network = &radio->heard[i];
+
+		lx_os_lock();
+		bzero(&bss, sizeof(bss));
+		memcpy(bss.bssid, network->sender, ETH_ALEN);
+		memcpy(bss.ssid, network->name, network->name_length);
+		bss.ssid_length = network->name_length;
+		/* (a beacon can be heard on the channel next to its own: where it says it is counts) */
+		bss.frequency = network->says_channel != 0 ? (uint16_t)linuxkpi_ieee80211_channel_to_frequency(network->says_channel,
+		    network->frequency < 4000 ? NL80211_BAND_2GHZ : NL80211_BAND_5GHZ) : network->frequency;
+		bss.rssi = network->signal;
+		bss.beacon_interval = network->interval;
+		bss.capability = network->capability;
+		bss.age_ms = (uint32_t)((lx_os_nanoseconds() - network->last) / 1000000ull);
+		bss.elements_length = network->elements_length;
+		memcpy(bss.elements, network->elements, network->elements_length);
+		lx_os_unlock();
+		each(&bss, context);
+	}
+}
+
+static int
+boundary_join(const struct redwood_sta_join *what)
+{
+	struct lx_radio *radio = the_radio;
+	int error;
+
+	if (radio == NULL || !radio->registered) {
+		return (ENXIO);
+	}
+	radio->joining = true;
+	error = station_join(radio, what);
+	radio->last_error = error;
+	radio->joining = false;
+	return (error);
+}
+
+static int
+boundary_leave(void)
+{
+	struct lx_radio *radio = the_radio;
+
+	if (radio != NULL && radio->sta != NULL) {
+		lx_station_say();
+		station_leave(radio);
+		radio->last_error = 0;
+		lx_tell("lx: the network is left\n");
+	}
+	return (0);
+}
+
+/* (on any thread: nothing here but reading) */
+static void
+boundary_state(struct redwood_sta_state *state)
+{
+	struct lx_radio *radio = the_radio;
+
+	bzero(state, sizeof(*state));
+	if (radio == NULL || radio->vif == NULL) {
+		return;
+	}
+	lx_os_lock();
+	state->phase = radio->joined ? REDWOOD_STA_JOINED : radio->joining ? REDWOOD_STA_JOINING : radio->scan == 1 ?
+	    REDWOOD_STA_SCANNING : REDWOOD_STA_IDLE;
+	state->last_error = radio->last_error;
+	if ((radio->joined || radio->joining) && radio->target.found) {
+		memcpy(state->bss.bssid, radio->target.address, ETH_ALEN);
+		memcpy(state->bss.ssid, radio->want, radio->want_length);
+		state->bss.ssid_length = radio->want_length;
+		state->bss.frequency = radio->channel != NULL && radio->channel->def.chan != NULL ?
+		    radio->channel->def.chan->center_freq : radio->target.frequency;
+		state->bss.rssi = radio->joined ? radio->signal : radio->target.signal;
+		state->bss.beacon_interval = radio->target.interval;
+		state->bss.capability = radio->target.capability;
+		state->bss.elements_length = (uint16_t)radio->target.elements_length;
+		memcpy(state->bss.elements, radio->target.elements, radio->target.elements_length);
+	}
+	lx_os_unlock();
+}
+
+static unsigned
+boundary_channels(struct redwood_sta_channel *channels, unsigned most)
+{
+	struct lx_radio *radio = the_radio;
+	unsigned count = 0;
+
+	for (unsigned band = 0; radio != NULL && band < NUM_NL80211_BANDS; band++) {
+		const struct ieee80211_supported_band *has = radio->wiphy->bands[band];
+
+		for (int i = 0; has != NULL && i < has->n_channels && count < most; i++) {
+			if (!(has->channels[i].flags & IEEE80211_CHAN_DISABLED)) {
+				channels[count].frequency = (uint16_t)has->channels[i].center_freq;
+				channels[count++].flags = (uint16_t)((has->channels[i].flags & IEEE80211_CHAN_NO_IR ? REDWOOD_STA_CHANNEL_PASSIVE :
+				    0) | (has->channels[i].flags & IEEE80211_CHAN_RADAR ? REDWOOD_STA_CHANNEL_RADAR : 0));
+			}
+		}
+	}
+	return (count);
+}
+
+static struct redwood_sta_ops boundary = {
+	.power = boundary_power,
+	.scan = boundary_scan,
+	.heard = boundary_heard,
+	.join = boundary_join,
+	.leave = boundary_leave,
+	.state = boundary_state,
+	.channels = boundary_channels,
+};
+
+/*
+ * The radio is the kernel's to ask from now on: an interface is brought up on it, and the
+ * kernel is given the calls above. 0, or an errno.
+ */
+int
+lx_station_offer(void)
+{
+	struct lx_radio *radio = the_radio;
+	int error;
+
+	if (radio == NULL || !radio->registered) {
+		lx_tell("lx: no radio is registered: there is no station to offer\n");
+		return (ENXIO);
+	}
+	lx_os_net_attach(radio->wiphy->perm_addr);
+	if ((error = station_up(radio)) != 0) {
+		return (error);
+	}
+	memcpy(boundary.address, radio->wiphy->perm_addr, ETH_ALEN);
+	lx_os_station(&boundary);
+	return (0);
+}
+
+/* ... and no longer: returns when no call of the kernel's is under way. */
+void
+lx_station_withdraw(void)
+{
+	lx_os_station(NULL);
 }

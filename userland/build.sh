@@ -60,9 +60,9 @@ IOS_JOBS=${JOBS-"
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
 	com.apple.SpringBoard
 "}
-# WIFID=1: iOS's own Wi-Fi daemon as well (for Settings to have a Wi-Fi to show: the kernel answers it in
-# bsd/dev/redwood_apple80211.c). NOT READY, and not for use: the kernel so far answers three of the eight things
-# wifid asks when it opens the radio, and with wifid and the radio (wifi=1) both there THE SCREEN STAYS DARK.
+# WIFID=1: iOS's own Wi-Fi daemon as well, for Settings to have a Wi-Fi to show: the kernel answers it in
+# bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
+# networks the radio hears. NOT FINISHED: a network cannot be joined from Settings yet.
 [ -n "$WIFID" ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is

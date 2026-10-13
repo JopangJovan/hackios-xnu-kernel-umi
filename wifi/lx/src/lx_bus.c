@@ -590,7 +590,12 @@ lx_start(void)
 	say_radio(ab);
 
 	driver = ab;
-	if (lx_os_option("wifi_join")) {
+	if (lx_os_option("wifi_station")) {
+		/* whoever wants a network asks the kernel, and the kernel asks the station: the driver stays up until lx_stop() */
+		if ((ret = lx_station_offer()) == 0) {
+			return (0);
+		}
+	} else if (lx_os_option("wifi_join")) {
 		if ((ret = lx_station_join()) == 0) {
 			if (lx_os_option("wifi_hold")) {	/* (seconds to stay before returning: to see frames pass) */
 				lx_pause_ms(1000 * lx_os_option("wifi_hold"));
@@ -622,6 +627,7 @@ lx_stop(void)
 		return;
 	}
 	driver = NULL;
+	lx_station_withdraw();
 	lx_station_leave();
 	ath11k_core_deinit(ab);
 	lx_tell("lx: the driver is down again\n");
