@@ -22,6 +22,7 @@
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
+#include <sys/random.h>
 #include <sys/redwood_input.h>
 #include <sys/redwood_lx.h>
 #include <sys/systm.h>
@@ -189,6 +190,12 @@ lx_os_wakeup(const void *address)
 }
 
 /* ---- the rest of the machine ------------------------------------------------------------------------- */
+
+void
+lx_os_random(void *buffer, unsigned long size)
+{
+	read_random(buffer, (u_int)size);
+}
 
 unsigned
 lx_os_option(const char *name)

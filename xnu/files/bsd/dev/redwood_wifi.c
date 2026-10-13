@@ -3131,6 +3131,16 @@ static void radio_space_faults(void);
  * firmware's first message is in a buffer of copy engine 2: HTC's "ready" (2 credits of 2176
  * bytes, 5 endpoints). The SMMU records no fault. No interrupt is involved: the rings are
  * looked at every millisecond.
+ *
+ * With htc.c and wmi.c built as well (the same day): 29 ms after the bus is started HTC has the
+ * firmware's "ready" and asks for the WMI service -- the first thing sent over a copy engine;
+ * it is given endpoint 1, up on copy engine 3 and down on 2 --, the firmware announces the
+ * radio over WMI ("service ready", in three events, within 60 ms), takes the driver's
+ * configuration and says "unified ready" 270 ms after the bus was started. Of the radio it
+ * says: one, of two chains, for 2.4 and 5 GHz (2312..2732 and 4900..7125 MHz, and capabilities
+ * for 6 GHz); the rules of the regulatory domain it starts in (CN: 2402..2482, 5170..5330,
+ * 5735..5835 MHz); and no address of its own (all zeros: the tree's "use-nv-mac" has Android
+ * give it one). Then the driver is taken down in order, mode "off" included.
  */
 static bool
 step_driver(uint32_t how)

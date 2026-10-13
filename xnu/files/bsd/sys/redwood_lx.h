@@ -45,6 +45,7 @@ int	 lx_os_sleep(const void *address, unsigned long long nanoseconds);
 void	 lx_os_wakeup(const void *address);			/* everyone asleep on it */
 
 /* ---- the rest of the machine ---- */
+void	 lx_os_random(void *buffer, unsigned long size);	/* bytes nobody can guess */
 /* a number given to the kernel when it was started ("wifi_lx=2"); 0 if it was not */
 unsigned lx_os_option(const char *name);
 /* a file the driver asks for by the name Linux has for it, in place: 0, or an errno (ENOENT) */
