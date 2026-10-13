@@ -51,6 +51,8 @@
  *              intents; from here a thread of ours listens to the DSP
  *  14  talks   QRTR on that channel: hello both ways, the services the DSP tells of; a port
  *              of ours looks the Wi-Fi firmware's service up (sys/redwood_qrtr.h)
+ *  15  talks   to the Wi-Fi firmware's service, what a WCN6750's driver says to it before it
+ *              touches the radio: a stand-in for ath11k's own code, see redwood_wlfw.c
  * Steps 1 to 5 are the survey; they write to nothing but the arbiter's command word.
  *
  * What is started is stopped: when the steps are over, and wherever a run ends in order while
@@ -84,6 +86,9 @@
  *   wifi_listen=S      how long step 14 waits for the Wi-Fi firmware's service (default 3)
  *   wifi_ask=1         step 14 also asks that service a question (its capabilities) and
  *                      writes down the beginning of an answer
+ *   wifi_cal=1         step 15 asks for cold-boot calibration as ath11k does when it is on, and
+ *                      waits up to a minute for it; wifi_ready=S: how long it waits for
+ *                      "firmware ready" otherwise (default 5)
  *   wifi_keep=1        when the steps are over the DSP and the link stay up while the system
  *                      runs, for whoever uses sys/redwood_qrtr.h; stopped when the run ends
  *   wifi_dirty=1       the DSP is not stopped: left as a kernel that died leaves it
@@ -164,6 +169,19 @@ say(const char *format, ...)
 	return length;
 }
 #define printf say
+
+/* (for redwood_wlfw.c, which says its lines the same way) */
+int
+redwood_wifi_say(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	return say("%s", line);
+}
 
 static void
 sleep_us(uint32_t us)
@@ -2472,7 +2490,7 @@ glink_send(const void *data, uint32_t length)
 		struct glink_message message;
 		uint32_t size, left;
 	} header = { { GLINK_DATA, GLINK_US, 0 }, length, 0 };
-	bool asked = false;
+	bool asked = false, fits;
 	int found = -1;
 
 	lck_mtx_lock(&glink_lock);
@@ -2487,21 +2505,25 @@ glink_send(const void *data, uint32_t length)
 			return ENOTCONN;
 		}
 		found = -1;
+		fits = false;
 		for (unsigned n = 0; n < sizeof(glink.their_intents) / sizeof(glink.their_intents[0]); n++) {
-			if (glink.their_intents[n].there && !glink.their_intents[n].in_use && glink.their_intents[n].size >= length &&
-			    (found < 0 || glink.their_intents[n].size < glink.their_intents[found].size)) {
+			if (!glink.their_intents[n].there || glink.their_intents[n].size < length) {
+				continue;
+			}
+			fits = true;                            /* (one that is in use comes back: that is waited for) */
+			if (!glink.their_intents[n].in_use && (found < 0 || glink.their_intents[n].size < glink.their_intents[found].size)) {
 				found = (int)n;
 			}
 		}
 		if (found >= 0 && glink_room() >= ((length + sizeof(header) + 7) & ~7u)) {
 			break;
 		}
-		if (found < 0 && !asked) {
+		if (!fits && !asked) {
 			glink.request_answered = false;
 			glink_say(GLINK_INTENT_REQUEST, GLINK_US, length, NULL, 0);
 			asked = true;
 		}
-		if (waited >= 5000 || (found < 0 && asked && glink.request_answered && !glink.request_granted)) {
+		if (waited >= 5000 || (!fits && asked && glink.request_answered && !glink.request_granted)) {
 			lck_mtx_unlock(&glink_lock);
 			return found < 0 ? ENOBUFS : EAGAIN;
 		}
@@ -2525,8 +2547,11 @@ glink_send(const void *data, uint32_t length)
  * port: when a link comes up each side says hello, and is told the other's services one by one
  * ("new server": a service, an instance, a node, a port), and later their going. We are node 1
  * (Linux's default, and what this phone's Android is); the DSP says who it is in what it sends.
- * The interface for the rest of the kernel is sys/redwood_qrtr.h.
+ * The interface for the rest of the kernel is sys/redwood_qrtr.h: the four calls at the end of
+ * this section, handed to the QMI helpers (bsd/dev/redwood_qmi.c), which is what speaks to the
+ * services.
  */
+#define REDWOOD_QRTR_MAX        8192            /* the most a datagram holds, either way */
 #define QRTR_US                 1u
 #define QRTR_CONTROL            0xfffffffeu     /* the control port */
 #define QRTR_FIRST_PORT         0x4000u         /* where Linux begins numbering ports that ask for no number */
@@ -2543,10 +2568,11 @@ struct qrtr_control {
 struct redwood_qrtr_port {
 	uint32_t number;                        /* 0: free */
 	redwood_qrtr_receive_t receive;
+	redwood_qrtr_server_t server;
 	void *context;
 	struct {
 		uint32_t service, instance;     /* the instance as on the wire: version | instance << 8; 0: any */
-		redwood_qrtr_service_t callback;
+		bool asked;
 		bool fresh;                     /* not yet told of the services that were there before it */
 	} lookups[4];
 };
@@ -2604,19 +2630,19 @@ qrtr_tell(uint32_t service, uint32_t instance, uint32_t node, uint32_t port, boo
 {
 	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
 		for (unsigned l = 0; l < 4; l++) {
-			redwood_qrtr_service_t callback = NULL;
+			redwood_qrtr_server_t server = NULL;
 			void *context;
 
 			lck_mtx_lock(&qrtr_lock);
-			if (qrtr_ports[p].number != 0 && qrtr_ports[p].lookups[l].callback != NULL && !qrtr_ports[p].lookups[l].fresh &&
+			if (qrtr_ports[p].number != 0 && qrtr_ports[p].lookups[l].asked && !qrtr_ports[p].lookups[l].fresh &&
 			    qrtr_ports[p].lookups[l].service == service &&
 			    (qrtr_ports[p].lookups[l].instance == 0 || qrtr_ports[p].lookups[l].instance == instance)) {
-				callback = qrtr_ports[p].lookups[l].callback;
+				server = qrtr_ports[p].server;
 			}
 			context = qrtr_ports[p].context;
 			lck_mtx_unlock(&qrtr_lock);
-			if (callback != NULL) {
-				callback(context, arrived, node, port);
+			if (server != NULL) {
+				server(context, arrived, service, instance & 0xff, instance >> 8, node, port);
 			}
 		}
 	}
@@ -2754,7 +2780,7 @@ qrtr_fresh(void)
 {
 	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
 		for (unsigned l = 0; l < 4; l++) {
-			redwood_qrtr_service_t callback;
+			redwood_qrtr_server_t server;
 			uint32_t service, instance;
 			void *context;
 
@@ -2764,22 +2790,23 @@ qrtr_fresh(void)
 				continue;
 			}
 			qrtr_ports[p].lookups[l].fresh = false;
-			callback = qrtr_ports[p].lookups[l].callback;
+			server = qrtr_ports[p].server;
 			service = qrtr_ports[p].lookups[l].service;
 			instance = qrtr_ports[p].lookups[l].instance;
 			context = qrtr_ports[p].context;
 			lck_mtx_unlock(&qrtr_lock);
-			for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+			for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]) && server != NULL; i++) {
 				if (qrtr_matches(service, instance, i)) {
-					callback(context, true, qrtr_servers[i].node, qrtr_servers[i].port);
+					server(context, true, qrtr_servers[i].service, qrtr_servers[i].instance & 0xff,
+					    qrtr_servers[i].instance >> 8, qrtr_servers[i].node, qrtr_servers[i].port);
 				}
 			}
 		}
 	}
 }
 
-struct redwood_qrtr_port *
-redwood_qrtr_open(redwood_qrtr_receive_t receive, void *context)
+static struct redwood_qrtr_port *
+qrtr_open(redwood_qrtr_receive_t receive, redwood_qrtr_server_t server, void *context)
 {
 	struct redwood_qrtr_port *port = NULL;
 
@@ -2790,6 +2817,7 @@ redwood_qrtr_open(redwood_qrtr_receive_t receive, void *context)
 			bzero(port, sizeof(*port));
 			port->number = qrtr_next_port++;
 			port->receive = receive;
+			port->server = server;
 			port->context = context;
 		}
 	}
@@ -2797,8 +2825,8 @@ redwood_qrtr_open(redwood_qrtr_receive_t receive, void *context)
 	return port;
 }
 
-int
-redwood_qrtr_send(struct redwood_qrtr_port *port, uint32_t node, uint32_t to, const void *data, size_t length)
+static int
+qrtr_send(struct redwood_qrtr_port *port, uint32_t node, uint32_t to, const void *data, size_t length)
 {
 	if (port == NULL || port->number == 0 || length > REDWOOD_QRTR_MAX) {
 		return EINVAL;
@@ -2806,18 +2834,17 @@ redwood_qrtr_send(struct redwood_qrtr_port *port, uint32_t node, uint32_t to, co
 	return qrtr_out_packet(QRTR_DATA, port->number, node, to, data, (uint32_t)length);
 }
 
-int
-redwood_qrtr_lookup(struct redwood_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance,
-    redwood_qrtr_service_t callback)
+static int
+qrtr_lookup(struct redwood_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance)
 {
 	int error = ENOSPC;
 
 	lck_mtx_lock(&qrtr_lock);
 	for (unsigned l = 0; l < 4 && error != 0 && port != NULL && port->number != 0; l++) {
-		if (port->lookups[l].callback == NULL) {
+		if (!port->lookups[l].asked) {
 			port->lookups[l].service = service;
 			port->lookups[l].instance = instance != 0 ? (version & 0xff) | instance << 8 : 0;
-			port->lookups[l].callback = callback;
+			port->lookups[l].asked = true;
 			port->lookups[l].fresh = true;
 			error = 0;
 		}
@@ -2826,8 +2853,8 @@ redwood_qrtr_lookup(struct redwood_qrtr_port *port, uint32_t service, uint32_t v
 	return error;
 }
 
-void
-redwood_qrtr_close(struct redwood_qrtr_port *port)
+static void
+qrtr_close(struct redwood_qrtr_port *port)
 {
 	struct qrtr_control gone = { .command = QRTR_DEL_CLIENT, .words = { QRTR_US, port ? port->number : 0 } };
 	bool outside = current_thread() != link_thread_is;
@@ -2848,6 +2875,8 @@ redwood_qrtr_close(struct redwood_qrtr_port *port)
 		qrtr_out_packet(QRTR_DEL_CLIENT, gone.words[1], qrtr_peer, QRTR_CONTROL, &gone, sizeof(gone));
 	}
 }
+
+static const struct redwood_qrtr_ops qrtr_ops = { .open = qrtr_open, .send = qrtr_send, .lookup = qrtr_lookup, .close = qrtr_close };
 
 /* ---- the link's thread -------------------------------------------------------------------------------- */
 
@@ -3031,7 +3060,8 @@ static volatile uint32_t wlfw_answer;           /* bytes of an answer received; 
 static uint8_t wlfw_answer_bytes[64];
 
 static void
-wlfw_service(__unused void *context, bool arrived, uint32_t node, uint32_t port)
+wlfw_service(__unused void *context, bool arrived, __unused uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
 {
 	printf("wifi: qrtr: THE WI-FI FIRMWARE'S SERVICE (%#x) %s node %u port %u\n", SERVICE_WLFW, arrived ? "IS AT" : "has left",
 	    node, port);
@@ -3047,6 +3077,28 @@ wlfw_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 	wlfw_answer = (uint32_t)length;
 }
 
+/* ---- step 15: the exchange with the Wi-Fi firmware's service ---------------------------------------- */
+
+static const uint8_t *image_file(const char *name, uint64_t *size);
+
+const uint8_t *
+redwood_wifi_file(const char *name, uint64_t *size)
+{
+	return image_file(name, size);
+}
+
+static bool
+step_exchange(void)
+{
+	if (!glink.open) {
+		return false;
+	}
+	announce("have the exchange a WCN6750's driver has with the Wi-Fi firmware's service before it touches the radio, by "
+	    "hand in ath11k's order (redwood_wlfw.c): indications, capabilities both ways, the regulatory database and the "
+	    "board's data; nothing is written but datagrams");
+	return redwood_wlfw_exchange(step);
+}
+
 static bool
 step_qrtr(void)
 {
@@ -3059,8 +3111,8 @@ step_qrtr(void)
 	PE_parse_boot_argn("wifi_listen", &seconds, sizeof(seconds));
 	announce("listen for QRTR on the channel: the DSP's hello is answered with ours, its services are written down; and a "
 	    "port of ours looks the Wi-Fi firmware's service up, as the radio's driver will");
-	port = redwood_qrtr_open(wlfw_receive, NULL);
-	if (port == NULL || redwood_qrtr_lookup(port, SERVICE_WLFW, 1, 0, wlfw_service) != 0) {
+	port = qrtr_open(wlfw_receive, wlfw_service, NULL);
+	if (port == NULL || qrtr_lookup(port, SERVICE_WLFW, 1, 0) != 0) {
 		printf("wifi: %u: no port\n", step);
 		return false;
 	}
@@ -3085,7 +3137,7 @@ step_qrtr(void)
 		announce("ask the Wi-Fi firmware's service for its capabilities (QMI message 0x24, seven bytes) and wait a second "
 		    "for an answer");
 		wlfw_answer = 0;
-		error = redwood_qrtr_send(port, wlfw_node, wlfw_port, question, sizeof(question));
+		error = qrtr_send(port, wlfw_node, wlfw_port, question, sizeof(question));
 		for (unsigned ms = 0; ms < 1000 && error == 0 && wlfw_answer == 0; ms++) {
 			sleep_ms(1);
 		}
@@ -3100,7 +3152,7 @@ step_qrtr(void)
 			printf("wifi: %u: THE SERVICE ANSWERS: %u bytes, beginning%s\n", step, wlfw_answer, text);
 		}
 	}
-	redwood_qrtr_close(port);
+	qrtr_close(port);
 	return qrtr_hellos != 0 && qrtr_out != 0;
 }
 
@@ -3164,7 +3216,7 @@ smmu_look(void)
 
 static bool(*const steps[])(void) = {
 	step_smem, step_mailbox, step_rpmh, step_rails, step_pins, step_firmware, step_mailbox_open, step_header, step_image,
-	step_our_item, step_start, step_queues, step_link, step_qrtr,
+	step_our_item, step_start, step_queues, step_link, step_qrtr, step_exchange,
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
 
@@ -3205,6 +3257,7 @@ redwood_wifi_init(void)
 	if (last_step > STEPS) {
 		last_step = STEPS;
 	}
+	redwood_qmi_set_transport(&qrtr_ops);
 	new_from = last_step;
 	PE_parse_boot_argn("wifi_new", &new_from, sizeof(new_from));
 	PE_parse_boot_argn("wifi_pause", &pause_ms, sizeof(pause_ms));

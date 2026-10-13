@@ -50,6 +50,9 @@ void redwood_adreno_stop(void);         /* before that, where the ending is no p
 void redwood_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
 void redwood_wifi_init(void);           /* boot-arg wifi=N: the first N steps towards the phone's Wi-Fi */
 void redwood_wifi_stop(void);           /* where a run ends in order: the Wi-Fi DSP, if it was started, shut down */
+int redwood_wifi_say(const char *format, ...) __printflike(1, 2);      /* a line of the Wi-Fi steps' log */
+const uint8_t *redwood_wifi_file(const char *name, uint64_t *size);     /* a file of fw/ in the small image, in place */
+bool redwood_wlfw_exchange(uint32_t step);                              /* step 15 of wifi=N: bsd/dev/redwood_wlfw.c */
 
 /*
  * The GPU kept on (boot-arg adreno_keep=1), for iokit/Kernel/RedwoodGPU.cpp: see "the GPU kept on"
