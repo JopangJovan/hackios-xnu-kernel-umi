@@ -106,7 +106,13 @@ run() { # run <oem command> <label>
 		*) [ -f "$rd" ] || { echo "xl: ramdisk $rd not found"; return 1; } ;;
 		esac
 		case $K in prebuilt/*) echo "xl: no kernel built here, running $K" >&2 ;; esac
-		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} ${XL_CMDLINE--v}" >/dev/null || return 1
+		# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
+		# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
+		local args=${XL_CMDLINE--v}
+		case " $args " in
+		*" wifi="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
+		esac
+		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	fi
 	local live=; live_loader && live=1

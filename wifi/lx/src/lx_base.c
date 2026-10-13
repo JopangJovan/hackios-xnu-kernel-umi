@@ -32,6 +32,7 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/rhashtable.h>
 #include <linux/sched.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -75,11 +76,31 @@ lx_stub(const char *name)
 		if (seen[i].name == name) {
 			if (seen[i].calls++ < 3) {
 				printf("lx: %s() is not there yet: answers 0%s\n", name, seen[i].calls == 3 ? " (said for the last time)" : "");
+				lx_mark(name);
 			}
 			break;
 		}
 	}
 	return (0);
+}
+
+/*
+ * A point the driver's start has reached. With the kernel's option wifi_lx_step=MS it is also
+ * waited at, so that whoever follows the log from outside has the line before what comes next:
+ * for finding where a run ends that ends without a word.
+ */
+void
+lx_mark(const char *what)
+{
+	static unsigned wait = ~0u;
+
+	if (wait == ~0u) {
+		wait = lx_os_option("wifi_lx_step");
+	}
+	if (wait != 0) {
+		printf("lx: reached: %s\n", what);
+		lx_pause_ms(wait);
+	}
 }
 
 void
@@ -196,6 +217,11 @@ ticks_to_ns(unsigned long ticks)
 }
 
 static struct timer_list *armed[16];
+static struct {
+	struct delayed_work *work;		/* to be queued on ... */
+	struct workqueue_struct *queue;		/* ... when the ticks have reached ... */
+	unsigned long when;
+} later[16];
 
 static void
 ticker(void *argument)
@@ -204,6 +230,8 @@ ticker(void *argument)
 
 	for (;;) {
 		struct timer_list *due = NULL;
+		struct delayed_work *work = NULL;
+		struct workqueue_struct *queue = NULL;
 
 		lx_os_lock();
 		lx_os_sleep(&jiffies, 2 * 1000000ull);
@@ -214,11 +242,77 @@ ticker(void *argument)
 				armed[i] = NULL;
 			}
 		}
+		for (unsigned i = 0; i < nitems(later) && work == NULL; i++) {
+			if (later[i].work != NULL && (long)(jiffies - later[i].when) >= 0) {
+				work = later[i].work;
+				queue = later[i].queue;
+				later[i].work = NULL;
+			}
+		}
 		lx_os_unlock();
-		if (due != NULL) {
+		/* (a timer that a part of the driver not built yet would have given its function has none) */
+		if (due != NULL && due->function_415 != NULL) {
 			due->function_415(due);
 		}
+		if (work != NULL) {
+			linux_queue_work_on(0, queue, &work->work);
+		}
 	}
+}
+
+/* Work that is to be queued when some time has passed: the thread above does that. */
+void
+linux_init_delayed_work(struct delayed_work *dwork, work_func_t function)
+{
+	bzero(dwork, sizeof(*dwork));
+	INIT_WORK(&dwork->work, function);
+}
+
+bool
+linux_queue_delayed_work_on(int cpu, struct workqueue_struct *wq, struct delayed_work *dwork, unsigned long delay)
+{
+	int slot = -1;
+
+	if (delay == 0) {
+		return (linux_queue_work_on(cpu, wq, &dwork->work));
+	}
+	lx_os_lock();
+	for (unsigned i = 0; i < nitems(later); i++) {
+		if (later[i].work == dwork) {
+			lx_os_unlock();
+			return (false);			/* (it waits already) */
+		}
+		if (later[i].work == NULL && slot < 0) {
+			slot = (int)i;
+		}
+	}
+	if (slot >= 0) {
+		later[slot].work = dwork;
+		later[slot].queue = wq;
+		later[slot].when = jiffies + delay;
+	}
+	lx_os_unlock();
+	if (slot < 0) {
+		printf("lx: no room for more work that waits for its time: one piece will not be done\n");
+	}
+	return (slot >= 0);
+}
+
+/* Not to be queued any more, if it waits for its time; true if it did. */
+bool
+linux_cancel_delayed_work(struct delayed_work *dwork)
+{
+	bool waited = false;
+
+	lx_os_lock();
+	for (unsigned i = 0; i < nitems(later); i++) {
+		if (later[i].work == dwork) {
+			later[i].work = NULL;
+			waited = true;
+		}
+	}
+	lx_os_unlock();
+	return (waited);
 }
 
 /* (A timer's function that is running on the ticker's thread at this moment is not waited for.) */
@@ -575,8 +669,9 @@ linux_cancel_work_sync(struct work_struct *work)
 bool
 linux_cancel_delayed_work_sync(struct delayed_work *dwork)
 {
-	/* (work is never queued with a delay by what is built so far) */
-	return (linux_cancel_work_sync(&dwork->work));
+	bool waited = linux_cancel_delayed_work(dwork);
+
+	return (linux_cancel_work_sync(&dwork->work) || waited);
 }
 
 void
@@ -929,6 +1024,94 @@ idr_for_each(struct idr *idr, int (*function)(int id, void *p, void *data), void
 		}
 	}
 	return (answer);
+}
+
+/*
+ * Things found by a key inside them (linux/rhashtable.h, ours). The chains are changed and walked
+ * under the layer's lock; that a thing found stays there while it is used is the caller's
+ * business, as it is under Linux.
+ */
+static struct rhash_head **
+rht_chain(struct rhashtable *table, const void *key, unsigned length)
+{
+	uint32_t hash = 2166136261u;
+
+	for (unsigned i = 0; i < length; i++) {
+		hash = (hash ^ ((const uint8_t *)key)[i]) * 16777619u;
+	}
+	return (&table->chains[hash % nitems(table->chains)]);
+}
+
+int
+rhashtable_init(struct rhashtable *table, const struct rhashtable_params *params)
+{
+	bzero(table, sizeof(*table));
+	return (0);
+}
+
+void
+rhashtable_destroy(struct rhashtable *table)
+{
+}
+
+static void *
+rht_find(struct rhashtable *table, const void *key, const struct rhashtable_params *params)
+{
+	for (struct rhash_head *head = *rht_chain(table, key, params->key_len); head != NULL; head = head->next) {
+		uint8_t *thing = (uint8_t *)head - params->head_offset;
+
+		if (memcmp(thing + params->key_offset, key, params->key_len) == 0) {
+			return (thing);
+		}
+	}
+	return (NULL);
+}
+
+void *
+rhashtable_lookup_fast(struct rhashtable *table, const void *key, const struct rhashtable_params params)
+{
+	void *thing;
+
+	lx_os_lock();
+	thing = rht_find(table, key, &params);
+	lx_os_unlock();
+	return (thing);
+}
+
+void *
+rhashtable_lookup_get_insert_fast(struct rhashtable *table, struct rhash_head *head, const struct rhashtable_params params)
+{
+	const uint8_t *key = (uint8_t *)head - params.head_offset + params.key_offset;
+	struct rhash_head **chain;
+	void *there;
+
+	lx_os_lock();
+	there = rht_find(table, key, &params);
+	if (there == NULL) {
+		chain = rht_chain(table, key, params.key_len);
+		head->next = *chain;
+		*chain = head;
+	}
+	lx_os_unlock();
+	return (there);
+}
+
+int
+rhashtable_remove_fast(struct rhashtable *table, struct rhash_head *head, const struct rhashtable_params params)
+{
+	const uint8_t *key = (uint8_t *)head - params.head_offset + params.key_offset;
+	int error = -ENOENT;
+
+	lx_os_lock();
+	for (struct rhash_head **link = rht_chain(table, key, params.key_len); *link != NULL; link = &(*link)->next) {
+		if (*link == head) {
+			*link = head->next;
+			error = 0;
+			break;
+		}
+	}
+	lx_os_unlock();
+	return (error);
 }
 
 void

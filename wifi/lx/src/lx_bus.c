@@ -9,18 +9,21 @@
  * Where this stage ends: qmi.c has its exchange with the firmware, core.c starts the firmware
  * in mission mode and has ce.c and hal.c set up the copy engines' rings, htc.c connects its
  * services over them and wmi.c has the firmware say what the radio is ("service ready") and,
- * given the driver's configuration, that it is ready for commands ("unified ready"). What the
- * firmware said is then put in the log, and the driver is taken down again the way its own
- * removal does it (ath11k_core_deinit()): mac.c and the data path are not built.
+ * given the driver's configuration, that it is ready for commands ("unified ready"); mac.c
+ * registers the radio with what stands in for mac80211 (lx_80211.c). What the firmware said is
+ * then put in the log, with the boot-arg wifi_scan=1 the station of lx_80211.c has the radio
+ * scan, and the driver is taken down again the way its own removal does it
+ * (ath11k_core_deinit()). The data path is not built.
  *
  * The kernel's boot-arg wifi_lx says how far the radio's registers are touched: 1, not at all
  * (every write is said and dropped, every read is 0: the driver's own exchange and nothing
  * else); 2, for real.
  *
  * What the phone said, 13 October: all of that happens, 270 ms from the start of the bus to
- * "unified ready", with the copy engines looked at once a millisecond (bsd/dev/redwood_wifi.c,
- * step_driver(), has the account).
+ * "unified ready", with the copy engines looked at once a millisecond, and the scan hears the
+ * networks around (bsd/dev/redwood_wifi.c, step_driver(), has the account).
  */
+#define LX_QMI_AS_IT_IS				/* (this file is where the driver's requests go past) */
 #include <linux/kernel.h>
 #include <linux/device.h>
 #include <linux/io.h>
@@ -42,6 +45,7 @@
 
 static struct {
 	unsigned how;				/* wifi_lx */
+	bool mission;				/* the firmware has been asked for mission mode, and for no other since */
 	bool closed;				/* the driver has stopped the bus: the registers are not touched again */
 	unsigned reads, writes, said, refused;
 	u32 last, last_value;			/* the register written last, and with what ... */
@@ -131,8 +135,7 @@ window(struct ath11k_base *ab, u32 offset)
 	if ((offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) < ATH11K_PCI_WINDOW_RANGE_MASK) {
 		return (2 * ATH11K_PCI_WINDOW_START + (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
 	}
-	printf("lx: the driver reaches for the chip's %#x, which no window shows\n", offset);
-	return (0);
+	return (0);				/* (refused() has kept such a one out) */
 }
 
 /*
@@ -142,13 +145,17 @@ window(struct ath11k_base *ab, u32 offset)
  * "off", nothing is let through any more.
  */
 static bool
-refused(u32 offset)
+refused(struct ath11k_base *ab, u32 offset)
 {
-	if (!bus.closed) {
+	bool known = offset < ATH11K_PCI_WINDOW_START || (offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK ||
+	    (offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) < ATH11K_PCI_WINDOW_RANGE_MASK;
+
+	if (known && bus.mission && !bus.closed) {
 		return (false);
 	}
 	if (bus.refused++ < 8) {
-		printf("lx: the chip's %#x is reached for after the bus was stopped: NOT DONE\n", offset);
+		printf("lx: the chip's %#x is reached for %s: NOT DONE\n", offset, !known ? "which no window shows" : bus.closed ?
+		    "after the bus was stopped" : "while the firmware is not in mission mode");
 	}
 	return (true);
 }
@@ -204,7 +211,7 @@ bus_read32(struct ath11k_base *ab, u32 offset)
 {
 	u32 value = 0;
 
-	if (refused(offset)) {
+	if (refused(ab, offset)) {
 		return (0);
 	}
 	bus.reads++;
@@ -223,7 +230,7 @@ bus_read32(struct ath11k_base *ab, u32 offset)
 static void
 bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
 {
-	if (refused(offset)) {
+	if (refused(ab, offset)) {
 		return;
 	}
 	bus.writes++;
@@ -272,7 +279,32 @@ bus_quiet(void)
 		lx_pause_ms(1);
 	}
 	say_repeats();
-	bus.closed = true;
+}
+
+/*
+ * A request of the driver's to the firmware, on its way out (linux/soc/qcom/qmi.h, ours). One
+ * matters here: the mode. With any mode but mission the radio's registers stop answering, and
+ * the driver does not always let go of the copy engines first -- where its start fails late,
+ * core.c asks for the mode "off" and stops the bus after that (ath11k_core_stop()). So the
+ * copy engines are let go of here, before the request leaves.
+ */
+int
+lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id, size_t largest,
+    const struct qmi_elem_info *ei, const void *structure)
+{
+	if (msg_id == QMI_WLANFW_WLAN_MODE_REQ_V01) {
+		u32 mode = ((const struct qmi_wlanfw_wlan_mode_req_msg_v01 *)structure)->mode;
+
+		if (mode != ATH11K_FIRMWARE_MODE_NORMAL && bus.looking) {
+			printf("lx: the driver asks for mode %u while the copy engines are still looked at: they are let go of first\n",
+			    mode);
+		}
+		if (mode != ATH11K_FIRMWARE_MODE_NORMAL) {
+			bus_quiet();
+		}
+		bus.mission = mode == ATH11K_FIRMWARE_MODE_NORMAL;
+	}
+	return (qmi_send_request(qmi, sq, txn, msg_id, largest, ei, structure));
 }
 
 /* pcic.c: ath11k_pcic_start(), with the thread above where it enables the interrupts */
@@ -298,6 +330,7 @@ static void
 bus_stop(struct ath11k_base *ab)
 {
 	bus_quiet();
+	bus.closed = true;
 	timer_delete_sync(&ab->rx_replenish_retry);
 	ath11k_ce_cleanup_pipes(ab);
 	printf("lx: the driver stops the bus (%u reads and %u writes of the chip's registers in all, %u of the writes a ring's "
@@ -400,6 +433,17 @@ int
 of_reserved_mem_region_to_resource(const struct device_node *np, unsigned int index, struct resource *res)
 {
 	return (-ENODEV);
+}
+
+/*
+ * The radio's own address, which the driver asks its device for before it falls back on what the
+ * firmware says (mac.c: ath11k_mac_register()); this radio's firmware says none. The kernel has
+ * it, if it was given one. Nothing here says the address.
+ */
+int
+linuxkpi_device_get_mac_address(struct device *dev, char *address)
+{
+	return (lx_os_radio_address((unsigned char *)address) ? 0 : -ENOENT);
 }
 
 /* ---- what the firmware has said of the radio ------------------------------------------------------- */
@@ -509,16 +553,10 @@ lx_start(void)
 	lx_pause_ms(1000);			/* (for what the firmware says unasked once it is ready) */
 	say_radio(ab);
 
-	/*
-	 * Down again, in the order of the driver's own removal (core.c: ath11k_core_deinit()), by
-	 * hand: that function first has every radio's interface told to suspend, and there is no
-	 * such interface until mac.c makes one.
-	 */
-	bus_quiet();
-	ath11k_qmi_firmware_stop(ab);
-	bus_stop(ab);
-	ath11k_wmi_detach(ab);
-	ath11k_qmi_deinit_service(ab);
+	ret = lx_os_option("wifi_scan") ? lx_station_scan() : 0;
+
+	/* Down again, as the driver's removal does it (the copy engines are let go of on the way: bus_quiet()). */
+	ath11k_core_deinit(ab);
 	printf("lx: the driver is down again\n");
-	return (0);
+	return (ret);
 }
