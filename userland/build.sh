@@ -106,7 +106,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# our library for inside stock iOS programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libredwood.dylib src/inject.c
-		$DYN -dynamiclib -install_name /redwood/lib/libredwood-sb.dylib -framework CoreFoundation -lobjc \
+		$DYN -dynamiclib -install_name /redwood/lib/libredwood-sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libredwood-sb.dylib src/inject_sb.c
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -lobjc \
 			-o obj/libredwood-media.dylib src/inject_media.c

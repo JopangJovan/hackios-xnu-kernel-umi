@@ -218,6 +218,9 @@ struct eagl {
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
 	GLuint plain, lookup;           /* programs of ours for when that is none (plain_draw_begin()) */
 	GLint plain_matrix, plain_textured, lookup_matrix;
+	GLuint vibrant, masking;        /* two more: what a colour matrix does to what is behind, and to the layer */
+	int blended;                    /* blending is off for such a draw, to be put back after it */
+	GLint vibrant_matrix, vibrant_colours, masking_matrix, masking_colours;
 	unsigned unit;                  /* the texture unit being spoken of */
 	GLuint bound[8];                /* the 2D texture bound to each of the first units */
 	const GLfloat *matrix;          /* where CoreAnimation keeps the matrix it gives its programs */
@@ -1154,7 +1157,84 @@ static const char table_fragment[] =
     "  result = vec4(clamp(both + over.rgb * (1. - under.a) + under.rgb * (1. - over.a), 0., opacity), opacity);\n"
     "}\n";
 
-static int plain_draws = 1;             /* boot-arg glplain=0: leave such draws as they are; 2: also those without a texture */
+/*
+ * Two more are told apart by the "function" itself, which CoreAnimation's context has in a known
+ * place while it draws (and which our library in the window server hands over with the context:
+ * redwood_gl_function_values() below, called from inject.c). Both take a colour matrix, four
+ * columns and what is added, the numbers function_values[] keeps.
+ *
+ *   "vcm" (45), the filter vibrantColorMatrix: the layer is not drawn, it says how much of the
+ *   matrix is applied to what is behind it. The lock screen has two: a gradient over the whole
+ *   screen, opaque red at the top and clear at the bottom, under which the wallpaper is toned
+ *   down for the clock to be read; and the clock itself, through whose digits the wallpaper
+ *   comes out nearly white. Drawn as a picture, the first was a red veil over the wallpaper.
+ *   What the filter does is CoreAnimation's software renderer's to say (tex_vibrant_color_matrix:
+ *   the matrix over what is there, tex_color_matrix_4x4_bias, and tex_mix by the layer's alpha);
+ *   the matrix arithmetic is also in the OpenGL ES renderer's own shaders, colorMatrix4x4Bias.
+ *   What is there is read with EXT_shader_framebuffer_fetch.
+ *
+ *   "c4p" (20), the filter colorMatrix told that its input is premultiplied
+ *   (inputPremultipliedValues): the matrix over the layer's pixels as they are. The clock's
+ *   digits pass through one that keeps nothing but red as alpha ("colorToAlphaMask") before they
+ *   are that mask; drawn as they were, they stayed white.
+ */
+#define FUNCTION_MATRIX_PREMULTIPLIED   20
+#define FUNCTION_VIBRANT_MATRIX         45
+
+static const char vibrant_fragment[] =
+    "#version 300 es\n"
+    "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform mediump vec4 colours[5];\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "layout(location = 0) inout highp vec4 result;\n"
+    "void main() {\n"
+    "  mediump vec4 layer = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+    "  mediump vec4 behind = result, s = behind;\n"
+    "  s.rgb = s.rgb / max(s.a, .005);\n"
+    "  s = s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4];\n"
+    "  s.a = clamp(s.a, 0., 1.);\n"
+    "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
+    "  result = mix(behind, s, layer.a);\n"
+    "}\n";
+static const char masking_fragment[] =
+    "#version 300 es\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform mediump vec4 colours[5];\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "out lowp vec4 result;\n"
+    "void main() {\n"
+    "  mediump vec4 s = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+    "  result = clamp(s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4], 0., 1.);\n"
+    "}\n";
+
+static void *ca_context;                /* CoreAnimation's GLContext */
+static GLfloat function_values[90][20];
+static uint8_t function_given[90];
+
+/* From inject.c, at every GLContext::function_uniform(): the numbers a function is given, which no shader of CoreAnimation's takes. */
+void
+redwood_gl_function_values(void *context, unsigned function, unsigned index, size_t components, size_t count, const float *values)
+{
+	static uint8_t said[90];
+
+	ca_context = context;
+	if (function >= 90 || index != 0 || components * count > 20) {
+		return;
+	}
+	memcpy(function_values[function], values, components * count * sizeof(values[0]));
+	function_given[function] = (uint8_t)(components * count);
+	if (!said[function]) {
+		said[function] = 1;
+		say("redwood-gl: CoreAnimation gives its function %u numbers: %zu of %zu, the first %g %g %g %g\n", function, count,
+		    components, (double)values[0], (double)values[1], (double)values[2], (double)values[3]);
+	}
+}
+
+/* boot-arg glplain=0: leave such draws as they are; 2: also those without a texture; 3: the two with a colour matrix drawn plainly too */
+static int plain_draws = 1;
 
 /* One of our programs, made: CoreAnimation's own vertex arrays go in at the places it has them. */
 static GLuint
@@ -1187,11 +1267,47 @@ static bool
 plain_draw_begin(struct eagl *e, GLint enabled[3])
 {
 	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	static uint8_t said[90];
+	unsigned function = ca_context != NULL ? *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10) : 0;
 	GLint rows = 0;
 	GLuint program;
 
 	if (e->program != 0 || !plain_draws || (plain_draws == 1 && e->bound[0] == 0)) {
 		return false;
+	}
+	if (function < 90 && !said[function]) {
+		said[function] = 1;
+		say("redwood-gl: a draw with no program is CoreAnimation's function %u\n", function);
+	}
+	e->blended = 0;
+	if (e->bound[0] != 0 && plain_draws != 3 && ((function == FUNCTION_VIBRANT_MATRIX && fetch_offered) ||
+	    function == FUNCTION_MATRIX_PREMULTIPLIED) && function_given[function] == 20) {
+		bool vibrant = function == FUNCTION_VIBRANT_MATRIX;
+
+		if (vibrant && e->vibrant == 0) {
+			e->vibrant = plain_program(vibrant_fragment, "a colour matrix over what is behind");
+			e->vibrant_matrix = glGetUniformLocation(e->vibrant, "vertex_matrix");
+			e->vibrant_colours = glGetUniformLocation(e->vibrant, "colours");
+		} else if (!vibrant && e->masking == 0) {
+			e->masking = plain_program(masking_fragment, "a colour matrix over premultiplied pixels");
+			e->masking_matrix = glGetUniformLocation(e->masking, "vertex_matrix");
+			e->masking_colours = glGetUniformLocation(e->masking, "colours");
+		}
+		program = vibrant ? e->vibrant : e->masking;
+		glUseProgram(program);
+		glUniformMatrix4fv(vibrant ? e->vibrant_matrix : e->masking_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
+		glUniform4fv(vibrant ? e->vibrant_colours : e->masking_colours, 5, function_values[function]);
+		if (vibrant && glIsEnabled(GL_BLEND)) {
+			e->blended = 1;                 /* the program has blended already */
+			glDisable(GL_BLEND);
+		}
+		for (GLuint i = 0; i < 3; i++) {
+			glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+			if (!enabled[i]) {
+				glEnableVertexAttribArray(i);
+			}
+		}
+		return true;
 	}
 	if (e->bound[0] != 0 && e->bound[1] != 0) {
 		glActiveTexture(GL_TEXTURE0 + 1);
@@ -1246,7 +1362,10 @@ plain_draw_end(struct eagl *e, const GLint enabled[3])
 		}
 	}
 	glUseProgram(0);
-	(void)e;
+	if (e->blended) {
+		glEnable(GL_BLEND);
+		e->blended = 0;
+	}
 }
 
 static void

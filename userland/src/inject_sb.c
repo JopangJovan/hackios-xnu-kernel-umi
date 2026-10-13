@@ -18,10 +18,14 @@
  *   - The picture SpringBoard keeps of an application that leaves the screen (for the application
  *     switcher and the next launch) is saved as JPEG or PNG, not as an ASTC texture: see
  *     snapshot_output_format().
+ *   - Where CoreAnimation draws with its software renderer (QEMU; the phone without gpu=1) the
+ *     "vibrant" views draw their content as it is: see plain_vibrancy().
  *   - Darwin notifications as a remote control, for scripts (rwtouch notify NAME):
  *       com.redwood.unlock      what the lock screen does after "swipe up to open"
+ *       com.redwood.layers      write down the layers SpringBoard has on the screen: see layers()
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
 #include <notify.h>
 #include <objc/message.h>
@@ -36,7 +40,7 @@
 static void
 say(const char *format, ...)
 {
-	char line[256];
+	char line[1280];
 	va_list ap;
 	int n;
 
@@ -138,6 +142,58 @@ snapshot_output_format(__unused id self, __unused SEL selector, id snapshot)
 	return SNAPSHOT_FORMAT_PNG;
 }
 
+/* ---- the lock screen's clock without a GPU ------------------------------------------------------- */
+
+#define REDWOOD_GL "/redwood/lib/libredwood-gl.dylib"
+
+/* Does the window server draw with OpenGL ES? The same question, asked the same way, as opengl_es() in inject.c. */
+static bool
+gpu_draws(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	const char *argument;
+	io_service_t gpu;
+
+	if (access(REDWOOD_GL, R_OK) != 0) {
+		return false;
+	}
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		for (argument = arguments; (argument = strstr(argument, "gl=")) != NULL; argument += 3) {
+			if (argument == arguments || argument[-1] == ' ') {
+				return argument[3] != '0';
+			}
+		}
+	}
+	gpu = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
+	if (gpu != 0) {
+		IOObjectRelease(gpu);
+	}
+	return gpu != 0;
+}
+
+/*
+ * The clock of the lock screen is a "vibrant" view (BSUIVibrancyEffectView in BaseBoardUI): its
+ * digits are not drawn, they are a mask -- a copy of them through a colour matrix that keeps red
+ * as alpha -- through which the filter vibrantColorMatrix lets the wallpaper behind come out
+ * lighter; and a gradient over the whole screen, red at the top, tones the wallpaper down the
+ * same way. On the GPU that is what is seen (eagl.c draws the two filters). CoreAnimation's
+ * software renderer shows neither: the digits come out red, and the top of the wallpaper as it
+ * was. Why was not found out; that renderer is in QuartzCore, not here.
+ * Such views have a switch, the user default BSUIVibrancyEffectViewDisabled: with it they show
+ * their content as it is drawn, the clock in plain white. It is set for this run of SpringBoard
+ * alone (nothing is written), and only where the software renderer draws.
+ */
+static void
+plain_vibrancy(void)
+{
+	if (gpu_draws()) {
+		return;
+	}
+	CFPreferencesSetAppValue(CFSTR("BSUIVibrancyEffectViewDisabled"), kCFBooleanTrue, kCFPreferencesCurrentApplication);
+	say("redwood: SpringBoard: no GPU draws, vibrant views are plain (the lock screen's clock is white)\n");
+}
+
 /* ---- remote control ------------------------------------------------------------------------------ */
 
 #define UNLOCK_SOURCE_COVER_SHEET       24      /* what the lock screen itself passes */
@@ -167,6 +223,153 @@ unlock(void)
 	}
 }
 
+/*
+ * What SpringBoard has put on the screen, as CoreAnimation has it: every layer of every window, a
+ * line each -- class and name, place, opacity, what it shows (an image, a colour, another
+ * process's layers), and what is done to it: its filters by type with their inputs, in order,
+ * the compositing filter, the mask. That is where a picture that comes out wrong on one renderer
+ * and right on another is described: the same description goes to both.
+ */
+#define SEND(type, object, name)        ((type (*)(id, SEL))objc_msgSend)((id)(object), sel_registerName(name))
+#define SEND1(type, object, name, argument_type, argument) \
+	((type (*)(id, SEL, argument_type))objc_msgSend)((id)(object), sel_registerName(name), argument)
+
+static const char *
+text_of(id object)
+{
+	id text = object ? SEND(id, object, "description") : NULL;
+
+	return text ? SEND(const char *, text, "UTF8String") : "-";
+}
+
+static void
+layer_filter(id filter, const char *what, int depth)
+{
+	static const char *const inputs[] = { "inputColorMatrix", "inputRadius", "inputAmount", "inputColor", "inputAngle",
+		                              "inputPremultipliedValues", "inputNormalizeEdges", "inputReversed" };
+	char line[1024];
+	size_t n;
+
+	if (!class_respondsToSelector(object_getClass(filter), sel_registerName("type"))) {
+		say("redwood: layers: %*s  %s %s\n", 2 * depth, "", what, text_of(filter));     /* a name alone */
+		return;
+	}
+	n = (size_t)snprintf(line, sizeof(line), "%s %s \"%s\"%s", what, text_of(SEND(id, filter, "type")),
+	    text_of(SEND(id, filter, "name")), SEND(BOOL, filter, "isEnabled") ? "" : " (disabled)");
+	for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]) && n < sizeof(line); i++) {
+		id key = SEND1(id, objc_getClass("NSString"), "stringWithUTF8String:", const char *, inputs[i]);
+		id value = SEND1(id, filter, "valueForKey:", id, key);
+		float m[20];
+
+		if (value == NULL) {
+			continue;
+		}
+		if (i == 0 && class_respondsToSelector(object_getClass(value), sel_registerName("CAColorMatrixValue"))) {
+			SEND1(void, value, "getValue:", void *, m);
+			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s [%.3g %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g %.3g | "
+			    "%.3g %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g %.3g]", inputs[i], m[0], m[1], m[2], m[3], m[4], m[5], m[6],
+			    m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15], m[16], m[17], m[18], m[19]);
+		} else {
+			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s %s", inputs[i], text_of(value));
+		}
+	}
+	say("redwood: layers: %*s  %s\n", 2 * depth, "", line);
+}
+
+static void
+layer_line(id layer, const char *role, int depth)
+{
+	struct { double x, y, w, h; } frame = SEND(typeof(frame), layer, "frame");
+	const char *class_name = object_getClassName(layer);
+	id contents = SEND(id, layer, "contents"), filters = SEND(id, layer, "filters"), mask = SEND(id, layer, "mask");
+	id compositing = SEND(id, layer, "compositingFilter"), sublayers = SEND(id, layer, "sublayers");
+	id background = SEND(id, layer, "backgroundFilters");
+	void *colour = SEND(void *, layer, "backgroundColor");
+	char more[512] = "";
+	size_t n = 0;
+
+	if (SEND(BOOL, layer, "isHidden")) {
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " HIDDEN");
+	}
+	if (contents != NULL) {
+		id text = (id)CFCopyDescription((CFTypeRef)contents);
+
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " contents %.60s", text_of(text));
+		CFRelease((CFTypeRef)text);
+	}
+	if (contents != NULL && class_respondsToSelector(object_getClass(layer), sel_registerName("contentsMultiplyColor")) &&
+	    SEND(void *, layer, "contentsMultiplyColor") != NULL) {
+		id text = (id)CFCopyDescription(SEND(void *, layer, "contentsMultiplyColor"));
+		const char *numbers = strstr(text_of(text), "( ");
+
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " times %.40s", numbers ? numbers : "?");
+		CFRelease((CFTypeRef)text);
+	}
+	if (colour != NULL) {
+		id text = (id)CFCopyDescription(colour);
+		const char *numbers = strstr(text_of(text), "( ");
+
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " colour %.40s", numbers ? numbers : "?");
+		CFRelease((CFTypeRef)text);
+	}
+	if (strcmp(class_name, "CAPortalLayer") == 0) {
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " PORTAL of %p%s%s", (void *)SEND(id, layer, "sourceLayer"),
+		    SEND(BOOL, layer, "hidesSourceLayer") ? " (hides it)" : "", SEND(BOOL, layer, "matchesOpacity") ? " (its opacity)" : "");
+	} else if (strcmp(class_name, "CABackdropLayer") == 0) {
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " BACKDROP group \"%s\" scale %g%s", text_of(SEND(id, layer, "groupName")),
+		    SEND(double, layer, "scale"), SEND(BOOL, layer, "captureOnly") ? " (capture only)" : "");
+	} else if (strcmp(class_name, "CAGradientLayer") == 0) {
+		struct { double x, y; } from = SEND(typeof(from), layer, "startPoint"), to = SEND(typeof(to), layer, "endPoint");
+		id colours = SEND(id, layer, "colors");
+
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " GRADIENT %s from %g,%g to %g,%g at %.40s:", text_of(SEND(id, layer, "type")),
+		    from.x, from.y, to.x, to.y, text_of(SEND(id, layer, "locations")));
+		for (long i = 0; colours != NULL && i < SEND(long, colours, "count") && n < sizeof(more); i++) {
+			id text = (id)CFCopyDescription((CFTypeRef)SEND1(id, colours, "objectAtIndex:", long, i));
+			const char *numbers = strstr(text_of(text), "( ");
+
+			n += (size_t)snprintf(more + n, sizeof(more) - n, " %.30s", numbers ? numbers : "?");
+			CFRelease((CFTypeRef)text);
+		}
+	} else if (strcmp(class_name, "CALayerHost") == 0) {
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " HOST of context %#x", SEND(unsigned, layer, "contextId"));
+	}
+	say("redwood: layers: %*s%s%s %p \"%s\" %g,%g %gx%g opacity %g%s\n", 2 * depth, "", role, class_name, (void *)layer,
+	    text_of(SEND(id, layer, "name")), frame.x, frame.y, frame.w, frame.h, (double)SEND(float, layer, "opacity"), more);
+	for (long i = 0; filters != NULL && i < SEND(long, filters, "count"); i++) {
+		layer_filter(SEND1(id, filters, "objectAtIndex:", long, i), "filter", depth);
+	}
+	for (long i = 0; background != NULL && i < SEND(long, background, "count"); i++) {
+		layer_filter(SEND1(id, background, "objectAtIndex:", long, i), "background filter", depth);
+	}
+	if (compositing != NULL) {
+		layer_filter(compositing, "compositing filter", depth);
+	}
+	if (mask != NULL) {
+		layer_line(mask, "MASK ", depth + 1);
+	}
+	for (long i = 0; sublayers != NULL && i < SEND(long, sublayers, "count"); i++) {
+		layer_line(SEND1(id, sublayers, "objectAtIndex:", long, i), "", depth + 1);
+	}
+}
+
+static void
+layers(void)
+{
+	Class window = objc_getClass("UIWindow");
+	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+	id windows = window && class_getClassMethod(window, all) ? ((id (*)(Class, SEL, BOOL, BOOL))objc_msgSend)(window, all, 1, 1) : NULL;
+
+	say("redwood: layers: %ld windows\n", windows ? SEND(long, windows, "count") : 0L);
+	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
+		id w = SEND1(id, windows, "objectAtIndex:", long, i);
+
+		say("redwood: layers: window %s level %g\n", object_getClassName(w), SEND(double, w, "windowLevel"));
+		layer_line(SEND(id, w, "layer"), "", 1);
+	}
+	say("redwood: layers: end\n");
+}
+
 __attribute__((constructor))
 static void
 redwood_springboard_init(void)
@@ -185,6 +388,7 @@ redwood_springboard_init(void)
 	    "_setSetupRequiredReason:", 0x1c4cdd3a4UL, (IMP)set_setup_required_reason);
 	snapshot_format = replace_method_of_kind('+', "XBApplicationSnapshotManifestImpl", "_outputFormatForSnapshot:",
 	    0x1f1c91480UL, (IMP)snapshot_output_format);
+	plain_vibrancy();
 	say("redwood: SpringBoard: activation %s, setup assistant %s, application snapshots %s\n",
 	    activation ? "answered here" : "NOT replaced", original_set_setup_required_reason ? "refused" : "NOT replaced",
 	    snapshot_format ? "as JPEG" : "NOT changed");
@@ -200,5 +404,8 @@ redwood_springboard_init(void)
 	}
 	notify_register_dispatch("com.redwood.unlock", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		unlock();
+	});
+	notify_register_dispatch("com.redwood.layers", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		layers();
 	});
 }

@@ -235,6 +235,27 @@ my_function_supported(void *context)
 	return supported;
 }
 
+/*
+ * A function that takes numbers besides its textures (a colour matrix, say) is given them through
+ * GLContext::function_uniform(), which hands them to the function's shader. The functions the
+ * OpenGL ES renderer has no shader for are drawn all the same, with no program, and their numbers
+ * go nowhere. Our OpenGL ES library draws some of those with programs of its own (eagl.c,
+ * plain_draw_begin()): it is told the numbers here, and with them the context, in which it
+ * finds which function a draw is.
+ */
+static void (*orig_function_uniform)(void *context, unsigned index, size_t components, size_t count, const float *values);
+static void (*gl_function_values)(void *context, unsigned function, unsigned index, size_t components, size_t count,
+    const float *values);
+
+static void
+my_function_uniform(void *context, unsigned index, size_t components, size_t count, const float *values)
+{
+	if (gl_function_values != NULL) {
+		gl_function_values(context, *(*(uint8_t **)((char *)context + 0x10) + 0x10), index, components, count, values);
+	}
+	orig_function_uniform(context, index, components, count, values);
+}
+
 static void
 window_server_fixes(void)
 {
@@ -251,6 +272,10 @@ window_server_fixes(void)
 	if (gl_loaded) {
 		orig_function_supported = replace_virtual("function_supported", VSLOT(VT_GLES_CONTEXT, 0x378), 0x1884a9308UL,
 		    my_function_supported);
+		if (gl_function_values != NULL) {
+			orig_function_uniform = replace_virtual("function_uniform", VSLOT(VT_GLES_CONTEXT, 0x388), 0x1884a9350UL,
+			    my_function_uniform);
+		}
 	}
 	say("redwood: window server hooks %s\n", orig_is_ready && orig_ignore_update_p && orig_begin_update &&
 	    orig_finish_update && orig_renderer && orig_render_update ? "installed" : "INCOMPLETE");
@@ -706,6 +731,7 @@ opengl_es(void)
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 	io_service_t gpu;
+	void *library;
 	int wanted = -1, told = 0;
 
 	if (access(REDWOOD_GL, R_OK) != 0) {
@@ -730,11 +756,13 @@ opengl_es(void)
 		say("redwood: %s: CoreAnimation keeps its software renderer\n", told ? "gl=0" : "no GPU to draw with");
 		return;
 	}
-	if (dlopen(REDWOOD_GL, RTLD_NOW) == NULL) {
+	if ((library = dlopen(REDWOOD_GL, RTLD_NOW)) == NULL) {
 		say("redwood: %s: %s\n", REDWOOD_GL, dlerror());
 		return;
 	}
 	gl_loaded = 1;
+	gl_function_values = (void (*)(void *, unsigned, unsigned, size_t, size_t, const float *))dlsym(library,
+	    "redwood_gl_function_values");
 }
 
 __attribute__((constructor))
