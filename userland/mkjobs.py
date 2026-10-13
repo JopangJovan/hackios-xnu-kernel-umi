@@ -53,6 +53,9 @@ for label in labels:
     with open(f'{src}/{label}.plist', 'rb') as f:
         job = plistlib.load(f)
     job['StandardErrorPath'] = '/dev/console'
+    # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
+    # device tree, which the loader's tree does not have yet
+    job.pop('_LimitLoadToDeviceTree', None)
     if 'all' in oslog or label in oslog:
         job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
     with open(f'{dest}/{label}.plist', 'wb') as f:
