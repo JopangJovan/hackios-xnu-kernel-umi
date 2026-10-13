@@ -25,7 +25,8 @@ void	*lx_os_radio_memory(unsigned long size, unsigned long long *address);
 void	*lx_os_map_registers(unsigned long long physical, unsigned long size);	/* never unmapped */
 
 /* ---- saying things ---- */
-void	 lx_os_print(const char *text);
+void	 lx_os_print(const char *text);				/* for whoever looks for a fault: may be kept back */
+void	 lx_os_tell(const char *text);				/* for whoever runs the machine: always said */
 void	 lx_os_panic(const char *text) __attribute__((noreturn));
 
 /* ---- time, threads, sleeping ---- */
@@ -69,11 +70,14 @@ void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an E
  * ---- the names the object shows the kernel. lx_start(): bring the driver up on the radio and
  * do what the kernel's options ask (scan; join a network). 0, or an errno. Returns when that is
  * over or has failed; with a network joined the driver stays up, lx_transmit() sends an
- * Ethernet frame through it (0, or an errno), and lx_stop() leaves the network and takes the
- * driver down in order (and does nothing if it is not up).
+ * Ethernet frame through it (0, or an errno; called by one thread, the kernel's own for that),
+ * and lx_stop() leaves the network and takes the driver down in order (and does nothing if it
+ * is not up).
  */
 int	 lx_start(void);
 void	 lx_stop(void);
 int	 lx_transmit(const unsigned char *frame, unsigned long length);
+/* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */
+int	 lx_prepare(void);
 
 #endif

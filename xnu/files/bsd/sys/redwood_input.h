@@ -48,17 +48,20 @@ void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps 
 void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
 void redwood_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
-void redwood_wifi_init(void);           /* boot-arg wifi=N: the first N steps towards the phone's Wi-Fi */
+void redwood_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
 void redwood_wifi_stop(void);           /* where a run ends in order: the Wi-Fi DSP, if it was started, shut down */
 int redwood_wifi_say(const char *format, ...) __printflike(1, 2);      /* a line of the Wi-Fi steps' log */
+int redwood_wifi_tell(const char *format, ...) __printflike(1, 2);     /* ... one that is said even with wifi=1 */
+uint32_t redwood_wifi_option(const char *name);                         /* a boot-arg's number, or what wifi=1 stands for */
 const uint8_t *redwood_wifi_file(const char *name, uint64_t *size);     /* a file of fw/ in the small image, in place */
-bool redwood_wlfw_exchange(uint32_t step);                              /* step 15 of wifi=N: bsd/dev/redwood_wlfw.c */
+bool redwood_wlfw_exchange(uint32_t step);                              /* step 15 of wifi_step=N: redwood_wlfw.c */
 bool redwood_wlfw_registers(uint64_t *address, uint32_t *size, bool *mission); /* ... and what it learnt for step 16 */
 void redwood_wlfw_stop(uint32_t step);                                  /* ... and its end, before the DSP is stopped */
 void redwood_wifi_quiesce(void);        /* on the way back to the loader: the Wi-Fi DSP, if it still runs, shut down */
 /* ath11k's object and the kernel's side of it (bsd/dev/redwood_lx.c), and what that asks of the phone's radio */
 int redwood_lx_start(void);             /* the driver brought up on the radio as far as it is built: 0 or an errno */
 void redwood_lx_stop(void);             /* ... and down again, if it stayed up (a network joined) */
+int redwood_lx_prepare(void);           /* before all that: the memory the radio will be shown, taken; 0 or an errno */
 bool redwood_wifi_dsp_is_up(void);      /* the DSP that runs the radio's firmware has been started and has a link */
 const uint8_t *redwood_wifi_driver_file(const char *name, uint64_t *size);     /* a file by the name Linux has for it */
 bool redwood_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */

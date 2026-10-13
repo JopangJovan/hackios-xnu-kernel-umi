@@ -20,7 +20,7 @@
  * (the "AOP", which runs RPMh, the keeper of the supply rails), which is told that the image is
  * being loaded before it honours the DSP's own requests for power.
  *
- * Boot-arg wifi=N performs steps 1 to N and stops; a step says what it is about to touch before
+ * Boot-arg wifi_step=N performs steps 1 to N and stops; a step says what it is about to touch before
  * it touches it and what it found after, reads come before writes, and a step that does not
  * find what it needs ends the sequence instead of going on blind.
  *
@@ -78,7 +78,16 @@
  *
  * Nothing here switches a supply rail or changes a pin.
  *
- * More boot-args:
+ * wifi=1 is all of it for whoever uses the phone: the steps that are needed (not the ones that
+ * only look), ath11k as step 15 for real, the network of fw/network joined, and everything left
+ * running while the system does -- on a thread of its own, so that the system's start does not
+ * wait for it, and without a word in the log but the outcome (what the steps say is kept, and
+ * shown if the radio does not come up). Without the radio's firmware or without a network to
+ * join in the small image it says so in a line and does nothing. (wifi_loud=1 with it: nothing
+ * is kept back, for looking into a start that goes wrong.) The rest of this comment is
+ * about the steps one by one, wifi_step=N, which is how all this was found out.
+ *
+ * More boot-args, for wifi_step=N:
  *   wifi_new=K         steps K and later have not been seen to work (default: the last one)
  *   wifi_pause=MS      how long such a step waits after announcing a group of accesses
  *                      (default 2200: the loader, watching from another core, notes the end of
@@ -174,6 +183,43 @@ static int say(const char *format, ...) __printflike(1, 2);
 static LCK_MTX_DECLARE(say_lock, &wifi_lock_group);      /* two threads talk here: a line at a time */
 static bool leaving;                    /* on the way back to the loader after a panic: no lock is taken, nothing sleeps */
 
+/*
+ * With wifi=1 what the steps and the driver say is not for the log of an ordinary session: it is
+ * kept here, the last of it, and shown only if the radio does not come up. What that log is for
+ * is said with redwood_wifi_tell().
+ */
+static bool quiet;
+static char kept[64 * 1024];
+static uint32_t kept_at;
+static bool kept_wrapped;
+
+static void
+say_line(const char *line, bool aloud)
+{
+	if (leaving) {
+		for (const char *c = line; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
+		return;
+	}
+	lck_mtx_lock(&say_lock);
+	if (quiet && !aloud) {
+		for (const char *c = line; *c != 0; c++) {
+			kept[kept_at] = *c;
+			if (++kept_at == sizeof(kept)) {
+				kept_at = 0;
+				kept_wrapped = true;
+			}
+		}
+	} else {
+		for (const char *c = line; *c != 0; c++) {
+			loader_log_putc(*c);
+		}
+		printf("%s", line);
+	}
+	lck_mtx_unlock(&say_lock);
+}
+
 static int
 say(const char *format, ...)
 {
@@ -184,23 +230,11 @@ say(const char *format, ...)
 	va_start(list, format);
 	length = vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	if (leaving) {
-		for (const char *c = line; *c != 0; c++) {
-			loader_log_putc(*c);
-		}
-		return length;
-	}
-	lck_mtx_lock(&say_lock);
-	for (const char *c = line; *c != 0; c++) {
-		loader_log_putc(*c);
-	}
-	length = printf("%s", line);
-	lck_mtx_unlock(&say_lock);
+	say_line(line, false);
 	return length;
 }
-#define printf say
 
-/* (for redwood_wlfw.c, which says its lines the same way) */
+/* (for redwood_wlfw.c and the driver's side, which say their lines the same way) */
 int
 redwood_wifi_say(const char *format, ...)
 {
@@ -210,8 +244,44 @@ redwood_wifi_say(const char *format, ...)
 	va_start(list, format);
 	vsnprintf(line, sizeof(line), format, list);
 	va_end(list);
-	return say("%s", line);
+	say_line(line, false);
+	return 0;
 }
+
+/* A line for whoever runs the phone, not only for whoever looks for a fault: said also when the rest is kept. */
+int
+redwood_wifi_tell(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	say_line(line, true);
+	return 0;
+}
+#define tell redwood_wifi_tell
+
+/* The last of what was kept, into the log after all: the radio has not come up. */
+static void
+say_kept(void)
+{
+	uint32_t length = kept_wrapped ? sizeof(kept) : kept_at, show = length < 24 * 1024 ? length : 24 * 1024;
+	char piece[201];
+
+	quiet = false;
+	for (uint32_t i = length - show; i < length; i += sizeof(piece) - 1) {
+		uint32_t n = length - i < sizeof(piece) - 1 ? length - i : sizeof(piece) - 1;
+
+		for (uint32_t k = 0; k < n; k++) {
+			piece[k] = kept[(kept_wrapped ? kept_at + i + k : i + k) % sizeof(kept)];
+		}
+		piece[n] = 0;
+		say_line(piece, true);
+	}
+}
+#define printf say
 
 static void
 sleep_us(uint32_t us)
@@ -239,6 +309,33 @@ static void
 settle(void)
 {
 	__asm__ volatile ("dsb sy");
+}
+
+/* ---- options --------------------------------------------------------------------------------------- */
+
+static bool whole;                      /* wifi=1: all of it, by itself (see the top of this file) */
+static volatile bool whole_runs;        /* ... and the thread that does it is at work */
+
+/* A number given to the kernel when it was started; with wifi=1 the ones that stands for are as if given. */
+uint32_t
+redwood_wifi_option(const char *name)
+{
+	static const struct {
+		const char *name;
+		uint32_t value;
+	} stands_for[] = { { "wifi_lx", 2 }, { "wifi_smmu", 2 }, { "wifi_join", 1 }, { "wifi_keep", 1 } };
+	uint32_t value = 0;
+
+	for (unsigned i = 0; whole && i < sizeof(stands_for) / sizeof(stands_for[0]); i++) {
+		if (strcmp(name, stands_for[i].name) == 0) {
+			return stands_for[i].value;
+		}
+	}
+	if (strcmp(name, "wifi_quiet") == 0) {
+		return quiet;
+	}
+	PE_parse_boot_argn(name, &value, sizeof(value));
+	return value;
 }
 
 /* ---- register access ------------------------------------------------------------------------------- */
@@ -1651,6 +1748,7 @@ dsp_shutdown(const char *why)
 {
 	uint64_t answer = ~0ull;
 	int32_t result;
+	bool ours = dsp_started;                /* (not the DSP of a kernel before this one, shut down before ours is started) */
 
 	printf("wifi: %u: %s: the DSP is asked to stop, then TrustZone to shut it down\n", step, why);
 	if (!leaving) {
@@ -1669,7 +1767,16 @@ dsp_shutdown(const char *why)
 	doorbells();
 	dsp_started = false;
 	mailbox_send("{class: image, res: load_state, name: wpss, val: off}");
-	radio_space_off();                      /* (nobody is left to use the radio's stream) */
+	/*
+	 * Nobody is left to use the radio's stream. Only after a DSP of ours: with wifi=1 the radio
+	 * is shown its memory before the DSP is started, and the shutdown of an earlier kernel's
+	 * DSP, which comes in between, took that away again -- the radio's first reach for memory,
+	 * at mission mode, was then a stream the SMMU knows nothing of, and the phone went down
+	 * without a word: every second start, and never a first.
+	 */
+	if (ours) {
+		radio_space_off();
+	}
 	return true;
 }
 
@@ -3181,6 +3288,16 @@ static void radio_space_faults(void);
  * well. At the run's end the network is left, the driver removes itself and the DSP stops
  * when asked.
  *
+ * As wifi=1, in the session the phone is ordinarily run in (four processors, the GPU drawing,
+ * touch, every stock job on demand), the same day: all of the above on a thread beside the
+ * system's start, which is not held up by it (its "first boot is finished" comes 23 to 26 s
+ * after the first line from user space, with the radio and without); the network is joined 12 s
+ * after the kernel began on the radio; a job of ours that is in every image has configd
+ * configure en0 as soon as it appears. Safari's search field then shows the search engine's
+ * suggestions as one types, which come over this network. (The pages themselves Safari
+ * fetches -- the lock and the site's name appear -- and does not draw: the page is black, with
+ * the GPU and without. That is not the network's doing.)
+ *
  * A PHONE THAT RESETS WITHOUT A WORD: twice on the way, two seconds after calibration. The
  * driver's registration failed (the hash table peer.c needs was a stub that fails), and where
  * its start fails that late core.c asks for the mode "off" before it stops the bus; our thread
@@ -3213,7 +3330,7 @@ step_exchange(void)
 	if (!glink.open) {
 		return false;
 	}
-	if (PE_parse_boot_argn("wifi_lx", &driver, sizeof(driver)) && driver) {
+	if ((driver = redwood_wifi_option("wifi_lx")) != 0) {
 		return step_driver(driver);
 	}
 	announce("have the exchange a WCN6750's driver has with the Wi-Fi firmware's service before it touches the radio, by "
@@ -3635,7 +3752,7 @@ radio_space_faults(void)
 		    status);
 		return;
 	}
-	printf("wifi: %u: THE SMMU HAS REFUSED A REQUEST: context %u: status %#x, address %#llx, syndrome %#x; the SMMU as a whole: "
+	tell("wifi: %u: THE SMMU HAS REFUSED A REQUEST: context %u: status %#x, address %#llx, syndrome %#x; the SMMU as a whole: "
 	    "status %#x, syndromes %#x %#x (the second names the stream)\n", step, radio_space.context, status,
 	    (uint64_t)rd(apps_smmu_context.base + SMMU_CB_FAR + 4) << 32 | rd(apps_smmu_context.base + SMMU_CB_FAR),
 	    rd(apps_smmu_context.base + SMMU_CB_FSYNR0), global, rd(apps_smmu.base + SMMU_SGFSYNR0),
@@ -3731,6 +3848,9 @@ redwood_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *add
 	}
 	*address = RADIO_ADDRESSES + radio_space.next;
 	radio_space.next += size;
+	if (whole) {
+		radio_space.wanted = 2;
+	}
 	if (radio_space.wanted != 2) {
 		printf("wifi: %u: THE RADIO IS NOT SHOWN the %llu KB of ours at %#llx that the driver will know as %#llx: that takes "
 		    "a context of the SMMU (wifi_smmu=2)\n", step, size >> 10, physical, *address);
@@ -3905,9 +4025,18 @@ static bool(*const steps[])(void) = {
 void
 redwood_wifi_stop(void)
 {
+	/* (a radio that is still on its way up is let get there first, or fail: half a minute at the most) */
+	for (unsigned ms = 0; whole_runs && ms < 40000; ms += 10) {
+		sleep_ms(10);
+	}
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started && !dirty) {
-		dsp_shutdown("the run is about to end");
+		bool down = dsp_shutdown("the run is about to end");
+
+		if (whole) {
+			tell("wifi: the radio is off: its DSP %s, and TrustZone %s\n", stopped_by_its_word ? "stopped when asked" :
+			    "DID NOT SAY IT HAD STOPPED", down ? "has shut it down" : "DID NOT SHUT IT DOWN");
+		}
 	}
 	lck_mtx_unlock(&dsp_lock);
 }
@@ -3935,33 +4064,123 @@ redwood_wifi_quiesce(void)
 
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
 
+/* The steps' end: the DSP stopped, or left as asked. */
+static void
+steps_over(uint32_t done)
+{
+	lck_mtx_lock(&dsp_lock);
+	if (dsp_started && dirty) {
+		printf("wifi: THE DSP IS LEFT RUNNING (wifi_dirty), as a kernel that died would leave it\n");
+	} else if (dsp_started && done == last_step && redwood_wifi_option("wifi_keep")) {
+		printf("wifi: THE DSP STAYS ON while the system runs (wifi_keep)%s\n", link_runs ? ", and the link with it" : "");
+	} else if (dsp_started) {
+		dsp_shutdown("the steps are over");
+	}
+	if (!dsp_started) {
+		radio_space_off();              /* (if the DSP could not be shut down in order: all the same) */
+	}
+	lck_mtx_unlock(&dsp_lock);
+}
+
 /*
- * Called while the system starts, before there is a root file system, and the start waits (see
- * redwood_adreno_init()).
+ * wifi=1: the whole of it on a thread of its own, so that the system starts meanwhile (the
+ * firmware's calibration alone takes seven seconds). The steps that only look are left out.
+ */
+static void
+whole_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	static const uint8_t needed[] = { 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+	uint64_t began = now_us();
+	uint32_t done = 0, failed = 0;
+
+	/* the memory the radio is shown is one piece: taken now, while that is easy to find */
+	if (redwood_lx_prepare() != 0) {
+		tell("wifi: NO MEMORY FOR THE RADIO in one piece: it is not brought up\n");
+		whole_runs = false;
+		thread_terminate(current_thread());
+	}
+	for (unsigned i = 0; i < sizeof(needed) && failed == 0; i++) {
+		step = needed[i];
+		if (step == 15) {
+			tell("wifi: the radio's DSP is up and linked, %llu ms in; now the driver\n", (now_us() - began) / 1000);
+		}
+		if (steps[step - 1]()) {
+			done = step;
+		} else {
+			failed = step;
+		}
+	}
+	last_step = needed[sizeof(needed) - 1];
+	if (failed == 0) {
+		tell("wifi: THE RADIO IS UP AND ITS NETWORK JOINED, %llu.%llu s after the kernel began on it\n", (now_us() - began) /
+		    1000000, (now_us() - began) / 100000 % 10);
+	} else {
+		tell("wifi: THE RADIO DID NOT COME UP: step %u failed, %llu s in. The last of what was said on the way:\n", failed,
+		    (now_us() - began) / 1000000);
+		say_kept();
+	}
+	steps_over(failed == 0 ? last_step : 0);
+	step = done;
+	whole_runs = false;
+	thread_terminate(current_thread());
+}
+
+/*
+ * Called while the system starts, before there is a root file system. With wifi_step=N the start
+ * waits until the steps are over (see redwood_adreno_init()); with wifi=1 it does not.
  */
 void
 redwood_wifi_init(void)
 {
-	uint32_t back = 0, done = 0;
+	uint32_t on = 0, back = 0, done = 0;
+	uint64_t size = 0;
+	thread_t thread;
 
-	if (!PE_parse_boot_argn("wifi", &last_step, sizeof(last_step)) || last_step == 0) {
+	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
+	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
+		return;
+	}
+	if (last_step == 0 && on != 1) {
+		printf("wifi: wifi=%u is not understood: wifi=1 turns the radio on, wifi_step=N goes the first N steps of that\n", on);
 		return;
 	}
 	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
-		if (PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {
+		if (last_step != 0 && PE_parse_boot_argn("wifi_lx", &back, sizeof(back)) && back) {
 			/* a check of what is under the driver: it gets as far as finding no firmware to talk to */
 			printf("wifi: this is not the phone; with wifi_lx the driver is started all the same, for what it does before "
 			    "it needs a radio\n");
 			printf("wifi: the driver's start returns %d\n", redwood_lx_start());
 		} else {
-			printf("wifi: wifi=N is for the phone, and this is not it\n");
+			printf("wifi: wifi=1 and wifi_step=N are for the phone's radio, and this is not the phone\n");
 		}
+		return;
+	}
+	redwood_qmi_set_transport(&qrtr_ops);
+	if (last_step == 0) {
+		if (image_file("wpss.mdt", &size) == NULL) {
+			printf("wifi: wifi=1, but the radio's firmware is not in the small image (fw-wifi/, see the README): no Wi-Fi\n");
+			return;
+		}
+		if (image_file("network", &size) == NULL) {
+			printf("wifi: wifi=1, but no network to join was given (fw-wifi/network, see the README): the radio stays off\n");
+			return;
+		}
+		whole = whole_runs = true;
+		quiet = !(PE_parse_boot_argn("wifi_loud", &back, sizeof(back)) && back);
+		pause_ms = watch_seconds = 0;
+		new_from = STEPS + 1;
+		if (kernel_thread_start(whole_thread, NULL, &thread) != KERN_SUCCESS) {
+			whole_runs = false;
+			tell("wifi: no thread: the radio is not brought up\n");
+			return;
+		}
+		thread_deallocate(thread);
+		tell("wifi: the radio is being brought up beside the system's start (wifi=1)\n");
 		return;
 	}
 	if (last_step > STEPS) {
 		last_step = STEPS;
 	}
-	redwood_qmi_set_transport(&qrtr_ops);
 	new_from = last_step;
 	PE_parse_boot_argn("wifi_new", &new_from, sizeof(new_from));
 	PE_parse_boot_argn("wifi_pause", &pause_ms, sizeof(pause_ms));
@@ -3971,7 +4190,7 @@ redwood_wifi_init(void)
 
 	printf("wifi: steps up to %u; those from %u on are new and wait %u ms %s\n", last_step, new_from, pause_ms,
 	    fine ? "before every write and call" : "after each announcement");
-	if (PE_parse_boot_argn("wifi_smmu", &radio_space.wanted, sizeof(radio_space.wanted)) && radio_space.wanted) {
+	if ((radio_space.wanted = redwood_wifi_option("wifi_smmu")) != 0) {
 		smmu_look();
 		if (radio_space.wanted == 2 && last_step < 15) {
 			uint32_t known_from = new_from;
@@ -3991,20 +4210,9 @@ redwood_wifi_init(void)
 	}
 	step = done;
 	new_from = STEPS + 1;                   /* (what follows has been announced) */
-	lck_mtx_lock(&dsp_lock);
-	if (dsp_started && dirty) {
-		printf("wifi: THE DSP IS LEFT RUNNING (wifi_dirty), as a kernel that died would leave it\n");
-	} else if (dsp_started && PE_parse_boot_argn("wifi_keep", &back, sizeof(back)) && back) {
-		printf("wifi: THE DSP STAYS ON while the system runs (wifi_keep)%s\n", link_runs ? ", and the link with it" : "");
-	} else if (dsp_started) {
-		dsp_shutdown("the steps are over");
-	}
-	back = 0;
-	if (!dsp_started) {
-		radio_space_off();              /* (if the DSP could not be shut down in order: all the same) */
-	}
-	lck_mtx_unlock(&dsp_lock);
+	steps_over(done);
 	printf("wifi: over after step %u; %s\n", done, last_write);
+	back = 0;
 	if (PE_parse_boot_argn("wifi_return", &back, sizeof(back)) && back) {
 		printf("wifi: back to the loader (wifi_return)\n");
 		loader_return();

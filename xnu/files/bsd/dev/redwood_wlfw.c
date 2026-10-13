@@ -10,7 +10,7 @@
  * work of running the real qmi.c is spent: whether this firmware build takes ath11k's messages,
  * whether it takes the phone's own board file, and what calibration does.
  *
- * It is step 15 of wifi=N (redwood_wifi.c), and stops where qmi.c hands over to the rest of the
+ * It is step 15 of wifi_step=N (redwood_wifi.c), and stops where qmi.c hands over to the rest of the
  * driver. Boot-arg wifi_cal=1 adds what qmi.c does with cold-boot calibration switched on.
  * Boot-arg wifi_mission=1 adds what qmi.c is asked for next (ath11k_qmi_firmware_start()): the
  * firmware's logging, the configuration, the mode "mission", after which the firmware has the

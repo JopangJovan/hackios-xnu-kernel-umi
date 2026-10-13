@@ -102,6 +102,12 @@ lx_os_print(const char *text)
 }
 
 void
+lx_os_tell(const char *text)
+{
+	redwood_wifi_tell("%s", text);
+}
+
+void
 lx_os_panic(const char *text)
 {
 	panic("%s", text);
@@ -201,10 +207,7 @@ lx_os_random(void *buffer, unsigned long size)
 unsigned
 lx_os_option(const char *name)
 {
-	uint32_t value = 0;
-
-	PE_parse_boot_argn(name, &value, sizeof(value));
-	return value;
+	return redwood_wifi_option(name);
 }
 
 int
@@ -241,18 +244,64 @@ lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *passphr
 
 /* ---- frames: the radio as the link behind en0 (sys/redwood_net.h) ------------------------------------ */
 
-static bool lx_link_attached;
+/*
+ * A frame from the network stack comes on whatever thread sends it, and the driver's side keeps
+ * a record of every thread that enters it: so frames are put in a queue here, and one thread of
+ * ours takes them to the driver. A queue that is full drops what comes (TCP sends it again).
+ */
+#define LX_QUEUE        256
 
-/* (called by one thread at a time: the frame is put together in one place) */
+struct lx_frame {
+	uint16_t length;
+	uint8_t bytes[REDWOOD_NET_FRAME_MAX];
+};
+
+static bool lx_link_attached;
+static LCK_MTX_DECLARE(lx_queue_lock, &lx_lock_group);
+static struct lx_frame *lx_queue;
+static uint32_t lx_queue_in, lx_queue_out;      /* frames put in and taken out, counted from the start */
+static uint64_t lx_queue_dropped;
+
+static void
+lx_queue_runs(__unused void *parameter, __unused wait_result_t result)
+{
+	for (;;) {
+		struct lx_frame *frame;
+
+		lck_mtx_lock(&lx_queue_lock);
+		while (lx_queue_in == lx_queue_out) {
+			lck_mtx_sleep(&lx_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_queue_in, THREAD_UNINT);
+		}
+		frame = &lx_queue[lx_queue_out % LX_QUEUE];     /* (stays ours until lx_queue_out moves) */
+		lck_mtx_unlock(&lx_queue_lock);
+		lx_transmit(frame->bytes, frame->length);
+		lck_mtx_lock(&lx_queue_lock);
+		lx_queue_out++;
+		lck_mtx_unlock(&lx_queue_lock);
+	}
+}
+
 static bool
 lx_link_transmit(mbuf_t packet, size_t length)
 {
-	static uint8_t frame[REDWOOD_NET_FRAME_MAX];
+	struct lx_frame *frame;
 
-	if (length > sizeof(frame) || mbuf_copydata(packet, 0, length, frame) != 0) {
+	lck_mtx_lock(&lx_queue_lock);
+	if (length > REDWOOD_NET_FRAME_MAX || lx_queue_in - lx_queue_out == LX_QUEUE) {
+		lx_queue_dropped++;
+		lck_mtx_unlock(&lx_queue_lock);
 		return false;
 	}
-	return lx_transmit(frame, length) == 0;
+	frame = &lx_queue[lx_queue_in % LX_QUEUE];
+	if (mbuf_copydata(packet, 0, length, frame->bytes) != 0) {
+		lck_mtx_unlock(&lx_queue_lock);
+		return false;
+	}
+	frame->length = (uint16_t)length;
+	lx_queue_in++;
+	lck_mtx_unlock(&lx_queue_lock);
+	thread_wakeup((event_t)&lx_queue_in);
+	return true;
 }
 
 static struct redwood_net_link lx_link = {
@@ -264,9 +313,18 @@ static struct redwood_net_link lx_link = {
 void
 lx_os_net_attach(const unsigned char *address)
 {
+	thread_t thread;
+
 	if (lx_link_attached) {
 		return;
 	}
+	lx_queue = kalloc_data(LX_QUEUE * sizeof(*lx_queue), Z_WAITOK | Z_ZERO);
+	if (lx_queue == NULL || kernel_thread_start(lx_queue_runs, NULL, &thread) != KERN_SUCCESS) {
+		say("lx: no memory or no thread for the frames to send: the radio's frames go nowhere\n");
+		return;
+	}
+	thread_set_thread_name(thread, "wifi-send");
+	thread_deallocate(thread);
 	memcpy(lx_link.address, address, sizeof(lx_link.address));
 	lx_link_attached = redwood_net_attach(&lx_link);
 	say("lx: %s\n", lx_link_attached ? "the radio is the link behind en0" : "EN0 HAS A LINK ALREADY: the radio's frames go "
@@ -306,6 +364,12 @@ lx_stop(void)
 }
 
 __attribute__((weak)) int
+lx_prepare(void)
+{
+	return 0;
+}
+
+__attribute__((weak)) int
 lx_transmit(__unused const unsigned char *frame, __unused unsigned long length)
 {
 	return ENXIO;
@@ -321,4 +385,10 @@ void
 redwood_lx_stop(void)
 {
 	lx_stop();
+}
+
+int
+redwood_lx_prepare(void)
+{
+	return lx_prepare();
 }
