@@ -875,7 +875,7 @@ my_glClear(void *context, GLbitfield mask)
 		eagl_trace("glClear(%#x)\n", mask);
 	}
 	clear_now(e);
-	if (e->program == 0 && e->colour != 0 && e->colour == e->bound[0]) {
+	if (e->colour != 0) {
 		/* what is about to be cleared may be what the next draw reads: see reads_what_it_writes() */
 		e->unclear = mask;
 		e->unclear_boxed = glIsEnabled(GL_SCISSOR_TEST);
@@ -1309,9 +1309,16 @@ static int plain_draws = 1;
  *
  * Which function a draw is can be asked of CoreAnimation's context only while it draws (between
  * frames the place it is read from may be gone: the window server died of being asked at a
- * glClear). So a clear of the texture that is also the one bound to be read is put off, with
- * the scissor and the colour it was to be made with, until the next draw says what it is: that
- * function, and the clear is dropped with the draw; anything else, and it is made first.
+ * glClear). So every clear of a texture is put off, with the scissor and the colour it was to be
+ * made with, until the next draw says what it is: that function, and the clear is dropped with
+ * the draw; anything else, and it is made first (as it is before anything else that could tell
+ * the difference: another framebuffer, another attachment, a texture deleted or filled, the end
+ * of a frame). Only the clears of a texture that was also bound to be read used to be put off,
+ * but CoreAnimation clears a surface as it makes it the target (GLESContext::set_surface: the
+ * framebuffer, the viewport, the clear), before it binds the textures of the draw that follows:
+ * the first of the four clears found the picture of the step before on the first unit, was
+ * made, and left the strip black -- now in the first Search of a run, now from the second on,
+ * by what had been drawn before.
  */
 static bool
 reads_what_it_writes(struct eagl *e)
@@ -1794,6 +1801,7 @@ my_glFinish(void *context)
 	if (eagl_tracing) {
 		eagl_trace("glFinish()\n");
 	}
+	clear_now(e);
 	glFinish();
 	frame_end(e, true);
 	EAGL_LEAVE(e, 0x2d0);
@@ -1809,6 +1817,7 @@ my_glFlush(void *context)
 	if (eagl_tracing) {
 		eagl_trace("glFlush()\n");
 	}
+	clear_now(e);
 	began = now_us();
 	glFlush();
 	e->flushing += now_us() - began;
@@ -1825,6 +1834,7 @@ my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
 	(void)object;
 	(void)name;
 	EAGL_ENTER(e, 0xeb8);
+	clear_now(e);
 	glFinish();
 	frame_end(e, true);
 	EAGL_LEAVE(e, 0xeb8);
@@ -1836,6 +1846,7 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 	struct eagl *e = context;
 
 	EAGL_ENTER(e, 0x1e0);
+	clear_now(e);
 	for (GLsizei i = 0; i < n; i++) {
 		image_forget(e, textures[i]);
 		if (textures[i] == e->colour) {
@@ -1912,6 +1923,7 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 			    half[4 * (width - 1)], half[4 * (width - 1) + 1], half[4 * (width - 1) + 2], half[4 * (width - 1) + 3]);
 		}
 	}
+	clear_now(e);
 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
 	EAGL_LEAVE(e, 0x970);
 }
@@ -1973,6 +1985,7 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
 	struct eagl *e = context;
 
 	EAGL_ENTER(e, 0x1530);
+	clear_now(e);
 	if (attachment == GL_COLOR_ATTACHMENT0 && target != GL_READ_FRAMEBUFFER) {
 		e->colour = texture;
 	}
@@ -1989,6 +2002,7 @@ my_glDeleteFramebuffers(void *context, GLsizei n, const GLuint *framebuffers)
 	struct eagl *e = context;
 
 	EAGL_ENTER(e, 0x1510);
+	clear_now(e);
 	for (GLsizei i = 0; i < n; i++) {
 		if (framebuffers[i] == e->framebuffer) {
 			e->framebuffer = e->colour = 0;
@@ -2309,6 +2323,7 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 		return NO;
 	}
 	eagl_enter(e, 0);
+	clear_now(e);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	if (target != GL_TEXTURE_2D || texture == 0 || (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("redwood-gl: -texImageIOSurface: target %#lx, texture %d: not done\n", target, texture);
@@ -2357,6 +2372,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 		return NO;
 	}
 	eagl_enter(e, 0);
+	clear_now(e);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	pixels = IOSurfaceGetPixelFormat(surface);
 	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0) ||

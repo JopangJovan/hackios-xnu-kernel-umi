@@ -1,0 +1,6 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# Search, pulled down from the home screen, before and after an application is left with the gesture
+# from the bottom edge (RC_JOBS=rc.jobs.uib, a run of about three minutes): the strip under the status
+# bar used to come out black from one of these on.
+/redwood/bin/rwtouch wait 40 swipe 0.5 0.985 0.5 0.3 200 wait 8 swipe 0.5 0.4 0.5 0.7 300 wait 10 button home wait 5 tap 0.615 0.71 wait 12 swipe 0.5 0.985 0.5 0.3 200 wait 6 swipe 0.5 0.4 0.5 0.7 300 wait 10
+/redwood/bin/rwtouch button home wait 5 tap 0.615 0.475 wait 12 swipe 0.5 0.985 0.5 0.3 200 wait 6 swipe 0.5 0.4 0.5 0.7 300 wait 10 button home wait 5
