@@ -510,6 +510,8 @@ bus_get_ce_msi_idx(struct ath11k_base *ab, u32 ce_id, u32 *index)
 static int
 bus_start(struct ath11k_base *ab)
 {
+	int ret;
+
 	set_bit(ATH11K_FLAG_DEVICE_INIT_DONE, &ab->dev_flags);
 	printf("lx: the driver starts the bus: buffers for the copy engines that receive (%u reads and %u writes of the chip's "
 	    "registers so far; the configuration the firmware was sent named %u shadow registers)\n", bus.reads, bus.writes,
@@ -517,6 +519,14 @@ bus_start(struct ath11k_base *ab)
 	ath11k_ce_rx_post_buf(ab);
 	say_repeats();
 	lx_tell("lx: the rings are set up and the copy engines have their buffers: the bus is started\n");
+	/*
+	 * (here and not when the driver is set up: the firmware is asked for calibration in between, and
+	 * the copy engines are let go of for that, interrupts and all; see lx_qmi_send_request())
+	 */
+	if (bus.irq && (ret = irq_attach(ab)) != 0) {
+		lx_tell("lx: wifi_irq: the radio's interrupts cannot be had (%d): its rings are looked at every 100 ms only\n", ret);
+		lx_os_irq_detach_all();
+	}
 	if (bus.irq) {
 		for (unsigned i = 0; i < CE_COUNT_MAX; i++) {
 			if (bus.ce_vector[i] >= 0) {
@@ -766,12 +776,6 @@ lx_start(void)
 	if ((ret = ath11k_core_pre_init(ab)) != 0 || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
 		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
 		return (-ret);
-	}
-	if (bus.irq && (ret = irq_attach(ab)) != 0) {
-		lx_tell("lx: wifi_irq: the radio's interrupts cannot be had (%d): the rings are looked at, as before\n", ret);
-		lx_os_irq_detach_all();
-		ab->hif.ops = &bus_ops;
-		bus.irq = false;
 	}
 	ab->qmi.ce_cfg.tgt_ce_len = ab->hw_params.target_ce_count;
 	ab->qmi.ce_cfg.tgt_ce = ab->hw_params.target_ce_config;
