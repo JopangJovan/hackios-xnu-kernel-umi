@@ -16,8 +16,13 @@
  *   reach NAME            what SCNetworkReachability says: the question applications ask first
  *   wait SECONDS
  *   wifi                  what the job com.redwood.wifi runs in every image: if the kernel was
- *                         started with wifi=1, wait for the radio's interface (en0) to appear
- *                         and ask for it to be configured by DHCP ("dhcp en0"); else nothing
+ *                         started with wifi=1, wait for the radio's interface (en0) to appear,
+ *                         and ask for it to be configured by DHCP ("dhcp en0") only if configd
+ *                         has no network service of its own for it; else nothing
+ *   watch SECONDS         for so long, say when configd's store changes what tells an interface's
+ *                         state: State:/Network/Service/.../IPv4, State:/Network/Interface/en0/...,
+ *                         State:/Network/Global/IPv4 (the key, whether it is there, the names in it;
+ *                         no addresses)
  *   wrongjoin             ask the radio to join the network it is on with a passphrase that is
  *                         wrong on purpose, through the request wifid uses (Apple80211's
  *                         ASSOCIATE), and say what the kernel answers: Apple80211's result number
@@ -63,6 +68,8 @@ typedef const struct __SCDynamicStore *SCDynamicStoreRef;
 extern SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef allocator, CFStringRef name, void *callout, void *context);
 extern CFArrayRef SCDynamicStoreCopyKeyList(SCDynamicStoreRef store, CFStringRef pattern);
 extern CFPropertyListRef SCDynamicStoreCopyValue(SCDynamicStoreRef store, CFStringRef key);
+extern Boolean SCDynamicStoreSetNotificationKeys(SCDynamicStoreRef store, CFArrayRef keys, CFArrayRef patterns);
+extern CFRunLoopSourceRef SCDynamicStoreCreateRunLoopSource(CFAllocatorRef allocator, SCDynamicStoreRef store, CFIndex order);
 
 static double
 seconds(void)
@@ -350,9 +357,12 @@ reach(const char *name)
 }
 
 /*
- * With wifi=1 among the kernel's arguments: wait for en0 and ask for DHCP on it. Since the radio's
- * interface has its IOKit objects configd configures it by itself and this call finds a service
- * there already; it stays for kernels without them.
+ * With wifi=1 among the kernel's arguments: wait for en0, and for configd's own network service for
+ * it ("Wi-Fi", made of the radio's IOKit objects, iokit/Kernel/RedwoodWLAN.cpp). That service runs
+ * DHCP by itself, and it has to be the one that does: wifid takes the interface for usable only
+ * when the address appears under a service whose settings name en0, and the service "dhcp en0"
+ * makes has none (Settings then shows a spinner where the tick belongs). Only a kernel without
+ * those IOKit objects gets the call.
  */
 static void
 wifi(void)
@@ -379,7 +389,69 @@ wifi(void)
 		return;
 	}
 	printf("net_test: wifi: en0 is there after %.1f s\n", seconds() - start);
+	for (;;) {
+		SCDynamicStoreRef session = SCDynamicStoreCreate(NULL, CFSTR("net_test"), NULL, NULL);
+		NSArray *keys = session ? CFBridgingRelease(SCDynamicStoreCopyKeyList(session, CFSTR("Setup:/Network/Service/[^/]+/Interface"))) : nil;
+		bool configd_has_it = false;
+
+		for (NSString *key in keys) {
+			NSDictionary *interface = CFBridgingRelease(SCDynamicStoreCopyValue(session, (__bridge CFStringRef)key));
+
+			configd_has_it |= [interface isKindOfClass:NSDictionary.class] && [interface[@"DeviceName"] isEqual:@"en0"];
+		}
+		if (session != NULL) {
+			CFRelease(session);
+		}
+		if (configd_has_it) {
+			printf("net_test: wifi: configd has a network service for en0 after %.1f s: it configures it itself\n", seconds() - start);
+			return;
+		}
+		if (seconds() - start > 30) {
+			break;
+		}
+		usleep(500000);
+	}
+	printf("net_test: wifi: configd has no network service for en0 (a kernel without its IOKit objects): DHCP asked for\n");
 	dhcp("en0");
+}
+
+/* ---- watch ------------------------------------------------------------------------------------------ */
+
+static double watch_start;
+
+static void
+watch_changed(SCDynamicStoreRef session, CFArrayRef keys, void *info)
+{
+	for (CFIndex i = 0; i < CFArrayGetCount(keys); i++) {
+		NSString *key = (__bridge NSString *)CFArrayGetValueAtIndex(keys, i);
+		id value = CFBridgingRelease(SCDynamicStoreCopyValue(session, (__bridge CFStringRef)key));
+		NSString *names = [value isKindOfClass:NSDictionary.class] ?
+		    [[[(NSDictionary *)value allKeys] sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" "] : @"";
+
+		printf("net_test: watch +%.2f s: %s %s%s%s\n", seconds() - watch_start, key.UTF8String, value ? "set" : "REMOVED",
+		    value ? ": " : "", names.UTF8String);
+	}
+}
+
+static void
+watch(double limit)
+{
+	SCDynamicStoreRef session = SCDynamicStoreCreate(NULL, CFSTR("net_test watch"), (void *)watch_changed, NULL);
+	NSArray *patterns = @[ @"State:/Network/Service/[^/]+/IPv4", @"State:/Network/Interface/en0/.*", @"State:/Network/Global/IPv4" ];
+	CFRunLoopSourceRef source;
+
+	if (session == NULL || !SCDynamicStoreSetNotificationKeys(session, NULL, (__bridge CFArrayRef)patterns) ||
+	    (source = SCDynamicStoreCreateRunLoopSource(NULL, session, 0)) == NULL) {
+		printf("net_test: watch: no session with configd\n");
+		return;
+	}
+	watch_start = seconds();
+	printf("net_test: watch: for %.0f s\n", limit);
+	CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+	CFRunLoopRunInMode(kCFRunLoopDefaultMode, limit, false);
+	CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+	CFRelease(source);
+	CFRelease(session);
 }
 
 /* ---- wrongjoin --------------------------------------------------------------------------------------- */
@@ -496,6 +568,8 @@ main(int argc, char **argv)
 				usleep((useconds_t)(atof(argv[++i]) * 1e6));
 			} else if (strcmp(step, "wifi") == 0) {
 				wifi();
+			} else if (strcmp(step, "watch") == 0 && i + 1 < argc) {
+				watch(atof(argv[++i]));
 			} else if (strcmp(step, "wrongjoin") == 0) {
 				wrongjoin();
 			} else {
