@@ -470,4 +470,16 @@ redwood_springboard_init(void)
 	notify_register_dispatch("com.redwood.layers", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		layers();
 	});
+	/*
+	 * Belt-and-suspenders unlock. The user can always swipe up to open the home screen -- that
+	 * works fine when the touch driver is doing its job. But if touch is still probing, has
+	 * failed, or the panel is a FocalTech and the firmware upload is still chewing through
+	 * ~114 KB of SPI (that takes a hot second during bring-up), the user ends up staring at a
+	 * dark lock screen with nothing to swipe. So we just forcibly dismiss it after 10 seconds
+	 * so iOS always lands on the home screen even in the worst case. Harmless if touch is
+	 * already working: the user just doesn't need to swipe themselves.
+	 */
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		unlock();
+	});
 }
