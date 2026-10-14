@@ -97,16 +97,6 @@ qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # сеанс на 20 ми�
   преобразование в ядре (`iokit/Kernel/MiniAppleKeyStore.cpp`), и всё записанное лежит в `/private/var`, то есть в
   памяти, и пропадает при следующем старте. Проверка: `/redwood/bin/keychain_test` (подписывается `ldid`
   с группой доступа к связке; без `ldid` связка такой программе отказывает).
-- **Панель HackiOS в Настройках (опытно): `HACKIOS_PANE=1 userland/build.sh`.** В главном списке Настроек
-  появляется пункт «HackiOS» — своей группой ниже настроек Apple, там же, где их ставят твики (так делает
-  PreferenceLoader). За ним панель только для чтения: сборка (коммит и дата), ядро, параметры загрузки (без адреса
-  радио), время работы, память, процессоры и их частота, GPU, Wi-Fi (имя сети — только если его показывают и сами
-  Настройки — и уровень сигнала), батарея (с `battery=1`), драйвер кнопок; и одна кнопка, «Return to the Loader»,
-  с подтверждением — то же, что пять пальцев на экране. Устроено как у твиков: запись
-  `userland/hackios/HackiOS.plist` ложится в `/redwood/Library/PreferenceLoader/Preferences/`, бандл панели — в
-  `/redwood/Library/PreferenceBundles/HackiOS.bundle`, а подхватывает их наша вставка в Настройки
-  (`userland/src/inject_prefs.m`, без Substrate). Новая строка панели — элемент в `userland/hackios/Root.plist` и
-  источник в `userland/src/hackios_pane.m`.
 - **Wi-Fi телефона (опытно): `wifi=1`.** Радио телефона подключается к одной сети WPA2 с паролем, и iOS выходит
   через него в интернет: адрес по DHCP, DNS, HTTPS. Нужны прошивка радио в `fw-wifi/` (см. `wifi_step=N` в
   таблице параметров ядра), адрес радио одной строкой в `fw-wifi/mac` и файл `fw-wifi/network` — имя сети первой
@@ -401,7 +391,7 @@ Userland не изменён ни в одном байте: всё, чего е�
 | `xnu/` | наши правки XNU: патч, новые файлы, `apply.sh`/`export.sh` |
 | `xnu-deps/` | всё для сборки XNU на Linux: `setup.sh`, обёртки инструментов, заглушки |
 | `xnu-build.sh`, `xnu-env.sh` | сборка ядра |
-| `userland/` | наш init, вставки (`src/inject.c` — backboardd, `src/inject_sb.c` — SpringBoard, `src/inject_media.c` — mediaserverd, `src/inject_prefs.m` — Настройки), тесты, сборка образов |
+| `userland/` | наш init, вставки (`src/inject.c` — backboardd, `src/inject_sb.c` — SpringBoard, `src/inject_media.c` — mediaserverd), тесты, сборка образов |
 | `ios165/` | добыча файлов iOS из IPSW и выбор того, что идёт в образ |
 | `mkpackfs.py` | сборщик образов packfs (формат описан в `bsd/miscfs/packfs/packfs.h` ядра) |
 | `qemu/` | запуск в QEMU, касания, снимки экрана, разбор стеков |

@@ -48,7 +48,6 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/redwood_input.h>
-#include <sys/sysctl.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -509,11 +508,6 @@ out:
 	thread_terminate(current_thread());
 }
 
-static int buttons_on;
-SYSCTL_DECL(_kern_redwood);
-SYSCTL_INT(_kern_redwood, OID_AUTO, buttons, CTLFLAG_RD | CTLFLAG_LOCKED, &buttons_on, 0,
-    "1 if the power and volume keys' driver runs");
-
 void
 redwood_buttons_init(void)
 {
@@ -538,7 +532,6 @@ redwood_buttons_init(void)
 	}
 	if (kernel_thread_start(buttons_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
-		buttons_on = 1;
 	}
 }
 

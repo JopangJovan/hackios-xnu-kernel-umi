@@ -10,9 +10,6 @@
 #                      JOBS="..."   labels of the stock iOS launchd jobs to load (default: IOS_JOBS)
 #                      REST=1       ... and the rest of them, started only when asked for (see mkjobs.py)
 #                      WIFID=1      ... and wifid, iOS's Wi-Fi daemon (see below at IOS_JOBS)
-#                      HACKIOS_PANE=1  an entry "HackiOS" in Settings' main list and a pane of ours behind it, the
-#                                   way tweaks add theirs (src/inject_prefs.m, src/hackios_pane.m, hackios/); not
-#                                   yet in every image
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
@@ -72,8 +69,7 @@ IOS_JOBS=${JOBS-"
 # libredwood-media.dylib).
 INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libredwood-sb.dylib SpringBoard
-/redwood/lib/libredwood-media.dylib mediaserverd
-/redwood/lib/libredwood-prefs.dylib Preferences"}
+/redwood/lib/libredwood-media.dylib mediaserverd"}
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -128,40 +124,6 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood-sb.dylib src/inject_sb.c
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -lobjc \
 			-o obj/libredwood-media.dylib src/inject_media.c
-		if [ -n "$HACKIOS_PANE" ]; then
-			# the loader of Settings' entries, as PreferenceLoader is on a jailbroken phone (src/inject_prefs.m) ...
-			$DYN -dynamiclib -install_name /redwood/lib/libredwood-prefs.dylib -fobjc-arc \
-				-F${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -framework Preferences \
-				-framework UIKit -framework Foundation -o obj/libredwood-prefs.dylib src/inject_prefs.m
-			# ... and the HackiOS pane, a preference bundle as tweaks ship theirs; the build it says it is: the
-			# repository's commit and its date (and whether the tree had changes)
-			build="HackiOS $(git -C .. rev-parse --short HEAD 2>/dev/null || echo ?) of $(git -C .. log -1 --format=%cd \
-				--date=short 2>/dev/null)$(git -C .. diff --quiet HEAD 2>/dev/null || echo ', with changes')"
-			rm -rf obj/HackiOS.bundle && mkdir -p obj/HackiOS.bundle
-			$DYN -bundle -fobjc-arc -DHACKIOS_BUILD="\"$build\"" \
-				-F${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks -framework Preferences \
-				-framework UIKit -framework Foundation -framework SystemConfiguration -o obj/HackiOS.bundle/HackiOS \
-				src/hackios_pane.m
-			cp hackios/Info.plist hackios/Root.plist obj/HackiOS.bundle/
-			# its icon: a glyph of our own, drawn here (no artwork of Apple's)
-			python3 -c '
-import sys
-from PIL import Image, ImageDraw, ImageFont
-for scale, name in ((1, "icon.png"), (2, "icon@2x.png"), (3, "icon@3x.png")):
-    size = 29 * scale
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((0, 0, size - 1, size - 1), radius=6.5 * scale, fill=(36, 41, 56, 255))
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 19 * scale)
-    except OSError:
-        font = ImageFont.load_default()
-    draw.text((size / 2, size / 2), "H", font=font, fill=(255, 255, 255, 255), anchor="mm")
-    image.save(sys.argv[1] + "/" + name)
-' obj/HackiOS.bundle
-		else
-			rm -rf obj/libredwood-prefs.dylib obj/HackiOS.bundle
-		fi
 		if [ -n "$GL" ]; then
 			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
 			# (Mesa says beside the library what it was built from: one from other patches is built again)
@@ -185,13 +147,6 @@ for scale, name in ((1, "icon.png"), (2, "icon@2x.png"), (3, "icon@3x.png")):
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
-	rm -rf root/lib/libredwood-prefs.dylib root/Library/PreferenceLoader root/Library/PreferenceBundles
-	if [ -f obj/libredwood-prefs.dylib ] && [ -d obj/HackiOS.bundle ]; then
-		cp obj/libredwood-prefs.dylib root/lib/
-		mkdir -p root/Library/PreferenceLoader/Preferences root/Library/PreferenceBundles
-		cp hackios/HackiOS.plist root/Library/PreferenceLoader/Preferences/
-		cp -r obj/HackiOS.bundle root/Library/PreferenceBundles/
-	fi
 	if [ -n "$GL" ]; then
 		cp obj/libOSMesa.8.dylib root/lib/
 		cp obj/gl_test root/bin/
