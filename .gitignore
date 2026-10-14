@@ -44,6 +44,7 @@ __pycache__/
 !/userland/rc.*
 !/userland/com.redwood.*.plist
 !/userland/src/
+!/userland/hackios/
 !/userland/libmini/
 !/userland/var/
 
