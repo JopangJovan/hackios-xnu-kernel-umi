@@ -129,6 +129,12 @@
  *   wifi_station=1     with wifi_lx=2: the driver stays up and its station is the kernel's to
  *                      ask (sys/redwood_sta.h); nothing is joined by the driver itself
  *   wifi_file=0        with wifi=1: the network of fw/network is not joined at the start
+ *   wifi_irq=1         the radio's interrupts (MSI through its SMMU context to the GIC) instead
+ *                      of looking at its rings every millisecond (lx_bus.c); wifi=1 stands for it
+ *   wifi_ba=1          block ack: the access point's requests to send aggregates are answered
+ *                      (lx_80211.c); without, the link carries about a fifth; wifi=1 stands for it
+ *   wifi_wide=1        the channel as wide as the access point offers (40 or 80 MHz) instead of
+ *                      20 MHz; wifi=1 stands for it
  *   wifi_lx_step=MS    the driver's start says each stub it comes to and waits MS there: for
  *                      a run that ends without a word (follow it with XL_FOLLOW=2)
  *   wifi_lx=1          step 15 is ath11k's own instead of the stand-in (redwood_lx.c), with
@@ -322,26 +328,32 @@ settle(void)
 static bool whole;                      /* wifi=1: all of it, by itself (see the top of this file) */
 static volatile bool whole_runs;        /* ... and the thread that does it is at work */
 
-/* A number given to the kernel when it was started; with wifi=1 the ones that stands for are as if given. */
+/*
+ * A number given to the kernel when it was started; with wifi=1 the ones that stands for are as if
+ * given, unless given otherwise (wifi_irq=0: the rings looked at as before).
+ */
 uint32_t
 redwood_wifi_option(const char *name)
 {
 	static const struct {
 		const char *name;
 		uint32_t value;
-	} stands_for[] = { { "wifi_lx", 2 }, { "wifi_smmu", 2 }, { "wifi_station", 1 }, { "wifi_keep", 1 } };
+	} stands_for[] = { { "wifi_lx", 2 }, { "wifi_smmu", 2 }, { "wifi_station", 1 }, { "wifi_keep", 1 }, { "wifi_irq", 1 },
+			   { "wifi_ba", 1 }, { "wifi_wide", 1 } };
 	uint32_t value = 0;
 
+	if (strcmp(name, "wifi_quiet") == 0) {
+		return quiet;
+	}
+	if (PE_parse_boot_argn(name, &value, sizeof(value))) {
+		return value;
+	}
 	for (unsigned i = 0; whole && i < sizeof(stands_for) / sizeof(stands_for[0]); i++) {
 		if (strcmp(name, stands_for[i].name) == 0) {
 			return stands_for[i].value;
 		}
 	}
-	if (strcmp(name, "wifi_quiet") == 0) {
-		return quiet;
-	}
-	PE_parse_boot_argn(name, &value, sizeof(value));
-	return value;
+	return 0;
 }
 
 /* ---- register access ------------------------------------------------------------------------------- */
@@ -3587,6 +3599,16 @@ smmu_look(void)
 #define RADIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11) /* a page; for requests of either
 	                                                                                  * privilege; shared, accessed, not
 	                                                                                  * global: Linux's for a device */
+#define RADIO_PTE_DEVICE        (RADIO_PTE | 2ull << 2 | 1ull << 53 | 1ull << 54)  /* ... a device's registers: Linux's
+	                                                                                  * IOMMU_MMIO (MAIR entry 2), never
+	                                                                                  * executed */
+/*
+ * Where the radio raises an interrupt by writing (its "MSI"): resource "msi_addr" of the device
+ * tree's node for it, a register of the GIC that raises the SPI whose number is written; the
+ * node's interrupts are SPI 768..799, so vector v is the GIC's number 800 + v.
+ */
+#define RADIO_MSI_REGISTER      0x17a10040ull
+#define RADIO_FIRST_SPI         768u
 #define PTE_ADDRESS             0x0000fffffffff000ull
 #define SMMU_SGFSR              0x048           /* what the SMMU as a whole has refused ... */
 #define SMMU_SGFSYNR0           0x050
@@ -3658,7 +3680,7 @@ radio_next(uint64_t *entry)
 
 /* Our memory at `physical` behind the radio's addresses from `address` on; the SMMU reads the tables from memory. */
 static bool
-radio_enter(uint64_t address, uint64_t physical, uint64_t size)
+radio_enter(uint64_t address, uint64_t physical, uint64_t size, uint64_t attributes)
 {
 	if (radio_space.tables == 0) {
 		if (kmem_alloc(kernel_map, &radio_space.tables, round_page(4096 * RADIO_TABLES), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
@@ -3675,7 +3697,7 @@ radio_enter(uint64_t address, uint64_t physical, uint64_t size)
 			printf("wifi: %u: no page table left for the radio's %#llx\n", step, at);
 			return false;
 		}
-		level3[at >> 12 & 0x1ff] = (physical + offset) | RADIO_PTE;
+		level3[at >> 12 & 0x1ff] = (physical + offset) | attributes;
 	}
 	for (vm_offset_t line = radio_space.tables; line < radio_space.tables + 4096 * RADIO_TABLES; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
@@ -3845,8 +3867,8 @@ radio_space_off(void)
  * For the driver (redwood_lx.c): memory of ours that the radio is to see, at the address
  * returned. Without wifi_smmu=2 it has an address and the radio is shown nothing.
  */
-bool
-redwood_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address)
+static bool
+radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long long *address)
 {
 	size = (size + 4095) & ~4095ull;
 	if (radio_space.next + size > RADIO_ADDRESSES_SIZE) {
@@ -3862,7 +3884,7 @@ redwood_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *add
 		    "a context of the SMMU (wifi_smmu=2)\n", step, size >> 10, physical, *address);
 		return true;
 	}
-	if ((!radio_space.found && !radio_space_find()) || !radio_enter(*address, physical, size)) {
+	if ((!radio_space.found && !radio_space_find()) || !radio_enter(*address, physical, size, attributes)) {
 		return false;
 	}
 	printf("wifi: %u: the radio is to see %llu KB of ours (%#llx) at %#llx\n", step, size >> 10, physical, *address);
@@ -3871,6 +3893,37 @@ redwood_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *add
 	}
 	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, radio_space.context);
 	put(&apps_smmu_context, "tlbsync", SMMU_CB_TLBSYNC, 1);
+	return true;
+}
+
+bool
+redwood_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address)
+{
+	return radio_map(physical, size, RADIO_PTE, address);
+}
+
+/*
+ * What the radio is to write, and where, to raise its interrupt vector 0 (vector v: data + v): the
+ * GIC's register that raises an SPI, shown to the radio in its SMMU context as a device's page.
+ * Once; the GIC's number of the SPI of vector 0 goes to *first_spi.
+ */
+bool
+redwood_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi)
+{
+	static unsigned long long page;
+
+	if (page == 0) {
+		tell("wifi: wifi_irq: THE RADIO'S SMMU CONTEXT GETS AN ENTRY for the GIC's register that raises an interrupt (%#llx), "
+		    "as a device's page\n", RADIO_MSI_REGISTER);
+		if (!radio_map(RADIO_MSI_REGISTER & ~4095ull, 4096, RADIO_PTE_DEVICE, &page)) {
+			page = 0;
+			return false;
+		}
+	}
+	*address = page + (RADIO_MSI_REGISTER & 4095);
+	*data = RADIO_FIRST_SPI + 32;
+	*first_spi = RADIO_FIRST_SPI + 32;
+	tell("wifi: wifi_irq: the radio raises its interrupt vector v by writing %u + v at %#llx\n", *data, *address);
 	return true;
 }
 
@@ -3884,7 +3937,7 @@ radio_space_try(void)
 {
 	bool as_found;
 
-	if (!radio_space_find() || !radio_enter(RADIO_ADDRESSES, 0, 0)) {
+	if (!radio_space_find() || !radio_enter(RADIO_ADDRESSES, 0, 0, RADIO_PTE)) {
 		return;
 	}
 	as_found = radio_space_on();

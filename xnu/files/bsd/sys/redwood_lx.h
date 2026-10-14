@@ -69,6 +69,20 @@ void	 lx_os_net_attach(const unsigned char *address);	/* there is a radio, and t
 void	 lx_os_net_link(int up);				/* frames can pass now (a network is joined) / no longer */
 void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an Ethernet frame has arrived */
 
+/*
+ * ---- the radio's interrupts (wifi_irq=1). The radio raises one by writing a number to an address
+ * (an "MSI": the GIC's register that raises the SPI of that number); vector v of its 32 is data + v.
+ * The driver's work for one is done in thread context, on the kernel's thread for them: the
+ * function given for a vector is called there after it has fired, with the vector masked until
+ * lx_os_irq_enable(). Nothing of the driver runs in an interrupt.
+ */
+int	 lx_os_irq_msi(unsigned long long *address, unsigned *data);	/* where and what: 1, or 0 (no interrupts) */
+int	 lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument);	/* masked to begin with; 0 or an errno */
+void	 lx_os_irq_enable(unsigned vector);
+void	 lx_os_irq_disable(unsigned vector);			/* returns when its function is not running */
+void	 lx_os_irq_detach_all(void);				/* returns when no function is running */
+unsigned long long lx_os_irq_count(unsigned vector);		/* how many have arrived */
+
 /* ---- the station: scanning and joining, for whoever asks the kernel (redwood_sta.h) ---- */
 void	 lx_os_station(const struct redwood_sta_ops *ops);	/* here it is, to be asked; NULL: no longer (returns when no call is under way) */
 void	 lx_os_station_lost(int error);				/* the network joined is gone by itself */

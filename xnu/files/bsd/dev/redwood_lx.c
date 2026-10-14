@@ -17,6 +17,7 @@
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
+#include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -360,6 +361,164 @@ lx_os_net_input(const unsigned char *frame, unsigned long length)
 	if (lx_link_attached && length <= REDWOOD_NET_FRAME_MAX) {
 		redwood_net_input(frame, length);
 	}
+}
+
+/* ---- the radio's interrupts ------------------------------------------------------------------------------- */
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
+extern void gic_v3_spi_detach(uint32_t intid);
+extern uint64_t gic_v3_spi_count(uint32_t intid);
+
+#define LX_VECTORS      32
+
+static struct {
+	void (*function)(void *);
+	void *argument;
+	bool attached;
+} lx_vector[LX_VECTORS];
+static uint32_t lx_irq_first;                   /* the GIC's number of vector 0; 0: no interrupts */
+static uint32_t lx_irq_pending;                 /* the vectors that have fired and are not dealt with yet */
+static uint32_t lx_irq_running;                 /* the vectors whose function the thread is in */
+static thread_t lx_irq_thread;
+static LCK_MTX_DECLARE(lx_irq_lock, &lx_lock_group);
+
+/* In interrupt context: the vector masked, and the thread told. */
+static void
+lx_irq_arrived(__unused void *context, uint32_t intid)
+{
+	gic_v3_spi_mask(intid);
+	os_atomic_or(&lx_irq_pending, 1u << (intid - lx_irq_first), relaxed);
+	thread_wakeup((event_t)&lx_irq_pending);
+}
+
+static void
+lx_irq_runs(__unused void *parameter, __unused wait_result_t result)
+{
+	for (;;) {
+		uint32_t pending;
+
+		for (;;) {
+			assert_wait((event_t)&lx_irq_pending, THREAD_UNINT);
+			if ((pending = os_atomic_xchg(&lx_irq_pending, 0, acquire)) != 0) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+				break;
+			}
+			thread_block(THREAD_CONTINUE_NULL);
+		}
+		for (unsigned v = 0; v < LX_VECTORS; v++) {
+			if (!(pending & 1u << v)) {
+				continue;
+			}
+			lck_mtx_lock(&lx_irq_lock);
+			if (!lx_vector[v].attached) {
+				lck_mtx_unlock(&lx_irq_lock);
+				continue;
+			}
+			lx_irq_running |= 1u << v;
+			lck_mtx_unlock(&lx_irq_lock);
+			lx_vector[v].function(lx_vector[v].argument);
+			lck_mtx_lock(&lx_irq_lock);
+			lx_irq_running &= ~(1u << v);
+			lck_mtx_unlock(&lx_irq_lock);
+			thread_wakeup((event_t)&lx_irq_running);
+		}
+	}
+}
+
+int
+lx_os_irq_msi(unsigned long long *address, unsigned *data)
+{
+	uint32_t first = 0;
+
+	if (!redwood_wifi_radio_msi(address, data, &first)) {
+		return 0;
+	}
+	lx_irq_first = first;
+	return 1;
+}
+
+int
+lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
+{
+	kern_return_t kr;
+
+	if (vector >= LX_VECTORS || lx_irq_first == 0 || function == NULL) {
+		return EINVAL;
+	}
+	if (lx_irq_thread == THREAD_NULL) {
+		redwood_wifi_tell("lx: wifi_irq: THE GIC'S DISTRIBUTOR IS WRITTEN for the radio's interrupts: each vector's SPI (%u + v) edge-"
+		    "triggered, group 1, routed to this processor, then enabled\n", lx_irq_first);
+		if (kernel_thread_start(lx_irq_runs, NULL, &lx_irq_thread) != KERN_SUCCESS) {
+			lx_irq_thread = THREAD_NULL;
+			return ENOMEM;
+		}
+		thread_set_thread_name(lx_irq_thread, "wifi-irq");
+	}
+	lck_mtx_lock(&lx_irq_lock);
+	lx_vector[vector].function = function;
+	lx_vector[vector].argument = argument;
+	lx_vector[vector].attached = true;
+	lck_mtx_unlock(&lx_irq_lock);
+	if ((kr = gic_v3_spi_attach(lx_irq_first + vector, true, lx_irq_arrived, NULL)) != KERN_SUCCESS) {
+		lck_mtx_lock(&lx_irq_lock);
+		lx_vector[vector].attached = false;
+		lck_mtx_unlock(&lx_irq_lock);
+		return kr == KERN_NAME_EXISTS ? EBUSY : EINVAL;
+	}
+	gic_v3_spi_mask(lx_irq_first + vector);
+	return 0;
+}
+
+void
+lx_os_irq_enable(unsigned vector)
+{
+	if (vector < LX_VECTORS && lx_vector[vector].attached) {
+		gic_v3_spi_unmask(lx_irq_first + vector);
+	}
+}
+
+void
+lx_os_irq_disable(unsigned vector)
+{
+	if (vector >= LX_VECTORS || !lx_vector[vector].attached) {
+		return;
+	}
+	gic_v3_spi_mask(lx_irq_first + vector);
+	if (current_thread() == lx_irq_thread) {
+		return;                         /* (from the vector's own function, or another's: nothing to wait for) */
+	}
+	lck_mtx_lock(&lx_irq_lock);
+	while (lx_irq_running & 1u << vector) {
+		lck_mtx_sleep(&lx_irq_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_irq_running, THREAD_UNINT);
+	}
+	lck_mtx_unlock(&lx_irq_lock);
+}
+
+void
+lx_os_irq_detach_all(void)
+{
+	for (unsigned v = 0; v < LX_VECTORS; v++) {
+		if (lx_vector[v].attached) {
+			gic_v3_spi_detach(lx_irq_first + v);
+		}
+	}
+	lck_mtx_lock(&lx_irq_lock);
+	for (unsigned v = 0; v < LX_VECTORS; v++) {
+		lx_vector[v].attached = false;
+	}
+	while (lx_irq_running != 0 && current_thread() != lx_irq_thread) {
+		lck_mtx_sleep(&lx_irq_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_irq_running, THREAD_UNINT);
+	}
+	lck_mtx_unlock(&lx_irq_lock);
+	os_atomic_store(&lx_irq_pending, 0, relaxed);
+}
+
+unsigned long long
+lx_os_irq_count(unsigned vector)
+{
+	return vector < LX_VECTORS && lx_irq_first != 0 ? gic_v3_spi_count(lx_irq_first + vector) : 0;
 }
 
 /* ---- the station (sys/redwood_sta.h) --------------------------------------------------------------------- */
