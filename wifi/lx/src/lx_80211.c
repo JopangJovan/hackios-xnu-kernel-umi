@@ -89,6 +89,7 @@ struct lx_radio {
 	unsigned heard_count, heard_lost;
 	struct lx_heard heard[HEARD_MOST];
 	uint8_t want[32], want_length;		/* the name of the network that is wanted ... */
+	unsigned width;				/* MHz of the channel joined: 20, or with wifi_wide=1 what the access point offers */
 	struct lx_target target;		/* ... and the best of it */
 
 	/* the network joined */
@@ -1109,15 +1110,17 @@ station_abilities(struct lx_radio *radio, const uint8_t *elements, unsigned leng
 	sta->deflink.supp_rates[band->band] = rates;
 	conf->basic_rates = basic;
 	sta->wme = conf->qos = vendor_element(elements, length, wmm) != NULL;
-	sta->deflink.bandwidth = IEEE80211_STA_RX_BW_20;
+	sta->deflink.bandwidth = radio->width == 80 ? IEEE80211_STA_RX_BW_80 : radio->width == 40 ? IEEE80211_STA_RX_BW_40 :
+	    IEEE80211_STA_RX_BW_20;
 	sta->deflink.rx_nss = 1;
 	sta->deflink.smps_mode = IEEE80211_SMPS_OFF;
 	if ((e = element(elements, length, 45)) != NULL && e[1] >= 26 && band->ht_cap.ht_supported) {	/* HT capabilities */
 		struct ieee80211_sta_ht_cap *ht = &sta->deflink.ht_cap;
 
 		ht->ht_supported = true;
-		/* (without the bits for 40 MHz: the channel asked for is 20 MHz wide) */
-		ht->cap = (uint16_t)((e[2] | e[3] << 8) & ~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 | IEEE80211_HT_CAP_SGI_40));
+		/* (without the bits for 40 MHz where the channel is 20 MHz wide) */
+		ht->cap = (uint16_t)((e[2] | e[3] << 8) & (radio->width > 20 ? 0xffff : ~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
+		    IEEE80211_HT_CAP_SGI_40)));
 		ht->ampdu_factor = e[4] & 3;
 		ht->ampdu_density = e[4] >> 2 & 7;
 		memcpy(&ht->mcs, e + 5, sizeof(ht->mcs));
@@ -1183,7 +1186,8 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
 	memcpy(at, radio->rsn, 22);
 	at += 22;
 	if (element(target->elements, target->elements_length, 45) != NULL && band->ht_cap.ht_supported) {
-		uint16_t cap = (uint16_t)(band->ht_cap.cap & ~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 | IEEE80211_HT_CAP_SGI_40));
+		uint16_t cap = (uint16_t)(band->ht_cap.cap & (radio->width > 20 ? 0xffff : ~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
+		    IEEE80211_HT_CAP_SGI_40)));
 
 		*at++ = 45;
 		*at++ = 26;
@@ -1388,6 +1392,59 @@ station_leave(struct lx_radio *radio)
 }
 
 /*
+ * How wide the channel is to be: with wifi_wide=1 as wide as the access point says it works (its
+ * HT operation element: the second 20 MHz above or below; its VHT operation element: 80 MHz around
+ * a centre) and as the radio may tune (every 20 MHz of it allowed here); else 20 MHz. 80 MHz
+ * only at 5 GHz. mac80211 does this in ieee80211_determine_chan_mode().
+ */
+static void
+station_width(struct lx_radio *radio, struct linuxkpi_ieee80211_channel *primary, struct cfg80211_chan_def *def)
+{
+	const struct lx_target *target = &radio->target;
+	struct ieee80211_supported_band *band = radio->wiphy->bands[primary->band];
+	const uint8_t *ht = element(target->elements, target->elements_length, 61);
+	const uint8_t *vht = element(target->elements, target->elements_length, 192);
+	unsigned offset;
+
+	def->chan = primary;
+	def->width = NL80211_CHAN_WIDTH_20;
+	def->center_freq1 = primary->center_freq;
+	radio->width = 20;
+	if (!lx_os_option("wifi_wide") || ht == NULL || ht[1] < 22 || !band->ht_cap.ht_supported ||
+	    !(band->ht_cap.cap & IEEE80211_HT_CAP_SUP_WIDTH_20_40) || !(ht[3] & 4)) {
+		return;
+	}
+	if (vht != NULL && vht[1] >= 3 && vht[2] == 1 && primary->band == NL80211_BAND_5GHZ && band->vht_cap.vht_supported) {
+		unsigned center = 5000 + 5 * vht[3];
+		bool all = true;
+
+		for (unsigned frequency = center - 30; frequency <= center + 30; frequency += 20) {
+			struct linuxkpi_ieee80211_channel *c = linuxkpi_ieee80211_get_channel(radio->wiphy, frequency);
+
+			all &= c != NULL && !(c->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_80MHZ));
+		}
+		if (all && primary->center_freq >= center - 30 && primary->center_freq <= center + 30) {
+			def->width = NL80211_CHAN_WIDTH_80;
+			def->center_freq1 = center;
+			radio->width = 80;
+			return;
+		}
+	}
+	offset = ht[3] & 3;		/* the second 20 MHz: 1 above, 3 below, 0 none */
+	if (offset == 1 || offset == 3) {
+		struct linuxkpi_ieee80211_channel *second = linuxkpi_ieee80211_get_channel(radio->wiphy, offset == 1 ?
+		    primary->center_freq + 20 : primary->center_freq - 20);
+
+		if (second != NULL && !(second->flags & IEEE80211_CHAN_DISABLED) && !(primary->flags & (offset == 1 ?
+		    IEEE80211_CHAN_NO_HT40PLUS : IEEE80211_CHAN_NO_HT40MINUS))) {
+			def->width = NL80211_CHAN_WIDTH_40;
+			def->center_freq1 = offset == 1 ? primary->center_freq + 10 : primary->center_freq - 10;
+			radio->width = 40;
+		}
+	}
+}
+
+/*
  * Join the network of that name with that passphrase, in the order mac80211 goes through
  * (net/mac80211/mlme.c of Linux: ieee80211_mgd_auth(), ieee80211_mgd_assoc(), and what the
  * supplicant does after them): the access point found by a scan that asks for the network; the
@@ -1508,9 +1565,7 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 		error = ENOMEM;
 		goto out;
 	}
-	radio->channel->def.chan = channel;
-	radio->channel->def.width = NL80211_CHAN_WIDTH_20;
-	radio->channel->def.center_freq1 = channel->center_freq;
+	station_width(radio, channel, &radio->channel->def);
 	radio->channel->min_def = radio->channel->def;
 	radio->channel->rx_chains_static = radio->channel->rx_chains_dynamic = 2;
 	vif->bss_conf.chanreq.oper = radio->channel->def;
@@ -1521,7 +1576,7 @@ station_join(struct lx_radio *radio, const struct redwood_sta_join *what)
 		ret = radio->ops->assign_vif_chanctx(hw, vif, &vif->bss_conf, radio->channel);
 	}
 	mutex_unlock(&hw->wiphy->mtx);
-	printf("lx: the channel is taken: %d\n", ret);
+	lx_tell("lx: the channel is taken, %u MHz wide around %u MHz: %d\n", radio->width, radio->channel->def.center_freq1, ret);
 	if (ret != 0) {
 		error = -ret;
 		goto out;

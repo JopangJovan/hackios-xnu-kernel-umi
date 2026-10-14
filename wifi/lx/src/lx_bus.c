@@ -55,7 +55,31 @@ static struct {
 	volatile bool looks;			/* ... and runs */
 	volatile bool data;			/* ... and looks at the data path's rings as well */
 	unsigned same;				/* it has written a ring's pointer what it held so many times */
+
+	/* the radio's interrupts (wifi_irq=1): what the copy engines and the data path's groups are taken care of on */
+	bool irq;
+	struct mutex service;			/* one thing at a time looks at the rings: an interrupt's or the thread */
+	int ce_vector[CE_COUNT_MAX];		/* a copy engine's vector, -1: it has none (ce.c: CE_ATTR_DIS_INTR) */
+	int group_vector[ATH11K_EXT_IRQ_GRP_NUM_MAX];
+	unsigned long long late;		/* work the thread found that no interrupt had brought */
 } bus;
+
+/*
+ * The radio's interrupt vectors, as pcic.c has them for this chip: 28 of the node's 32, ten for the
+ * copy engines from vector 0 and eighteen for the data path's groups from vector 10.
+ */
+static struct ath11k_msi_user msi_users[] = {
+	{ .name = "CE", .num_vectors = 10, .base_vector = 0 },
+	{ .name = "DP", .num_vectors = 18, .base_vector = 10 },
+};
+static void irq_say(void);
+
+static const struct ath11k_msi_config msi_config = {
+	.total_vectors = 28,
+	.total_users = 2,
+	.users = msi_users,
+	.hw_rev = ATH11K_HW_WCN6750_HW10,
+};
 
 /* ---- what the driver says ---------------------------------------------------------------------- */
 
@@ -264,6 +288,10 @@ bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
  * driver's NAPI poll calls: frames received, frames that have been sent, errors, the reorder
  * block's answers). Once a millisecond while nothing comes; again at once while a group has
  * used up what it was allowed in one go.
+ *
+ * With the radio's interrupts (wifi_irq=1) the rings are looked at when one arrives, on the
+ * kernel's thread for them (irq_ce(), irq_group() below), and this thread looks only every 100 ms,
+ * to count what the interrupts left behind and to take care of it.
  */
 #define DATA_BUDGET	64
 
@@ -281,16 +309,28 @@ bus_looks(void *argument)
 			said = lx_os_nanoseconds();
 			lx_station_say();
 			lx_memory_say();
+			if (bus.irq) {
+				irq_say();
+			}
 		}
 
+		if (bus.irq) {
+			mutex_lock(&bus.service);
+		}
 		for (unsigned i = 0; i < ab->hw_params.ce_count; i++) {
 			ath11k_ce_per_engine_service(ab, i);
 		}
 		for (unsigned i = 0; bus.data && i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
-			more |= ath11k_dp_service_srng(ab, &ab->ext_irq_grp[i], DATA_BUDGET) >= DATA_BUDGET;
+			int done = ath11k_dp_service_srng(ab, &ab->ext_irq_grp[i], DATA_BUDGET);
+
+			more |= done >= DATA_BUDGET;
+			bus.late += bus.irq && done > 0;
+		}
+		if (bus.irq) {
+			mutex_unlock(&bus.service);
 		}
 		if (!more) {
-			lx_pause_ms(1);
+			lx_pause_ms(bus.irq ? 100 : 1);
 		}
 	}
 	bus.looks = false;
@@ -305,6 +345,12 @@ bus_looks(void *argument)
 static void
 bus_quiet(void)
 {
+	if (bus.irq && bus.looking) {
+		irq_say();
+	}
+	if (bus.irq) {
+		lx_os_irq_detach_all();
+	}
 	bus.data = false;
 	bus.looking = false;
 	while (bus.looks) {
@@ -340,6 +386,126 @@ lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi
 	return (qmi_send_request(qmi, sq, txn, msg_id, largest, ei, structure));
 }
 
+/* ---- the radio's interrupts ---------------------------------------------------------------------- */
+
+/* A copy engine's interrupt (pcic.c: ath11k_pcic_ce_interrupt_handler() and its tasklet). */
+static void
+irq_ce(void *argument)
+{
+	struct ath11k_ce_pipe *pipe = argument;
+
+	mutex_lock(&bus.service);
+	ath11k_ce_per_engine_service(pipe->ab, pipe->pipe_num);
+	mutex_unlock(&bus.service);
+	lx_os_irq_enable(bus.ce_vector[pipe->pipe_num]);
+}
+
+/* A data path group's (pcic.c: ath11k_pcic_ext_interrupt_handler() and its NAPI poll, until it has less to do than allowed). */
+static void
+irq_group(void *argument)
+{
+	struct ath11k_ext_irq_grp *group = argument;
+	int done;
+
+	mutex_lock(&bus.service);
+	do {
+		done = bus.data ? ath11k_dp_service_srng(group->ab, group, DATA_BUDGET) : 0;
+	} while (done >= DATA_BUDGET);
+	mutex_unlock(&bus.service);
+	if (bus.data) {
+		lx_os_irq_enable(bus.group_vector[group->grp_id]);
+	}
+}
+
+/* pcic.c: ath11k_pcic_config_irq(), for this chip: which vector is whose, and the functions for them, all masked */
+static int
+irq_attach(struct ath11k_base *ab)
+{
+	unsigned index = 0;
+	int ret;
+
+	for (unsigned i = 0; i < CE_COUNT_MAX; i++) {
+		bus.ce_vector[i] = -1;
+	}
+	for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+		bus.group_vector[i] = -1;
+	}
+	for (unsigned i = 0; i < ab->hw_params.ce_count; i++) {
+		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR) {
+			continue;
+		}
+		bus.ce_vector[i] = (int)(index++ % msi_users[0].num_vectors + msi_users[0].base_vector);
+		if ((ret = lx_os_irq_attach((unsigned)bus.ce_vector[i], irq_ce, &ab->ce.ce_pipe[i])) != 0) {
+			return (ret);
+		}
+	}
+	for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+		const struct ath11k_hw_ring_mask *mask = ab->hw_params.ring_mask;
+
+		ab->ext_irq_grp[i].ab = ab;
+		ab->ext_irq_grp[i].grp_id = i;
+		if (!(mask->tx[i] || mask->rx[i] || mask->rx_err[i] || mask->rx_wbm_rel[i] || mask->reo_status[i] ||
+		    mask->rxdma2host[i] || mask->host2rxdma[i] || mask->rx_mon_status[i])) {
+			continue;
+		}
+		bus.group_vector[i] = (int)(i % msi_users[1].num_vectors + msi_users[1].base_vector);
+		if ((ret = lx_os_irq_attach((unsigned)bus.group_vector[i], irq_group, &ab->ext_irq_grp[i])) != 0) {
+			return (ret);
+		}
+	}
+	return (0);
+}
+
+/* What came, by vector: for the log. */
+static void
+irq_say(void)
+{
+	char line[400] = "";
+
+	for (unsigned v = 0; v < msi_config.total_vectors; v++) {
+		unsigned long long count = lx_os_irq_count(v);
+
+		if (count != 0) {
+			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %u: %llu,", v, count);
+		}
+	}
+	lx_tell("lx: the radio's interrupts by vector (copy engines 0-9, the data path's groups 10-27):%s the thread found %llu "
+	    "times work no interrupt had brought\n", line[0] ? line : " NONE", bus.late);
+}
+
+static int
+bus_get_user_msi_vector(struct ath11k_base *ab, char *user, int *count, u32 *user_base_data, u32 *base_vector)
+{
+	for (unsigned i = 0; i < nitems(msi_users); i++) {
+		if (strcmp(user, msi_users[i].name) == 0) {
+			*count = (int)msi_users[i].num_vectors;
+			*base_vector = msi_users[i].base_vector;
+			*user_base_data = msi_users[i].base_vector + ab->pci.msi.ep_base_data;
+			return (0);
+		}
+	}
+	return (-EINVAL);
+}
+
+static void
+bus_get_msi_address(struct ath11k_base *ab, u32 *low, u32 *high)
+{
+	*low = ab->pci.msi.addr_lo;
+	*high = ab->pci.msi.addr_hi;
+}
+
+/* pcic.c: ath11k_pcic_get_ce_msi_idx(): the copy engines with interrupts, counted */
+static void
+bus_get_ce_msi_idx(struct ath11k_base *ab, u32 ce_id, u32 *index)
+{
+	u32 n = 0;
+
+	for (u32 i = 0; i < ab->hw_params.ce_count && i != ce_id; i++) {
+		n += !(ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR);
+	}
+	*index = n;
+}
+
 /* pcic.c: ath11k_pcic_start(), with the thread above where it enables the interrupts */
 static int
 bus_start(struct ath11k_base *ab)
@@ -351,6 +517,13 @@ bus_start(struct ath11k_base *ab)
 	ath11k_ce_rx_post_buf(ab);
 	say_repeats();
 	lx_tell("lx: the rings are set up and the copy engines have their buffers: the bus is started\n");
+	if (bus.irq) {
+		for (unsigned i = 0; i < CE_COUNT_MAX; i++) {
+			if (bus.ce_vector[i] >= 0) {
+				lx_os_irq_enable((unsigned)bus.ce_vector[i]);
+			}
+		}
+	}
 	bus.looking = true;
 	if (lx_os_thread("wifi-rings", bus_looks, ab) != 0) {
 		bus.looking = false;
@@ -416,6 +589,11 @@ bus_irq_enable(struct ath11k_base *ab)
 		ab->ext_irq_grp[i].grp_id = i;
 	}
 	bus.data = true;
+	for (unsigned i = 0; bus.irq && i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+		if (bus.group_vector[i] >= 0) {
+			lx_os_irq_enable((unsigned)bus.group_vector[i]);
+		}
+	}
 }
 
 static void
@@ -435,6 +613,22 @@ static const struct ath11k_hif_ops bus_ops = {
 	.power_up = bus_power_up,
 	.power_down = bus_power_down,
 	/* (no interrupt vectors are offered: the rings are then set up without any, see ce.c) */
+};
+
+/* ... and with the radio's interrupts: the vectors, and where the radio writes to raise one */
+static const struct ath11k_hif_ops bus_ops_irq = {
+	.read32 = bus_read32,
+	.write32 = bus_write32,
+	.irq_enable = bus_irq_enable,
+	.irq_disable = bus_irq_disable,
+	.start = bus_start,
+	.stop = bus_stop,
+	.map_service_to_pipe = bus_map_service_to_pipe,
+	.power_up = bus_power_up,
+	.power_down = bus_power_down,
+	.get_user_msi_vector = bus_get_user_msi_vector,
+	.get_msi_address = bus_get_msi_address,
+	.get_ce_msi_idx = bus_get_ce_msi_idx,
 };
 
 /* ---- the device tree, of which there is none ------------------------------------------------------ */
@@ -548,11 +742,36 @@ lx_start(void)
 		return (ENOMEM);
 	}
 	ab->hif.ops = &bus_ops;
+	bus.irq = false;
+	if (lx_os_option("wifi_irq")) {
+		unsigned long long address;
+		unsigned data;
+
+		/* (pcic.c: ath11k_pcic_init_msi_config() and what ahb.c takes from the device tree for this chip) */
+		if (lx_os_irq_msi(&address, &data)) {
+			mutex_init(&bus.service);
+			ab->pci.msi.config = &msi_config;
+			ab->pci.msi.addr_lo = (u32)address;
+			ab->pci.msi.addr_hi = (u32)(address >> 32);
+			ab->pci.msi.ep_base_data = data;
+			set_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags);
+			ab->hif.ops = &bus_ops_irq;
+			bus.irq = true;
+		} else {
+			lx_tell("lx: wifi_irq: the radio cannot be shown where to raise an interrupt: the rings are looked at, as before\n");
+		}
+	}
 	ab->hw_rev = ATH11K_HW_WCN6750_HW10;
 	ab->fw_mode = ATH11K_FIRMWARE_MODE_NORMAL;
 	if ((ret = ath11k_core_pre_init(ab)) != 0 || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
 		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
 		return (-ret);
+	}
+	if (bus.irq && (ret = irq_attach(ab)) != 0) {
+		lx_tell("lx: wifi_irq: the radio's interrupts cannot be had (%d): the rings are looked at, as before\n", ret);
+		lx_os_irq_detach_all();
+		ab->hif.ops = &bus_ops;
+		bus.irq = false;
 	}
 	ab->qmi.ce_cfg.tgt_ce_len = ab->hw_params.target_ce_count;
 	ab->qmi.ce_cfg.tgt_ce = ab->hw_params.target_ce_config;
