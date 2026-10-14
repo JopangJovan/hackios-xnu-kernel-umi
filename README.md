@@ -1,6 +1,6 @@
-# Darwin на redwood
+# HackiOS
 
-Открытое ядро Apple XNU (xnu-8796.121.2 — ядро iOS 16.5), свой загрузчик и свои замены закрытых драйверов,
+**HackiOS** — iOS 16.5 на POCO X5 Pro 5G (redwood). Открытое ядро Apple XNU (xnu-8796.121.2 — ядро iOS 16.5), свой загрузчик и свои замены закрытых драйверов,
 под которыми работает **немодифицированный userland iOS 16.5** от iPhone X: launchd → backboardd → SpringBoard →
 приложения. Работает в двух местах:
 
