@@ -117,6 +117,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework Security -o obj/keychain_test src/keychain_test.c &&
 			{ ${LDID:-ldid} -Ssrc/keychain_test.entitlements obj/keychain_test 2>/dev/null ||
 			  echo "build.sh: no ldid: keychain_test is unsigned, and the keychain will refuse it (-34018)"; }
+		# (and wifid's way of keeping a network's password, by wifid's name: src/wifipw_test.c)
+		$DYN -framework CoreFoundation -framework Security -o obj/wifipw_test src/wifipw_test.c &&
+			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
+			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
 		# our library for inside stock iOS programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libredwood.dylib src/inject.c
@@ -176,6 +180,7 @@ for scale, name in ((1, "icon.png"), (2, "icon@2x.png"), (3, "icon@3x.png")):
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
+	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
 	for f in $EXTRA; do cp "$f" root/bin/; done
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
