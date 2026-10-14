@@ -17,6 +17,7 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/redwood_input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -53,6 +54,12 @@ domain_of(uint32_t phys_id)
 	return core < 4 ? 0 : core < 7 ? 1 : 2;
 }
 
+/* the speed the group of the boot processor was raised to, for whoever asks (Settings' HackiOS pane): kHz, 0 when not */
+static int cpufreq_khz;
+SYSCTL_DECL(_kern_redwood);
+SYSCTL_INT(_kern_redwood, OID_AUTO, cpu_khz, CTLFLAG_RD | CTLFLAG_LOCKED, &cpufreq_khz, 0,
+    "the speed cpufreq=1 set the fastest group of processors to, in kHz (0: left as the boot loader left it)");
+
 static void
 raise_domain(uint32_t domain, uint32_t cores)
 {
@@ -75,6 +82,9 @@ raise_domain(uint32_t domain, uint32_t cores)
 	delay_for_interval(20, NSEC_PER_MSEC);
 	printf("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
 	    top_khz / 1000);
+	if ((int)top_khz > cpufreq_khz) {
+		cpufreq_khz = (int)top_khz;
+	}
 }
 
 void

@@ -26,6 +26,7 @@
 #include <sys/errno.h>
 #include <sys/redwood_input.h>
 #include <sys/redwood_sta.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 
 extern void thread_set_thread_name(thread_t thread, const char *name);
@@ -369,3 +370,47 @@ redwood_sta_address(uint8_t *address)
 	}
 	return ops != NULL;
 }
+
+/* For whoever asks (Settings' HackiOS pane): "none" (no radio), "off" (turned off), "on", "joining", "joined". */
+static int
+sysctl_wifi(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+	const char *text = "none";
+	int error;
+
+	if (state == NULL) {
+		return ENOMEM;
+	}
+	if (redwood_sta_present()) {
+		redwood_sta_state(state);
+		text = !redwood_sta_powered() ? "off" : state->phase == REDWOOD_STA_JOINED ? "joined" : state->phase ==
+		    REDWOOD_STA_JOINING ? "joining" : "on";
+	}
+	kfree_data(state, sizeof(*state));
+	error = SYSCTL_OUT(req, text, strlen(text) + 1);
+	return error;
+}
+SYSCTL_DECL(_kern_redwood);
+SYSCTL_PROC(_kern_redwood, OID_AUTO, wifi, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_wifi, "A",
+    "the phone's radio: none, off, on, joining, joined");
+
+/* ... and how strongly the network joined is heard: dBm, 0 when none is joined */
+static int
+sysctl_wifi_rssi(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+	int rssi = 0;
+
+	if (state == NULL) {
+		return ENOMEM;
+	}
+	if (redwood_sta_present()) {
+		redwood_sta_state(state);
+		rssi = state->phase == REDWOOD_STA_JOINED ? state->bss.rssi : 0;
+	}
+	kfree_data(state, sizeof(*state));
+	return SYSCTL_OUT(req, &rssi, sizeof(rssi));
+}
+SYSCTL_PROC(_kern_redwood, OID_AUTO, wifi_rssi, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_wifi_rssi, "I",
+    "how strongly the network joined is heard, dBm (0: none joined)");

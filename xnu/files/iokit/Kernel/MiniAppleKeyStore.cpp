@@ -4,8 +4,13 @@
  * and libaks.
  *
  * It describes one fixed situation: a device that has no passcode -- never locked, unlocked
- * since boot. Nothing is encrypted here and no keys exist; requests that would need them
- * (wrapping keys for the keychain, creating or loading bags) are refused, logged once.
+ * since boot. No keys exist here. The keychain (securityd) gives every item a key of its own and
+ * has it wrapped by the key of the item's protection class (kAKSWrapKey) before it stores it, and
+ * unwrapped (kAKSUnwrapKey) to read the item: that is answered, so that the keychain works -- but
+ * with nothing secret to wrap with, the "wrapping" is a reversible transformation and protects
+ * nothing (and the keychain lives in /private/var, in memory, and is gone at the next start).
+ * Requests that would need real keys or bags otherwise (creating or loading bags, keys kept in the
+ * key store) are refused, logged once.
  *
  * The protocol was worked out from the user-space side of iOS 16.5: selectors, and the
  * DER-encoded answers ("SET of SEQUENCE { UTF8String key, INTEGER value }").
@@ -26,6 +31,8 @@ enum {
 	kAKSGetLockState        = 0x07,         /* in: handle; out: state flags */
 	kAKSLockDevice          = 0x08,
 	kAKSUnlockDevice        = 0x09,
+	kAKSWrapKey             = 0x0a,         /* in: handle, class; a key; out: the class, the key wrapped */
+	kAKSUnwrapKey           = 0x0b,         /* in: handle, class; a wrapped key; out: the key */
 	kAKSUnlockBag           = 0x0c,
 	kAKSGetSystem           = 0x0e,         /* out: the handle of the system keybag */
 	kAKSGetDeviceState      = 0x11,         /* in: handle; out: DER */
@@ -158,6 +165,21 @@ AppleKeyStoreUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
 	return kIOReturnSuccess;
 }
 
+/*
+ * kAKSWrapKey and kAKSUnwrapKey. A wrapped key is 8 bytes longer than the key, as with AES key
+ * wrap (RFC 3394), which is what callers size their buffers for: a mark, the class, and the key
+ * mixed with a fixed pattern. Not encryption: there is no secret here to encrypt with.
+ */
+static const uint8_t kWrapMark[4] = { 'H', 'K', 'w', 'r' };
+
+static void
+wrapMix(uint8_t * bytes, size_t length)
+{
+	for (size_t i = 0; i < length; i++) {
+		bytes[i] ^= (uint8_t)(0x5a + 37 * i);
+	}
+}
+
 /* A structure answer; a big buffer on the other side arrives as a memory descriptor. */
 IOReturn
 AppleKeyStoreUserClient::answer(IOExternalMethodArguments * args, const uint8_t * bytes, size_t length)
@@ -235,6 +257,38 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	case kAKSNotifyStateSet:
 		gAKSNotifyState = true;
 		return kIOReturnSuccess;
+
+	case kAKSWrapKey: {
+		uint8_t wrapped[8 + 64];
+		size_t length = args->structureInputSize;
+
+		if (args->structureInput == NULL || length == 0 || length > 64 || args->scalarInputCount < 2) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(wrapped, kWrapMark, sizeof(kWrapMark));
+		wrapped[4] = (uint8_t)args->scalarInput[1];
+		wrapped[5] = wrapped[6] = wrapped[7] = 0;
+		memcpy(wrapped + 8, args->structureInput, length);
+		wrapMix(wrapped + 8, length);
+		if (args->scalarOutputCount >= 1) {
+			out[0] = args->scalarInput[1];
+			args->scalarOutputCount = 1;
+		}
+		return answer(args, wrapped, 8 + length);
+	}
+
+	case kAKSUnwrapKey: {
+		uint8_t key[64];
+		const uint8_t * wrapped = (const uint8_t *)args->structureInput;
+		size_t length = args->structureInputSize;
+
+		if (wrapped == NULL || length <= 8 || length > 8 + sizeof(key) || memcmp(wrapped, kWrapMark, sizeof(kWrapMark)) != 0) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(key, wrapped + 8, length - 8);
+		wrapMix(key, length - 8);
+		return answer(args, key, length - 8);
+	}
 
 	case kAKSNotifyStateIsSet:
 		if (args->scalarOutputCount < 1) {

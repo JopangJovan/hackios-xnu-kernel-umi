@@ -99,6 +99,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/redwood_input.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
@@ -2311,6 +2312,9 @@ static struct block gpu = { "gpu", 0x03d00000, 0x40000 };
 #define GMU_CORE_GRANTED        (1u << 31)      /* of gmu2host_intr_info */
 
 static uint32_t core_khz;               /* the 3D core's speed, as asked of the GMU */
+SYSCTL_DECL(_kern_redwood);
+SYSCTL_UINT(_kern_redwood, OID_AUTO, gpu_khz, CTLFLAG_RD | CTLFLAG_LOCKED, &core_khz, 0,
+    "the GPU's 3D core speed as asked of its GMU, in kHz (0: the GPU is not on)");
 
 /*
  * What the vendor's driver sends at this point (a6xx_hfi_start; Linux the same with fewer
