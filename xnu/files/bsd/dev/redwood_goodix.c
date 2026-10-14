@@ -1,36 +1,29 @@
 /*
- * Touch screen driver for the POCO X5 Pro (redwood). Depending on the panel the phone shipped
- * with, this is either a Goodix GT9916 ("Berlin-D") or a FocalTech FT3680 hanging off the SoC's
- * QUP serial engine 13 over SPI. We feed samples into /dev/redwood-touch (sys/redwood_input.h),
- * which userland's inject.c then turns into HID events for backboardd. Only runs when the kernel
- * gets touchscreen=1 on the boot args.
+ * The touch screen of the POCO X5 Pro (redwood): either a Goodix GT9916 ("Berlin-D") or a
+ * FocalTech FT3680 on the SPI bus of the SoC's serial engine 13, as a source of touches for
+ * /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg touchscreen=1: every address
+ * below belongs to this phone.
  *
- * This kernel has no clock / pin / regulator / SPI framework, so this file is the whole stack
- * from registers upward. The bring-up order matches what Linux does for both chips:
- *
+ * There is no clock, pin, regulator or SPI framework in this kernel, so the driver does all of
+ * it itself, in the order the vendor's Linux drivers do:
  *   power    the chip's I/O supply is LDO2 of the PM8350C, switched through RPMh (one request
  *            written into the "always on" processor's command slots); the analog supply is
- *            behind a GPIO load switch
- *   clocks   the serial engine's three clocks, by vote in the global clock controller (GCC)
- *   pins     four GPIOs for SPI, plus reset / interrupt / analog supply enable
- *   SPI      the serial engine ("GENI") in FIFO mode, polled; or (used for both chips in
- *            practice because GENI returns zeroes) the same four pins driven by hand
- *   panel    GPIO96=1 and GPIO68=0 means the FocalTech variant, anything else is Goodix.
- *            Same discriminator sm8350-kernel-OKX's fts_init_sysfs() uses.
- *   chip     Goodix: find the registers that hold the touch report, then poll them whenever
- *                    the IRQ line signals a new one
- *            FocalTech: whole different animal -- the chip comes up totally brain-dead and
- *                       won't do anything until the host uploads its ~114 KB firmware blob
- *                       into PRAM via the boot ROM every single power cycle. See the big
- *                       comment block above focaltech_probe() for the whole dance.
+ *            behind a GPIO
+ *   clocks   the serial engine's three clocks, by vote in the global clock controller
+ *   pins     four GPIOs to the serial engine, plus reset, interrupt and the analog supply switch
+ *   SPI      the serial engine ("GENI") in FIFO mode, polled; or, if the engine cannot be used,
+ *            the same four pins driven by hand
+ *   panel    GPIO96=1 and GPIO68=0 identify the FocalTech variant; everything else is Goodix,
+ *            the same discriminator the vendor sm8350-kernel-OKX uses
+ *   chip     Goodix: find where it keeps the touch report, then read it when the IRQ line signals;
+ *            FocalTech: read the report at register 0x01 with FTS 5.x SPI framing (cmd 0xC1 for
+ *            read, 0xC0 for write, two-byte CRC-16/Kermit)
+ * No interrupt is used: a thread looks at the interrupt line 125 times a second.
  *
- * No interrupt is wired up: a thread polls the INT line 125 times a second. Good enough for
- * finger input, saves us from writing an interrupt controller stub.
- *
- * References: Linux drivers/spi/spi-geni-qcom.c, drivers/soc/qcom/{qcom-geni-se,rpmh-rsc,
+ * Register layouts: Linux drivers/spi/spi-geni-qcom.c, drivers/soc/qcom/{qcom-geni-se,rpmh-rsc,
  * cmd-db}.c, drivers/clk/qcom/gcc-sc7280.c, drivers/pinctrl/qcom/pinctrl-sc7280.c,
- * drivers/input/touchscreen/{goodix_berlin_*,focaltech_3680/*}.c (OKX fork for the FTS bits),
- * and the phone's own device tree.
+ * drivers/input/touchscreen/{goodix_berlin_*,focaltech_touch/focaltech_core}.c, and the phone's
+ * own device tree.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -850,27 +843,16 @@ goodix_poll(void)
 /* ---- the FocalTech FT3680 chip --------------------------------------------------------------------- */
 
 /*
- * So here's the deal with FocalTech: unlike Goodix which just boots itself from its own flash
- * and gets to work, this chip comes up totally brain-dead with nothing but a boot ROM. The host
- * (us) has to shove the whole firmware blob (~114 KB) into the chip's PRAM over SPI every single
- * cold boot, THEN tell it to go run that code. Only after the chip has the firmware actually
- * executing can we read touch events out of it.
- *
- * The whole SPI framing is lifted verbatim from sm8350-kernel-OKX drivers/input/touchscreen/
- * focaltech_3680/focaltech_spi.c. Every transfer looks like this:
- *
- *   TX[0]        = register address (writebuf[0] / cmd[0])
- *   TX[1]        = ctrl byte: 0xA0 for read (with CRC check), 0x00 for write (no CRC)
- *   TX[2..3]     = data length, big-endian
- *   TX[4..6]     = three dummy bytes (SPI_DUMMY_BYTE), give the chip time to think
- *   TX[7..]      = write data (reads leave this blank so the chip can drive MISO here)
- *   TX[last-1..] = CRC-16/Kermit of the data bytes, LE (reads only; writes have no CRC)
- *
- * SPI_HEADER_LENGTH = 4 + SPI_DUMMY_BYTE = 7 bytes.
- *
- * Status byte lives at RX[3]: bit 7 = chip busy, bit 5 = CRC error, 0 means we're good.
- * If the data we read back is 0xEF with a valid CRC, the chip's firmware isn't running --
- * that's its "no app in memory, go upload firmware or shut up" NACK pattern.
+ * FTS 5.x SPI framing from sm8350-kernel-OKX drivers/input/touchscreen/focaltech_3680/
+ * focaltech_spi.c (verbatim):
+ *   TX[0] = register address (writebuf[0] / cmd[0])
+ *   TX[1] = FOCALTECH_READ_CTRL (0xA0 = READ_CMD, CRC_EN set) or FOCALTECH_WRITE_CTRL (0x00)
+ *   TX[2..3] = data length BE (for read: datalen; for write: writelen - 1)
+ *   TX[4..6] = three dummy bytes (SPI_DUMMY_BYTE)
+ *   TX[7..7+len-1] = write data (empty on read; chip drives MISO here)
+ *   TX[last-1..last] = CRC-16/Kermit of the data bytes, little-endian (only when READ_CMD or
+ *                     when a vendor WRITE op needs CRC; vendor WRITE_CMD = 0x00 has no CRC)
+ * SPI_HEADER_LENGTH = 4 + SPI_DUMMY_BYTE = 7.
  */
 #define FOCALTECH_READ_CTRL         0xa0		/* READ_CMD = 0x80 | DATA_CRC_EN(0x20) */
 #define FOCALTECH_WRITE_CTRL        0x00		/* WRITE_CMD, no CRC on TX */
@@ -883,9 +865,7 @@ goodix_poll(void)
 
 static uint8_t focaltech_tx[FOCALTECH_MAX_TRANSFER], focaltech_rx[FOCALTECH_MAX_TRANSFER];
 
-/* The chip's CRC flavor: Kermit (0x8408 poly reflected, init 0xffff). Byte-for-byte identical to
- * the vendor's rckit_crc16() so our math matches whatever the chip wants to see.
- */
+/* CRC-16/Kermit (polynomial 0x8408 reflected, initial 0xffff) -- same as vendor rckit_crc16(). */
 static uint16_t
 focaltech_crc(const uint8_t *data, uint32_t length)
 {
@@ -998,14 +978,10 @@ focaltech_write(uint8_t address, const uint8_t *data, uint32_t length)
 #include "redwood_focaltech_fw.h"
 
 /*
- * Knock on the chip's boot ROM door and ask who it is. The handshake is:
- *   1. framed write { 0x55, 0xAA } -- this is really a "write 0xAA to register 0x55", the
- *      magic combo FocalTech decided means "yo, pay attention, host is here"
- *   2. chill for 12 ms (FTS_CMD_START_DELAY) -- less and the chip isn't ready, more and it
- *      may have already auto-booted past this point
- *   3. framed read of 2 bytes from register 0x90 -- the boot ROM answers with its ID
- * For FT3680 the expected answer is { 0x56, 0x62 }. Anything else means the chip is either
- * running firmware already or hung somewhere we don't want to be.
+ * Vendor fts_read_bootid(): send { 0x55, 0xAA } as a 2-byte framed write (treated as a write of
+ * one data byte 0xAA to register 0x55), wait 12 ms, then do a framed read of 2 bytes at
+ * register 0x90. The chip answers with its ROM ID (0x56 0x62 for FT3680) if it is sitting in
+ * the boot ROM waiting for a firmware download.
  */
 static bool
 focaltech_read_boot_id(uint8_t *high, uint8_t *low)
@@ -1024,11 +1000,7 @@ focaltech_read_boot_id(uint8_t *high, uint8_t *low)
 	return ok;
 }
 
-/*
- * Poll the runtime chip-ID registers (0xA3 / 0x9F) until the firmware has had time to boot
- * and start answering with { 0x56, 0x62 }. Vendor's fts_wait_tp_to_valid gives up after 1 s;
- * we do the same: 5 attempts, 200 ms apart.
- */
+/* Vendor fts_wait_tp_to_valid: poll chip ID for up to TIMEOUT_READ_REG (1 s) at 200 ms steps. */
 static bool
 focaltech_wait_valid(uint8_t *high, uint8_t *low)
 {
@@ -1045,10 +1017,9 @@ focaltech_wait_valid(uint8_t *high, uint8_t *low)
 }
 
 /*
- * Reset-and-knock. The boot ROM has a tiny window after reset release where it listens --
- * blink and you miss it, which is why our old 200 ms wait never caught the chip in boot mode.
- * Vendor fts_get_ic_information tries 3 times with escalating settle delays (12, 20, 28 ms)
- * so we do the same. Returns true if we caught it: boot-ID register answers { 0x56, 0x62 }.
+ * Reset the chip and send 0x55/0xAA to put it in boot ROM, as vendor fts_get_ic_information
+ * does. Try up to 3 times with escalating settle delays (12, 20, 28 ms). Returns true if the
+ * chip is sitting in its boot ROM, with { 0x56, 0x62 } read back from the boot-ID register.
  */
 static bool
 focaltech_enter_boot_rom(void)
@@ -1071,19 +1042,9 @@ focaltech_enter_boot_rom(void)
 }
 
 /*
- * Here's the main event: shove the firmware blob into the chip's PRAM.
- *
- * The boot ROM can only speak this one tiny upload protocol -- SET_PRAM_ADDR (0xAD) tells it
- * where to write, then WRITE (0xAE) hands over the data. We chunk the 116 KB file into 32-byte
- * packets (FTS_FLASH_PACKET_LENGTH), so for FT3680 it's ~3640 packets per cold boot. Each
- * packet costs two framed writes = ~7280 SPI transactions. On bit-banged pins at full tilt
- * this takes ~700 ms wall time, which is honestly fine for a once-per-boot thing.
- *
- * No ECC check here (vendor does one afterwards via register 0xCC) -- our framed writes
- * already carry per-packet status that we validate inside focaltech_write(), and if any
- * packet actually corrupts, the firmware either fails to start or runtime ID stays wrong.
- * Either way we notice without the extra round-trip, and skipping the ECC pass saves another
- * ~100 ms. If the chip ever ships flaky, add it back.
+ * Download the embedded firmware (pramboot + application) into the chip's PRAM via the boot
+ * ROM's SPI_V2 upload protocol. Each 32-byte packet is sent as two framed writes: first set
+ * the PRAM destination address (SET_PRAM_ADDR + 3 BE address bytes), then WRITE + data bytes.
  */
 static bool
 focaltech_write_pram(const uint8_t *buf, uint32_t len)
@@ -1110,12 +1071,6 @@ focaltech_write_pram(const uint8_t *buf, uint32_t len)
 	return true;
 }
 
-/*
- * Tell the boot ROM to shut up and hand control over to the code we just uploaded. One byte
- * command (0x08), no payload. After this the chip starts executing from PRAM address 0 and
- * (if everything above went right) a few hundred ms later it's answering runtime register
- * reads like a normal functioning touchscreen.
- */
 static bool
 focaltech_start_app(void)
 {
@@ -1125,33 +1080,19 @@ focaltech_start_app(void)
 }
 
 /*
- * The whole dance, start to finish:
- *
- *   1. Maybe the chip is already running from a previous session (warm reboot, loader bounce,
- *      whatever) -- try reading runtime chip ID first, that's basically free. If it answers
- *      0x56 / 0x62, skip the upload entirely and get on with the touchscreen's actual job.
- *   2. Otherwise, hard reset and catch the chip in its boot ROM (the handshake window is
- *      narrow, see focaltech_enter_boot_rom).
- *   3. Blast the firmware blob into PRAM (focaltech_write_pram) and tell it to run
- *      (focaltech_start_app).
- *   4. Give the firmware 300 ms to actually come up and initialize whatever analog stuff it
- *      needs (sensor drive signals, calibration load, whatever), then poll runtime ID again.
- *
- * If any of this fails we log where and give up -- the caller falls back to Goodix probe path
- * which will also fail for a FocalTech board, and bring_up() prints "no touch screen" and the
- * driver thread just exits. iOS still boots thanks to the auto-unlock in inject_sb.c.
+ * Full chip bring-up: look for an already-running firmware; if none, reset to boot ROM and
+ * download the embedded firmware into PRAM; then start it and wait for runtime to come up.
  */
 static bool
 focaltech_probe(bool verbose)
 {
 	uint8_t high = 0, low = 0;
 
-	/* Step 1: maybe firmware is already running. */
+	/* Maybe firmware is already running (previous session, warm boot). */
 	if (focaltech_wait_valid(&high, &low)) {
 		return true;
 	}
 
-	/* Step 2: reset and catch the boot ROM. */
 	if (!focaltech_enter_boot_rom()) {
 		if (verbose) {
 			printf("focaltech: chip not in boot ROM; last read runtime %02x %02x\n", high, low);
@@ -1159,7 +1100,6 @@ focaltech_probe(bool verbose)
 		return false;
 	}
 
-	/* Step 3: upload firmware and start it. */
 	printf("focaltech: downloading %u bytes of firmware to PRAM...\n", FOCALTECH_FW_LENGTH);
 	if (!focaltech_write_pram(focaltech_fw, FOCALTECH_FW_LENGTH)) {
 		printf("focaltech: PRAM download failed\n");
@@ -1170,9 +1110,8 @@ focaltech_probe(bool verbose)
 		printf("focaltech: start-app command failed\n");
 		return false;
 	}
-	sleep_ms(300);			/* let the firmware spin up all its analog bits */
+	sleep_ms(300);			/* firmware needs time to initialize all peripherals */
 
-	/* Step 4: confirm firmware is up and answering. */
 	if (focaltech_wait_valid(&high, &low)) {
 		return true;
 	}
@@ -1185,29 +1124,20 @@ focaltech_probe(bool verbose)
 /* ---- FocalTech touch reports --------------------------------------------------------------------- */
 
 /*
- * Report layout for FT3680 (vendor focaltech_core.c, FTS_TOUCH_OFF_* offsets).
- *
- * The first two bytes are the header: a gesture byte (nonzero only when the chip is in
- * gesture mode, which we don't use) and a count byte that packs chip type in the upper
- * nibble and the number of fingers currently touching in the lower nibble.
- *
- * After that, each finger slot is six bytes:
- *
- *   [0] E_XH:  [7:6] event   (0 = finger down, 1 = finger up, 2 = still touching aka contact)
- *              [3:0] x bits 14..11
- *   [1] XL:    x bits 10..3
- *   [2] ID_YH: [7:4] finger id (0..9), [3:0] y bits 14..11
- *   [3] YL:    y bits 10..3
- *   [4] PRE:   [7:5] x bits 2..0, [4:2] y bits 2..0   (yes, both axes borrow bits from the
- *                                                      pressure byte -- the chip gives us
- *                                                      "super-high resolution" sub-pixel coords
- *                                                      and this is where the extra precision
- *                                                      lives)
- *   [5] AREA:  touch area / major axis (we don't use it)
- *
- * X and Y are 15-bit sub-pixel values. The physical panel is 1080 x 2400 but the chip reports
- * in 10x finer units -- 10800 x 24000 (same as Goodix on this same panel). We then rescale to
- * 0..65535 before shipping to iOS via /dev/redwood-touch.
+ * Per-chip report layout for FT3680 (vendor focaltech_core.c, FTS_TOUCH_OFF_* offsets):
+ *   report[0] = gesture (0 outside gesture mode)
+ *   report[1] = (chip_type << 4) | finger_count
+ *   report[2 + 6*i + 0] = E_XH:  bits 7..6 = event (0 = down, 1 = up, 2 = contact)
+ *                                bits 3..0 = x bits 14..11
+ *   report[2 + 6*i + 1] = XL:    x bits 10..3
+ *   report[2 + 6*i + 2] = ID_YH: bits 7..4 = finger id, bits 3..0 = y bits 14..11
+ *   report[2 + 6*i + 3] = YL:    y bits 10..3
+ *   report[2 + 6*i + 4] = PRE:   bits 7..5 = x bits 2..0, bits 4..2 = y bits 2..0
+ *                                (also the pressure byte -- the lowest bits of each 15-bit axis
+ *                                 are packed in with it)
+ *   report[2 + 6*i + 5] = AREA:  touch area / major
+ * Coordinates are 15-bit "super-high resolution" sub-pixel values; the touch panel's actual
+ * extent is reported through the device tree as x_max/y_max (10800 x 24000 for redwood).
  */
 #define FOCALTECH_EVENT_DOWN        0
 #define FOCALTECH_EVENT_UP          1
@@ -1313,19 +1243,7 @@ focaltech_poll(void)
 	focaltech_report(report);
 }
 
-/*
- * Which touch chip is physically on this particular board. Xiaomi ships redwood with two
- * different touch controllers depending on which panel the factory happened to grab -- Goodix
- * GT9916 or FocalTech FT3680. They're on the same SPI pins but speak totally different
- * protocols, so we need to figure out which one before doing anything else.
- *
- * The vendor's sm8350-kernel-OKX uses two GPIO straps to tell them apart:
- *   GPIO96 reads high AND GPIO68 reads low  -->  FocalTech
- *   anything else                           -->  Goodix
- *
- * These pins are tied to specific pads on the panel connector and set by the panel itself, so
- * reading them tells us what's actually plugged in. We just copy the vendor's discriminator.
- */
+/* Which touch chip is on this board. */
 enum touch_chip { TOUCH_GOODIX, TOUCH_FOCALTECH };
 static enum touch_chip touch_chip;
 
@@ -1339,9 +1257,6 @@ touch_chip_detect(void)
 	}
 	return TOUCH_GOODIX;
 }
-
-/* The two per-chip dispatchers below just hand off to goodix_* or focaltech_* based on what
- * touch_chip_detect() figured out. Keeps bring_up() clean of per-vendor if-else noise. */
 
 static bool
 chip_probe(bool verbose)

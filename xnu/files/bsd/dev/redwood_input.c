@@ -171,6 +171,7 @@ redwood_input_init(void)
 	redwood_virtio_input_init();
 	redwood_goodix_init();
 	redwood_buttons_init();
+	redwood_battery_init();
 	redwood_net_init();
 	redwood_adreno_init();
 	redwood_wifi_init();

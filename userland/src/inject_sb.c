@@ -145,6 +145,59 @@ snapshot_output_format(__unused id self, __unused SEL selector, id snapshot)
 	return SNAPSHOT_FORMAT_PNG;
 }
 
+/* ---- real battery level from the PM7250B fuel gauge ---------------------------------------------- */
+
+/*
+ * iOS reads battery level through UIDevice.batteryLevel and UIDevice.batteryState; SpringBoard's
+ * status bar reads it the same way via SBBatteryController. There is no IOPMPowerSource kernel
+ * driver yet (that is the right long-term fix; see redwood_battery.c for the register work), so
+ * we hook the UIDevice accessors to return what the kernel's SPMI poller found, which it stores
+ * in kern.redwood.battery_soc (0..100) and kern.redwood.battery_current_ma (negative = charging).
+ * When the sysctl is missing (battery=1 not in boot-args, or the driver never started) we hand
+ * back the value the real implementation computed; the status bar then shows whatever iOS last
+ * knew, which is better than crashing.
+ */
+static float (*original_battery_level)(id self, SEL sel);
+static long  (*original_battery_state)(id self, SEL sel);
+
+static int
+sysctl_int(const char *name)
+{
+	int value = -1;
+	size_t size = sizeof(value);
+
+	sysctlbyname(name, &value, &size, NULL, 0);
+	return value;
+}
+
+/* UIDevice.batteryLevel: 0.0..1.0; -1.0 if monitoring not enabled */
+static float
+battery_level(id self, SEL sel)
+{
+	int soc = sysctl_int("kern.redwood.battery_soc");
+
+	if (soc < 0 || soc > 100) {
+		return original_battery_level ? original_battery_level(self, sel) : -1.0f;
+	}
+	return (float)soc / 100.0f;
+}
+
+/* UIDevice.batteryState: 0=unknown 1=unplugged 2=charging 3=full */
+static long
+battery_state(id self, SEL sel)
+{
+	int ma = sysctl_int("kern.redwood.battery_current_ma");
+	int soc = sysctl_int("kern.redwood.battery_soc");
+
+	if (ma == -1 && soc == -1) {
+		return original_battery_state ? original_battery_state(self, sel) : 0;
+	}
+	if (ma < -50) {		/* negative current = charging */
+		return soc >= 99 ? 3 : 2;
+	}
+	return 1;
+}
+
 /* ---- the lock screen's clock without a GPU ------------------------------------------------------- */
 
 #define REDWOOD_GL "/redwood/lib/libredwood-gl.dylib"
@@ -436,7 +489,7 @@ redwood_springboard_init(void)
 {
 	const char *name = getprogname();
 	size_t length = 0;
-	IMP activation, snapshot_format;
+	IMP activation, snapshot_format, battery_lvl, battery_st;
 	int token;
 
 	if (name == NULL || strcmp(name, "SpringBoard") != 0) {
@@ -451,9 +504,20 @@ redwood_springboard_init(void)
 	plain_vibrancy();
 	original_lock_long_press = (void (*)(id, SEL, id))replace_method("SBLockHardwareButton", "longPress:", 0x1c4f6ab44UL,
 	    (IMP)lock_long_press);
-	say("redwood: SpringBoard: activation %s, setup assistant %s, application snapshots %s, the side button's long press %s\n",
+	/*
+	 * Battery hooks on UIDevice: these are the methods every app and SpringBoard itself calls, so
+	 * hooking them here in the SpringBoard process covers both the status bar and any app that
+	 * reads [UIDevice currentDevice].batteryLevel. The addresses are for iOS 16.5 (20F66).
+	 */
+	original_battery_level = (float (*)(id, SEL))replace_method("UIDevice", "batteryLevel", 0x1aa038b5cUL, (IMP)battery_level);
+	original_battery_state = (long (*)(id, SEL))replace_method("UIDevice", "batteryState", 0x1aa038b90UL, (IMP)battery_state);
+	battery_lvl = (IMP)original_battery_level;
+	battery_st  = (IMP)original_battery_state;
+	say("redwood: SpringBoard: activation %s, setup assistant %s, application snapshots %s, the side button's long press %s, "
+	    "battery level %s, battery state %s\n",
 	    activation ? "answered here" : "NOT replaced", original_set_setup_required_reason ? "refused" : "NOT replaced",
-	    snapshot_format ? "as JPEG" : "NOT changed", original_lock_long_press ? "checked" : "NOT checked");
+	    snapshot_format ? "as JPEG" : "NOT changed", original_lock_long_press ? "checked" : "NOT checked",
+	    battery_lvl ? "from QG" : "NOT replaced", battery_st ? "from QG" : "NOT replaced");
 	{
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
@@ -464,6 +528,21 @@ redwood_springboard_init(void)
 			usleep((useconds_t)(atof(delay + 9) * 1e6));
 		}
 	}
+	/*
+	 * UIDevice won't call batteryLevel/batteryState unless monitoring is enabled. Flip it on once
+	 * SpringBoard's run loop is running (the dispatch_after fires on the main queue, which means
+	 * we are past UIApplication startup).
+	 */
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		Class uidev = objc_getClass("UIDevice");
+		SEL current = sel_registerName("currentDevice");
+		SEL monitoring = sel_registerName("setBatteryMonitoringEnabled:");
+		id device = uidev ? ((id (*)(Class, SEL))objc_msgSend)(uidev, current) : nil;
+
+		if (device && class_getInstanceMethod(object_getClass(device), monitoring)) {
+			((void (*)(id, SEL, BOOL))objc_msgSend)(device, monitoring, YES);
+		}
+	});
 	notify_register_dispatch("com.redwood.unlock", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		unlock();
 	});

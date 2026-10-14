@@ -46,10 +46,10 @@ index 222158a93918..68bb0f3e56bf 100755
  ######################################################################
  # HISTORY
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..4ca9899feb85 100644
+index 44274016a4cf..fb5e9cb8a444 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,20 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,21 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -57,6 +57,7 @@ index 44274016a4cf..4ca9899feb85 100644
 +bsd/dev/redwood_virtio_input.c	standard
 +bsd/dev/redwood_goodix.c	standard
 +bsd/dev/redwood_buttons.c	standard
++bsd/dev/redwood_battery.c	standard
 +bsd/dev/redwood_net.c		standard
 +bsd/dev/redwood_virtio_net.c	standard
 +bsd/dev/redwood_apple80211.c	standard
@@ -70,7 +71,7 @@ index 44274016a4cf..4ca9899feb85 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +169,10 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +170,10 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -81,7 +82,7 @@ index 44274016a4cf..4ca9899feb85 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +379,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +380,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -89,7 +90,7 @@ index 44274016a4cf..4ca9899feb85 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +402,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +403,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -2530,3 +2531,23 @@ index 97028c06bb92..0daad830d0c0 100644
  	uio_t auio;
  	int error;
  
+diff --git a/tools/lldbmacros/core/syntax_checker.py b/tools/lldbmacros/core/syntax_checker.py
+index 3ebc295117a3..de101eafc83b 100755
+--- a/tools/lldbmacros/core/syntax_checker.py
++++ b/tools/lldbmacros/core/syntax_checker.py
+@@ -12,10 +12,13 @@ Usage:
+ """
+ import sys
+ import os
++# When this file is executed directly, its directory is first on sys.path.
++# That directory contains collections.py, which shadows Python's standard
++# library collections module while importing re on Python 3.14 and newer.
++_script_dir = os.path.dirname(os.path.abspath(__file__))
++sys.path = [p for p in sys.path if os.path.abspath(p or os.curdir) != _script_dir]
+ import re
+-
+ tabs_search_rex = re.compile("^\s*\t+",re.MULTILINE|re.DOTALL)
+-
+ def find_non_ascii(s):
+     for c in s:
+         if ord(c) >= 0x80: return True
