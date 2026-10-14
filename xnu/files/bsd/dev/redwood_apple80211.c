@@ -292,29 +292,27 @@ get(struct apple80211req *request)
 	int error = 0;
 
 	switch (request->req_type) {
-	case 43: {                              /* the driver's name: a version, a length, the text */
-		static const char name[] = "redwood: ath11k for the WCN6750";
-		struct {
-			uint32_t version;
-			uint16_t length;
-			char text[256];
-		} __attribute__((packed)) answer = { .version = 1, .length = sizeof(name) - 1 };
+	case 43:
+	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
+		static const char name[256] = "redwood: ath11k for the WCN6750";
 
-		memcpy(answer.text, name, sizeof(name));
-		return give(request, &answer, sizeof(answer));
+		return give(request, name, sizeof(name));
 	}
-	case 12: {                              /* what the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*) */
-		struct {
-			uint32_t version;
-			uint8_t bits[9];
-		} __attribute__((packed)) answer = { .version = 1 };
-		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };    /* AES, AES-CCM, power management, short slot
-			                                                         * and preamble, WPA2, WME, short guard at 20 MHz */
+	case 12: {
+		/*
+		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): the 13 bytes are the
+		 * bits alone, from the first (the framework hands in a buffer that begins after the old
+		 * header's version word). AES, AES-CCM, power management, short slot and preamble, WPA2, WME,
+		 * short guard interval at 20 MHz. Read wrong, the framework sees no WPA2 and builds no join
+		 * for a WPA2 network ("Unable to join").
+		 */
+		uint8_t bits[13] = { 0 };
+		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
 
 		for (unsigned i = 0; i < sizeof(has); i++) {
-			answer.bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
+			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
 		}
-		return give(request, &answer, sizeof(answer));
+		return give(request, bits, sizeof(bits));
 	}
 	case 19: {                              /* the radio's power: one radio. Until the driver is up it counts as on: it */
 		struct {                        /* is being brought up, and iOS asks this once, early */
@@ -696,6 +694,12 @@ note(const struct apple80211req *request, bool is_set, int error)
 void
 redwood_apple80211_summary(void)
 {
+	static bool said;
+
+	if (said) {
+		return;
+	}
+	said = true;
 	for (unsigned i = 0; i < kind_count; i++) {
 		printf("apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
 		    type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error == 0 ? "\n" : "");
