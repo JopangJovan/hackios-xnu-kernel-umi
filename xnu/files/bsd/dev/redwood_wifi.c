@@ -128,6 +128,7 @@
  *                      else until the steps are over (wifi_hold=S: S seconds longer)
  *   wifi_station=1     with wifi_lx=2: the driver stays up and its station is the kernel's to
  *                      ask (sys/redwood_sta.h); nothing is joined by the driver itself
+ *   wifi_file=0        with wifi=1: the network of fw/network is not joined at the start
  *   wifi_lx_step=MS    the driver's start says each stub it comes to and waits MS there: for
  *                      a run that ends without a word (follow it with XL_FOLLOW=2)
  *   wifi_lx=1          step 15 is ath11k's own instead of the stand-in (redwood_lx.c), with
@@ -4099,10 +4100,15 @@ join_given(uint64_t began)
 	struct redwood_sta_state *state;
 	unsigned name_length = sizeof(what.ssid), passphrase_length = sizeof(what.passphrase);
 	uint64_t size = 0;
+	uint32_t given = 1;
 	int error;
 
 	if (image_file("network", &size) == NULL) {
 		tell("wifi: no network to join was given (fw-wifi/network, see the README): the radio waits to be asked\n");
+		return;
+	}
+	if (PE_parse_boot_argn("wifi_file", &given, sizeof(given)) && given == 0) {
+		tell("wifi: the network of the file is not joined at the start (wifi_file=0): the radio waits to be asked\n");
 		return;
 	}
 	bzero(&what, sizeof(what));
@@ -4113,7 +4119,7 @@ join_given(uint64_t began)
 	what.ssid_length = (uint8_t)name_length;
 	what.passphrase_length = (uint8_t)passphrase_length;
 	what.security = REDWOOD_STA_WPA2_PSK;
-	error = redwood_sta_ask_join(&what);
+	error = redwood_sta_ask_join_standing(&what);
 	bzero(&what, sizeof(what));
 	for (unsigned waited = 0; error == 0 && redwood_sta_busy() && waited < 300; waited++) {
 		sleep_ms(100);

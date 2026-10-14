@@ -22,7 +22,14 @@
  * The request types and the layouts are Apple's. The old ones are as the headers of its open
  * IO80211 sources once described them (apple80211_ioctl.h, apple80211_var.h); where iOS 16.5
  * differs the layout was read out of IO80211.framework of 16.5, which fills and reads the same
- * structures on the other side (Apple80211GetWithIOCTL, _getScanData, _addScanResultToList).
+ * structures on the other side (Apple80211GetWithIOCTL, _getScanData, _addScanResultToList,
+ * _performAssociation, _dispatchAsyncAssocEvent, _dispatchLinkChangedEvent).
+ *
+ * A join: ASSOCIATE (20) carries the network's name, perhaps its access point, and the
+ * passphrase as typed (the framework does not make the key of it), and is answered at once;
+ * when the station has joined or failed, event 9 says so, and ASSOCIATE_RESULT (21) gives the
+ * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
+ * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
  */
 #include <kern/kalloc.h>
 #include <kern/locks.h>
@@ -143,6 +150,37 @@ struct apple80211_scan_result {
 	uint8_t elements[1024];
 };
 
+/* ASSOCIATE (20): 592 bytes; of what follows the key (the RSN element wifid built, flags) nothing is used */
+struct apple80211_assoc {
+	uint32_t version;
+	uint16_t mode, auth_lower, auth_upper, unused_0;
+	uint32_t ssid_length;
+	uint8_t ssid[32];
+	uint8_t bssid[6], unused_1[2];
+	uint32_t key_version, key_length, key_cipher;   /* cipher 10: a passphrase as typed; 6: the key (from 64 hex digits) */
+	uint16_t key_flags, key_index;
+	uint8_t key[64];
+	uint8_t rest[0x250 - 0x88];
+};
+
+#define CIPHER_PMK              6
+#define CIPHER_PASSPHRASE       10
+
+/* the link event's data (at least 32 bytes, or the framework drops the event) */
+struct apple80211_link_changed {
+	uint8_t down, unused_0[3];
+	int32_t rssi;
+	uint16_t snr, noise;
+	uint8_t unused_1[4];
+	uint8_t involuntary, unused_2[3];
+	uint32_t reason, subreason;
+	uint8_t unused_3[4];
+};
+
+_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
+    "the association request as iOS 16.5 has it");
+_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
+    "the link event as iOS 16.5 reads it");
 _Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
 _Static_assert(sizeof(struct apple80211_channels_info) == 10016 && offsetof(struct apple80211_channels_info, number) == 0x32e &&
     offsetof(struct apple80211_channels_info, flags) == 0x12d0, "the channels' description as iOS 16.5 has it");
@@ -162,6 +200,7 @@ static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes 
 static LCK_GRP_DECLARE(apple80211_lock_group, "redwood-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
@@ -327,6 +366,11 @@ get(struct apple80211req *request)
 		kfree_data(answer, sizeof(*answer));
 		return error;
 	}
+	case 21:                                /* how the last join went (0: not over yet) */
+		lck_mtx_lock(&apple80211_lock);
+		request->req_val = (int32_t)join_result;
+		lck_mtx_unlock(&apple80211_lock);
+		return 0;
 	case 11: {                              /* what the last scan heard, one access point a request; EIO: that was all */
 		struct redwood_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
 		unsigned index;
@@ -394,6 +438,14 @@ get(struct apple80211req *request)
 	case 103:                               /* all of it, as a scan's result */
 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
 		break;
+	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
+		struct {
+			uint32_t version, lower, upper, extended;
+		} answer = { .version = 1, .lower = 1, .upper = 8 };
+
+		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
 	default:
 		error = EOPNOTSUPP;
 		break;
@@ -462,9 +514,69 @@ out:
 }
 
 static int
+set_join(const struct apple80211req *request, char *said, size_t said_size)
+{
+	struct apple80211_assoc *asked;
+	struct redwood_sta_join *what;
+	int error;
+
+	if (request->req_len < offsetof(struct apple80211_assoc, rest)) {
+		return EINVAL;
+	}
+	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
+	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
+	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
+		error = asked == NULL || what == NULL ? ENOMEM : error;
+		goto out;
+	}
+	/* (lengths and kinds only: the name, the access point and the key stay out of the log) */
+	snprintf(said, said_size, " (a join: a name of %u bytes, %s access point, authentication %#x/%#x, a key of %u bytes of kind %u)",
+	    asked->ssid_length, asked->bssid[0] | asked->bssid[1] | asked->bssid[2] | asked->bssid[3] | asked->bssid[4] |
+	    asked->bssid[5] ? "a given" : "any", asked->auth_lower, asked->auth_upper, asked->key_length, asked->key_cipher);
+	if (asked->ssid_length == 0 || asked->ssid_length > sizeof(what->ssid)) {
+		error = EINVAL;
+		goto out;
+	}
+	what->ssid_length = (uint8_t)asked->ssid_length;
+	memcpy(what->ssid, asked->ssid, asked->ssid_length);
+	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
+	if (asked->key_length == 0) {
+		what->security = REDWOOD_STA_OPEN;
+	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8 && asked->key_length <= 63) {
+		what->security = REDWOOD_STA_WPA2_PSK;
+		what->passphrase_length = (uint8_t)asked->key_length;
+		memcpy(what->passphrase, asked->key, asked->key_length);
+	} else if (asked->key_cipher == CIPHER_PMK && asked->key_length == sizeof(what->pmk)) {
+		what->security = REDWOOD_STA_WPA2_PSK;
+		memcpy(what->pmk, asked->key, sizeof(what->pmk));
+	} else {
+		error = EINVAL;
+		goto out;
+	}
+	lck_mtx_lock(&apple80211_lock);
+	join_result = 0;
+	lck_mtx_unlock(&apple80211_lock);
+	error = redwood_sta_ask_join(what);
+out:
+	if (asked != NULL) {
+		memset_s(asked, sizeof(*asked), 0, sizeof(*asked));
+		kfree_data(asked, sizeof(*asked));
+	}
+	if (what != NULL) {
+		memset_s(what, sizeof(*what), 0, sizeof(*what));
+		kfree_data(what, sizeof(*what));
+	}
+	return error;
+}
+
+static int
 set(const struct apple80211req *request, char *said, size_t said_size)
 {
 	switch (request->req_type) {
+	case 20:
+		return set_join(request, said, said_size);
+	case 22:                                /* leave the network */
+		return redwood_sta_ask_leave();
 	case 19: {                              /* the radio's power */
 		struct {
 			uint32_t version, radios, state[4];
@@ -525,12 +637,26 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
 		post(EVENT_SCAN_DONE, NULL, 0);
 		break;
 	case REDWOOD_STA_JOIN_DONE:
+		lck_mtx_lock(&apple80211_lock);
+		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
+		lck_mtx_unlock(&apple80211_lock);
+		post(EVENT_ASSOC_DONE, NULL, 0);
 		break;
-	case REDWOOD_STA_LINK:
+	case REDWOOD_STA_LINK: {
+		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
+			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
+		struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+
+		if (state != NULL) {
+			redwood_sta_state(state);
+			link.rssi = status == 1 ? state->bss.rssi : 0;
+			kfree_data(state, sizeof(*state));
+		}
 		post(EVENT_SSID_CHANGED, NULL, 0);
 		post(EVENT_BSSID_CHANGED, NULL, 0);
-		post(EVENT_LINK_CHANGED, NULL, 0);
+		post(EVENT_LINK_CHANGED, &link, sizeof(link));
 		break;
+	}
 	}
 }
 

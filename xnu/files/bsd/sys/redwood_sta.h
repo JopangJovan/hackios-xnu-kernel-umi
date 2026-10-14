@@ -89,7 +89,8 @@ enum redwood_sta_event {
 	REDWOOD_STA_POWER,                      /* status: 1 on, 0 off */
 	REDWOOD_STA_SCAN_DONE,                  /* status: 0, or the scan's errno */
 	REDWOOD_STA_JOIN_DONE,                  /* status: 0, or the join's errno */
-	REDWOOD_STA_LINK,                       /* status: 1 a network is joined, 0 it has been left or lost */
+	REDWOOD_STA_LINK,                       /* status: 1 a network is joined, 0 it has been left when asked,
+	                                         * an errno: it was lost (the access point showed us the door) */
 };
 
 #ifdef KERNEL
@@ -102,6 +103,8 @@ bool     redwood_sta_present(void);
 int      redwood_sta_ask_power(bool on);
 int      redwood_sta_ask_scan(const struct redwood_sta_scan *what);
 int      redwood_sta_ask_join(const struct redwood_sta_join *what);
+/* ... and joined again whenever the radio is turned on, until some other network is asked for */
+int      redwood_sta_ask_join_standing(const struct redwood_sta_join *what);
 int      redwood_sta_ask_leave(void);
 bool     redwood_sta_busy(void);                                        /* something asked for is not over yet */
 bool     redwood_sta_powered(void);

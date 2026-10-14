@@ -11,6 +11,11 @@
  *
  * What the last scan heard is kept here, so that it can be read without entering the station
  * side, and so is the list of channels.
+ *
+ * The network the kernel was given in a file is a standing request: joined at the start, and
+ * again whenever the radio is turned back on (Settings' switch), until somebody asks for
+ * another network -- as iOS itself rejoins the networks it knows. If that other network cannot
+ * be joined (a wrong passphrase), the standing one is joined again.
  */
 #include <kern/kalloc.h>
 #include <kern/locks.h>
@@ -41,6 +46,8 @@ static bool sta_on;                             /* the radio's power, as last as
 static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
 static struct redwood_sta_scan asked_scan_what;
 static struct redwood_sta_join asked_join_what;
+static struct redwood_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
+static struct redwood_sta_join fallback;        /* ... as it was before a join that has not come through yet */
 
 static struct redwood_sta_bss *heard;           /* by the last scan that came to an end */
 static unsigned heard_count;
@@ -96,8 +103,25 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 		lck_mtx_unlock(&sta_lock);
 
 		if (power) {
+			struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+			bool was_joined = false;
+
+			if (state != NULL) {
+				ops->state(state);
+				was_joined = state->phase == REDWOOD_STA_JOINED;
+				kfree_data(state, sizeof(*state));
+			}
 			error = ops->power(power_on);
+			if (!power_on && was_joined) {
+				redwood_apple80211_event(REDWOOD_STA_LINK, 0);
+			}
 			redwood_apple80211_event(REDWOOD_STA_POWER, error == 0 ? power_on : !power_on);
+			lck_mtx_lock(&sta_lock);
+			if (error == 0 && power_on && standing.ssid_length != 0 && !asked_join) {
+				asked_join_what = standing;
+				asked_join = true;
+			}
+			lck_mtx_unlock(&sta_lock);
 		} else if (leave) {
 			ops->leave();
 			redwood_apple80211_event(REDWOOD_STA_LINK, 0);
@@ -108,6 +132,14 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			if (error == 0) {
 				redwood_apple80211_event(REDWOOD_STA_LINK, 1);
 			}
+			/* a join that did not come through (a wrong passphrase) leaves things as they were: the standing network again */
+			lck_mtx_lock(&sta_lock);
+			if (error != 0 && fallback.ssid_length != 0 && !asked_join && !asked_leave && !asked_power) {
+				standing = asked_join_what = fallback;
+				asked_join = true;
+			}
+			bzero(&fallback, sizeof(fallback));
+			lck_mtx_unlock(&sta_lock);
 		} else if (do_scan) {
 			error = ops->scan(&scan);
 			lck_mtx_lock(&sta_lock);
@@ -168,9 +200,9 @@ redwood_sta_attach(const struct redwood_sta_ops *ops)
 }
 
 void
-redwood_sta_lost(__unused int error)
+redwood_sta_lost(int error)
 {
-	redwood_apple80211_event(REDWOOD_STA_LINK, 0);
+	redwood_apple80211_event(REDWOOD_STA_LINK, error != 0 ? error : ECONNRESET);
 }
 
 /* ---- who wants a network ------------------------------------------------------------------------------- */
@@ -233,6 +265,19 @@ redwood_sta_ask_scan(const struct redwood_sta_scan *what)
 }
 
 int
+redwood_sta_ask_join_standing(const struct redwood_sta_join *what)
+{
+	int error = redwood_sta_ask_join(what);
+
+	lck_mtx_lock(&sta_lock);
+	if (error == 0) {
+		standing = *what;
+	}
+	lck_mtx_unlock(&sta_lock);
+	return error;
+}
+
+int
 redwood_sta_ask_join(const struct redwood_sta_join *what)
 {
 	lck_mtx_lock(&sta_lock);
@@ -240,6 +285,10 @@ redwood_sta_ask_join(const struct redwood_sta_join *what)
 		lck_mtx_unlock(&sta_lock);
 		return sta_ops == NULL ? ENXIO : ENETDOWN;
 	}
+	if (standing.ssid_length != 0) {
+		fallback = standing;
+	}
+	bzero(&standing, sizeof(standing));     /* (whoever asks for a network now has the say) */
 	asked_join_what = *what;
 	asked_join = true;
 	asked_leave = false;
@@ -259,6 +308,7 @@ redwood_sta_ask_leave(void)
 	asked_leave = true;
 	asked_join = false;
 	bzero(&asked_join_what, sizeof(asked_join_what));
+	bzero(&fallback, sizeof(fallback));
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
 	return 0;

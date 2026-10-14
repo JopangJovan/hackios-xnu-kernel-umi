@@ -32,7 +32,7 @@
 #include <sys/sockio.h>
 #include <sys/systm.h>
 
-extern void RedwoodWLANStart(const char *interface);    /* iokit/Kernel/RedwoodWLAN.cpp */
+extern void RedwoodWLANStart(const char *interface, const uint8_t *address);  /* iokit/Kernel/RedwoodWLAN.cpp */
 
 static LCK_GRP_DECLARE(net_lck_grp, "redwood-net");
 static LCK_MTX_DECLARE(net_tx_lock, &net_lck_grp);
@@ -357,7 +357,7 @@ redwood_net_attach(const struct redwood_net_link *link)
 	if (link->wireless) {
 		/* (a radio's address is the phone's own: not for the log; and iOS's Wi-Fi side finds the interface by a service) */
 		printf("net: en0 attached on %s (a radio), link %s\n", link->name, net_link_up ? "up" : "down");
-		RedwoodWLANStart("en0");
+		RedwoodWLANStart("en0", address);
 	} else {
 		printf("net: en0 attached on %s, address %02x:%02x:%02x:%02x:%02x:%02x, link %s\n", link->name, address[0],
 		    address[1], address[2], address[3], address[4], address[5], net_link_up ? "up" : "down");
