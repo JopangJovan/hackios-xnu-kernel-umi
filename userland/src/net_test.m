@@ -18,9 +18,16 @@
  *   wifi                  what the job com.redwood.wifi runs in every image: if the kernel was
  *                         started with wifi=1, wait for the radio's interface (en0) to appear
  *                         and ask for it to be configured by DHCP ("dhcp en0"); else nothing
+ *   wrongjoin             ask the radio to join the network it is on with a passphrase that is
+ *                         wrong on purpose, through the request wifid uses (Apple80211's
+ *                         ASSOCIATE), and say what the kernel answers: Apple80211's result number
+ *                         (21: a wrong passphrase) and how long it took. The network's name is
+ *                         the kernel's (its SSID request) and is not printed.
  *
- * The interface (en0, bsd/dev/redwood_net.c) has no IOKit object behind it, and configd makes
- * its network services out of those. But the plugin that does the configuring keeps its own list
+ * The interface QEMU's network gives (en0, bsd/dev/redwood_net.c) has no IOKit object behind it,
+ * and configd makes its network services out of those. (The phone's radio has one now:
+ * iokit/Kernel/RedwoodWLAN.cpp, and configd makes a "Wi-Fi" service of it by itself.) But the
+ * plugin that does the configuring keeps its own list
  * of interfaces, straight from the kernel, and has a Mach interface of its own, the one the
  * "ipconfig" command of macOS uses ("ipconfig set en0 DHCP"; the command itself is not part of
  * iOS). "dhcp" is one of its calls: the plugin makes a service for the interface that exists in
@@ -33,6 +40,7 @@
 #import <Foundation/Foundation.h>
 #include <SystemConfiguration/SCNetworkReachability.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <ifaddrs.h>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -44,6 +52,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -341,10 +350,9 @@ reach(const char *name)
 }
 
 /*
- * The radio's interface is made by the kernel when its driver is up, a quarter of a minute into
- * the system's start, and nothing in iOS configures an interface that has no IOKit object: with
- * wifi=1 among the kernel's arguments this waits for en0 and makes the one call that does. From
- * then on configd's own machinery has it: DHCP when the link comes up, again when it comes back.
+ * With wifi=1 among the kernel's arguments: wait for en0 and ask for DHCP on it. Since the radio's
+ * interface has its IOKit objects configd configures it by itself and this call finds a service
+ * there already; it stays for kernels without them.
  */
 static void
 wifi(void)
@@ -372,6 +380,83 @@ wifi(void)
 	}
 	printf("net_test: wifi: en0 is there after %.1f s\n", seconds() - start);
 	dhcp("en0");
+}
+
+/* ---- wrongjoin --------------------------------------------------------------------------------------- */
+
+struct apple80211req {
+	char name[16];
+	int32_t type, value;
+	uint32_t length;
+	void *data __attribute__((aligned(8)));
+};
+
+#define SIOCSA80211     0x802869c8u
+#define SIOCGA80211     0xc02869c9u
+
+static void
+wrongjoin(void)
+{
+	static const char wrong[] = "not-the-passphrase-0";     /* (a passphrase nobody has: the test is that it fails) */
+	uint8_t ssid[32], assoc[592];
+	struct apple80211req request = { .name = "en0" };
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	double start;
+	uint32_t length;
+
+	request.type = 1;
+	request.length = sizeof(ssid);
+	request.data = ssid;
+	if (s < 0 || ioctl(s, SIOCGA80211, &request) != 0 || request.length == 0 || request.length > sizeof(ssid)) {
+		printf("net_test: wrongjoin: no network is joined (or no radio): nothing to try\n");
+		if (s >= 0) {
+			close(s);
+		}
+		return;
+	}
+	length = request.length;
+	/* the layout of iOS 16.5 (bsd/dev/redwood_apple80211.c of the kernel): version, mode, authentication lower and
+	 * upper, the name's length and the name, the access point (none: any), the key's version, length and kind (10:
+	 * a passphrase as typed), the key */
+	memset(assoc, 0, sizeof(assoc));
+	*(uint32_t *)(assoc + 0x00) = 1;
+	*(uint16_t *)(assoc + 0x04) = 1;
+	*(uint16_t *)(assoc + 0x06) = 1;
+	*(uint16_t *)(assoc + 0x08) = 8;
+	*(uint32_t *)(assoc + 0x0c) = length;
+	memcpy(assoc + 0x10, ssid, length);
+	*(uint32_t *)(assoc + 0x38) = 1;
+	*(uint32_t *)(assoc + 0x3c) = sizeof(wrong) - 1;
+	*(uint32_t *)(assoc + 0x40) = 10;
+	memcpy(assoc + 0x48, wrong, sizeof(wrong) - 1);
+	memset(&request, 0, sizeof(request));
+	strlcpy(request.name, "en0", sizeof(request.name));
+	request.type = 20;
+	request.length = sizeof(assoc);
+	request.data = assoc;
+	start = seconds();
+	if (ioctl(s, SIOCSA80211, &request) != 0) {
+		printf("net_test: wrongjoin: the kernel refuses the request: %s\n", strerror(errno));
+		close(s);
+		return;
+	}
+	printf("net_test: wrongjoin: a join with a wrong passphrase is asked for (a name of %u bytes)\n", length);
+	for (;;) {
+		memset(&request, 0, sizeof(request));
+		strlcpy(request.name, "en0", sizeof(request.name));
+		request.type = 21;
+		if (ioctl(s, SIOCGA80211, &request) != 0) {
+			printf("net_test: wrongjoin: the result cannot be asked for: %s\n", strerror(errno));
+			break;
+		}
+		if (request.value != 0 || seconds() - start > 60) {
+			printf("net_test: wrongjoin: the result is %d after %.1f s%s\n", request.value, seconds() - start, request.value == 21 ?
+			    " (Apple80211's \"invalid PMK\": a wrong passphrase)" : request.value == 0 ? " (NOT OVER)" : "");
+			break;
+		}
+		usleep(200000);
+	}
+	close(s);
 }
 
 int
@@ -411,6 +496,8 @@ main(int argc, char **argv)
 				usleep((useconds_t)(atof(argv[++i]) * 1e6));
 			} else if (strcmp(step, "wifi") == 0) {
 				wifi();
+			} else if (strcmp(step, "wrongjoin") == 0) {
+				wrongjoin();
 			} else {
 				fprintf(stderr, "net_test: bad step \"%s\"\n", step);
 				return 1;
