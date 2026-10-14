@@ -783,6 +783,64 @@ struct kernel_live {
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 };
 
+/*
+ * Battery state shared with XNU.  Qualcomm's charger firmware remains a UEFI
+ * boot-service client on core 0 while XNU runs on another core.  The loader is
+ * therefore the one safe place to call it; XNU only reads this cache.
+ */
+#define LOADER_BATTERY_MAGIC            0x2154544142574452ULL /* "RDWBATT!" */
+#define LOADER_BATTERY_VERSION          1
+#define LOADER_BATTERY_VALID            (1u << 0)
+#define LOADER_BATTERY_PRESENT          (1u << 1)
+#define LOADER_BATTERY_CHARGER_PRESENT  (1u << 2)
+#define LOADER_BATTERY_VOLTAGE_VALID    (1u << 3)
+#define LOADER_BATTERY_CHARGING         (1u << 4)
+#define LOADER_BATTERY_SOC_ESTIMATED    (1u << 5)
+
+struct loader_battery {
+	uint64_t magic;
+	uint32_t version, size;
+	volatile uint32_t sequence;
+	uint32_t flags;
+	int32_t soc_percent;
+	int32_t voltage_mv;
+	int32_t current_ma;
+	int32_t temperature_c;
+	uint32_t charger_action;
+	uint32_t polls;
+	uint32_t failures;
+	uint32_t reserved;
+};
+
+/*
+ * Layout returned by QcomChargerDxeLA's GetChargingAction, word offsets confirmed by dumping the
+ * raw buffer on this phone: [2] state of charge, [3] charge current (signed mA), [4] battery
+ * voltage (mV), [5] temperature (C). `rest` is oversized on purpose so a firmware that writes
+ * more than the fields we name cannot smash the stack.
+ */
+struct qcom_battery_status {
+	uint32_t status0, status1;
+	int32_t state_of_charge;
+	int32_t charge_current_ma;
+	int32_t battery_voltage_mv;
+	int32_t battery_temperature_c;
+	uint32_t rest[26];
+};
+
+static struct loader_battery charger_shared __attribute__((aligned(0x2000))) = {
+	.magic = LOADER_BATTERY_MAGIC,
+	.version = LOADER_BATTERY_VERSION,
+	.size = sizeof(struct loader_battery),
+	.soc_percent = -1,
+	.voltage_mv = -1,
+	.current_ma = 0,
+	.temperature_c = -273,
+	.charger_action = 0xffffffffu,
+};
+static efi_charger_ex *CHARGER_EX;
+static efi_qcom_charger *QCOM_CHARGER;
+static int charger_enabled;
+
 /* The screen recording the last kernel left in memory, if it made one ("oem recording" stages it). */
 static const char *recording_data;
 static uint64_t recording_len;
@@ -889,6 +947,122 @@ static void print(const char *fmt, ...);
 static void flush_log(void);
 static void put_char(char c);
 
+/* A voltage-only fallback is deliberately conservative; the real QG SOC wins whenever available. */
+static int
+soc_from_voltage(uint32_t mv)
+{
+	if (mv <= 3300) return 0;
+	if (mv < 3700) return (int)((mv - 3300) * 10 / 400);
+	if (mv < 3900) return 10 + (int)((mv - 3700) * 40 / 200);
+	if (mv < 4200) return 50 + (int)((mv - 3900) * 40 / 300);
+	if (mv < 4400) return 90 + (int)((mv - 4200) * 10 / 200);
+	return 100;
+}
+
+/* Read-only status query.  No TakeAction call and no charger-limit writes are made here. */
+static void
+charger_poll(void)
+{
+	struct qcom_battery_status status;
+	uint32_t action = 0xffffffffu, flags = 0, voltage = 0;
+	uint8_t present = 0, plugged = 0;
+	efi_status s;
+	int have_soc = 0, have_voltage = 0;
+
+	if (!charger_enabled) {
+		return;
+	}
+	memset(&status, 0, sizeof(status));
+
+	charger_shared.sequence++;
+	__asm__ volatile ("dmb ish" ::: "memory");
+	if (CHARGER_EX != NULL) {
+		s = CHARGER_EX->get_battery_presence(&present);
+		if (!EFI_ERROR(s) && present) flags |= LOADER_BATTERY_PRESENT;
+		s = CHARGER_EX->get_charger_presence(&plugged);
+		if (!EFI_ERROR(s) && plugged) flags |= LOADER_BATTERY_CHARGER_PRESENT;
+		s = CHARGER_EX->get_battery_voltage(&voltage);
+		if (!EFI_ERROR(s) && voltage >= 2500 && voltage <= 5000) {
+			have_voltage = 1;
+			flags |= LOADER_BATTERY_VOLTAGE_VALID;
+			charger_shared.voltage_mv = (int32_t)voltage;
+		}
+	}
+	if (QCOM_CHARGER != NULL) {
+		s = QCOM_CHARGER->get_charging_action(&action, &status, 0);
+		if (!EFI_ERROR(s)) {
+			charger_shared.charger_action = action;
+			if (status.battery_voltage_mv >= 2500 && status.battery_voltage_mv <= 5000) {
+				charger_shared.voltage_mv = status.battery_voltage_mv;
+				have_voltage = 1;
+				flags |= LOADER_BATTERY_VOLTAGE_VALID;
+			}
+			/*
+			 * GetChargingAction returns the firmware's state of charge in word [2] of its
+			 * output (confirmed by dumping the raw buffer on this device). We use it as-is
+			 * EXCEPT when the fuel gauge is clearly not ready yet: right after initialize()
+			 * it can report a near-empty SOC while the cell voltage says otherwise, which is
+			 * where the old "shows 1% on a half-full battery" came from. A Li-ion cell above
+			 * ~3.6 V is never under 5%, so in that case we distrust the gauge and fall back to
+			 * the voltage estimate below until it settles.
+			 */
+			if (status.state_of_charge >= 0 && status.state_of_charge <= 100) {
+				int vmv = have_voltage ? charger_shared.voltage_mv : 0;
+				if (status.state_of_charge < 5 && vmv > 3600) {
+					/* fuel gauge not settled; leave it to the voltage fallback */
+				} else {
+					charger_shared.soc_percent = status.state_of_charge;
+					have_soc = 1;
+					flags |= LOADER_BATTERY_VALID;
+				}
+			}
+			charger_shared.current_ma = status.charge_current_ma;
+			charger_shared.temperature_c = status.battery_temperature_c;
+		}
+	}
+	if (!have_soc && have_voltage) {
+		charger_shared.soc_percent = soc_from_voltage((uint32_t)charger_shared.voltage_mv);
+		flags |= LOADER_BATTERY_VALID | LOADER_BATTERY_SOC_ESTIMATED;
+	}
+	if (plugged && charger_shared.soc_percent < 100) {
+		flags |= LOADER_BATTERY_CHARGING;
+	}
+	charger_shared.flags = flags;
+	charger_shared.polls++;
+	if (!(flags & LOADER_BATTERY_VALID)) charger_shared.failures++;
+	__asm__ volatile ("dmb ish" ::: "memory");
+	charger_shared.sequence++;
+	clean_dcache((uint64_t)(uintptr_t)&charger_shared,
+	    (uint64_t)(uintptr_t)&charger_shared + sizeof(charger_shared));
+}
+
+static void
+charger_start(void)
+{
+	static const efi_guid charger_ex_guid = QCOM_CHARGER_EX_GUID;
+	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
+	efi_status ex_status, qcom_status, init_status = 0;
+
+	if (charger_enabled || PLAT != &platform_redwood) {
+		return;
+	}
+	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
+	qcom_status = BS->locate_protocol(&qcom_charger_guid, NULL, (void **)&QCOM_CHARGER);
+	if (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL) {
+		/* Re-open the driver's status path after QcomChargerApp handed off to the OS. */
+		init_status = QCOM_CHARGER->initialize(1);
+	}
+	charger_enabled = (!EFI_ERROR(ex_status) && CHARGER_EX != NULL) ||
+	    (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL);
+	print("battery: ChargerEx=%x QcomCharger=%x init=%x shared=%x\n", ex_status, qcom_status, init_status,
+	    (uint64_t)(uintptr_t)&charger_shared);
+	charger_poll();
+	print("battery: flags=%x SOC=%d%% V=%d mV I=%d mA T=%d C action=%d\n", (uint64_t)charger_shared.flags,
+	    (uint64_t)(int64_t)charger_shared.soc_percent, (uint64_t)(int64_t)charger_shared.voltage_mv,
+	    (uint64_t)(int64_t)charger_shared.current_ma, (uint64_t)(int64_t)charger_shared.temperature_c,
+	    (uint64_t)charger_shared.charger_action);
+}
+
 /* For the record: how much the kernel on the other core has logged so far, and the end of it. */
 static void
 note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t seconds)
@@ -951,7 +1125,7 @@ static int64_t
 run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const struct kernel_live *live, uint64_t slide,
     uint64_t budget)
 {
-	uint64_t daif = 0, group1 = 0, started, last_pet, last_beat_at, last_beat = 0, noted = 0;
+	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
 	int64_t status;
 	int arrived = 0, watching_only = 0;
 
@@ -973,7 +1147,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	/* the last argument arrives in that core's x0 */
 	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
 
-	started = last_pet = last_beat_at = READ_SYSREG(CNTVCT_EL0);
+	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
 	if (PLAT->log_other_cpu) {
 		flush_log();
@@ -1029,6 +1203,11 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(started) < budget + 60) {
 			wdt_pet();
 			last_pet = READ_SYSREG(CNTVCT_EL0);
+		}
+		/* Qualcomm's UEFI charger stack owns the PMIC/GLINK side; keep XNU's cache live. */
+		if (charger_enabled && seconds_since(last_battery) >= 5) {
+			charger_poll();
+			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
 		if (arrived && live != NULL) {
 			if (live->heartbeat != last_beat) {
@@ -1518,12 +1697,17 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
-	int more_cores = 0;
+	int more_cores = 0, battery_requested = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
 		}
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
+		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[9] == 0 || c[9] == ' ');
+	}
+	if (battery_requested) {
+		charger_start();
 	}
 	if (checkpoint == CHECKPOINT_SELFTEST) {
 		kernel_mpidr = this_mpidr;
@@ -1626,6 +1810,19 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		for (const char *c = "hv_wdt_pet=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 			ba->commandLine[n++] = *c;
 		}
+	}
+	if (battery_requested) {
+		static const char prefix[] = "battery_shared_pa=0x";
+		static const char hex[] = "0123456789abcdef";
+		uint64_t address = (uint64_t)(uintptr_t)&charger_shared;
+
+		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
+		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
+			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
+		}
+		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
 	}
 	for (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 		ba->commandLine[n++] = *c;

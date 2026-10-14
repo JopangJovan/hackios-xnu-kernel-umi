@@ -120,6 +120,36 @@ typedef struct efi_gop {
 	efi_gop_mode *mode;
 } efi_gop;
 
+/*
+ * Qualcomm's open ChargerEx protocol.  The protocol is implemented by the
+ * stock ChargerExDxe in the redwood UEFI image and is safe to use for
+ * read-only charger/battery queries while boot services remain resident.
+ */
+typedef struct {
+	uint64_t revision;
+	efi_status (EFIAPI *get_charger_presence)(uint8_t *present);
+	efi_status (EFIAPI *get_battery_presence)(uint8_t *present);
+	efi_status (EFIAPI *get_battery_voltage)(uint32_t *millivolts);
+	efi_status (EFIAPI *is_offmode_charging)(uint8_t *offmode);
+	efi_status (EFIAPI *is_power_ok)(uint32_t type, void *info);
+} efi_charger_ex;
+
+/*
+ * The first public entries of Xiaomi's Qualcomm charger protocol.  Its GUID,
+ * revision and function layout are taken from the QcomChargerDxeLA.efi and
+ * QcomChargerApp.efi shipped in this repository.  get_charging_action is used
+ * only as a status read: the loader never calls take_action and therefore does
+ * not change current/voltage limits or bypass the firmware's JEITA checks.
+ */
+typedef struct {
+	uint64_t revision;
+	efi_status (EFIAPI *initialize)(uint8_t enable);
+	void *reserved_10;
+	void *reserved_18;
+	efi_status (EFIAPI *get_charging_action)(uint32_t *action, void *battery_status, uint8_t display);
+	efi_status (EFIAPI *take_action)(uint32_t action, const void *battery_status);
+} efi_qcom_charger;
+
 /* Block I/O + Partition Info (used to persist the log on the phone) */
 typedef struct {
 	uint32_t media_id; uint8_t removable, present, logical, read_only, write_caching; uint8_t pad[3];
@@ -202,5 +232,7 @@ typedef struct {
 #define EFI_GOP_GUID            { 0x9042a9de, 0x23dc, 0x4a38, { 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a } }
 #define EFI_BLOCK_IO_GUID       { 0x964e5b21, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 #define EFI_PARTITION_INFO_GUID { 0x8cf2f62c, 0xbc9b, 0x4821, { 0x80, 0x8d, 0xec, 0x9e, 0xc4, 0x21, 0xa1, 0xa0 } }
+#define QCOM_CHARGER_EX_GUID     { 0x6edc8a6d, 0x2663, 0x43cd, { 0x90, 0xff, 0x46, 0x21, 0xff, 0xd1, 0x0d, 0xf5 } }
+#define QCOM_CHARGER_GUID        { 0x21bfb78b, 0x02ea, 0x4ab7, { 0x99, 0x40, 0xb5, 0x8a, 0x2a, 0xd6, 0x58, 0x29 } }
 
 #endif /* XNULOADER_EFI_H */

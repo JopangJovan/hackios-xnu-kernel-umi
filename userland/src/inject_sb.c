@@ -145,20 +145,26 @@ snapshot_output_format(__unused id self, __unused SEL selector, id snapshot)
 	return SNAPSHOT_FORMAT_PNG;
 }
 
-/* ---- real battery level from the PM7250B fuel gauge ---------------------------------------------- */
+/* ---- battery state from redwood's Qualcomm charger stack ----------------------------------------- */
 
 /*
  * iOS reads battery level through UIDevice.batteryLevel and UIDevice.batteryState; SpringBoard's
  * status bar reads it the same way via SBBatteryController. There is no IOPMPowerSource kernel
- * driver yet (that is the right long-term fix; see redwood_battery.c for the register work), so
- * we hook the UIDevice accessors to return what the kernel's SPMI poller found, which it stores
- * in kern.redwood.battery_soc (0..100) and kern.redwood.battery_current_ma (negative = charging).
+ * driver yet (that is the right long-term fix), so we hook the UIDevice accessors to return what
+ * xnuloader reads through Qualcomm's UEFI charger protocols and XNU publishes as
+ * kern.redwood.battery_soc (0..100) and kern.redwood.battery_charging.
  * When the sysctl is missing (battery=1 not in boot-args, or the driver never started) we hand
  * back the value the real implementation computed; the status bar then shows whatever iOS last
  * knew, which is better than crashing.
  */
-static float (*original_battery_level)(id self, SEL sel);
-static long  (*original_battery_state)(id self, SEL sel);
+static float  (*original_battery_level)(id self, SEL sel);
+static long   (*original_battery_state)(id self, SEL sel);
+static BOOL   (*original_battery_view_shows_percentage)(id self, SEL sel);
+static void   (*original_battery_view_set_shows_percentage)(id self, SEL sel, BOOL shows);
+static BOOL   (*original_battery_view_should_show_bolt)(id self, SEL sel);
+static double (*original_battery_view_charge_percent)(id self, SEL sel);
+static void   (*original_battery_view_set_charge_percent)(id self, SEL sel, double p);
+static double (*original_ring_charging_level)(id self, SEL sel);
 
 static int
 sysctl_int(const char *name)
@@ -186,16 +192,102 @@ battery_level(id self, SEL sel)
 static long
 battery_state(id self, SEL sel)
 {
-	int ma = sysctl_int("kern.redwood.battery_current_ma");
+	int charging = sysctl_int("kern.redwood.battery_charging");
+	int present = sysctl_int("kern.redwood.battery_present");
+	int plugged = sysctl_int("kern.redwood.battery_charger_present");
 	int soc = sysctl_int("kern.redwood.battery_soc");
 
-	if (ma == -1 && soc == -1) {
+	if (charging == -1 || present == -1 || plugged == -1 || soc < 0 || soc > 100) {
 		return original_battery_state ? original_battery_state(self, sel) : 0;
 	}
-	if (ma < -50) {		/* negative current = charging */
-		return soc >= 99 ? 3 : 2;
+	if (!present) return 0;
+	if (plugged && soc >= 100) return 3;
+	return charging ? 2 : 1;
+}
+
+/* UIKitCore's status-bar view has its own presentation policy, separate from UIDevice. */
+static BOOL
+battery_view_shows_percentage(id self, SEL sel)
+{
+	int soc = sysctl_int("kern.redwood.battery_soc");
+
+	if (soc >= 0 && soc <= 100) return YES;
+	return original_battery_view_shows_percentage ? original_battery_view_shows_percentage(self, sel) : NO;
+}
+
+static void
+battery_view_set_shows_percentage(id self, SEL sel, BOOL shows)
+{
+	int soc = sysctl_int("kern.redwood.battery_soc");
+
+	original_battery_view_set_shows_percentage(self, sel, (soc >= 0 && soc <= 100) ? YES : shows);
+}
+
+static BOOL
+battery_view_should_show_bolt(id self, SEL sel)
+{
+	int charging = sysctl_int("kern.redwood.battery_charging");
+	int present = sysctl_int("kern.redwood.battery_present");
+	int plugged = sysctl_int("kern.redwood.battery_charger_present");
+
+	if (charging != -1 && present != -1 && plugged != -1) return charging && present && plugged;
+	return original_battery_view_should_show_bolt ? original_battery_view_should_show_bolt(self, sel) : NO;
+}
+
+/*
+ * The actual number the status bar draws. _UIBatteryView keeps the fill fraction (0.0..1.0) in
+ * chargePercent; it is set through setChargePercent: and read back for layout. iOS feeds it from
+ * BatteryCenter / IOPowerSources, which is empty on this phone, so without us it sits near zero
+ * (the "1%" the user saw). We override both sides: setChargePercent: so the stored value is ours
+ * no matter who writes it, and the getter so any layout path that reads it agrees.
+ */
+static double
+battery_view_charge_percent(id self, SEL sel)
+{
+	int soc = sysctl_int("kern.redwood.battery_soc");
+
+	if (soc >= 0 && soc <= 100) return (double)soc / 100.0;
+	return original_battery_view_charge_percent ? original_battery_view_charge_percent(self, sel) : 0.0;
+}
+
+static void
+battery_view_set_charge_percent(id self, SEL sel, double p)
+{
+	int soc = sysctl_int("kern.redwood.battery_soc");
+
+	original_battery_view_set_charge_percent(self, sel, (soc >= 0 && soc <= 100) ? (double)soc / 100.0 : p);
+}
+
+/* The big charging ring on the lock screen (CoverSheet) reads its fill level the same way. */
+static double
+ring_charging_level(id self, SEL sel)
+{
+	int soc = sysctl_int("kern.redwood.battery_soc");
+
+	if (soc >= 0 && soc <= 100) return (double)soc / 100.0;
+	return original_ring_charging_level ? original_ring_charging_level(self, sel) : 0.0;
+}
+
+/* Keep SpringBoard's normal battery observers awake while the XNU cache changes. */
+static void
+battery_post_notifications(void)
+{
+	Class uidev = objc_getClass("UIDevice");
+	Class notification_center = objc_getClass("NSNotificationCenter");
+	id device = uidev ? ((id (*)(Class, SEL))objc_msgSend)(uidev, sel_registerName("currentDevice")) : nil;
+	id center = notification_center ? ((id (*)(Class, SEL))objc_msgSend)(notification_center,
+	    sel_registerName("defaultCenter")) : nil;
+
+	if (center != nil) {
+		SEL post = sel_registerName("postNotificationName:object:");
+		((void (*)(id, SEL, id, id))objc_msgSend)(center, post,
+		    (id)CFSTR("UIDeviceBatteryLevelDidChangeNotification"), device);
+		((void (*)(id, SEL, id, id))objc_msgSend)(center, post,
+		    (id)CFSTR("UIDeviceBatteryStateDidChangeNotification"), device);
 	}
-	return 1;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		battery_post_notifications();
+	});
 }
 
 /* ---- the lock screen's clock without a GPU ------------------------------------------------------- */
@@ -509,8 +601,20 @@ redwood_springboard_init(void)
 	 * hooking them here in the SpringBoard process covers both the status bar and any app that
 	 * reads [UIDevice currentDevice].batteryLevel. The addresses are for iOS 16.5 (20F66).
 	 */
-	original_battery_level = (float (*)(id, SEL))replace_method("UIDevice", "batteryLevel", 0x1aa038b5cUL, (IMP)battery_level);
-	original_battery_state = (long (*)(id, SEL))replace_method("UIDevice", "batteryState", 0x1aa038b90UL, (IMP)battery_state);
+	original_battery_level = (float (*)(id, SEL))replace_method("UIDevice", "batteryLevel", 0x1897021b0UL, (IMP)battery_level);
+	original_battery_state = (long (*)(id, SEL))replace_method("UIDevice", "batteryState", 0x189209794UL, (IMP)battery_state);
+	original_battery_view_shows_percentage = (BOOL (*)(id, SEL))replace_method("_UIBatteryView", "showsPercentage",
+	    0x189a9370cUL, (IMP)battery_view_shows_percentage);
+	original_battery_view_set_shows_percentage = (void (*)(id, SEL, BOOL))replace_method("_UIBatteryView", "setShowsPercentage:",
+	    0x18926e150UL, (IMP)battery_view_set_shows_percentage);
+	original_battery_view_should_show_bolt = (BOOL (*)(id, SEL))replace_method("_UIBatteryView", "_shouldShowBolt",
+	    0x189203e28UL, (IMP)battery_view_should_show_bolt);
+	original_battery_view_charge_percent = (double (*)(id, SEL))replace_method("_UIBatteryView", "chargePercent",
+	    0x189a935d8UL, (IMP)battery_view_charge_percent);
+	original_battery_view_set_charge_percent = (void (*)(id, SEL, double))replace_method("_UIBatteryView", "setChargePercent:",
+	    0x18928d310UL, (IMP)battery_view_set_charge_percent);
+	original_ring_charging_level = (double (*)(id, SEL))replace_method("CSBatteryChargingRingView", "batteryChargingLevel",
+	    0x1c48c2cf4UL, (IMP)ring_charging_level);
 	battery_lvl = (IMP)original_battery_level;
 	battery_st  = (IMP)original_battery_state;
 	say("redwood: SpringBoard: activation %s, setup assistant %s, application snapshots %s, the side button's long press %s, "
@@ -518,6 +622,13 @@ redwood_springboard_init(void)
 	    activation ? "answered here" : "NOT replaced", original_set_setup_required_reason ? "refused" : "NOT replaced",
 	    snapshot_format ? "as JPEG" : "NOT changed", original_lock_long_press ? "checked" : "NOT checked",
 	    battery_lvl ? "from QG" : "NOT replaced", battery_st ? "from QG" : "NOT replaced");
+	say("redwood: battery UI: shows%% %s, set-shows%% %s, bolt %s, chargePercent %s, setChargePercent %s, lockscreen ring %s\n",
+	    original_battery_view_shows_percentage ? "ok" : "NO",
+	    original_battery_view_set_shows_percentage ? "ok" : "NO",
+	    original_battery_view_should_show_bolt ? "ok" : "NO",
+	    original_battery_view_charge_percent ? "ok" : "NO",
+	    original_battery_view_set_charge_percent ? "ok" : "NO",
+	    original_ring_charging_level ? "ok" : "NO");
 	{
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
@@ -542,6 +653,10 @@ redwood_springboard_init(void)
 		if (device && class_getInstanceMethod(object_getClass(device), monitoring)) {
 			((void (*)(id, SEL, BOOL))objc_msgSend)(device, monitoring, YES);
 		}
+		say("redwood: battery: SOC=%d%% battery=%d charger=%d charging=%d\n",
+		    sysctl_int("kern.redwood.battery_soc"), sysctl_int("kern.redwood.battery_present"),
+		    sysctl_int("kern.redwood.battery_charger_present"), sysctl_int("kern.redwood.battery_charging"));
+		battery_post_notifications();
 	});
 	notify_register_dispatch("com.redwood.unlock", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		unlock();

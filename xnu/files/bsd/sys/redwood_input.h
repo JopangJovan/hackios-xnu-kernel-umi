@@ -41,8 +41,8 @@ void redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
 void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
-void redwood_battery_init(void);        /* boot-arg battery=1: SOC/voltage/current from PM7250B fuel gauge */
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
+void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
 void redwood_net_init(void);            /* en0, if there is something to carry its frames: sys/redwood_net.h */
 void redwood_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
