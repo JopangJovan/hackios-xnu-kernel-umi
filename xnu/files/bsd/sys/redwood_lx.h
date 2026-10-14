@@ -2,7 +2,8 @@
  * The whole of what the Wi-Fi driver's object asks of the kernel it is linked into. That object
  * (tools/mk-ath11k.sh in the repository: Linux's ath11k on FreeBSD's LinuxKPI headers and our
  * wifi/lx) is compiled as FreeBSD kernel code, bsd/dev/redwood_lx.c on this side as XNU's;
- * neither sees the other's headers, so nothing but C's own types crosses. Everything the
+ * neither sees the other's headers, so nothing but C's own types crosses (and the station
+ * boundary's, redwood_sta.h, which is written for both). Everything the
  * driver's side knows of locks, timers, work queues and buffers is built in wifi/lx/src on the
  * few calls here.
  *
@@ -11,6 +12,8 @@
  */
 #ifndef _SYS_REDWOOD_LX_H_
 #define _SYS_REDWOOD_LX_H_
+
+#include "redwood_sta.h"
 
 /* ---- memory ---- */
 void	*lx_os_alloc(unsigned long size);			/* zeroed; NULL when there is none */
@@ -65,6 +68,10 @@ int	 lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *pa
 void	 lx_os_net_attach(const unsigned char *address);	/* there is a radio, and this is its address */
 void	 lx_os_net_link(int up);				/* frames can pass now (a network is joined) / no longer */
 void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an Ethernet frame has arrived */
+
+/* ---- the station: scanning and joining, for whoever asks the kernel (redwood_sta.h) ---- */
+void	 lx_os_station(const struct redwood_sta_ops *ops);	/* here it is, to be asked; NULL: no longer (returns when no call is under way) */
+void	 lx_os_station_lost(int error);				/* the network joined is gone by itself */
 
 /*
  * ---- the names the object shows the kernel. lx_start(): bring the driver up on the radio and

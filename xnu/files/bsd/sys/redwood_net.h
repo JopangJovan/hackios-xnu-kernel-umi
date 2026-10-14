@@ -55,6 +55,8 @@ void redwood_net_input(const uint8_t *frame, size_t length);
 void redwood_net_link_state(bool up);
 
 void redwood_net_init(void);            /* the links there are: each looks for its hardware (or its boot-arg) */
+/* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: redwood_apple80211.c */
+errno_t redwood_apple80211_ioctl(u_long command, void *data);
 void redwood_virtio_net_init(void);     /* boot-arg virtio_net=1: QEMU's virtio network device */
 #endif /* KERNEL */
 

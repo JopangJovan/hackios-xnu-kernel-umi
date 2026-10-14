@@ -331,6 +331,21 @@ lx_os_net_attach(const unsigned char *address)
 	    "nowhere");
 }
 
+/*
+ * With wifi=1 the interface is made when the kernel starts, before the radio is up: iOS's Wi-Fi
+ * side looks for it and for its registry entry as soon as it runs, once, and a radio that
+ * turns up twelve seconds later is one it has already failed to open.
+ */
+void
+redwood_lx_net_early(void)
+{
+	uint8_t address[6];
+
+	if (redwood_wifi_radio_address(address)) {
+		lx_os_net_attach(address);
+	}
+}
+
 void
 lx_os_net_link(int up)
 {
@@ -345,6 +360,20 @@ lx_os_net_input(const unsigned char *frame, unsigned long length)
 	if (lx_link_attached && length <= REDWOOD_NET_FRAME_MAX) {
 		redwood_net_input(frame, length);
 	}
+}
+
+/* ---- the station (sys/redwood_sta.h) --------------------------------------------------------------------- */
+
+void
+lx_os_station(const struct redwood_sta_ops *ops)
+{
+	redwood_sta_attach(ops);
+}
+
+void
+lx_os_station_lost(int error)
+{
+	redwood_sta_lost(error);
 }
 
 /* ---- the driver ---------------------------------------------------------------------------------------- */

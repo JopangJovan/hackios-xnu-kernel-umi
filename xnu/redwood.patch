@@ -46,10 +46,10 @@ index 222158a93918..68bb0f3e56bf 100755
  ######################################################################
  # HISTORY
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..9666e7866eed 100644
+index 44274016a4cf..4ca9899feb85 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,18 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,20 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -59,16 +59,18 @@ index 44274016a4cf..9666e7866eed 100644
 +bsd/dev/redwood_buttons.c	standard
 +bsd/dev/redwood_net.c		standard
 +bsd/dev/redwood_virtio_net.c	standard
++bsd/dev/redwood_apple80211.c	standard
 +bsd/dev/redwood_cpufreq.c	standard
 +bsd/dev/redwood_adreno.c	standard
 +bsd/dev/redwood_wifi.c		standard
 +bsd/dev/redwood_qmi.c		standard
 +bsd/dev/redwood_wlfw.c		standard
 +bsd/dev/redwood_lx.c		standard
++bsd/dev/redwood_sta.c		standard
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +167,10 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +169,10 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -79,7 +81,7 @@ index 44274016a4cf..9666e7866eed 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +377,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +379,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -87,7 +89,7 @@ index 44274016a4cf..9666e7866eed 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +400,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +402,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1394,10 +1396,10 @@ index 5219fb0d9ed6..29978e9cff43 100644
  		}
  	}
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..5edb1f225d18 100644
+index 5fb0a52062e0..f90b663607f3 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,11 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,13 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
@@ -1405,7 +1407,9 @@ index 5fb0a52062e0..5edb1f225d18 100644
 +iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
 +iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
 +iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
++iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
++iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp

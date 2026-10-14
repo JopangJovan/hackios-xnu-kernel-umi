@@ -27,9 +27,12 @@
 #include <pexpert/pexpert.h>
 #include <sys/kern_event.h>
 #include <sys/kpi_mbuf.h>
+#include <sys/proc.h>
 #include <sys/redwood_net.h>
 #include <sys/sockio.h>
 #include <sys/systm.h>
+
+extern void RedwoodWLANStart(const char *interface);    /* iokit/Kernel/RedwoodWLAN.cpp */
 
 static LCK_GRP_DECLARE(net_lck_grp, "redwood-net");
 static LCK_MTX_DECLARE(net_tx_lock, &net_lck_grp);
@@ -173,15 +176,28 @@ redwood_net_input(const uint8_t *frame, size_t length)
 	ifnet_input(net_ifp, packet, &stats);
 }
 
+static unsigned net_ioctls_said;
+
 static errno_t
 net_ioctl(ifnet_t ifp, u_long command, void *data)
 {
-	static const int media[] = { IFM_ETHER | IFM_AUTO };
+	/* (a radio says it is one here too: IO80211.framework lists the interfaces whose media is 802.11) */
+	const int media[] = { (net_link->wireless ? IFM_IEEE80211 : IFM_ETHER) | IFM_AUTO };
 	struct ifreq *request = data;
 	struct ifmediareq *media_request = data;
 	user_addr_t list;
 	errno_t error = 0;
 
+	if (net_link->wireless && net_ioctls_said < 80) {
+		char who[32] = "?";
+
+		/* (while iOS's Wi-Fi side is being got to talk to this: who asks the interface what) */
+		proc_selfname(who, sizeof(who));
+		if (strcmp(who, "configd") != 0) {
+			net_ioctls_said++;
+			printf("net: en0 is asked %#lx by %s\n", command, who);
+		}
+	}
 	switch (command) {
 	case SIOCSIFADDR:
 		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
@@ -215,7 +231,8 @@ net_ioctl(ifnet_t ifp, u_long command, void *data)
 	case SIOCDELMULTI:
 		break;                          /* the link hands us everything anyway */
 	default:
-		error = EOPNOTSUPP;
+		/* what iOS's Wi-Fi side asks of a radio's interface: bsd/dev/redwood_apple80211.c */
+		error = net_link->wireless ? redwood_apple80211_ioctl(command, data) : EOPNOTSUPP;
 		break;
 	}
 	return error;
@@ -337,9 +354,14 @@ redwood_net_attach(const struct redwood_net_link *link)
 	if (net_link_up) {
 		net_link_event(ifp, KEV_DL_LINK_ON);
 	}
-	printf("net: en0 attached on %s%s, address %02x:%02x:%02x:%02x:%02x:%02x, link %s\n", link->name,
-	    link->wireless ? " (a radio)" : "", address[0], address[1], address[2], address[3], address[4], address[5],
-	    net_link_up ? "up" : "down");
+	if (link->wireless) {
+		/* (a radio's address is the phone's own: not for the log; and iOS's Wi-Fi side finds the interface by a service) */
+		printf("net: en0 attached on %s (a radio), link %s\n", link->name, net_link_up ? "up" : "down");
+		RedwoodWLANStart("en0");
+	} else {
+		printf("net: en0 attached on %s, address %02x:%02x:%02x:%02x:%02x:%02x, link %s\n", link->name, address[0],
+		    address[1], address[2], address[3], address[4], address[5], net_link_up ? "up" : "down");
+	}
 	if (kernel_thread_start(net_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
