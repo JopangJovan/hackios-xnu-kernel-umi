@@ -4059,6 +4059,7 @@ redwood_wifi_stop(void)
 void
 redwood_wifi_quiesce(void)
 {
+	redwood_apple80211_summary();           /* (also when the run is ended from the phone: five fingers) */
 	if (!dsp_started || dirty) {
 		return;
 	}
