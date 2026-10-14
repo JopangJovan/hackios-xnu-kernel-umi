@@ -46,10 +46,10 @@ index 222158a93918..68bb0f3e56bf 100755
  ######################################################################
  # HISTORY
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..fb5e9cb8a444 100644
+index 44274016a4cf..1750e10d3697 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,21 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,24 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -63,6 +63,9 @@ index 44274016a4cf..fb5e9cb8a444 100644
 +bsd/dev/redwood_apple80211.c	standard
 +bsd/dev/redwood_cpufreq.c	standard
 +bsd/dev/redwood_adreno.c	standard
++bsd/dev/redwood_audio.c		standard
++bsd/dev/redwood_virtio_sound.c	standard
++bsd/dev/redwood_speaker.c	standard
 +bsd/dev/redwood_wifi.c		standard
 +bsd/dev/redwood_qmi.c		standard
 +bsd/dev/redwood_wlfw.c		standard
@@ -71,7 +74,7 @@ index 44274016a4cf..fb5e9cb8a444 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +170,10 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +173,10 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -82,7 +85,7 @@ index 44274016a4cf..fb5e9cb8a444 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +380,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +383,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -90,7 +93,7 @@ index 44274016a4cf..fb5e9cb8a444 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +403,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +406,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -283,18 +286,19 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..abe2352d6a61 100644
+index 4df41ba1f61b..d532c567ba6b 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,7 @@
+@@ -147,6 +147,8 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
 +#include <sys/redwood_input.h>
++#include <sys/redwood_audio.h>
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +491,7 @@ bsd_init(void)
+@@ -490,7 +492,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -303,11 +307,12 @@ index 4df41ba1f61b..abe2352d6a61 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +977,7 @@ bsd_init(void)
+@@ -976,6 +978,8 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
 +		redwood_input_init();           /* /dev/redwood-touch */
++		redwood_audio_init();           /* /dev/redwood-audio */
  	}
  #endif /* DEVFS */
  
@@ -667,6 +672,33 @@ index 4ca22ee4371a..e95e618b4cb6 100644
  	uio_t uio;
  	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
  
+diff --git a/bsd/kern/sys_work_interval.c b/bsd/kern/sys_work_interval.c
+index b544bf307dfe..85e34caf9f62 100644
+--- a/bsd/kern/sys_work_interval.c
++++ b/bsd/kern/sys_work_interval.c
+@@ -265,6 +265,22 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+ 
+ 		break;
+ 
++	case 6:
++	case 7:
++	case 8:
++		/*
++		 * (redwood) Not in the open source: what os_workgroup_interval_start(), _update() and
++		 * _finish() of iOS send, for the performance controller, which is not here either.
++		 * CoreAudio does it in every I/O cycle and logs an error each time it is refused: fifty
++		 * lines a second from the audio server's real-time thread. For its threads, and only
++		 * for them, there is nothing to do and nothing wrong. (The window server asks for its
++		 * frames too, and is used to the refusal.)
++		 */
++		if (kern_work_interval_type_of_thread(current_thread()) == WORK_INTERVAL_TYPE_COREAUDIO) {
++			return 0;
++		}
++		return ENOTSUP;
++
+ 	default:
+ 		return ENOTSUP;
+ 	}
 diff --git a/bsd/kern/uipc_syscalls.c b/bsd/kern/uipc_syscalls.c
 index dce802fc36f1..e2e6b3a3f3db 100644
 --- a/bsd/kern/uipc_syscalls.c
@@ -2414,6 +2446,42 @@ index bec97fbf7243..203e1f48783f 100644
  #endif
  
  #if CONFIG_DTRACE
+diff --git a/osfmk/kern/work_interval.c b/osfmk/kern/work_interval.c
+index f2b9ce24bd8d..3aed167fe32e 100644
+--- a/osfmk/kern/work_interval.c
++++ b/osfmk/kern/work_interval.c
+@@ -683,6 +683,18 @@ work_interval_get_priority(thread_t thread)
+ 	return priority;
+ }
+ 
++/*
++ * (redwood) What kind of work the thread's work interval is for: one of WORK_INTERVAL_TYPE_*,
++ * or WORK_INTERVAL_TYPE_LAST for a thread that has joined none.
++ */
++uint32_t
++kern_work_interval_type_of_thread(thread_t thread)
++{
++	const struct work_interval *work_interval = thread->th_work_interval;
++
++	return work_interval ? work_interval->wi_create_flags & WORK_INTERVAL_TYPE_MASK : WORK_INTERVAL_TYPE_LAST;
++}
++
+ /*
+  * Switch to a policy driven by the work interval (if applicable).
+  */
+diff --git a/osfmk/kern/work_interval.h b/osfmk/kern/work_interval.h
+index 8b46efb05c86..e161ca426b1a 100644
+--- a/osfmk/kern/work_interval.h
++++ b/osfmk/kern/work_interval.h
+@@ -83,6 +83,8 @@ extern kern_return_t
+ kern_work_interval_notify(thread_t thread, struct kern_work_interval_args* kwi_args);
+ extern kern_return_t
+ kern_work_interval_set_name(mach_port_name_t port_name, char *name, size_t len);
++extern uint32_t
++kern_work_interval_type_of_thread(thread_t thread);
+ extern kern_return_t
+ kern_work_interval_set_workload_id(mach_port_name_t port_name,
+     struct kern_work_interval_workload_id_args *workload_id_args);
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 index 3ad743fc3efb..ce036c5a2c26 100644
 --- a/pexpert/arm/pe_fiq.c

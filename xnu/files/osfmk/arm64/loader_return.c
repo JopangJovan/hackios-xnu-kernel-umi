@@ -153,6 +153,8 @@ struct loader_live {
 	uint64_t log_head, log_ring;    /* sizes of the two parts */
 	const uint64_t *recording;      /* loader_recording: { physical address, length } of a screen recording */
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
+	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
+	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
 };
 
 /*
@@ -160,11 +162,14 @@ struct loader_live {
  * loader to hand to the host once the kernel is back. { physical address, bytes, kernel address }.
  */
 uint64_t loader_recording[3];
+/* ... and of the sound (/dev/redwood-audio makes one with boot-arg rec_sound). */
+uint64_t loader_sound[3];
 
 struct loader_live loader_live = {
 	.magic = 0x214556494c554e58ULL, .log = loader_log, .log_len = &loader_log_len, .log_ring_at = &loader_log_ring_at,
 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
 	.recording = loader_recording,
+	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
 };
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
@@ -229,6 +234,11 @@ loader_jump(uint64_t reason, uint64_t code)
 	}
 	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_recording));
 	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_recording + 16));
+	for (uintptr_t p = loader_sound[2] & ~63UL; p < loader_sound[2] + loader_sound[1]; p += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (p));
+	}
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_sound));
+	__asm__ volatile ("dc cvac, %0" : : "r" ((uintptr_t)loader_sound + 16));
 	__asm__ volatile ("dsb sy");
 
 	register uint64_t r_ttbr0 __asm__("x0") = static_kvtophys(loader_l1);
