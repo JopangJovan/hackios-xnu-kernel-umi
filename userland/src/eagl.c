@@ -1922,7 +1922,16 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		}
 		return false;
 	}
-	if (!plain_draws || (plain_draws == 1 && e->bound[0] == 0) || reads_what_it_writes(e)) {
+	/*
+	 * Nor is any other draw with no program that would read the very texture it draws into. The
+	 * window server's snapshots end with one: function 61 ("edr", by its numbers the display's
+	 * headroom, infinite: nothing to change) over the whole picture, with that picture as its
+	 * texture. Drawn as the picture it is given, it read what the GPU had not yet written out of
+	 * its own memory -- nothing -- and wrote that over everything: every launch image SpringBoard
+	 * keeps came out black, and with it the zoom that opens an application the first time.
+	 */
+	if (!plain_draws || (plain_draws == 1 && e->bound[0] == 0) || reads_what_it_writes(e) ||
+	    (e->colour != 0 && e->colour == e->bound[0])) {
 		census_draw(e, function, CENSUS_NOT_DRAWN);
 		return false;
 	}
