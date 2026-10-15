@@ -22,9 +22,13 @@
  *     "vibrant" views draw their content as it is: see plain_vibrancy().
  *   - A press of the side button that is long over is not taken for a long press (Siri) because
  *     SpringBoard was busy waking the display: see lock_long_press().
+ *   - A long press on the lock screen's wallpaper does not open the poster switcher, which the
+ *     window server here shows as a black screen: see poster_switcher_allowed().
  *   - Darwin notifications as a remote control, for scripts (rwtouch notify NAME):
  *       com.redwood.unlock      what the lock screen does after "swipe up to open"
  *       com.redwood.layers      write down the layers SpringBoard has on the screen: see layers()
+ *     In any other program given this library (INJECT in build.sh) only the last of them is
+ *     answered, with that program's layers.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -429,6 +433,29 @@ unlock(void)
 }
 
 /*
+ * The poster switcher: on iOS 16 a long press on the lock screen's wallpaper shrinks it into a
+ * row of posters to choose from or customize. The row is PosterBoard's, an application scene of
+ * that process which the lock screen hosts (CSPosterSwitcherViewController, a CALayerHost of the
+ * context of PosterBoard's window over an opaque black layer). PosterBoard does lay it out -- its
+ * window has the posters, "Customize" and "+", the hosted context is that window's, the scene is
+ * in the foreground -- but the window server draws nothing of that context, with either
+ * renderer, so what is left is the black layer under it, until a swipe up takes the switcher
+ * away. Why is not known: the display is not in secure mode, SpringBoard counts the user as
+ * authenticated, the same nesting of hosted contexts works for the wallpaper itself.
+ * Until it is, the switcher is not offered, the way SpringBoard itself withholds it where it has
+ * none (an iPad, Guided Access): its policy says the capability is not there, and the long press
+ * does nothing.
+ */
+static BOOL
+poster_switcher_allowed(__unused id self, __unused SEL selector, id *explanation)
+{
+	if (explanation != NULL) {
+		*explanation = (id)CFSTR("the poster switcher is not shown here (see inject_sb.c)");
+	}
+	return NO;
+}
+
+/*
  * What SpringBoard has put on the screen, as CoreAnimation has it: every layer of every window, a
  * line each -- class and name, place, opacity, what it shows (an image, a colour, another
  * process's layers), and what is done to it: its filters by type with their inputs, in order,
@@ -438,6 +465,8 @@ unlock(void)
 #define SEND(type, object, name)        ((type (*)(id, SEL))objc_msgSend)((id)(object), sel_registerName(name))
 #define SEND1(type, object, name, argument_type, argument) \
 	((type (*)(id, SEL, argument_type))objc_msgSend)((id)(object), sel_registerName(name), argument)
+
+static const char *layers_of = "";               /* in another program than SpringBoard: " of" and its name */
 
 static const char *
 text_of(id object)
@@ -456,7 +485,7 @@ layer_filter(id filter, const char *what, int depth)
 	size_t n;
 
 	if (!class_respondsToSelector(object_getClass(filter), sel_registerName("type"))) {
-		say("redwood: layers: %*s  %s %s\n", 2 * depth, "", what, text_of(filter));     /* a name alone */
+		say("redwood: layers%s: %*s  %s %s\n", layers_of, 2 * depth, "", what, text_of(filter));     /* a name alone */
 		return;
 	}
 	n = (size_t)snprintf(line, sizeof(line), "%s %s \"%s\"%s", what, text_of(SEND(id, filter, "type")),
@@ -478,7 +507,7 @@ layer_filter(id filter, const char *what, int depth)
 			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s %s", inputs[i], text_of(value));
 		}
 	}
-	say("redwood: layers: %*s  %s\n", 2 * depth, "", line);
+	say("redwood: layers%s: %*s  %s\n", layers_of, 2 * depth, "", line);
 }
 
 static void
@@ -537,9 +566,11 @@ layer_line(id layer, const char *role, int depth)
 			CFRelease((CFTypeRef)text);
 		}
 	} else if (strcmp(class_name, "CALayerHost") == 0) {
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " HOST of context %#x", SEND(unsigned, layer, "contextId"));
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " HOST of context %#x%s%s", SEND(unsigned, layer, "contextId"),
+		    SEND(BOOL, layer, "inheritsSecurity") ? " (inherits security)" : "",
+		    SEND(BOOL, layer, "rendersAsynchronously") ? " (asynchronously)" : "");
 	}
-	say("redwood: layers: %*s%s%s %p \"%s\" %g,%g %gx%g opacity %g%s\n", 2 * depth, "", role, class_name, (void *)layer,
+	say("redwood: layers%s: %*s%s%s %p \"%s\" %g,%g %gx%g opacity %g%s\n", layers_of, 2 * depth, "", role, class_name, (void *)layer,
 	    text_of(SEND(id, layer, "name")), frame.x, frame.y, frame.w, frame.h, (double)SEND(float, layer, "opacity"), more);
 	for (long i = 0; filters != NULL && i < SEND(long, filters, "count"); i++) {
 		layer_filter(SEND1(id, filters, "objectAtIndex:", long, i), "filter", depth);
@@ -564,15 +595,28 @@ layers(void)
 	Class window = objc_getClass("UIWindow");
 	SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
 	id windows = window && class_getClassMethod(window, all) ? ((id (*)(Class, SEL, BOOL, BOOL))objc_msgSend)(window, all, 1, 1) : NULL;
+	id application = SEND(id, objc_getClass("UIApplication"), "sharedApplication");
+	id authentication = application && class_respondsToSelector(object_getClass(application),
+	    sel_registerName("authenticationController")) ? SEND(id, application, "authenticationController") : NULL;
 
-	say("redwood: layers: %ld windows\n", windows ? SEND(long, windows, "count") : 0L);
+	say("redwood: layers%s: %ld windows\n", layers_of, windows ? SEND(long, windows, "count") : 0L);
+	if (authentication != NULL) {
+		say("redwood: layers: the user is %sauthenticated, %s passcode, the display %sin secure mode\n",
+		    SEND(BOOL, authentication, "isAuthenticated") ? "" : "NOT ", SEND(BOOL, authentication, "hasPasscodeSet") ? "a" : "no",
+		    SEND(BOOL, authentication, "inSecureDisplayMode") ? "" : "not ");
+	}
 	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
 		id w = SEND1(id, windows, "objectAtIndex:", long, i);
+		id scene = class_respondsToSelector(object_getClass(w), sel_registerName("windowScene")) ? SEND(id, w, "windowScene") : NULL;
+		id context = class_respondsToSelector(object_getClass(w), sel_registerName("_boundContext")) ? SEND(id, w, "_boundContext") : NULL;
 
-		say("redwood: layers: window %s level %g\n", object_getClassName(w), SEND(double, w, "windowLevel"));
+		say("redwood: layers%s: window %s level %g, context %#x (%ssecure, %u commits), scene %s (activation state %ld)\n",
+		    layers_of, object_getClassName(w), SEND(double, w, "windowLevel"), context ? SEND(unsigned, context, "contextId") : 0,
+		    context && SEND(BOOL, context, "isSecure") ? "" : "not ", context ? (unsigned)SEND(unsigned long long, context, "commitId") : 0,
+		    scene ? text_of(SEND(id, scene, "_persistenceIdentifier")) : "none", scene ? SEND(long, scene, "activationState") : -1L);
 		layer_line(SEND(id, w, "layer"), "", 1);
 	}
-	say("redwood: layers: end\n");
+	say("redwood: layers%s: end\n", layers_of);
 }
 
 __attribute__((constructor))
@@ -581,10 +625,20 @@ redwood_springboard_init(void)
 {
 	const char *name = getprogname();
 	size_t length = 0;
-	IMP activation, snapshot_format, battery_lvl, battery_st;
+	IMP activation, snapshot_format, battery_lvl, battery_st, poster_switcher;
 	int token;
 
-	if (name == NULL || strcmp(name, "SpringBoard") != 0) {
+	if (name == NULL) {
+		return;
+	}
+	if (strcmp(name, "SpringBoard") != 0) {
+		static char who[64];
+
+		snprintf(who, sizeof(who), " of %s", name);
+		layers_of = who;
+		notify_register_dispatch("com.redwood.layers", &token, dispatch_get_main_queue(), ^(__unused int t) {
+			layers();
+		});
 		return;
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
@@ -596,6 +650,8 @@ redwood_springboard_init(void)
 	plain_vibrancy();
 	original_lock_long_press = (void (*)(id, SEL, id))replace_method("SBLockHardwareButton", "longPress:", 0x1c4f6ab44UL,
 	    (IMP)lock_long_press);
+	poster_switcher = replace_method("SBMainDisplayPolicyAggregator", "_allowsCapabilityPosterSwitcherWithExplanation:",
+	    0x1c507e0fcUL, (IMP)poster_switcher_allowed);
 	/*
 	 * Battery hooks on UIDevice: these are the methods every app and SpringBoard itself calls, so
 	 * hooking them here in the SpringBoard process covers both the status bar and any app that
@@ -618,10 +674,11 @@ redwood_springboard_init(void)
 	battery_lvl = (IMP)original_battery_level;
 	battery_st  = (IMP)original_battery_state;
 	say("redwood: SpringBoard: activation %s, setup assistant %s, application snapshots %s, the side button's long press %s, "
-	    "battery level %s, battery state %s\n",
+	    "battery level %s, battery state %s, poster switcher %s\n",
 	    activation ? "answered here" : "NOT replaced", original_set_setup_required_reason ? "refused" : "NOT replaced",
 	    snapshot_format ? "as JPEG" : "NOT changed", original_lock_long_press ? "checked" : "NOT checked",
-	    battery_lvl ? "from QG" : "NOT replaced", battery_st ? "from QG" : "NOT replaced");
+	    battery_lvl ? "from QG" : "NOT replaced", battery_st ? "from QG" : "NOT replaced",
+	    poster_switcher ? "not offered" : "NOT withheld");
 	say("redwood: battery UI: shows%% %s, set-shows%% %s, bolt %s, chargePercent %s, setChargePercent %s, lockscreen ring %s\n",
 	    original_battery_view_shows_percentage ? "ok" : "NO",
 	    original_battery_view_set_shows_percentage ? "ok" : "NO",
