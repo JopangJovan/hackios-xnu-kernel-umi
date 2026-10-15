@@ -8,6 +8,11 @@
  *                                      as on an iPhone with its switch on silent
  *   tone SECONDS [LEFT_HZ RIGHT_HZ]    a sine wave in each channel (default 1000 and 440 Hz) at half of
  *                                      full scale, through an audio queue: what a music player does
+ *   level PEAK                         the tones after this one at PEAK of full scale (0 to 1) instead
+ *                                      (before iOS's volume, which scales the samples itself)
+ *   raw SECONDS                        the same tone written straight to /dev/redwood-audio, past iOS's own
+ *                                      processing and volume (which keep a tone more than 12 dB under full
+ *                                      scale even at the top): to try what the kernel does with full scale
  *   system ID                          a system sound by its number (1100 is the lock sound,
  *                                      1104 a keyboard click), as SpringBoard plays them
  *   file PATH                          a sound file, played as a system sound
@@ -22,6 +27,8 @@
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <mach/mach_time.h>
 #include <math.h>
 #include <notify.h>
 #include <objc/message.h>
@@ -35,7 +42,7 @@
 #define RATE            48000
 #define BUFFER_FRAMES   4096
 
-static double frequency[2] = { 1000, 440 };
+static double frequency[2] = { 1000, 440 }, peak = 0.5;
 static uint64_t frame, frames_wanted;
 
 static void
@@ -50,7 +57,7 @@ fill(__unused void *context, AudioQueueRef queue, AudioQueueBufferRef buffer)
 		    frames_wanted - frame < RATE / 100 ? (frames_wanted - frame) / (RATE / 100.0) : 1;
 
 		for (int channel = 0; channel < 2; channel++) {
-			samples[2 * count + channel] = (int16_t)(16384 * edge * sin(2 * M_PI * frequency[channel] * frame / RATE));
+			samples[2 * count + channel] = (int16_t)(32767 * peak * edge * sin(2 * M_PI * frequency[channel] * frame / RATE));
 		}
 	}
 	if (count == 0) {
@@ -59,6 +66,52 @@ fill(__unused void *context, AudioQueueRef queue, AudioQueueBufferRef buffer)
 	}
 	buffer->mAudioDataByteSize = count * 4;
 	AudioQueueEnqueueBuffer(queue, buffer, 0, NULL);
+}
+
+/* The tone to the kernel's device itself, 10 ms at a time and as fast as it plays (48000 frames a second). */
+static int
+raw(double seconds)
+{
+	int device = open("/dev/redwood-audio", O_WRONLY);
+	int16_t block[2 * 480];
+	uint64_t total = (uint64_t)(seconds * RATE), written = 0, start;
+	mach_timebase_info_data_t timebase;
+
+	if (device < 0) {
+		printf("sound_test: /dev/redwood-audio: %s\n", strerror(errno));
+		return 1;
+	}
+	mach_timebase_info(&timebase);
+	printf("sound_test: a tone of %.0f and %.0f Hz at %.2f of full scale for %.1f s, straight to /dev/redwood-audio\n",
+	    frequency[0], frequency[1], peak, seconds);
+	fflush(stdout);
+	start = mach_absolute_time();
+	while (written < total) {
+		uint64_t due;
+		uint32_t count = total - written < 480 ? (uint32_t)(total - written) : 480;
+
+		for (uint32_t f = 0; f < count; f++) {
+			uint64_t n = written + f;
+			double edge = n < RATE / 100 ? n / (RATE / 100.0) : total - n < RATE / 100 ? (total - n) / (RATE / 100.0) : 1;
+
+			for (int channel = 0; channel < 2; channel++) {
+				block[2 * f + channel] = (int16_t)(32767 * peak * edge * sin(2 * M_PI * frequency[channel] * n / RATE));
+			}
+		}
+		if (write(device, block, count * 4) != (ssize_t)(count * 4)) {
+			printf("sound_test: /dev/redwood-audio: a write failed: %s\n", strerror(errno));
+			break;
+		}
+		written += count;
+		/* stay 100 ms ahead of the clock, not more: the kernel's ring holds 0.68 s */
+		due = start + (written > RATE / 10 ? written - RATE / 10 : 0) * 1000000000ull / RATE * timebase.denom / timebase.numer;
+		if (mach_absolute_time() < due) {
+			mach_wait_until(due);
+		}
+	}
+	close(device);
+	printf("sound_test: %llu frames written straight to the device\n", written);
+	return written < total;
 }
 
 static int
@@ -91,7 +144,8 @@ tone(double seconds)
 		fill(NULL, queue, buffer);
 	}
 	status = AudioQueueStart(queue, NULL);
-	printf("sound_test: a tone of %.0f and %.0f Hz for %.1f s: AudioQueueStart: %d\n", frequency[0], frequency[1], seconds,
+	printf("sound_test: a tone of %.0f and %.0f Hz at %.2f of full scale for %.1f s: AudioQueueStart: %d\n", frequency[0],
+	    frequency[1], peak, seconds,
 	    (int)status);
 	if (status == 0) {
 		/* a slow machine may take its time: wait for the end, three times as long as it should take at most */
@@ -231,6 +285,12 @@ main(int argc, char **argv)
 				frequency[1] = atof(argv[++i]);
 			}
 			failed |= tone(seconds);
+		} else if (strcmp(argv[i], "raw") == 0 && i + 1 < argc) {
+			failed |= raw(atof(argv[++i]));
+		} else if (strcmp(argv[i], "level") == 0 && i + 1 < argc) {
+			peak = atof(argv[++i]);
+			peak = peak < 0 ? 0 : peak > 1 ? 1 : peak;
+			printf("sound_test: the tones from now on at %.2f of full scale\n", peak);
 		} else if (strcmp(argv[i], "system") == 0 && i + 1 < argc) {
 			failed |= system_sound((SystemSoundID)atoi(argv[++i]));
 		} else if (strcmp(argv[i], "file") == 0 && i + 1 < argc) {

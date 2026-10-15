@@ -50,9 +50,10 @@
  * the boost or the output, over-temperature, no clock, the watchdog, over-voltage) has both
  * amplifiers powered down at once (amplifier power-down and power-down, bits 1 and 0 of 0x04)
  * and nothing more done. What is not done, compared with Android: the DSP's Awinic algorithm,
- * which protects the speakers with their calibration (aw882xx_rx_switch), and the driver's
- * watch of battery voltage and temperature, which only ever turns the volume down -- whoever
- * plays through this keeps the level low.
+ * which protects the speakers with their calibration (aw882xx_rx_switch); in its place the
+ * samples go through redwood_guard.c on their way here. The driver's monitor is done
+ * (redwood_speaker_monitor(), below): once a second the chips' temperature and the battery's
+ * voltage, and the reduction that the file's table asks for at either.
  *
  * I2C is done by hand: a pin is either pulled low or let go (and the pull-ups raise it), at 100
  * kHz at most. For each register read or written the two pins are taken from the serial engine
@@ -360,6 +361,11 @@ amplifier_name(uint16_t id)
 #define AW_SYSCTRL              0x04
 #define AW_SYSCTRL2             0x05            /* [9:0] the volume, attenuation: [9:6] 6 dB steps, [5:0] eighths of a dB */
 #define AW_I2SCTRL3             0x08
+#define AW_VBAT                 0x21            /* [9:0] the battery's voltage as the amplifier sees it: x 6025 / 1023 mV */
+#define AW_TEMP                 0x22            /* [9:0] the amplifier's temperature, degrees Celsius, two's complement */
+#define AW_PVDD                 0x23            /* [9:0] its boosted supply */
+#define AW_ISNDAT               0x24            /* the current and voltage sense, as last measured */
+#define AW_VSNDAT               0x25
 #define AW_DBGCTRL              0x14
 #define AW_VSNTM1               0x50
 #define AW_EFRH4                0x78
@@ -397,6 +403,8 @@ amplifier_name(uint16_t id)
 /* Android's configuration file ("ACF", Awinic's format; Linux: sound/soc/codecs/aw88395/aw88395_lib.c) */
 #define ACF_PROFILE_MUSIC       0
 #define ACF_DATA_REGISTERS      4               /* a block with a header of its own and registers in it */
+#define ACF_DATA_MONITOR        10              /* the driver's "monitor": what to do when the chip is cold or the battery low */
+#define MONITOR_ROWS            8
 #define ACF_BLOCK_HEADER        0x3c
 
 struct amplifier {
@@ -411,11 +419,16 @@ struct amplifier {
 	uint16_t volume;                /* where it is now */
 	uint16_t volume_high;           /* the profile's bits 15:10 of 0x05, which the volume leaves as they are */
 	bool prepared, started;
+	/* the monitor's tables (from the file) and what was last seen */
+	struct { int16_t min, max; uint16_t less; } temp_rows[MONITOR_ROWS], vbat_rows[MONITOR_ROWS];
+	unsigned temp_count, vbat_count, looks;
+	int temps[3], vbats[3];
+	int temp_row, vbat_row;
 };
 
 static struct amplifier amplifiers[2] = {
-	{ .address = 0x35, .device = 0, .where = "0x35, slot 0" },
-	{ .address = 0x34, .device = 1, .where = "0x34, slot 1" },
+	{ .address = 0x35, .device = 0, .where = "0x35, slot 0", .temp_row = -1, .vbat_row = -1 },
+	{ .address = 0x34, .device = 1, .where = "0x34, slot 1", .temp_row = -1, .vbat_row = -1 },
 };
 static bool broken;                     /* something went wrong: both have been powered down, nothing more is done */
 
@@ -423,6 +436,82 @@ static uint32_t
 le32(const uint8_t *p)
 {
 	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/*
+ * The driver's monitor for one amplifier (Android has it on: aw_dev_N_monitor), from the file: every second it
+ * reads the chip's temperature and the battery's voltage, and a table says what to do for each range of them.
+ * This file's: at 7 to 100 degrees nothing; at 2 to 5 degrees 3 dB less, at -2 to 0 4.5 dB, at -50 to -5 8 dB (and
+ * a lower current limit for the boost, which is not done here); from 3.85 V nothing, at 3.65 to 3.75 V and up to
+ * 3.55 V a lower "vmax" for the DSP's algorithm, which does not run here. In its temperature rows a vmax goes with
+ * each reduction of the volume, so the battery rows' vmax is turned into a volume reduction in the same proportion
+ * (the first temperature row's: 3 dB for its vmax): 1.6 and 3.1 dB. Between the ranges the last one holds.
+ *   block: checksum (of the bytes after it), version, chip name[16], ui version, the time and count of looks,
+ *   switches, then for the temperatures and for the voltages each: a value, the number of rows, a row's size and
+ *   the rows' offset; a row: int16 lowest, int16 highest, uint16 boost current, uint16 reduction (eighths of a
+ *   dB), int32 vmax
+ */
+static void
+acf_monitor(uint16_t device, const uint8_t *block, uint32_t length)
+{
+	struct amplifier *a = NULL;
+	uint32_t sum = 0, temp_count, temp_size, temp_at, vbat_count, vbat_size, vbat_at;
+	int64_t per_eighth = 0;
+
+	for (unsigned i = 0; i < 2; i++) {
+		if (amplifiers[i].device == device) {
+			a = &amplifiers[i];
+		}
+	}
+	if (a == NULL || length < 0x48) {
+		return;
+	}
+	for (uint32_t i = 4; i < length; i++) {
+		sum += block[i];
+	}
+	temp_count = le32(block + 0x2c);
+	temp_size = le32(block + 0x30);
+	temp_at = le32(block + 0x34);
+	vbat_count = le32(block + 0x3c);
+	vbat_size = le32(block + 0x40);
+	vbat_at = le32(block + 0x44);
+	if (sum != le32(block) || temp_size < 12 || vbat_size < 12 || temp_count > MONITOR_ROWS || vbat_count > MONITOR_ROWS ||
+	    temp_at + temp_count * temp_size > length || vbat_at + vbat_count * vbat_size > length) {
+		say("speaker: device %u's monitor table is not of the shape known: not used\n", device);
+		return;
+	}
+	for (uint32_t i = 0; i < temp_count; i++) {
+		const uint8_t *row = block + temp_at + i * temp_size;
+		int32_t vmax = (int32_t)le32(row + 8);
+
+		a->temp_rows[i].min = (int16_t)(row[0] | row[1] << 8);
+		a->temp_rows[i].max = (int16_t)(row[2] | row[3] << 8);
+		a->temp_rows[i].less = (uint16_t)(row[6] | row[7] << 8);
+		if (per_eighth == 0 && a->temp_rows[i].less != 0 && vmax < 0) {
+			per_eighth = -(int64_t)vmax / a->temp_rows[i].less;
+		}
+	}
+	for (uint32_t i = 0; i < vbat_count; i++) {
+		const uint8_t *row = block + vbat_at + i * vbat_size;
+		int32_t vmax = (int32_t)le32(row + 8);
+
+		a->vbat_rows[i].min = (int16_t)(row[0] | row[1] << 8);
+		a->vbat_rows[i].max = (int16_t)(row[2] | row[3] << 8);
+		a->vbat_rows[i].less = (uint16_t)(row[6] | row[7] << 8);
+		if (vmax < 0 && per_eighth > 0) {
+			a->vbat_rows[i].less += (uint16_t)((-(int64_t)vmax + per_eighth / 2) / per_eighth);
+		}
+	}
+	a->temp_count = temp_count;
+	a->vbat_count = vbat_count;
+	for (uint32_t i = 0; i < temp_count; i++) {
+		say("speaker: the amplifier %s's monitor: at %d to %d degrees, %u.%03u dB less\n", a->where, a->temp_rows[i].min,
+		    a->temp_rows[i].max, a->temp_rows[i].less / 8, a->temp_rows[i].less % 8 * 125);
+	}
+	for (uint32_t i = 0; i < vbat_count; i++) {
+		say("speaker: the amplifier %s's monitor: at %d to %d mV, %u.%03u dB less\n", a->where, a->vbat_rows[i].min,
+		    a->vbat_rows[i].max, a->vbat_rows[i].less / 8, a->vbat_rows[i].less % 8 * 125);
+	}
 }
 
 /* The "Music" profile of every amplifier, from the file; false if the file is not of the shape known. */
@@ -455,6 +544,10 @@ acf_profiles(const uint8_t *acf, uint64_t size)
 
 		memcpy(name, entry + 4, 16);
 		name[16] = 0;
+		if (kind == ACF_DATA_MONITOR) {
+			acf_monitor(device, acf + offset, (uint64_t)offset + length <= size ? length : 0);
+			continue;
+		}
 		if (kind != ACF_DATA_REGISTERS || profile != ACF_PROFILE_MUSIC || strcmp(name, "aw88261") != 0) {
 			continue;
 		}
@@ -869,6 +962,71 @@ redwood_speaker_healthy(void)
 		}
 	}
 	return true;
+}
+
+/* the row of a monitor table that a value falls in; between rows, the one before */
+static int
+monitor_row(const struct amplifier *a, bool temperature, int value, int before)
+{
+	unsigned count = temperature ? a->temp_count : a->vbat_count;
+
+	for (unsigned i = 0; i < count; i++) {
+		int min = temperature ? a->temp_rows[i].min : a->vbat_rows[i].min;
+		int max = temperature ? a->temp_rows[i].max : a->vbat_rows[i].max;
+
+		if (value >= min && value <= max) {
+			return (int)i;
+		}
+	}
+	return before;
+}
+
+/*
+ * The driver's monitor, once: the temperature and the battery voltage of every amplifier that runs (the average of
+ * the last three looks, as the file's count says), and the reduction their tables ask for, the larger of the two
+ * amplifiers'. With `tell', what was read (also the boosted supply and the current and voltage sense, raw).
+ */
+uint32_t
+redwood_speaker_monitor(bool tell)
+{
+	uint32_t wanted = 0;
+
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+		uint16_t vbat = 0, temp = 0, pvdd = 0, isn = 0, vsn = 0;
+		int t = 0, v = 0;
+		uint32_t less = 0;
+
+		if (broken || !a->started) {
+			continue;
+		}
+		if (!get(a, AW_VBAT, &vbat) || !get(a, AW_TEMP, &temp)) {
+			continue;
+		}
+		a->temps[a->looks % 3] = (temp & 0x200) ? (int)(temp & 0x3ff) - 0x400 : (int)(temp & 0x3ff);
+		a->vbats[a->looks % 3] = (int)(vbat & 0x3ff) * 6025 / 1023;
+		a->looks++;
+		for (unsigned k = 0; k < 3 && k < a->looks; k++) {
+			t += a->temps[k];
+			v += a->vbats[k];
+		}
+		t /= (int)(a->looks < 3 ? a->looks : 3);
+		v /= (int)(a->looks < 3 ? a->looks : 3);
+		a->temp_row = monitor_row(a, true, t, a->temp_row);
+		a->vbat_row = monitor_row(a, false, v, a->vbat_row);
+		less = (a->temp_row >= 0 ? a->temp_rows[a->temp_row].less : 0) + (a->vbat_row >= 0 ? a->vbat_rows[a->vbat_row].less : 0);
+		if (less > wanted) {
+			wanted = less;
+		}
+		if (tell) {
+			(void)get(a, AW_PVDD, &pvdd);
+			(void)get(a, AW_ISNDAT, &isn);
+			(void)get(a, AW_VSNDAT, &vsn);
+			say("speaker: the amplifier %s: %d degrees, the battery %d mV (%#05x, %#05x; supply %#05x, sense %#06x %#06x): "
+			    "%u.%03u dB less\n", a->where, t, v, temp, vbat, pvdd, isn, vsn, less / 8, less % 8 * 125);
+		}
+	}
+	return wanted;
 }
 
 void

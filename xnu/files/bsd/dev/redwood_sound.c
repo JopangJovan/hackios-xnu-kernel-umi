@@ -23,7 +23,7 @@
  *            events say whether it takes the samples at 48 kHz. The amplifiers stay off.
  *   sound=3  ... and the amplifiers, with the tone playing: set up as Android's driver sets them
  *            up, started once the clock runs, faded in to sound_below eighths of a dB under
- *            Android's own level (default 240: 30 dB under, the least it may be is 0), faded
+ *            Android's own level (default 160: 20 dB under, the least it may be is 0), faded
  *            out and powered down at the end. Audible.
  *   sound=4  what iOS plays (/dev/redwood-audio, redwood_audio.c), until the run ends: the port
  *            and the stream as above, kept running (silence when iOS writes nothing); the
@@ -33,7 +33,14 @@
  *            so far under sound_below, which stays the loudest, and at 0 they stay off. (iOS sets
  *            that control only once, to the top, and applies its volume to the samples itself --
  *            see userland/src/audio_plugin.c --; at its volume 0 it writes silence, and the
- *            amplifiers stay off for that too.)
+ *            amplifiers stay off for that too.) On their way the samples go through the speakers'
+ *            guard (redwood_guard.c), in place of the DSP's speaker protection that Android has:
+ *            sound_gain eighths of a dB of gain (default and most 96, 12 dB: iOS's own processing
+ *            keeps its top that far under full scale), a high-pass filter, three averages of the
+ *            power at the speakers and a peak limiter. sound_guard_as=N, for a test: the guard
+ *            reckons the amplifiers N eighths of a dB under Android's level (louder than they are)
+ *            and holds back as it would there -- with sound_below=720 (the amplifiers at -90 dB)
+ *            what it does at the loudest can be seen in the log and the recording without a sound.
  *
  * The numbers are Android's own, from the phone's live device tree (qcom,msm-dai-tdm-pri-rx and
  * its port, the pins pri_tdm_*_active), its mixer paths (the speaker: PRI_TDM_RX_0 at 48 kHz,
@@ -85,7 +92,8 @@ extern lck_mtx_t redwood_smmu_lock;
 static LCK_GRP_DECLARE(sound_lock_group, "redwood-sound");
 static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
 
-static uint32_t level, seconds = 3, below = 240, pause_ms = 1000;
+static uint32_t level, seconds = 3, below = 160, pause_ms = 1000, gain = REDWOOD_GUARD_MAX_GAIN;
+static uint32_t guard_as = UINT32_MAX;  /* boot-arg sound_guard_as=N: the guard reckons the amplifiers at most N under (a test) */
 static char last_write[96] = "nothing written";
 
 /* ---- what is said: to the loader's log as well, as it happens ---------------------------------------- */
@@ -1019,6 +1027,38 @@ ios_sink(const int16_t *frames, uint32_t count)
 	return taken;
 }
 
+static uint32_t guard_periods;                  /* periods through the guard */
+static volatile bool guard_on;                  /* the amplifiers are on: what the guard lets through is heard */
+
+/* tenths of a dB as text: "-5.7" */
+static const char *
+db_text(char *text, int tenths)
+{
+	snprintf(text, 16, "%s%d.%d", tenths < 0 ? "-" : "", (tenths < 0 ? -tenths : tenths) / 10, (tenths < 0 ? -tenths : tenths) % 10);
+	return text;
+}
+
+/* What the guard has done since it was last said (redwood_guard.c), as one line; nothing if `quiet'. */
+static void
+guard_say(const char *when, bool quiet)
+{
+	struct redwood_guard_report r;
+	char t[6][16];
+
+	redwood_guard_take_report(&r);
+	if (r.blocks == 0 || quiet) {
+		return;
+	}
+	/* (levels at the speakers: dB under a full-scale square wave at Android's level; gains in dB) */
+	say("sound: the guard%s: peaks in %u, out %u (of 32768); gain now %s dB, least %s dB, held down by the 0.2 s/3 s/60 s "
+	    "averages in %u/%u/%u of %u periods; peaks limited in %u frames (by %s dB at most); averages %s/%s/%s dB\n",
+	    when, r.peak_in, r.peak_out, db_text(t[0], redwood_guard_decibels(r.gain * r.gain >> 30)),
+	    db_text(t[1], redwood_guard_decibels(r.least_gain * r.least_gain >> 30)), r.rms_blocks, r.fast_blocks, r.slow_blocks,
+	    r.blocks, r.limited_frames, db_text(t[2], redwood_guard_decibels((uint64_t)r.least_peak_gain * r.least_peak_gain >> 2)),
+	    db_text(t[3], redwood_guard_decibels(r.rms)), db_text(t[4], redwood_guard_decibels(r.fast)),
+	    db_text(t[5], redwood_guard_decibels(r.slow)));
+}
+
 /* A period from the ring, the rest of it silence. */
 static void
 period_fill_ios(unsigned period)
@@ -1036,6 +1076,12 @@ period_fill_ios(unsigned period)
 	ring_tail = tail + n;
 	fed_frames += n;
 	silent_frames += PERIOD_FRAMES - n;
+	/* the guard, on every period, silence too: its filter and its averages go on (redwood_guard.c) */
+	redwood_guard_process(samples, PERIOD_FRAMES);
+	if (n != 0 && redwood_audio_recording_fed()) {
+		redwood_audio_record_fed(samples, n);
+	}
+	guard_periods++;
 	for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + PERIOD_BYTES; line += 64) {
 		__asm__ volatile ("dc cvac, %0" : : "r" (line));
 	}
@@ -1054,7 +1100,18 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	while (!stopping) {
 		uint32_t back = returned;
+		static bool was_on;
 
+		if (guard_on && !was_on) {
+			guard_say("", true);    /* (what it did to the silence meanwhile is of no interest) */
+			guard_periods = 0;
+		} else if (was_on && !guard_on) {
+			guard_say(" until the amplifiers stopped", false);
+		} else if (guard_on && guard_periods >= 250) {
+			guard_say(", 5 s", false);
+			guard_periods = 0;
+		}
+		was_on = guard_on;
 		if (back != 0) {
 			OSBitAndAtomic(~back, &returned);
 			for (unsigned p = 0; p < PERIODS; p++) {
@@ -1077,6 +1134,28 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/* The amplifiers' level as the guard is to reckon with it (sound_guard_as: louder than it is, for a test). */
+static void
+guard_level(uint32_t level_below)
+{
+	redwood_guard_attenuation(level_below < guard_as ? level_below : guard_as);
+}
+
+/*
+ * The amplifiers are off. The guard goes on at their level all the same: what it lets through now reaches them
+ * 160 ms later, behind the periods queued at the DSP, and if that is sound, they will have been started by then
+ * (70 ms after it comes). While they are off nothing but silence comes, and the averages fall as a speaker cools.
+ * Only when nothing can be heard at all -- iOS's volume at 0, the amplifiers given up on -- is the guard told so.
+ */
+static void
+guard_off(bool unheard)
+{
+	guard_on = false;
+	if (unheard) {
+		redwood_guard_attenuation(REDWOOD_GUARD_SILENT);
+	}
+}
+
 /*
  * The amplifiers on while there is sound, at the volume iOS has set (redwood_audio_volume(): how
  * far under the loudest, sound_below under Android's level), and off while iOS's volume is 0;
@@ -1086,8 +1165,10 @@ static void
 watch(void)
 {
 	bool on = false, given_up = false, muted = false;
-	uint64_t last_look = 0;
-	uint32_t starts = 0, changes = 0, generation = 0, extra = 0;
+	uint64_t last_look = 0, last_monitor = 0;
+	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0;
+
+	guard_level(below);                     /* (from the first sample on: see guard_off()) */
 
 	while (!stopping) {
 		uint64_t now = now_us(), sounded = last_sound_us;
@@ -1102,12 +1183,18 @@ watch(void)
 			say("sound: iOS sets the volume: %s%u.%03u dB under the loudest, which is %u.%03u dB under Android's level%s\n",
 			    muted ? "muted (0), " : "", extra / 8, extra % 8 * 125, below / 8, below % 8 * 125,
 			    on ? (muted ? ": the amplifiers are stopped" : ": the amplifiers follow") : "");
-			if (on && muted) {
-				redwood_speaker_stop();
-				on = false;
+			if (muted) {
+				guard_off(true);
+				if (on) {
+					redwood_speaker_stop();
+					on = false;
+				}
 			} else if (on && !redwood_speaker_volume(below + extra, 1)) {
+				guard_off(true);
 				on = false;
 				given_up = true;
+			} else if (!given_up) {
+				guard_level(below + extra);
 			}
 		}
 		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
@@ -1116,10 +1203,14 @@ watch(void)
 			ios_peak = 0;
 			if (!redwood_speaker_start() || !redwood_speaker_volume(below + extra, 1)) {
 				say("sound: THE AMPLIFIERS DID NOT START; iOS's sound goes on to the DSP, unheard\n");
+				guard_off(true);
 				given_up = true;
 			} else {
 				on = true;
+				guard_on = true;
 				last_look = now_us();
+				last_monitor = 0;
+				monitor_looks = 0;
 				/* (what is written now is heard after the periods already queued at the DSP: PERIODS x 20 ms) */
 				say("sound: the amplifiers are up %llu ms after the first write that was not silence; that write reaches "
 				    "them %u ms after it was made, behind the periods queued at the DSP\n", (last_look - sounded) / 1000,
@@ -1129,17 +1220,32 @@ watch(void)
 			say_when("three seconds of silence: the amplifiers are stopped");
 			say("sound: what iOS wrote while they were on peaked at %u%% of full scale (%u)\n", ios_peak * 100 / 32768,
 			    ios_peak);
+			guard_off(false);
 			redwood_speaker_stop();
 			on = false;
 		} else if (on && now - last_look >= 200000) {
 			last_look = now;
 			if (!redwood_speaker_healthy()) {
+				guard_off(true);
 				on = false;
 				given_up = true;
+			} else if (now - last_monitor >= 1000000) {
+				/* the amplifiers' temperature and the battery as they see it, every second: a reduction if Android's table asks for one */
+				uint32_t wanted;
+
+				last_monitor = now;
+				wanted = redwood_speaker_monitor(monitor_looks++ % 10 == 0);
+				if (wanted != monitor) {
+					say("sound: the amplifiers' watch asks for %u.%03u dB less (it was %u.%03u)\n", wanted / 8, wanted % 8 * 125,
+					    monitor / 8, monitor % 8 * 125);
+					monitor = wanted;
+					redwood_guard_monitor(monitor);
+				}
 			}
 		}
 		sleep_ms(5);
 	}
+	guard_off(true);
 	say("sound: the watcher stops; the amplifiers were started %u times, iOS set the volume %u times%s\n", starts, changes,
 	    given_up ? ", and the amplifiers were then given up on" : "");
 	watcher_runs = false;
@@ -1265,6 +1371,12 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		redwood_audio_set_sink("the speakers (the audio DSP, redwood_sound.c)", ios_sink);
 		say("sound: WHAT IOS PLAYS GOES TO THE SPEAKERS from here on, %u.%03u dB under Android's level, until the run ends\n",
 		    below / 8, below % 8 * 125);
+		say("sound: through the guard (redwood_guard.c): %u.%03u dB of gain first (sound_gain), then high-pass at 200 Hz; peaks "
+		    "3 dB, the 0.2 s/3 s/60 s power 6/9/12 dB under full scale at Android's level\n", gain / 8, gain % 8 * 125);
+		if (guard_as < below) {
+			say("sound: sound_guard_as=%u: FOR A TEST the guard reckons the amplifiers %u.%03u dB under Android's level, louder "
+			    "than they are, and holds back as much as it would there\n", guard_as, guard_as / 8, guard_as % 8 * 125);
+		}
 		lck_mtx_unlock(&sound_lock);
 		watch();
 		thread_terminate(current_thread());
@@ -1312,6 +1424,12 @@ redwood_sound_dsp_up(void)
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));
 	PE_parse_boot_argn("sound_below", &below, sizeof(below));
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
+	PE_parse_boot_argn("sound_guard_as", &guard_as, sizeof(guard_as));
+	PE_parse_boot_argn("sound_gain", &gain, sizeof(gain));
+	if (gain > REDWOOD_GUARD_MAX_GAIN) {
+		gain = REDWOOD_GUARD_MAX_GAIN;
+	}
+	redwood_guard_configure(true, gain);
 	if (level >= 2 && level <= 3 && seconds > 3) {
 		seconds = 3;            /* the test tone: three seconds at most */
 	}

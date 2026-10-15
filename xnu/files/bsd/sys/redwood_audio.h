@@ -63,6 +63,33 @@ bool redwood_speaker_volume(uint32_t below, uint32_t step_ms); /* below Android'
 bool redwood_speaker_healthy(void);     /* no fault reported; on one, both are powered down at once */
 void redwood_speaker_stop(void);        /* faded out, muted, powered down, in Android's order */
 void redwood_speaker_quiesce(void);     /* powered down at once, without sleeping: on a panic's way out */
+/* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
+uint32_t redwood_speaker_monitor(bool tell);
+
+/*
+ * The speakers' guard (bsd/dev/redwood_guard.c): what the samples go through in the feeder on their
+ * way to the amplifiers, for want of the DSP's speaker protection. Levels in eighths of a dB.
+ */
+#define REDWOOD_GUARD_SILENT    0xffffffffu     /* the amplifiers are off: nothing reaches the speakers */
+struct redwood_guard_report {
+	uint32_t blocks, rms_blocks, fast_blocks, slow_blocks;  /* blocks done, and in how many each average held the level down */
+	uint32_t limited_frames;        /* frames in which the peak limiter turned the level down */
+	uint32_t peak_in, peak_out;     /* the largest sample that came in and that went out */
+	uint32_t least_peak_gain;       /* the peak limiter's least gain, in 1/65536 */
+	uint64_t least_gain, gain;      /* the power guard's (with the monitor's) least gain and the latest, Q30 */
+	uint64_t rms, fast, slow;       /* the averages now, the louder speaker's: Q30 of a full-scale square wave at Android's level */
+};
+#define REDWOOD_GUARD_MAX_GAIN  (12 * 8)        /* the most gain before the guard: 12 dB */
+void redwood_guard_configure(bool hpf, uint32_t gain);         /* the high-pass filter; `gain' before everything */
+void redwood_guard_attenuation(uint32_t below);                 /* the amplifiers' level under Android's (or REDWOOD_GUARD_SILENT):
+                                                                 * what the limits are reckoned from */
+void redwood_guard_monitor(uint32_t below);                     /* a reduction asked for by redwood_speaker_monitor() */
+void redwood_guard_process(int16_t *frames, uint32_t count);    /* stereo frames, in place */
+void redwood_guard_take_report(struct redwood_guard_report *report);   /* what happened since the last call */
+int redwood_guard_decibels(uint64_t ratio);                     /* 10 log10 of a Q30 ratio, in tenths of a dB */
+/* boot-arg rec_sound_fed=1: the recording (rec_sound=N) has what the guard let through instead of what iOS wrote */
+bool redwood_audio_recording_fed(void);
+void redwood_audio_record_fed(const int16_t *frames, uint32_t count);
 
 /*
  * The audio DSP's services, for the sound's path (bsd/dev/redwood_adsp.c, bsd/dev/redwood_sound.c).
