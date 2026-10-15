@@ -18,6 +18,7 @@ extern "C" {
 #include <IOKit/IOLib.h>
 #include <IOKit/IOCPU.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 
 #include "MiniDrivers.h"
 
@@ -221,7 +222,7 @@ GenericARMPE::start(IOService * provider)
 	 * one the kernel has a number for, register them all -- that settles the CPU count --
 	 * and then start them, the boot processor (number master_cpu) first.
 	 */
-	GenericARMCPU * cpus[MAX_CPUS] = {};
+	static GenericARMCPU * cpus[MAX_CPUS];        /* (static: the slower cores may be started later, see below) */
 	unsigned int count = 0;
 	OSIterator * iter = getChildIterator(gIOServicePlane);
 	if (iter != NULL) {
@@ -254,11 +255,40 @@ GenericARMPE::start(IOService * provider)
 		if (count > 1) {
 			psci_smp_init();
 		}
+		/*
+		 * The slower cores (an L2 access penalty, the loader's "small-core") are started 28 seconds
+		 * later (boot-arg small_cores_after=S; 0: at once). With all seven from the start the lock
+		 * screen came 1.5 s later than with the four big ones alone (26.5-27.0 s after the kernel
+		 * began instead of 25.3-25.5: start-up's other work shares memory and cache with
+		 * SpringBoard's), while that work as a whole was done earlier (34 s instead of 38). With
+		 * the slower cores joining once the lock screen is there: 25.3 s and 36 s.
+		 */
+		uint32_t later = 28;
+		static thread_call_t later_call;
+
+		PE_parse_boot_argn("small_cores_after", &later, sizeof(later));
 		cpus[master_cpu]->run();
 		for (unsigned int number = 0; number < MAX_CPUS; number++) {
 			if (cpus[number] != NULL && number != (unsigned int)master_cpu) {
+				if (later != 0 && ml_get_topology_info()->cpus[number].l2_access_penalty != 0) {
+					continue;
+				}
 				cpus[number]->run();
 			}
+		}
+		if (later != 0) {
+			uint64_t deadline;
+
+			later_call = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
+				for (unsigned int number = 0; number < MAX_CPUS; number++) {
+					if (cpus[number] != NULL && ml_get_topology_info()->cpus[number].l2_access_penalty != 0) {
+						cpus[number]->run();
+					}
+				}
+				IOLog("GenericARMPE: the slower cores started too: %u processors running\n", processor_avail_count);
+			}, NULL);
+			clock_interval_to_deadline(later, NSEC_PER_SEC, &deadline);
+			thread_call_enter_delayed(later_call, deadline);
 		}
 		if (count > 1) {
 			IOLog("GenericARMPE: %u of %u processors are running\n", processor_avail_count, count);
