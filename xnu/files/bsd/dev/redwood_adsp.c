@@ -81,6 +81,7 @@
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+#include <os/atomic_private.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <vm/memory_types.h>
@@ -94,6 +95,7 @@
 #include <sys/vnode_internal.h>
 #include <vm/vm_kern.h>
 #include <sys/redwood_audio.h>
+#include <sys/redwood_input.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
@@ -1833,7 +1835,7 @@ struct glink_packet {
  * carries APR, the audio services' own protocol (below; Android's apr_tal_rpmsg.c asks for no
  * particular intents: what the DSP sends there is a few hundred bytes, up to a few kilobytes).
  */
-enum { CHANNEL_QRTR, CHANNEL_APR, CHANNELS };
+enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNELS };
 
 struct glink_channel {
 	const char *name;
@@ -1869,6 +1871,8 @@ static struct {
 	.channel = {
 		[CHANNEL_QRTR] = { .name = "IPCRTR", .ours = 1, .intents = { { 0x800, 5 }, { 0x2000, 3 }, { 0x4400, 2 } } },
 		[CHANNEL_APR] = { .name = "apr_audio_svc", .ours = 2, .intents = { { 0x200, 8 }, { 0x1000, 4 }, { 0x2000, 2 } } },
+		/* the battery manager's (battmgr below): answers of a few dozen bytes, a name of 128 */
+		[CHANNEL_PMIC] = { .name = "PMIC_RTR_ADSP_APPS", .ours = 3, .intents = { { 0x200, 6 }, { 0x1000, 2 }, { 0, 0 } } },
 	},
 };
 
@@ -2628,6 +2632,236 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 	return redwood_adsp_apr(service, 0, 0, opcode, payload, length, ms, NULL);
 }
 
+/* ---- the battery manager, on the channel PMIC_RTR_ADSP_APPS ------------------------------------------ */
+
+/*
+ * On this SoC the audio DSP also runs the battery's and the charger's management -- the fuel gauge,
+ * the charging -- and the operating system only asks it how things are: Android's
+ * qti_battery_charger.c, Linux's qcom_battmgr.c over pmic_glink.c, on the channel PMIC_RTR_ADSP_APPS
+ * that the DSP opens. A message is a header (owner 32778, the battery manager; type 1, request and
+ * answer, or 2, a notice; an opcode) and its words; a property is asked for with opcode 0x30 (the
+ * battery's) or 0x32 (the USB port's), the battery's number (0), the property's number and a word
+ * that a get does not use, and is answered with the property's number, its value and a result (0:
+ * good). Only gets are sent from here: nothing is set, no limit, no current, no notice asked for.
+ * With adsp=1 (battmgr=0: not) it is asked every BATTMGR_SECONDS while the DSP runs, and what it says
+ * goes to bsd/dev/redwood_battery.c (redwood_battery_report()), and from there to the power source
+ * that iOS reads (iokit/Kernel/RedwoodBattery.cpp). battmgr=2: every property once, for the log.
+ * Units: capacity in hundredths of a percent, voltage in uV, current in uA (more than 0 while the
+ * battery takes charge), the temperature in hundredths of a degree, charges in uAh.
+ * The properties' numbers are this phone's firmware's, read with battmgr=2 and checked against what
+ * Android shows at the same moment (dumpsys battery, /sys/class/power_supply/battery): up to 9 they
+ * are those of Linux's qcom_battmgr.c (sm8350), from there on one more property comes before the
+ * temperature, so the temperature is 13, not 12, and the charge counter, the cycles, the designed and
+ * the learnt full charge are 15 to 18.
+ */
+#define BATTMGR_OWNER           32778
+#define BATTMGR_REQUEST         1
+#define BATTMGR_NOTICE          2
+#define BATTMGR_BATTERY_GET     0x30
+#define BATTMGR_USB_GET         0x32
+#define BATT_STATUS             0               /* Linux's POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
+#define BATT_HEALTH             1
+#define BATT_PRESENT            2
+#define BATT_CAPACITY           4
+#define BATT_VOLT_NOW           7
+#define BATT_CURR_NOW           9
+#define BATT_TEMP               13              /* hundredths of a degree: 3900 when Android says 39.0 */
+#define BATT_CHG_COUNTER        15              /* the charge in the battery now, uAh */
+#define BATT_CYCLE_COUNT        16
+#define BATT_CHG_FULL_DESIGN    17              /* 5000000 uAh */
+#define BATT_CHG_FULL           18              /* the full charge as the fuel gauge has learnt it, uAh */
+#define USB_VOLT_NOW            1               /* uV */
+#define USB_CURR_NOW            3               /* uA, what the port gives */
+#define USB_TYPE                6               /* Linux's POWER_SUPPLY_USB_TYPE_*: 1 here, a computer's port */
+#define USB_ONLINE              0
+#define BATTMGR_SECONDS         10
+
+struct battmgr_message {
+	uint32_t owner, type, opcode;
+	uint32_t words[3];                      /* asked: battery, property, value; answered: property, value, result */
+};
+
+static struct {
+	volatile uint32_t answers, notices;
+	uint32_t opcode, property, value, result, length;
+	bool wanted;
+	volatile bool runs;
+} battmgr;
+
+static void
+battmgr_input(const uint8_t *data, uint32_t length)
+{
+	struct battmgr_message m;
+
+	bzero(&m, sizeof(m));
+	memcpy(&m, data, length < sizeof(m) ? length : sizeof(m));
+	if (m.owner != BATTMGR_OWNER || length < 12) {
+		printf("adsp: battmgr: < %u bytes of owner %u, type %u, opcode %#x: not the battery manager's\n", length, m.owner,
+		    m.type, m.opcode);
+		return;
+	}
+	if (m.type == BATTMGR_NOTICE) {
+		if (battmgr.notices++ < 8) {
+			tell("adsp: battmgr: < a notice, opcode %#x, %u bytes (%#x %#x %#x)\n", m.opcode, length, m.words[0], m.words[1],
+			    m.words[2]);
+		}
+		return;
+	}
+	battmgr.opcode = m.opcode;
+	battmgr.property = m.words[0];
+	battmgr.value = m.words[1];
+	battmgr.result = m.words[2];
+	battmgr.length = length;
+	os_atomic_inc(&battmgr.answers, release);
+}
+
+/* One property asked for and its answer waited for (a second at most); one thread asks at a time (battmgr_thread). */
+static bool
+battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
+{
+	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode, { 0, property, 0 } };
+	uint32_t before = os_atomic_load(&battmgr.answers, acquire);
+
+	if (glink_send(&glink.channel[CHANNEL_PMIC], &q, sizeof(q)) != 0) {
+		return false;
+	}
+	for (unsigned ms = 0; ms < 1000; ms++) {
+		if (os_atomic_load(&battmgr.answers, acquire) != before) {
+			if (battmgr.opcode != opcode || battmgr.property != property || battmgr.length < sizeof(struct battmgr_message)) {
+				before = battmgr.answers;       /* (somebody else's answer: wait on) */
+				continue;
+			}
+			if (battmgr.result != 0) {
+				return false;
+			}
+			*value = battmgr.value;
+			return true;
+		}
+		sleep_ms(1);
+	}
+	return false;
+}
+
+static void
+battmgr_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	battmgr.runs = true;
+	for (unsigned ms = 0; ms < 15000 && battmgr.wanted && !glink.channel[CHANNEL_PMIC].open; ms += 10) {
+		sleep_ms(10);
+	}
+	if (!glink.channel[CHANNEL_PMIC].open) {
+		tell("adsp: battmgr: the DSP has not opened PMIC_RTR_ADSP_APPS: nothing is asked\n");
+		battmgr.runs = false;
+		thread_terminate(current_thread());
+	}
+	{
+		/* boot-arg battmgr=2: every property once, for the log (which number is which on this phone's firmware) */
+		uint32_t mode = 1;
+
+		PE_parse_boot_argn("battmgr", &mode, sizeof(mode));
+		for (uint32_t p = 0; mode == 2 && p < 32; p++) {
+			uint32_t v = 0;
+			bool ok = battmgr_get(BATTMGR_BATTERY_GET, p, &v);
+
+			tell("adsp: battmgr: battery property %u: %s %u (%d)\n", p, ok ? "" : "NO ANSWER", v, (int)v);
+		}
+		for (uint32_t p = 0; mode == 2 && p < 12; p++) {
+			uint32_t v = 0;
+			bool ok = battmgr_get(BATTMGR_USB_GET, p, &v);
+
+			tell("adsp: battmgr: USB property %u: %s %u (%d)\n", p, ok ? "" : "NO ANSWER", v, (int)v);
+		}
+	}
+	for (unsigned round = 0; battmgr.wanted && glink.up && glink.channel[CHANNEL_PMIC].open; round++) {
+		struct redwood_battery_state b = { .size = sizeof(b) };
+		uint32_t capacity = 0, status = 0, present = 0, volt = 0, curr = 0, temp = 0, usb = 0;
+		uint32_t usb_type = 0, usb_volt = 0, usb_curr = 0, charge = 0;
+		static uint32_t full, design, cycles;
+		bool good = battmgr_get(BATTMGR_BATTERY_GET, BATT_CAPACITY, &capacity) &&
+		    battmgr_get(BATTMGR_BATTERY_GET, BATT_STATUS, &status) &&
+		    battmgr_get(BATTMGR_BATTERY_GET, BATT_PRESENT, &present) &&
+		    battmgr_get(BATTMGR_BATTERY_GET, BATT_VOLT_NOW, &volt) &&
+		    battmgr_get(BATTMGR_BATTERY_GET, BATT_CURR_NOW, &curr) &&
+		    battmgr_get(BATTMGR_BATTERY_GET, BATT_TEMP, &temp) &&
+		    battmgr_get(BATTMGR_USB_GET, USB_ONLINE, &usb);
+
+		if (good) {
+			/* (what may be missing without harm, and the capacities and the cycles only now and then: they hardly change) */
+			(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_COUNTER, &charge);
+			if (usb) {
+				(void)battmgr_get(BATTMGR_USB_GET, USB_TYPE, &usb_type);
+				(void)battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &usb_volt);
+				(void)battmgr_get(BATTMGR_USB_GET, USB_CURR_NOW, &usb_curr);
+			}
+			if (round % 30 == 0 || full == 0) {
+				(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_FULL, &full);
+				(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_FULL_DESIGN, &design);
+				(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CYCLE_COUNT, &cycles);
+			}
+			b.percent_hundredths = (int32_t)capacity;
+			b.voltage_uv = (int32_t)volt;
+			b.current_ua = (int32_t)curr;
+			b.temperature_hundredths = (int32_t)temp;
+			b.present = present != 0;
+			b.external = usb != 0;
+			b.status = (int32_t)status;
+			b.charge_uah = (int32_t)charge;
+			b.full_uah = (int32_t)full;
+			b.design_uah = (int32_t)design;
+			b.cycles = (int32_t)cycles;
+			b.usb_type = (int32_t)usb_type;
+			b.usb_voltage_uv = (int32_t)usb_volt;
+			b.usb_current_ua = (int32_t)usb_curr;
+			redwood_battery_report(&b);
+		}
+		if (round < 3 || round % 6 == 0 || !good) {
+			tell("adsp: battmgr: %s capacity %u (hundredths of a percent), status %u, present %u, %d uV, %d uA, temperature %d "
+			    "(hundredths of a degree), charge %u uAh, USB online %u (type %u, %u uV, %u uA)\n",
+			    good ? "the DSP says:" : "NO ANSWER to all of", capacity, status, present, (int)volt, (int)curr, (int)temp,
+			    charge, usb, usb_type, usb_volt, usb_curr);
+			if (round % 30 == 0 && good) {
+				tell("adsp: battmgr: full charge %u uAh, as designed %u uAh, %u cycles\n", full, design, cycles);
+			}
+		}
+		for (unsigned ms = 0; ms < BATTMGR_SECONDS * 1000 && battmgr.wanted && glink.up; ms += 50) {
+			sleep_ms(50);
+		}
+	}
+	battmgr.runs = false;
+	thread_terminate(current_thread());
+}
+
+static void
+battmgr_start(void)
+{
+	thread_t thread;
+
+	uint32_t wanted = 1;            /* (on with adsp=1 unless battmgr=0) */
+
+	PE_parse_boot_argn("battmgr", &wanted, sizeof(wanted));
+	if (wanted == 0 || battmgr.runs) {
+		return;
+	}
+	if (option("battery")) {
+		/* (the loader's way, through Qualcomm's UEFI charger drivers: one way to the battery at a time) */
+		tell("adsp: battmgr: not with battery=1: the battery is asked about the loader's way\n");
+		return;
+	}
+	battmgr.wanted = true;
+	if (kernel_thread_start(battmgr_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+static void
+battmgr_stop(void)
+{
+	battmgr.wanted = false;
+	for (unsigned ms = 0; ms < 2000 && battmgr.runs; ms++) {
+		sleep_ms(1);
+	}
+}
+
 /* ---- the link's thread ----------------------------------------------------------------------------- */
 
 static volatile bool link_wanted, link_runs;
@@ -2674,6 +2908,8 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			if (from == CHANNEL_QRTR) {
 				qrtr_input(packet->data, packet->length);
+			} else if (from == CHANNEL_PMIC) {
+				battmgr_input(packet->data, packet->length);
 			} else {
 				apr_input(packet->data, packet->length);
 			}
@@ -2902,6 +3138,7 @@ steps_over(uint32_t done)
 void
 redwood_adsp_stop(void)
 {
+	battmgr_stop();
 	redwood_sound_dsp_down();               /* the amplifiers, the stream and the port first, while the DSP still listens */
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started) {
@@ -2971,6 +3208,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		tell("adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
 		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
 		redwood_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, redwood_sound.c) */
+		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
