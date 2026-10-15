@@ -143,6 +143,6 @@ main(void)
 	run("silence", REDWOOD_GUARD_SILENT, 0, 0, 0, 600, 600);
 	run("pink noise at -24 dB RMS (loud music as iOS leaves it) with 12 dB of gain", 0, 2, pow(10, -24 / 20.0), 0, 60, 20);
 	run("silence", REDWOOD_GUARD_SILENT, 0, 0, 0, 600, 600);
-	run("the same with the amplifiers 90 dB under (as tonight)", 720, 2, pow(10, -24 / 20.0), 0, 10, 5);
+	run("the same with the amplifiers 90 dB under (sound_below=720)", 720, 2, pow(10, -24 / 20.0), 0, 10, 5);
 	return 0;
 }
