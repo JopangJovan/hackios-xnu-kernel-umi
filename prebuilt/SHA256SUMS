@@ -1,6 +1,6 @@
 Built 2026-10-15 10:48 from this tree.
 
-4208a4b466bcefc2864882202260576dc4595cf8cd91e301c888cbd7e36d980b  prebuilt/mach.development.bcm2837
+8ad05afab8f83432511f01b7a05bf9f4f9a12bd1113d01b5d70a4eee010b6d7d  prebuilt/mach.development.bcm2837
 7e306f191235a9164e9d88d4cf814e86ee600b104cebf475e6d8a3e6c45f668f  prebuilt/loader.efi
 d2a35a4a1d6658ffb3696914f727661b52c9333de8a3af8a31642b8023ce03ac  prebuilt/userland/child
 1a413befd511384052e1962c1394adce20f718e1f2657ce63ab09828ebc4bd1b  prebuilt/userland/cpu_test
