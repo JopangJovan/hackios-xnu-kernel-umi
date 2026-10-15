@@ -2404,7 +2404,13 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 		}
 	}
 	clear_now(e);
+	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+	if (began != 0 && now_us() - began >= slow_calls_us) {
+		/* (with glslow=US: which pictures take long to hand over) */
+		say("tl: slow-tex %dx%d level %d format %#x type %#x%s %llu at %llu\n", width, height, level, format, type,
+		    pixels ? "" : " (empty)", now_us() - began, began);
+	}
 	EAGL_LEAVE(e, 0x970);
 }
 

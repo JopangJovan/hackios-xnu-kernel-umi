@@ -3230,6 +3230,8 @@ static uint64_t gpu_ticks;              /* how long the core has worked on the s
 static uint32_t gpu_timed_count;
 static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
+uint32_t gpu_log;                       /* boot-arg gpu_log=1: a line for every submission and the time the core spent on it */
+extern void redwood_tl(const char *format, ...) __printflike(1, 2);
 static struct {
 	uint64_t start, size;
 } gpu_free[1024];                       /* the addresses not in use, in order */
@@ -3454,6 +3456,11 @@ gpu_times(void)
 			static const uint32_t under[6] = { 1920, 4800, 9600, 19200, 38400, 76800 };     /* (19.2 ticks a microsecond) */
 			uint64_t ticks = times[2 * slot + 1] - times[2 * slot];
 			unsigned by = 0;
+
+			if (gpu_log) {
+				/* "tl: q FENCE took US": what the core spent on that submission (iokit/Kernel/RedwoodGPU.cpp: tl: Q) */
+				redwood_tl("tl: q %u took %llu\n", gpu_timed, ticks * 10 / 192);
+			}
 
 			while (by < 6 && ticks >= under[by]) {
 				by++;
@@ -3844,6 +3851,7 @@ redwood_adreno_init(void)
 			bzero((void *)core_scratch.memory, 4096);
 			to_memory(core_scratch.memory, 4096);
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
+			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
 			gpu_kept = true;
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service RedwoodGPU\n");

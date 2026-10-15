@@ -55,6 +55,7 @@ void redwood_gpu_mapped(void);
 void redwood_gpu_unmap(uint64_t address, uint64_t size);
 void redwood_gpu_to_memory(void * start, uint64_t size);
 uint32_t redwood_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+extern uint32_t gpu_log;
 bool redwood_gpu_done(uint32_t fence);
 uint32_t redwood_gpu_last(void);
 void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
@@ -801,6 +802,22 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
 		words[count++] = cmds[i].size / 4;
 	}
 	request->fence = redwood_gpu_submit(addresses, words, count);
+	if (gpu_log && request->fence != 0) {
+		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
+		uint32_t big = 0, all_words = 0;
+		uint64_t ns;
+
+		for (uint32_t i = 0; i < request->nr_bos; i++) {
+			struct gpu_buffer * b = buffer(bos[i].handle);
+
+			big += b != NULL && b->size >= (4u << 20);
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			all_words += words[i];
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		redwood_tl("tl: Q %u at %llu: %u buffers, %u big, %u words\n", request->fence, ns / 1000, request->nr_bos, big, all_words);
+	}
 	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
 		request->fence_fd = -1;
 	}
