@@ -729,7 +729,20 @@ redwood_springboard_init(void)
 	 * dark lock screen with nothing to swipe. So we just forcibly dismiss it after 10 seconds
 	 * so iOS always lands on the home screen even in the worst case. Harmless if touch is
 	 * already working: the user just doesn't need to swipe themselves.
+	 * With autounlock=0 among the kernel's arguments the lock screen stays until it is swiped away
+	 * (to show the phone starting the way an iPhone does).
 	 */
+	{
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *arg;
+
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (arg = strstr(args, "autounlock=0")) != NULL &&
+		    (arg == args || arg[-1] == ' ')) {
+			say("redwood: the lock screen stays until it is swiped away (autounlock=0)\n");
+			return;
+		}
+	}
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 		unlock();
 	});
