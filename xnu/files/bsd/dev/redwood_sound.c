@@ -92,7 +92,7 @@ extern lck_mtx_t redwood_smmu_lock;
 static LCK_GRP_DECLARE(sound_lock_group, "redwood-sound");
 static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
 
-static uint32_t level, seconds = 3, below = 160, pause_ms = 1000, gain = REDWOOD_GUARD_MAX_GAIN;
+static uint32_t level, seconds = 3, below = 240, pause_ms = 1000, gain = REDWOOD_GUARD_MAX_GAIN;
 static uint32_t guard_as = UINT32_MAX;  /* boot-arg sound_guard_as=N: the guard reckons the amplifiers at most N under (a test) */
 static char last_write[96] = "nothing written";
 
