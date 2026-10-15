@@ -229,6 +229,13 @@ fi
 if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	{ [ ! -f system.packfs ] || [ obj/stage0 -nt system.packfs ] || [ $IOS/system.manifest -nt system.packfs ] ||
 	  [ $IOS/cryptex -nt system.packfs ] || [ -n "$SYSTEM" ]; }; then
+	# what ios165/select-system.py has chosen since ios165/rootfs was extracted is not in it, and would not be
+	# in the image either (so it was once with the audio plug-ins and the system's sounds: iOS found no
+	# speaker and played nothing, though our device was there and the kernel's side worked)
+	if [ -f $IOS/.done-rootfs ] && [ $IOS/select-system.py -nt $IOS/.done-rootfs ]; then
+		echo "build.sh: ios165/select-system.py has changed since ios165/rootfs was extracted: run KEEP=1 ios165/fetch.sh" >&2
+		exit 1
+	fi
 	rm -rf sysroot
 	cp -al $IOS/rootfs sysroot                      # hard links: no copies of the 0.5 GB
 	# launchd must load our choice of jobs, not all 500 that iOS has
