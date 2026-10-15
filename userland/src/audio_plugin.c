@@ -34,12 +34,23 @@
  *
  * The device has no clock but the system's: it claims to play exactly REDWOOD_AUDIO_RATE frames
  * a second of mach_absolute_time(), and the HAL's I/O thread paces itself by that.
+ *
+ * The speaker's output has a volume control, as the iPhone's own speaker has: what is set on it
+ * goes to the kernel (ioctl REDWOOD_AUDIO_SET_VOLUME), which sets the amplifiers' level by it -- on
+ * the phone, so far under the loudest it allows. Its scale is 48 dB in a straight line of
+ * decibels, 3 dB for each of iOS's sixteen steps; 0 is silence. What iOS does with it (the phone,
+ * 15 October): the virtual audio device sets it once, to its top (0 dB), when it takes the
+ * device, and leaves it there -- its routing tables keep the iPhone X's speaker in software volume
+ * mode, so the volume buttons and Control Center scale the samples themselves, and at 0 what is
+ * written is silence (on which the kernel keeps the amplifiers off).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFPlugInCOM.h>
 #include <CoreAudioTypes/CoreAudioTypes.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
+#include <sys/ioctl.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -154,6 +165,12 @@ enum {
 	kAudioStreamTerminalTypeSpeaker = 'spkr', kAudioStreamTerminalTypeMicrophone = 'micr',
 
 	kAudioServerPlugInIOOperationReadInput = 'read', kAudioServerPlugInIOOperationWriteMix = 'rite',
+
+	kAudioLevelControlClassID = 'levl', kAudioVolumeControlClassID = 'vlme',
+	kAudioControlPropertyScope = 'cscp', kAudioControlPropertyElement = 'celm',
+	kAudioLevelControlPropertyScalarValue = 'lcsv', kAudioLevelControlPropertyDecibelValue = 'lcdv',
+	kAudioLevelControlPropertyDecibelRange = 'lcdr', kAudioLevelControlPropertyConvertScalarToDecibels = 'lcsd',
+	kAudioLevelControlPropertyConvertDecibelsToScalar = 'lcds',
 };
 
 /* ---- the devices ---------------------------------------------------------------------------------- */
@@ -166,8 +183,11 @@ enum {
 	OBJECT_PLUGIN = 1,
 	OBJECT_SPEAKER, OBJECT_SPEAKER_OUTPUT, OBJECT_SPEAKER_INPUT,
 	OBJECT_HAWKING, OBJECT_HAWKING_INPUT,
-	OBJECT_LAST = OBJECT_HAWKING_INPUT
+	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
+	OBJECT_LAST = OBJECT_SPEAKER_VOLUME
 };
+
+#define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
 
 struct device {
 	AudioObjectID object;
@@ -198,6 +218,7 @@ static int sink = -1;                   /* /dev/redwood-audio */
 static Float64 ticks_per_frame;
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
+static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
 
 static void
 say(const char *format, ...)
@@ -213,6 +234,36 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+}
+
+/* The volume control's scale: a straight line of decibels over VOLUME_RANGE_DB. */
+static Float32
+scalar_to_db(Float32 scalar)
+{
+	scalar = scalar < 0 ? 0 : scalar > 1 ? 1 : scalar;
+	return (Float32)(-VOLUME_RANGE_DB * (1.0 - scalar));
+}
+
+static Float32
+db_to_scalar(Float32 db)
+{
+	Float32 scalar = (Float32)(1.0 + db / VOLUME_RANGE_DB);
+
+	return scalar < 0 ? 0 : scalar > 1 ? 1 : scalar;
+}
+
+/* The volume, to the kernel. With the lock held. */
+static void
+volume_to_kernel(void)
+{
+	struct redwood_audio_volume v = { (uint32_t)lround(-scalar_to_db(volume) * 8), volume <= 0 };
+
+	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_VOLUME, &v) < 0) {
+		say("redwood: audio: the volume %.3f could not be given to the kernel (%s)\n", volume, strerror(errno));
+		return;
+	}
+	say("redwood: audio: the volume is %.3f: %s%.1f dB under the loudest\n", volume, v.muted ? "silence, " : "",
+	    v.below / 8.0);
 }
 
 /* The device with this object number, or the one this stream belongs to; NULL = neither. */
@@ -316,6 +367,7 @@ struct value {
 	union {
 		UInt32 words[4];
 		Float64 number;
+		Float32 decimal;
 		CFStringRef string;
 		AudioValueRange range;
 		AudioStreamBasicDescription format;
@@ -334,6 +386,45 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 #define WORD(x)         (v.u.words[0] = (x), v.size = sizeof(UInt32))
 #define LIST(x)         (v.u.words[v.size / sizeof(UInt32)] = (x), v.size += sizeof(UInt32))
 #define STRING(x)       (v.u.string = (x), v.string = true, v.size = sizeof(CFStringRef))
+#define FLOAT(x)        (v.u.decimal = (x), v.size = sizeof(Float32))
+	if (object == OBJECT_SPEAKER_VOLUME) {
+		switch (selector) {
+		case kAudioObjectPropertyBaseClass:
+			WORD(kAudioLevelControlClassID);
+			break;
+		case kAudioObjectPropertyClass:
+			WORD(kAudioVolumeControlClassID);
+			break;
+		case kAudioObjectPropertyOwner:
+			WORD(OBJECT_SPEAKER);
+			break;
+		case kAudioObjectPropertyOwnedObjects:
+			v.empty = true;
+			break;
+		case kAudioControlPropertyScope:
+			WORD(kAudioObjectPropertyScopeOutput);
+			break;
+		case kAudioControlPropertyElement:
+			WORD(0);
+			break;
+		case kAudioLevelControlPropertyScalarValue:
+			FLOAT(volume);
+			break;
+		case kAudioLevelControlPropertyDecibelValue:
+			FLOAT(scalar_to_db(volume));
+			break;
+		case kAudioLevelControlPropertyDecibelRange:
+			v.u.range.mMinimum = -VOLUME_RANGE_DB;
+			v.u.range.mMaximum = 0;
+			v.size = sizeof(AudioValueRange);
+			break;
+		case kAudioLevelControlPropertyConvertScalarToDecibels:
+		case kAudioLevelControlPropertyConvertDecibelsToScalar:
+			FLOAT(0);       /* (converts what it is given: get_property_data()) */
+			break;
+		}
+		return v;
+	}
 	if (object != OBJECT_PLUGIN && d == NULL) {
 		return v;
 	}
@@ -412,17 +503,23 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioObjectPropertyOwnedObjects:
 		case kAudioDevicePropertyStreams:
-			/* the streams of one direction, or of both */
+			/* the streams of one direction, or of both (and the speaker's volume control, which it owns) */
 			if (scope != kAudioObjectPropertyScopeInput && d->output != 0) {
 				LIST(d->output);
 			}
 			if (scope != kAudioObjectPropertyScopeOutput && d->input != 0) {
 				LIST(d->input);
 			}
+			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_SPEAKER) {
+				LIST(OBJECT_SPEAKER_VOLUME);
+			}
 			v.empty = v.size == 0;
 			break;
 		case kAudioObjectPropertyControlList:
-			v.empty = true;
+			if (d->object == OBJECT_SPEAKER) {
+				LIST(OBJECT_SPEAKER_VOLUME);
+			}
+			v.empty = v.size == 0;
 			break;
 		case kAudioDevicePropertyNominalSampleRate:
 			v.u.number = REDWOOD_AUDIO_RATE;
@@ -474,6 +571,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 #undef WORD
 #undef LIST
 #undef STRING
+#undef FLOAT
 	return v;
 }
 
@@ -499,8 +597,11 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 	if (address == NULL || settable == NULL || !has_property(driver, object, client, address)) {
 		return kAudioHardwareUnknownPropertyError;
 	}
-	/* the rate and the formats can be "set", to the ones there are */
-	if (object == OBJECT_PLUGIN) {
+	/* the rate and the formats can be "set", to the ones there are; the volume can be set */
+	if (object == OBJECT_SPEAKER_VOLUME) {
+		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
+		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
+	} else if (object == OBJECT_PLUGIN) {
 		*settable = false;
 	} else if (object == d->object) {
 		*settable = address->mSelector == kAudioDevicePropertyNominalSampleRate;
@@ -531,6 +632,17 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 
 	if (address == NULL || size == NULL || data == NULL || !has_property(driver, object, client, address)) {
 		return object < OBJECT_PLUGIN || object > OBJECT_LAST ? kAudioHardwareBadObjectError : kAudioHardwareUnknownPropertyError;
+	}
+	if (object == OBJECT_SPEAKER_VOLUME && (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
+	    address->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
+		/* what is in the buffer, converted where it is */
+		if (room < sizeof(Float32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		*(Float32 *)data = address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ?
+		    scalar_to_db(*(Float32 *)data) : db_to_scalar(*(Float32 *)data);
+		*size = sizeof(Float32);
+		return 0;
 	}
 	pthread_mutex_lock(&lock);
 	v = property(object, address, qualifier_size, qualifier);
@@ -563,6 +675,28 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	}
 	if (!settable) {
 		return kAudioHardwareIllegalOperationError;
+	}
+	if (object == OBJECT_SPEAKER_VOLUME) {
+		AudioObjectPropertyAddress changed[2] = {
+			{ kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 0 },
+			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 0 },
+		};
+		Float32 wanted;
+
+		if (size != sizeof(Float32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		wanted = *(const Float32 *)data;
+		wanted = address->mSelector == kAudioLevelControlPropertyDecibelValue ? db_to_scalar(wanted) :
+		    wanted < 0 ? 0 : wanted > 1 ? 1 : wanted;
+		pthread_mutex_lock(&lock);
+		volume = wanted;
+		volume_to_kernel();
+		pthread_mutex_unlock(&lock);
+		if (host != NULL) {
+			host->PropertiesChanged(host, OBJECT_SPEAKER_VOLUME, 2, changed);
+		}
+		return 0;
 	}
 	if (address->mSelector == kAudioStreamPropertyIsActive) {
 		if (size != sizeof(UInt32)) {

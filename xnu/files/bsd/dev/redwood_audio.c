@@ -222,9 +222,42 @@ audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	return error;
 }
 
+/* the speakers' volume, as iOS sets it (sys/redwood_audio.h): kept for the sink's driver to look at */
+static uint32_t volume_below, volume_generation;
+static bool volume_muted;
+
+static int
+audio_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags, __unused struct proc *p)
+{
+	const struct redwood_audio_volume *volume = (const struct redwood_audio_volume *)data;
+
+	if (command != REDWOOD_AUDIO_SET_VOLUME) {
+		return ENOTTY;
+	}
+	lck_mtx_lock(&audio_lock);
+	volume_below = volume->below;
+	volume_muted = volume->muted != 0;
+	volume_generation++;
+	lck_mtx_unlock(&audio_lock);
+	printf("redwood-audio: the volume: %s%u.%03u dB under the loudest\n", volume->muted ? "muted; " : "", volume->below / 8,
+	    volume->below % 8 * 125);
+	return 0;
+}
+
+bool
+redwood_audio_volume(uint32_t *below, bool *muted, uint32_t *generation)
+{
+	lck_mtx_lock(&audio_lock);
+	*below = volume_below;
+	*muted = volume_muted;
+	*generation = volume_generation;
+	lck_mtx_unlock(&audio_lock);
+	return *generation != 0;
+}
+
 static const struct cdevsw audio_cdevsw = {
 	.d_open = audio_open, .d_close = audio_close, .d_read = eno_rdwrt, .d_write = audio_write,
-	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_ioctl = audio_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 

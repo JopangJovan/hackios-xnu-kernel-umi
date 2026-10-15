@@ -23,7 +23,23 @@
 #define REDWOOD_AUDIO_CHANNELS  2
 #define REDWOOD_AUDIO_FRAME     4       /* bytes */
 
+/*
+ * ioctl(REDWOOD_AUDIO_SET_VOLUME): the speakers' volume, as iOS sets it on the plug-in's volume
+ * control -- how many eighths of a dB under the loudest they may play, and whether they are
+ * muted (iOS's volume at 0). The loudest is the kernel's to say (on the phone: Android's own
+ * level less sound_below, redwood_sound.c); the plug-in only says how far under it.
+ */
+#include <sys/ioccom.h>
+
+struct redwood_audio_volume {
+	uint32_t below;                 /* eighths of a dB */
+	uint32_t muted;
+};
+#define REDWOOD_AUDIO_SET_VOLUME _IOW('r', 1, struct redwood_audio_volume)
+
 #ifdef KERNEL
+#include <stdbool.h>
+
 /*
  * For drivers. A sink is offered frames as they are written and says how many it took (the
  * rest are lost); it is called from the writer's thread and must not wait.
@@ -31,11 +47,11 @@
 typedef uint32_t (*redwood_audio_sink_t)(const int16_t *frames, uint32_t count);
 
 void redwood_audio_set_sink(const char *name, redwood_audio_sink_t sink);
+/* The volume iOS has set last (REDWOOD_AUDIO_SET_VOLUME): false if it has set none; *generation counts the settings. */
+bool redwood_audio_volume(uint32_t *below, bool *muted, uint32_t *generation);
 void redwood_audio_init(void);
 void redwood_virtio_sound_init(void);   /* boot-arg virtio_sound=1: QEMU's virtio sound device */
 void redwood_speaker_init(void);        /* boot-arg speaker_probe=N: a look at the phone's speaker amplifiers */
-
-#include <stdbool.h>
 
 /*
  * The phone's speakers (bsd/dev/redwood_speaker.c): its two Awinic amplifiers, set up as

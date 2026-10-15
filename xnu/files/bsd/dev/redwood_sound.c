@@ -28,7 +28,12 @@
  *   sound=4  what iOS plays (/dev/redwood-audio, redwood_audio.c), until the run ends: the port
  *            and the stream as above, kept running (silence when iOS writes nothing); the
  *            amplifiers set up once and powered down, started and faded in (the driver's quick
- *            fade) whenever a write is not silence, stopped after three seconds of silence
+ *            fade) whenever a write is not silence, stopped after three seconds of silence; their
+ *            level is what is set on the plug-in's volume control (ioctl REDWOOD_AUDIO_SET_VOLUME):
+ *            so far under sound_below, which stays the loudest, and at 0 they stay off. (iOS sets
+ *            that control only once, to the top, and applies its volume to the samples itself --
+ *            see userland/src/audio_plugin.c --; at its volume 0 it writes silence, and the
+ *            amplifiers stay off for that too.)
  *
  * The numbers are Android's own, from the phone's live device tree (qcom,msm-dai-tdm-pri-rx and
  * its port, the pins pri_tdm_*_active), its mixer paths (the speaker: PRI_TDM_RX_0 at 48 kHz,
@@ -985,6 +990,7 @@ static volatile uint32_t ring_head, ring_tail;  /* frames: written by the sink, 
 static volatile uint64_t last_sound_us;         /* when the latest write that was not silence came */
 static volatile bool feeder_runs, watcher_runs;
 static uint64_t fed_frames, silent_frames, ios_frames;
+static volatile uint32_t ios_peak;              /* the largest sample since the amplifiers last started */
 
 /* From the writer's thread, under redwood_audio.c's lock: never waits. */
 static uint32_t
@@ -995,10 +1001,14 @@ ios_sink(const int16_t *frames, uint32_t count)
 
 	for (uint32_t i = 0; i < taken; i++) {
 		int16_t left = frames[2 * i], right = frames[2 * i + 1];
+		uint32_t l = left < 0 ? (uint32_t)-(int32_t)left : (uint32_t)left, r = right < 0 ? (uint32_t)-(int32_t)right : (uint32_t)right;
 
 		ring[2 * ((head + i) % RING_FRAMES)] = left;
 		ring[2 * ((head + i) % RING_FRAMES) + 1] = right;
-		sound |= left > SILENCE || left < -SILENCE || right > SILENCE || right < -SILENCE;
+		sound |= l > SILENCE || r > SILENCE;
+		if (l > ios_peak || r > ios_peak) {
+			ios_peak = l > r ? l : r;
+		}
 	}
 	OSMemoryBarrier();
 	ring_head = head + taken;
@@ -1067,21 +1077,44 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
-/* The amplifiers on while there is sound; their status looked at every 200 ms while they are. On the sound's thread. */
+/*
+ * The amplifiers on while there is sound, at the volume iOS has set (redwood_audio_volume(): how
+ * far under the loudest, sound_below under Android's level), and off while iOS's volume is 0;
+ * their status looked at every 200 ms while they are on. On the sound's thread.
+ */
 static void
 watch(void)
 {
-	bool on = false, given_up = false;
+	bool on = false, given_up = false, muted = false;
 	uint64_t last_look = 0;
-	uint32_t starts = 0;
+	uint32_t starts = 0, changes = 0, generation = 0, extra = 0;
 
 	while (!stopping) {
 		uint64_t now = now_us(), sounded = last_sound_us;
+		uint32_t extra_now, generation_now;
+		bool muted_now;
 
-		if (!on && !given_up && sounded != 0 && now - sounded < 100000) {
+		if (redwood_audio_volume(&extra_now, &muted_now, &generation_now) && generation_now != generation) {
+			generation = generation_now;
+			extra = extra_now;
+			muted = muted_now;
+			changes++;
+			say("sound: iOS sets the volume: %s%u.%03u dB under the loudest, which is %u.%03u dB under Android's level%s\n",
+			    muted ? "muted (0), " : "", extra / 8, extra % 8 * 125, below / 8, below % 8 * 125,
+			    on ? (muted ? ": the amplifiers are stopped" : ": the amplifiers follow") : "");
+			if (on && muted) {
+				redwood_speaker_stop();
+				on = false;
+			} else if (on && !redwood_speaker_volume(below + extra, 1)) {
+				on = false;
+				given_up = true;
+			}
+		}
+		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
 			say_when("iOS plays: the amplifiers are started");
 			starts++;
-			if (!redwood_speaker_start() || !redwood_speaker_volume(below, 1)) {
+			ios_peak = 0;
+			if (!redwood_speaker_start() || !redwood_speaker_volume(below + extra, 1)) {
 				say("sound: THE AMPLIFIERS DID NOT START; iOS's sound goes on to the DSP, unheard\n");
 				given_up = true;
 			} else {
@@ -1094,6 +1127,8 @@ watch(void)
 			}
 		} else if (on && now - sounded > QUIET_BEFORE_OFF_US) {
 			say_when("three seconds of silence: the amplifiers are stopped");
+			say("sound: what iOS wrote while they were on peaked at %u%% of full scale (%u)\n", ios_peak * 100 / 32768,
+			    ios_peak);
 			redwood_speaker_stop();
 			on = false;
 		} else if (on && now - last_look >= 200000) {
@@ -1105,7 +1140,8 @@ watch(void)
 		}
 		sleep_ms(5);
 	}
-	say("sound: the watcher stops; the amplifiers were started %u times%s\n", starts, given_up ? ", and then given up on" : "");
+	say("sound: the watcher stops; the amplifiers were started %u times, iOS set the volume %u times%s\n", starts, changes,
+	    given_up ? ", and the amplifiers were then given up on" : "");
 	watcher_runs = false;
 }
 
