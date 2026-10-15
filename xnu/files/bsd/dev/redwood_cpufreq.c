@@ -28,7 +28,12 @@ extern void loader_log_putc(char c);
 extern void redwood_tl(const char *format, ...) __printflike(1, 2);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
 
-/* The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. */
+/*
+ * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
+ * interrupts off -- on the way back to the loader (redwood_ddr_quiesce()) -- the loader's log only: the
+ * kernel's console may not be written there, and printf was a panic ("Console I/O from interrupt-disabled
+ * context") at the end of every run once the memory vote was taken away on the way back.
+ */
 static void
 tell(const char *format, ...) __printflike(1, 2);
 
@@ -44,7 +49,9 @@ tell(const char *format, ...)
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
 	}
-	printf("%s", line);
+	if (ml_get_interrupts_enabled()) {
+		printf("%s", line);
+	}
 }
 
 #define EPSS_PHYS               0x18591000UL    /* three groups ("domains") of 0x1000: small cores, big, biggest */
