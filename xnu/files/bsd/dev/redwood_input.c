@@ -175,4 +175,5 @@ redwood_input_init(void)
 	redwood_net_init();
 	redwood_adreno_init();
 	redwood_wifi_init();
+	redwood_adsp_init();
 }

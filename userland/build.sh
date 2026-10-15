@@ -30,6 +30,9 @@
 #                                   and nothing changes (src/inject.c, opengl_es()).
 #                                   GL=test: only the library and bin/gl_test (a triangle, src/gl_test.c;
 #                                   RC_JOBS=rc.jobs.gltest runs it); the window server stays as it is.
+#                      ADSP=1       with the audio DSP's firmware from ../fw-audio in fw/ (20 MB; for the
+#                                   kernel's adsp=1 / adsp_step=N, bsd/dev/redwood_adsp.c). Not beside GL=1:
+#                                   the two do not fit the 64 MB the loader takes with the kernel.
 #   system.packfs    the system image, the root filesystem (second RAM disk, /dev/md1): the part of
 #                    iOS 16.5 chosen by ../ios165/select-system.py at its real paths, the dyld
 #                    shared cache, and src/stage0.c as /sbin/launchd (the real one is
@@ -206,6 +209,13 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# so not in the repository; it goes where the firmware goes and the kernel reads it there (wifi_join=1)
 	rm -f root/fw/network
 	[ -f ../fw-wifi/network ] && install -m 0600 ../fw-wifi/network root/fw/network
+fi
+# ... and with ADSP=1 the image of the audio DSP, from the same place into ../fw-audio (bsd/dev/redwood_adsp.c):
+# adsp.mdt and adsp.b02 to adsp.b36, 20 MB. Only when asked for: beside GL=1 the payload would be more than the 64 MB
+# the loader takes.
+if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
 fi
 ../mkpackfs.py -o root.packfs root
 
