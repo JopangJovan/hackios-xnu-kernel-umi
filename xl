@@ -130,7 +130,10 @@ run() { # run <oem command> <label>
 			[ "$(date +%s)" -ge "$deadline" ] && { result=; break; }
 			if [ -n "$XL_FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$XL_FOLLOW" ]; then
 				followed=$(date +%s)
-				fb oem log | grep -q OKAY && fetch_log "$log.live"
+				# (XL_FOLLOW_KEEP=1: every one kept, $log.live.1, .2, ...: a long run's middle, which the log
+				# itself loses once more than a megabyte follows it, is then all there)
+				followed_n=$(( ${followed_n:-0} + 1 ))
+				fb oem log | grep -q OKAY && fetch_log "$log.live" && { [ -z "$XL_FOLLOW_KEEP" ] || cp "$log.live" "$log.live.$followed_n"; }
 			fi
 			sleep 2
 		done

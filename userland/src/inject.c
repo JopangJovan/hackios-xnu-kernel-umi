@@ -831,6 +831,20 @@ redwood_init(void)
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
 	if (strcmp(name, "backboardd") == 0) {
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		/*
+		 * Boot-arg ca_vbl=1: CoreAnimation's frame clock from the display driver's refresh
+		 * notifications. QuartzCore takes them (IOMobileFramebufferEnableVSyncNotifications) only on
+		 * the phones with an A7 to A10, or when CA_FORCE_TIMER is in the environment
+		 * (CADeviceUseVBL()); on the iPhone X it runs a timer of its own instead (CADisplayTimer),
+		 * whose phase it would set from the frame timings of a display driver this one is not.
+		 */
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "ca_vbl=1") != NULL) {
+			setenv("CA_FORCE_TIMER", "1", 1);
+			say("redwood: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
+		}
 		opengl_es();
 		window_server_fixes();
 		/*

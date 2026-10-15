@@ -452,6 +452,7 @@ struct platform {
 	int cores;                       /* at most this many processor cores, numbered from 0 ... */
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
+	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 };
 
 static const struct platform platform_qemu_virt = {
@@ -471,6 +472,12 @@ static const struct platform platform_redwood = {
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
+	/*
+	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-7 Cortex-A78s (2.4 GHz): a big one is about
+	 * 2.5 times as fast. The kernel uses the small ones only when the big ones are all busy
+	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
+	 */
+	.small_cores = 0x0f,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -2011,6 +2018,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
+		if (plat->small_cores & (1u << ((cpu_mpidr[i] >> plat->core_shift) & 31))) {
+			dt_prop_u32(&w, "small-core", 1);
+		}
 		dt_end(&w);
 	}
 	dt_end(&w);

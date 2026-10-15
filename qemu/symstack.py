@@ -67,10 +67,10 @@ def main():
             continue
         if not show:
             continue
-        m = re.search(r'ustacks:  thread (0x[0-9a-f]+): (.*)', line)
+        m = re.search(r'ustacks:  thread (0x[0-9a-f]+)([^:]*): (.*)', line)
         if m:
-            print(f'  thread {m.group(1)}')
-            for depth, text in enumerate(m.group(2).split()):
+            print(f'  thread {m.group(1)}{m.group(2)}')
+            for depth, text in enumerate(m.group(3).split()):
                 if depth == 1:
                     continue            # the link register: usually stale, the frame chain has the caller
                 print(f'    {name(int(text, 16), slide)}')

@@ -36,6 +36,8 @@
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
 
+extern void redwood_tl(const char *format, ...) __printflike(1, 2);
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
@@ -1478,7 +1480,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 			reads++;
 			reading += read_at - looked;
 			if (latency) {
-				printf("tl: c before %llu seen %llu read %llu\n", before, looked, read_at);
+				redwood_tl("tl: c before %llu seen %llu read %llu\n", before, looked, read_at);
 			}
 		} else if (++idle >= idle_looks) {
 			idle = 0;

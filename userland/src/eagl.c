@@ -128,6 +128,9 @@ struct eagl;
 static int eagl_tracing;                /* this frame's calls are written down (boot-arg gltrace=FIRST-LAST) */
 static int frame_lines;                 /* boot-arg glframes=1: a line for every frame (see frame_end()) */
 static int latency_lines;               /* boot-arg touch_lat=1: when every frame began and ended (see frame_end()) */
+static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
+static uint64_t call_began_us;          /* (when the call in progress began) */
+static uint64_t now_us(void);
 static void eagl_trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static void eagl_trace_floats(const float *values, int count);
 static void eagl_enter(struct eagl *e, unsigned offset);
@@ -336,6 +339,9 @@ eagl_enter(struct eagl *e, unsigned offset)
 	}
 	slot_calls[offset / 8]++;
 	e->calls++;
+	if (slow_calls_us != 0) {
+		call_began_us = now_us();
+	}
 }
 
 static void
@@ -346,6 +352,15 @@ eagl_leave(struct eagl *e, unsigned offset)
 	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
 		if (e->errors++ < 60) {
 			say("redwood-gl: %s: error %#x\n", eagl_slot_name(offset), error);
+		}
+	}
+	if (slow_calls_us != 0) {
+		uint64_t now = now_us();
+
+		/* "tl: slow NAME US at US, frame N": a call that took long, and when it ended (tools/frames.py) */
+		if (now - call_began_us >= slow_calls_us) {
+			say("tl: slow %s %llu at %llu, frame %u%s\n", eagl_slot_name(offset), now - call_began_us, now, e->frames + 1,
+			    e->in_frame ? "" : " (before its first draw)");
 		}
 	}
 }
@@ -2988,6 +3003,9 @@ install(void)
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
+		if ((argument = strstr(arguments, "glslow=")) != NULL) {
+			slow_calls_us = strtoull(argument + 7, NULL, 10);
+		}
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {

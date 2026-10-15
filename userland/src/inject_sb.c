@@ -33,6 +33,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
+#include <mach/mach_time.h>
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -58,6 +59,51 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	write(2, line, (size_t)n);
+}
+
+/*
+ * Boot-arg touch_lat=1: a line for every turn of SpringBoard's main run loop -- when it woke up (a
+ * touch, a timer, the display link ...) and when it went to sleep again, CoreAnimation's commit of
+ * what that turn changed done (its observer comes before ours) -- in microseconds of
+ * mach_absolute_time, as the other "tl:" lines (tools/latency.py, tools/frames.py):
+ *   tl: a WOKE SLEPT
+ */
+static uint64_t main_woke;
+static mach_timebase_info_data_t timebase;
+
+static uint64_t
+now_us(void)
+{
+	return mach_absolute_time() * timebase.numer / timebase.denom / 1000;
+}
+
+static void
+main_loop_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, __unused void *info)
+{
+	if (activity == kCFRunLoopAfterWaiting) {
+		main_woke = now_us();
+	} else if (activity == kCFRunLoopBeforeWaiting && main_woke != 0) {
+		say("tl: a %llu %llu\n", main_woke, now_us());
+		main_woke = 0;
+	}
+}
+
+static void
+watch_main_loop(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const char *arg;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (arg = strstr(args, "touch_lat=1")) == NULL ||
+	    (arg != args && arg[-1] != ' ')) {
+		return;
+	}
+	mach_timebase_info(&timebase);
+	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, LONG_MIN,
+	    main_loop_turn, NULL), kCFRunLoopCommonModes);
+	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true, LONG_MAX,
+	    main_loop_turn, NULL), kCFRunLoopCommonModes);
 }
 
 /* ---- methods of SpringBoard's classes, replaced --------------------------------------------------- */
@@ -710,6 +756,7 @@ redwood_springboard_init(void)
 		if (device && class_getInstanceMethod(object_getClass(device), monitoring)) {
 			((void (*)(id, SEL, BOOL))objc_msgSend)(device, monitoring, YES);
 		}
+		watch_main_loop();
 		say("redwood: battery: SOC=%d%% battery=%d charger=%d charging=%d\n",
 		    sysctl_int("kern.redwood.battery_soc"), sysctl_int("kern.redwood.battery_present"),
 		    sysctl_int("kern.redwood.battery_charger_present"), sysctl_int("kern.redwood.battery_charging"));

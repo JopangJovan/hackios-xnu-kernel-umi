@@ -75,6 +75,8 @@ static char     loader_log_scratch[LOADER_LOG_RING];
  */
 static uint32_t loader_log_lock;
 
+static void loader_log_put_locked(char c);
+
 void
 loader_log_putc(char c)
 {
@@ -89,7 +91,44 @@ loader_log_putc(char c)
 	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
 		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
 	}
+	loader_log_put_locked(c);
+	if (locked) {
+		os_atomic_store(&loader_log_lock, 0, release);
+	}
+	__builtin_arm_wsr64("DAIF", daif);
+}
 
+/*
+ * A whole line at once, under the lock: lines written from several processors at the same time
+ * (tools/latency.py's "tl:" lines, a frame's on one and a touch's on another) are not mixed up.
+ */
+void loader_log_line(const char *line);
+
+void
+loader_log_line(const char *line)
+{
+	uint64_t daif;
+	bool locked = false;
+
+	daif = __builtin_arm_rsr64("DAIF");
+	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
+		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+	}
+	for (; *line != 0; line++) {
+		if (*line != '\r') {
+			loader_log_put_locked(*line);
+		}
+	}
+	if (locked) {
+		os_atomic_store(&loader_log_lock, 0, release);
+	}
+	__builtin_arm_wsr64("DAIF", daif);
+}
+
+static void
+loader_log_put_locked(char c)
+{
 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
 		if (loader_log_len < LOADER_LOG_SIZE) {
 			loader_log[loader_log_len++] = c;
@@ -104,11 +143,6 @@ loader_log_putc(char c)
 			loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
 		}
 	}
-
-	if (locked) {
-		os_atomic_store(&loader_log_lock, 0, release);
-	}
-	__builtin_arm_wsr64("DAIF", daif);
 }
 
 /* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */

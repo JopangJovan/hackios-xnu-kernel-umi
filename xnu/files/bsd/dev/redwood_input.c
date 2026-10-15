@@ -25,6 +25,26 @@
  */
 static uint32_t touch_lat = 2;          /* 2: not yet looked up */
 
+extern void loader_log_line(const char *line);
+
+/*
+ * A "tl:" line, for the kernel's drivers: into the loader's log as it is written -- the kernel's own
+ * log keeps only the last of a run, and a live look at the loader's (XL_FOLLOW) then misses nothing.
+ */
+void redwood_tl(const char *format, ...) __printflike(1, 2);
+
+void
+redwood_tl(const char *format, ...)
+{
+	char line[192];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	loader_log_line(line);
+}
+
 static bool
 latency_lines(void)
 {
@@ -101,7 +121,7 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 		uint64_t ns;
 
 		absolutetime_to_nanoseconds(t->time, &ns);
-		printf("tl: p %u %u %u %u at %llu\n", type, finger, x, y, ns / 1000);
+		redwood_tl("tl: p %u %u %u %u at %llu\n", type, finger, x, y, ns / 1000);
 	}
 	t->type = type;
 	t->finger = finger;

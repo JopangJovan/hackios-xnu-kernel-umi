@@ -42,6 +42,8 @@
 
 #include "MiniIOSurface.h"
 
+extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+
 extern "C" {
 /* bsd/dev/redwood_adreno.c ("the GPU kept on"; declared in bsd/sys/redwood_input.h, which is not seen from here) */
 bool redwood_gpu_ready(void);
@@ -221,6 +223,27 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 		IOLockUnlock(gGPULock);
 	}
 	return done;
+}
+
+/*
+ * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or
+ * more ("tl: f KIND US at US"), for telling apart what holds a frame up (tools/frames.py).
+ */
+static TUNABLE(uint32_t, gWaitLines, "touch_lat", 0);
+
+static void
+slowWait(const char * kind, uint64_t began)
+{
+	uint64_t now = mach_absolute_time(), ns, at;
+
+	if (!gWaitLines) {
+		return;
+	}
+	absolutetime_to_nanoseconds(now - began, &ns);
+	if (ns >= NSEC_PER_MSEC) {
+		absolutetime_to_nanoseconds(now, &at);
+		redwood_tl("tl: f %s %llu at %llu\n", kind, ns / 1000, at / 1000);
+	}
 }
 
 /* How long from now a time of msm's is, in milliseconds; 0: now or past. */
@@ -910,7 +933,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 	size_t size = args->structureInputSize;
 	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnSuccess;
-	uint64_t zero = 0, patience;
+	uint64_t zero = 0, patience, waitBegan;
 
 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
 		return kIOReturnBadArgument;
@@ -936,6 +959,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		ret = gemInfo(&r.gemInfo);
 		break;
 	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer: with all it has been given, here */
+		waitBegan = mach_absolute_time();
 		IOLockLock(gGPULock);
 		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
 		if (!gpuWait(redwood_gpu_last(), patience)) {
@@ -945,11 +969,13 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 			}
 		}
 		IOLockUnlock(gGPULock);
+		slowWait("cpu-prep", waitBegan);
 		break;
 	case kMsmGemSubmit:
 		ret = submit(&r.submit);
 		break;
 	case kMsmWaitFence:
+		waitBegan = mach_absolute_time();
 		IOLockLock(gGPULock);
 		patience = millisecondsUntil(&r.waitFence.timeout);
 		if (!gpuWait(r.waitFence.fence, patience)) {
@@ -959,6 +985,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 			}
 		}
 		IOLockUnlock(gGPULock);
+		slowWait("fence", waitBegan);
 		break;
 	case kMsmGemMadvise:
 		r.madvise.retained = 1;

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-latency.py RUN.log RECORDING.raw: how far behind the finger the phone's screen is.
+latency.py RUN.log [MORE.log ...] [RECORDING.raw]: how far behind the finger the phone's screen is.
+(More logs: the live ones of the same run, XL_FOLLOW=N XL_FOLLOW_KEEP=1, which keep what the run's log loses.)
 
 A run with boot-arg touch_lat=1 writes a line at every stage a touch passes on its way to the panel,
 all in microseconds of mach_absolute_time (the kernel's clock, which user space reads too):
@@ -31,10 +32,13 @@ import sys
 import numpy as np
 
 
-def micros_lines(path):
-    """The tl: lines of a log, once each (the kernel's own also come back in its log at the end)."""
+def micros_lines(paths):
+    """The tl: lines of the logs, once each (the kernel's own also come back in its log at the end)."""
     seen, lines = set(), []
-    with open(path, 'rb') as f:
+    if isinstance(paths, str):
+        paths = [paths]
+    for path in paths:
+      with open(path, 'rb') as f:
         for raw in f:
             text = raw.decode('utf-8', 'replace')
             at = text.find('tl: ')
@@ -172,7 +176,9 @@ def mean(values):
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
-    samples, reads, frames, swaps, shows, chip = parse(micros_lines(sys.argv[1]))
+    logs = [a for a in sys.argv[1:] if not a.endswith('.raw')]
+    raws = [a for a in sys.argv[1:] if a.endswith('.raw')]
+    samples, reads, frames, swaps, shows, chip = parse(micros_lines(logs))
     print(f'latency.py: {len(samples)} samples, {len(reads)} read by the window server, {len(frames)} frames drawn, '
           f'{len(swaps)} handed over, {len(shows)} shown; {len(chip)} reports read from the touch chip')
     if chip:
@@ -180,7 +186,7 @@ def main():
         took = [read - seen for before, seen, read in chip]
         print(f'  touch chip: looked at every {mean(found) / 1000:.2f} ms (a report waits half of that on average); '
               f'reading a report takes {mean(took) / 1000:.2f} ms')
-    pictures, width, height = recording(sys.argv[2]) if len(sys.argv) > 2 else ([], 0, 0)
+    pictures, width, height = recording(raws[0]) if raws else ([], 0, 0)
     totals = []
     for number, (down, up, touch) in enumerate(zigzags(samples)):
         moves = [p for p in touch[1:-1]]

@@ -166,14 +166,39 @@ extern lck_mtx_t tasks_threads_lock;
 
 static char ustacks_name[32];
 static uint32_t ustacks_every;
+static uint32_t ustacks_threads = USTACKS_MAX_THREADS;  /* boot-arg ustacks_threads=N: only the first N (1: the main thread) */
+/*
+ * Boot-arg ustacks_tname=TEXT: only the threads whose name has TEXT in it (ustacks_tname=coreanimation:
+ * the window server's render-server and its other threads), each line with the thread's name and, in
+ * the first, the time in microseconds of mach_absolute_time (as the "tl:" lines of tools/latency.py);
+ * the lines are few enough then to go to the loader's log as well, where all of a long run is kept.
+ */
+static char ustacks_tname[32];
+static uint32_t ustacks_count;          /* boot-arg ustacks_count=N: so many times, then no more (0: for ever) */
 static thread_call_t ustacks_call;
+
+extern void bsd_getthreadname(void *uth, char *buffer);
+extern void loader_log_line(const char *line);
+
+static void
+ustacks_say(const char *line)
+{
+	printf("%s", line);
+	if (ustacks_tname[0] != 0) {
+		loader_log_line(line);
+	}
+}
 
 static void
 ustacks_task(task_t task, struct proc *proc)
 {
 	static struct {
 		uint64_t tid, pc, lr, fp;
+		int state;
+		char name[64];          /* (bsd_getthreadname() copies MAXTHREADNAMESIZE, 64) */
 	} snap[USTACKS_MAX_THREADS];
+	char line[512];
+	int at;
 	vm_shared_region_t region;
 	vm_map_t map, old_map;
 	thread_t thread;
@@ -184,10 +209,19 @@ ustacks_task(task_t task, struct proc *proc)
 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
 		const arm_saved_state_t *state = get_user_regs(thread);
 
-		if (count == USTACKS_MAX_THREADS || state == NULL || !is_saved_state64(state)) {
+		if (count == USTACKS_MAX_THREADS || count >= ustacks_threads || state == NULL || !is_saved_state64(state)) {
+			continue;
+		}
+		snap[count].name[0] = 0;
+		if (get_bsdthread_info(thread) != NULL) {
+			bsd_getthreadname(get_bsdthread_info(thread), snap[count].name);
+			snap[count].name[63] = 0;
+		}
+		if (ustacks_tname[0] != 0 && strnstr(snap[count].name, ustacks_tname, sizeof(snap[count].name)) == NULL) {
 			continue;
 		}
 		snap[count].tid = thread_tid(thread);
+		snap[count].state = thread->state;
 		snap[count].pc = get_saved_state_pc(state);
 		snap[count].lr = get_saved_state_lr(state);
 		snap[count].fp = get_saved_state_fp(state);
@@ -209,27 +243,36 @@ ustacks_task(task_t task, struct proc *proc)
 	clock_sec_t secs;
 	clock_usec_t usecs;
 
+	uint64_t nanos;
+
 	clock_get_system_microtime(&secs, &usecs);
-	printf("ustacks: %s[%d] %u threads, shared cache slide 0x%x, uptime %lu.%03u\n", proc_name_address(proc),
-	    proc_pid(proc), count, slide, (unsigned long)secs, (unsigned)usecs / 1000);
+	absolutetime_to_nanoseconds(mach_absolute_time(), &nanos);
+	snprintf(line, sizeof(line), "ustacks: %s[%d] %u threads, shared cache slide 0x%x, uptime %lu.%03u, at %llu\n",
+	    proc_name_address(proc), proc_pid(proc), count, slide, (unsigned long)secs, (unsigned)usecs / 1000, nanos / 1000);
+	ustacks_say(line);
 
 	old_map = vm_map_switch(map);
 	for (unsigned i = 0; i < count; i++) {
 		uint64_t frame[2], fp = snap[i].fp;
 
-		printf("ustacks:  thread 0x%llx: 0x%llx 0x%llx", (unsigned long long)snap[i].tid,
-		    (unsigned long long)snap[i].pc, (unsigned long long)snap[i].lr);
+		/* (a thread that runs shows where it last came into the kernel, not where it is) */
+		at = snprintf(line, sizeof(line), "ustacks:  thread 0x%llx%s%s%s%s: 0x%llx 0x%llx", (unsigned long long)snap[i].tid,
+		    snap[i].name[0] ? " \"" : "", snap[i].name, snap[i].name[0] ? "\"" : "",
+		    (snap[i].state & TH_RUN) ? " (running)" : "", (unsigned long long)snap[i].pc, (unsigned long long)snap[i].lr);
 		for (int depth = 0; depth < USTACKS_MAX_FRAMES && plausible_user_address(fp) && (fp & 7) == 0; depth++) {
 			if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
 				break;
 			}
-			printf(" 0x%llx", (unsigned long long)frame[1]);
+			if (at < (int)sizeof(line) - 24) {
+				at += snprintf(line + at, sizeof(line) - at, " 0x%llx", (unsigned long long)frame[1]);
+			}
 			if (frame[0] <= fp) {
 				break;
 			}
 			fp = frame[0];
 		}
-		printf("\n");
+		snprintf(line + at, sizeof(line) - at, "\n");
+		ustacks_say(line);
 	}
 	vm_map_switch(old_map);
 	vm_map_deallocate(map);
@@ -350,6 +393,9 @@ ustacks_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		task_deallocate(found[i]);
 	}
 again:
+	if (ustacks_count != 0 && --ustacks_count == 0) {
+		return;
+	}
 	if (ustacks_every != 0) {
 		uint64_t deadline;
 
@@ -382,6 +428,9 @@ ustacks_init(void)
 		return;
 	}
 	PE_parse_boot_argn("ustacks_ms", &ustacks_every, sizeof(ustacks_every));
+	PE_parse_boot_argn("ustacks_threads", &ustacks_threads, sizeof(ustacks_threads));
+	PE_parse_boot_argn("ustacks_tname", ustacks_tname, sizeof(ustacks_tname));
+	PE_parse_boot_argn("ustacks_count", &ustacks_count, sizeof(ustacks_count));
 	ustacks_call = thread_call_allocate(ustacks_fire, NULL);
 	clock_interval_to_deadline(at, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(ustacks_call, deadline);
