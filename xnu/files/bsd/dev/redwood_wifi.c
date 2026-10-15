@@ -190,6 +190,8 @@ static LCK_GRP_DECLARE(wifi_lock_group, "redwood-wifi");
  */
 LCK_MTX_DECLARE(redwood_aop_mailbox_lock, &wifi_lock_group);
 LCK_MTX_DECLARE(redwood_smem_alloc_lock, &wifi_lock_group);
+/* ... and the sound's (redwood_sound.c): a free match register and context of the SMMU, found and taken */
+LCK_MTX_DECLARE(redwood_smmu_lock, &wifi_lock_group);
 
 static uint32_t last_step, pause_ms = 2200, fine, watch_seconds = 3;
 static uint32_t step;                   /* the one being performed */
@@ -3935,13 +3937,19 @@ radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long l
 		    "a context of the SMMU (wifi_smmu=2)\n", step, size >> 10, physical, *address);
 		return true;
 	}
+	lck_mtx_lock(&redwood_smmu_lock);       /* (the sound may be looking for a free context at the same time) */
 	if ((!radio_space.found && !radio_space_find()) || !radio_enter(*address, physical, size, attributes)) {
+		lck_mtx_unlock(&redwood_smmu_lock);
 		return false;
 	}
 	printf("wifi: %u: the radio is to see %llu KB of ours (%#llx) at %#llx\n", step, size >> 10, physical, *address);
 	if (!radio_space.on) {
-		return radio_space_on();
+		bool on = radio_space_on();
+
+		lck_mtx_unlock(&redwood_smmu_lock);
+		return on;
 	}
+	lck_mtx_unlock(&redwood_smmu_lock);
 	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, radio_space.context);
 	put(&apps_smmu_context, "tlbsync", SMMU_CB_TLBSYNC, 1);
 	return true;

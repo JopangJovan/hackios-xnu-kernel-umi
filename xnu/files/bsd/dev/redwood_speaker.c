@@ -1,55 +1,103 @@
 /*
- * The speakers of the POCO X5 Pro (redwood): so far only a look at what is there.
- * Only with boot-arg speaker_probe=N: every address below belongs to this phone.
- *   speaker_probe=1    reads registers and nothing else: pins, power (below)
- *   speaker_probe=2    ... and asks the amplifiers who they are, for which two pins are
- *                      reconfigured for the time it takes (I2C, below)
- * NEITHER HAS BEEN RUN ON THE PHONE YET.
+ * The speakers of the POCO X5 Pro (redwood): their two amplifiers. Every address below belongs
+ * to this phone, and nothing here is touched unless a boot-arg asks for it.
  *
- * Each of the phone's two speakers has an amplifier of its own, an Awinic AW882xx ("smart
- * PA"), which is set up over I2C (bus of the SoC's serial engine 3, GPIO 12 data and 13 clock;
- * addresses 0x34, the bottom speaker, and 0x35, the top one) and takes its samples from the
- * SoC's first I2S interface ("MI2S 0": GPIO 97 bit clock, 100 word select, 98 and 99 data).
- * That interface belongs to the audio subsystem (LPASS), which under Android is run by the
- * audio DSP: there, sound goes from the kernel to the DSP's firmware as messages, and the
- * firmware drives the interface. None of that is running here, and before anything is built
- * the questions are which amplifier it is and whether it is powered without Android.
+ * Each speaker has an amplifier of its own, an Awinic AW88261 (chip ID 0x2113, a "smart PA"),
+ * set up over I2C -- the bus of the SoC's serial engine 3, GPIO 12 data and 13 clock, on which
+ * Android's device tree and its running kernel have these two and nothing else -- and fed by
+ * the SoC's first TDM interface ("MI2S 0": GPIO 97 bit clock, 100 frame sync, 99 data out),
+ * which the audio DSP drives (redwood_sound.c). In Android's tree the amplifier at 0x35 is
+ * "sound-channel 0" and takes slot 0 of the frame (the left channel), the one at 0x34 is
+ * channel 1 and takes slot 1; neither has a reset pin.
  *
- *   pins     how the firmware left the pins involved: their configuration and level are read
- *            from the pin controller, nothing is written
- *   power    the names under which the audio subsystem's supplies can be asked for (read from
- *            the command database the boot loader left in memory), and whether its bus clock
- *            runs (one register of the global clock controller, read)
- *   I2C      register 0 (the chip ID) and three more of each amplifier, read through the two
- *            pins driven by hand, open-drain: a pin is either pulled low or let go. This
- *            WRITES the configuration of GPIO 12 and 13 (to "GPIO, pull-up", and the output
- *            enable for every low bit) and puts back what was there before; if the bus is not
- *            at rest when the pins are let go, nothing more is done. The amplifiers are only
- *            read: the writes on the bus are their addresses and the numbers of the registers
- *            to read. They stay in the power-down state they start in.
+ * Two uses:
  *
- * (Whether the secure world would start the audio DSP for us cannot be asked without doing it:
- * its "is this image supported" answers no for every image, the GPU's included, which it then
- * authenticates and starts all the same -- see redwood_adreno.c.)
+ *   speaker_probe=1    reads registers and nothing else: the pins, the power names (below)
+ *   speaker_probe=2    ... and asks the amplifiers who they are (I2C, below)
  *
- * Register layouts: Linux sound/soc/codecs/aw88261.c and aw88395/, drivers/pinctrl/qcom/
- * pinctrl-sc7280.c, drivers/clk/qcom/gcc-sc7280.c, drivers/soc/qcom/cmd-db.c, and the phone's
- * own device tree.
+ *   redwood_speaker_prepare() and the rest (sys/redwood_audio.h), for boot-arg sound=3 of
+ *   redwood_sound.c: the amplifiers set up and run exactly as Android's own driver does it
+ *   (Xiaomi's redwood-s-oss kernel, techpack/audio/asoc/codecs/aw88263s_m20: aw882xx_device.c,
+ *   aw882xx_init.c and aw882xx_pid_2113_reg.h; the phone runs its version 2.0.0), with the
+ *   registers' values from Android's own configuration file -- /vendor/etc/aw882xx_acf.bin of
+ *   the phone, which userland/build.sh puts into /fw of the system image from fw-audio/ and
+ *   which is not in this repository. Its "Music" profile is what Android plays the speakers
+ *   with (tinymix: aw_dev_0_prof, aw_dev_1_prof); 55 of its 57 registers read back from the
+ *   idle chips under Android exactly as the file has them, and the other two as the driver
+ *   leaves them (0x04 powered down and muted, 0x08 with the feedback off).
+ *
+ * What the driver does and this does the same way, per amplifier:
+ *
+ *   prepare  reads the chip ID and the four fuse registers; a soft reset (0x55aa into
+ *            register 0); the profile's registers, every one but three as the file has them:
+ *            0x04 keeps the power-down, amplifier power-down and mute bits as they are and
+ *            sets the mute of the power stage ("ULS"), 0x08 has the feedback off, and 0x05 (the
+ *            volume) is turned down to the lowest, -90 dB, right after; 0x50 gets the value the
+ *            driver works out from the fuses (8192 * (1000 + icalk) / (1000 + vcalk)), which for
+ *            this phone's two chips is the value Android left in them
+ *   start    only while the TDM clock runs: power-down off, 2 ms, the PLL locked (status bits 0
+ *            and 4); amplifier power-down off, 1 ms, the status as the driver wants it (bits 0, 4,
+ *            8, 9); the feedback on; the two mutes off; the interrupts read away; the volume
+ *            stays at the lowest
+ *   volume   stepwise, 6 dB a step, to `below' eighths of a dB under Android's own level (the
+ *            profile's 0x05, -2.1 dB, with Android's aw_dev_N_volume 0) and never above it
+ *   stop     the power stage muted, the volume stepped down to the lowest, muted, the feedback
+ *            off, 1 ms, amplifier power-down, power-down
+ *
+ * Every write is said in the log and read back; a value that does not read back as written, a
+ * byte nobody acknowledges, or a fault in the status register (under-voltage, over-current of
+ * the boost or the output, over-temperature, no clock, the watchdog, over-voltage) has both
+ * amplifiers powered down at once (amplifier power-down and power-down, bits 1 and 0 of 0x04)
+ * and nothing more done. What is not done, compared with Android: the DSP's Awinic algorithm,
+ * which protects the speakers with their calibration (aw882xx_rx_switch), and the driver's
+ * watch of battery voltage and temperature, which only ever turns the volume down -- whoever
+ * plays through this keeps the level low.
+ *
+ * I2C is done by hand: a pin is either pulled low or let go (and the pull-ups raise it), at 50
+ * kHz at most. For each register read or written the two pins are taken from the serial engine
+ * (function qup03) as GPIOs and given back as they were found right after.
+ *
+ * Register layouts: the files above, and Linux's sound/soc/codecs/aw88261.c; pins:
+ * drivers/pinctrl/qcom/pinctrl-yupik.c of the same kernel and the phone's own device tree.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
-#include <sys/redwood_audio.h>
 #include <sys/systm.h>
+#include <sys/redwood_audio.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
+extern void loader_log_putc(char c);
 
 static vm_offset_t tlmm, gcc, cmd_db;
 static uint32_t probe_level;
+static bool leaving;                    /* on a panic's way out: nothing sleeps, nothing is said but to the loader */
+
+/* Every line to the loader's log as well: what is written to the amplifiers should be known even if the kernel dies. */
+static int say(const char *format, ...) __printflike(1, 2);
+
+static int
+say(const char *format, ...)
+{
+	char line[300];
+	va_list list;
+	int length;
+
+	va_start(list, format);
+	length = vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	if (!leaving) {
+		printf("%s", line);
+	}
+	return length;
+}
 
 static inline uint32_t
 rd(vm_offset_t address)
@@ -63,6 +111,28 @@ wr(vm_offset_t address, uint32_t value)
 	*(volatile uint32_t *)address = value;
 }
 
+/* Waits without sleeping (also with interrupts off, on a panic's way out). */
+static void
+spin_us(uint32_t us)
+{
+	uint64_t until;
+
+	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &until);
+	until += mach_absolute_time();
+	while (mach_absolute_time() < until) {
+	}
+}
+
+static void
+wait_ms(uint32_t ms)
+{
+	if (leaving) {
+		spin_us(ms * 1000);
+	} else {
+		delay_for_interval(ms, NSEC_PER_MSEC);
+	}
+}
+
 /* ---- pins ------------------------------------------------------------------------------------------ */
 
 #define TLMM_PHYS               0x0f100000UL
@@ -72,16 +142,16 @@ wr(vm_offset_t address, uint32_t value)
 #define CFG_PULL_UP             3
 #define CFG_OUTPUT              (1u << 9)
 
-/* the serial engine's first pin is the data line, the second the clock (should the board differ, see show_amplifiers) */
-static unsigned PIN_SDA = 12, PIN_SCL = 13;
+#define PIN_SDA                 12      /* the serial engine's first pin is the data line, the second the clock */
+#define PIN_SCL                 13
 
 static const struct {
 	unsigned pin;
 	const char *what;
 } pins[] = {
-	{ 12, "I2C data" }, { 13, "I2C clock" }, { 96, "MI2S 0 master clock" }, { 97, "MI2S 0 bit clock" },
-	{ 100, "MI2S 0 word select" }, { 98, "MI2S 0 data 0" }, { 99, "MI2S 0 data 1" }, { 102, "top amplifier's interrupt" },
-	{ 45, "bottom amplifier's interrupt" },
+	{ 12, "I2C data" }, { 13, "I2C clock" }, { 97, "MI2S 0 bit clock" }, { 100, "MI2S 0 word select" },
+	{ 98, "MI2S 0 data 0" }, { 99, "MI2S 0 data 1" }, { 102, "the amplifier 0x35's interrupt" },
+	{ 45, "the amplifier 0x34's interrupt" },
 };
 
 static void
@@ -90,7 +160,7 @@ show_pins(void)
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
 		uint32_t cfg = rd(GPIO_CFG(pins[i].pin)), io = rd(GPIO_IO(pins[i].pin));
 
-		printf("speaker: gpio%u (%s): function %u, pull %u, %u mA, %s, reads %u\n", pins[i].pin, pins[i].what,
+		say("speaker: gpio%u (%s): function %u, pull %u, %u mA, %s, reads %u\n", pins[i].pin, pins[i].what,
 		    (cfg >> 2) & 15, cfg & 3, (((cfg >> 6) & 7) + 1) * 2, (cfg & CFG_OUTPUT) ? (io & 2 ? "drives high" : "drives low") :
 		    "input", io & 1);
 	}
@@ -101,7 +171,7 @@ show_pins(void)
 static void
 half_bit(void)
 {
-	delay_for_interval(10, NSEC_PER_USEC);          /* 50 kHz at most; the bus does not mind slower */
+	spin_us(10);                    /* 50 kHz at most; the bus does not mind slower */
 }
 
 /* A line is pulled low (the pin drives 0) or let go (the pin is an input and the pull-up raises it). */
@@ -150,6 +220,9 @@ i2c_bit(bool out)
 	line(PIN_SDA, out);
 	half_bit();
 	line(PIN_SCL, true);
+	for (unsigned stretched = 0; !level(PIN_SCL) && stretched < 100; stretched++) {
+		half_bit();             /* (a device may hold the clock low until it is ready) */
+	}
 	half_bit();
 	in = level(PIN_SDA);
 	line(PIN_SCL, false);
@@ -178,12 +251,52 @@ i2c_read(bool more)
 	return byte;
 }
 
+/*
+ * The two pins taken from the serial engine for one transaction, and given back as found. False
+ * if the bus is not at rest: then nothing is driven.
+ */
+static uint32_t taken_cfg[2], taken_io[2];
+
+static bool
+bus_take(void)
+{
+	taken_cfg[0] = rd(GPIO_CFG(PIN_SDA));
+	taken_cfg[1] = rd(GPIO_CFG(PIN_SCL));
+	taken_io[0] = rd(GPIO_IO(PIN_SDA));
+	taken_io[1] = rd(GPIO_IO(PIN_SCL));
+	line(PIN_SDA, true);
+	line(PIN_SCL, true);
+	half_bit();
+	if (!level(PIN_SDA) || !level(PIN_SCL)) {
+		wr(GPIO_IO(PIN_SDA), taken_io[0] & 2);
+		wr(GPIO_IO(PIN_SCL), taken_io[1] & 2);
+		wr(GPIO_CFG(PIN_SDA), taken_cfg[0]);
+		wr(GPIO_CFG(PIN_SCL), taken_cfg[1]);
+		return false;
+	}
+	return true;
+}
+
+static void
+bus_give_back(void)
+{
+	wr(GPIO_IO(PIN_SDA), taken_io[0] & 2);
+	wr(GPIO_IO(PIN_SCL), taken_io[1] & 2);
+	wr(GPIO_CFG(PIN_SDA), taken_cfg[0]);
+	wr(GPIO_CFG(PIN_SCL), taken_cfg[1]);
+}
+
 /* A 16-bit register of an Awinic amplifier, most significant byte first. Returns false if nobody answers. */
 static bool
-amplifier_read(uint8_t address, uint8_t reg, uint16_t *value)
+register_read(uint8_t address, uint8_t reg, uint16_t *value)
 {
 	bool answered;
 
+	if (!bus_take()) {
+		say("speaker: the I2C bus is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n", PIN_SDA,
+		    level(PIN_SDA), PIN_SCL, level(PIN_SCL));
+		return false;
+	}
 	i2c_start();
 	answered = i2c_write((uint8_t)(address << 1)) && i2c_write(reg);
 	if (answered) {
@@ -195,6 +308,25 @@ amplifier_read(uint8_t address, uint8_t reg, uint16_t *value)
 		*value |= i2c_read(false);
 	}
 	i2c_stop();
+	bus_give_back();
+	return answered;
+}
+
+static bool
+register_write(uint8_t address, uint8_t reg, uint16_t value)
+{
+	bool answered;
+
+	if (!bus_take()) {
+		say("speaker: the I2C bus is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n", PIN_SDA,
+		    level(PIN_SDA), PIN_SCL, level(PIN_SCL));
+		return false;
+	}
+	i2c_start();
+	answered = i2c_write((uint8_t)(address << 1)) && i2c_write(reg) && i2c_write((uint8_t)(value >> 8)) &&
+	    i2c_write((uint8_t)value);
+	i2c_stop();
+	bus_give_back();
 	return answered;
 }
 
@@ -216,71 +348,607 @@ amplifier_name(uint16_t id)
 	return "an amplifier this list does not know";
 }
 
+/* ---- the amplifiers, as Android's driver runs them -------------------------------------------------- */
+
+#define AW_ID                   0x00            /* reads the chip ID; 0x55aa written resets the chip */
+#define AW_ID_AW88261           0x2113
+#define AW_SOFT_RESET           0x55aa
+#define AW_SYSST                0x01
+#define AW_SYSINT               0x02            /* read: cleared */
+#define AW_SYSINTM              0x03
+#define AW_SYSCTRL              0x04
+#define AW_SYSCTRL2             0x05            /* [9:0] the volume, attenuation: [9:6] 6 dB steps, [5:0] eighths of a dB */
+#define AW_I2SCTRL3             0x08
+#define AW_DBGCTRL              0x14
+#define AW_VSNTM1               0x50
+#define AW_EFRH4                0x78
+#define AW_EFRH3                0x79
+#define AW_EFRL4                0x7c
+#define AW_EFRL3                0x7d
+
+#define SYSCTRL_PWDN            (1u << 0)
+#define SYSCTRL_AMPPD           (1u << 1)
+#define SYSCTRL_HMUTE           (1u << 8)
+#define SYSCTRL_ULS_HMUTE       (1u << 14)
+#define I2SCTRL3_TXEN           (1u << 6)
+#define DBGCTRL_EF_OR           (1u << 3)       /* the fuses' two copies are or-ed; else and-ed */
+#define SYSINTM_DEFAULT         0xffff
+
+#define SYSST_PLLS              (1u << 0)
+#define SYSST_OTHS              (1u << 1)
+#define SYSST_OCDS              (1u << 3)
+#define SYSST_CLKS              (1u << 4)
+#define SYSST_NOCLKS            (1u << 5)
+#define SYSST_WDS               (1u << 6)
+#define SYSST_SWS               (1u << 8)
+#define SYSST_BSTS              (1u << 9)
+#define SYSST_BSTOCS            (1u << 11)
+#define SYSST_UVLS              (1u << 14)
+#define SYSST_OVP2S             (1u << 15)
+#define SYSST_PLL_CHECK         (SYSST_CLKS | SYSST_PLLS)
+#define SYSST_CHECK             (SYSST_BSTS | SYSST_SWS | SYSST_CLKS | SYSST_PLLS)
+#define SYSST_FAULTS            (SYSST_OVP2S | SYSST_UVLS | SYSST_BSTOCS | SYSST_WDS | SYSST_NOCLKS | SYSST_OCDS | SYSST_OTHS)
+
+#define VOLUME_LOWEST           (90 * 8)        /* the driver's "mute volume", in eighths of a dB */
+#define VOLUME_STEP             (6 * 8)
+#define STATUS_TRIES            10              /* the driver's AW_DEV_SYSST_CHECK_MAX, 2 ms apart */
+
+/* Android's configuration file ("ACF", Awinic's format; Linux: sound/soc/codecs/aw88395/aw88395_lib.c) */
+#define ACF_PROFILE_MUSIC       0
+#define ACF_DATA_REGISTERS      4               /* a block with a header of its own and registers in it */
+#define ACF_BLOCK_HEADER        0x3c
+
+struct amplifier {
+	uint8_t address;
+	unsigned device;                /* the file's device number for it (Android's sound-channel) */
+	const char *where;
+	uint16_t profile[64][2];        /* register, value */
+	unsigned count;
+	uint16_t sysctrl;               /* what the profile has for 0x04, 0x08 and 0x05 */
+	uint16_t i2sctrl3;
+	uint16_t volume_at;             /* Android's level: from the profile's 0x05, in eighths of a dB of attenuation */
+	uint16_t volume;                /* where it is now */
+	bool prepared, started;
+};
+
+static struct amplifier amplifiers[2] = {
+	{ .address = 0x35, .device = 0, .where = "0x35, slot 0" },
+	{ .address = 0x34, .device = 1, .where = "0x34, slot 1" },
+};
+static bool broken;                     /* something went wrong: both have been powered down, nothing more is done */
+
+static uint32_t
+le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* The "Music" profile of every amplifier, from the file; false if the file is not of the shape known. */
+static bool
+acf_profiles(const uint8_t *acf, uint64_t size)
+{
+	uint32_t entry_size, entries, at;
+
+	if (size < 0x50 || size > 0x100000) {
+		say("speaker: the configuration file is %llu bytes: not one of Awinic's\n", size);
+		return false;
+	}
+	entry_size = le32(acf + 0x34);
+	entries = le32(acf + 0x38);
+	at = le32(acf + 0x3c);
+	if (entries == 0 || entries > 64 || entry_size % entries != 0 || entry_size / entries < 0x30 ||
+	    (uint64_t)at + entry_size > size) {
+		say("speaker: the configuration file's table (%u entries, %u bytes at %#x) is not of a shape known\n", entries,
+		    entry_size, at);
+		return false;
+	}
+	for (uint32_t e = 0; e < entries; e++) {
+		const uint8_t *entry = acf + at + e * (entry_size / entries);
+		char name[17];
+		uint16_t device = (uint16_t)(entry[20] | entry[21] << 8), profile = (uint16_t)(entry[26] | entry[27] << 8);
+		uint32_t kind = le32(entry + 28), length = le32(entry + 32), offset = le32(entry + 36);
+		uint32_t checksum, sum = 0, data_length, count;
+		const uint8_t *block = acf + offset;
+		struct amplifier *a = NULL;
+
+		memcpy(name, entry + 4, 16);
+		name[16] = 0;
+		if (kind != ACF_DATA_REGISTERS || profile != ACF_PROFILE_MUSIC || strcmp(name, "aw88261") != 0) {
+			continue;
+		}
+		for (unsigned i = 0; i < 2; i++) {
+			if (amplifiers[i].device == device) {
+				a = &amplifiers[i];
+			}
+		}
+		if (a == NULL || (uint64_t)offset + length > size || length < ACF_BLOCK_HEADER + 4) {
+			say("speaker: the configuration file's entry %u (device %u) does not fit\n", e, device);
+			return false;
+		}
+		checksum = le32(block);
+		data_length = le32(block + 0x10);
+		count = le32(block + ACF_BLOCK_HEADER);
+		if (ACF_BLOCK_HEADER + data_length > length || data_length != 4 + 4 * count || count > 64 ||
+		    le32(block + 0x20) != 2 || le32(block + 0x24) != 2) {
+			say("speaker: device %u's Music profile is not a list of 16-bit registers (%u bytes, %u registers)\n", device,
+			    data_length, count);
+			return false;
+		}
+		for (uint32_t i = 4; i < ACF_BLOCK_HEADER + data_length; i++) {
+			sum += block[i];
+		}
+		if (sum != checksum) {
+			say("speaker: device %u's Music profile does not add up (%#x, the file says %#x)\n", device, sum, checksum);
+			return false;
+		}
+		a->count = count;
+		for (uint32_t i = 0; i < count; i++) {
+			const uint8_t *pair = block + ACF_BLOCK_HEADER + 4 + 4 * i;
+
+			a->profile[i][0] = (uint16_t)(pair[0] | pair[1] << 8);
+			a->profile[i][1] = (uint16_t)(pair[2] | pair[3] << 8);
+		}
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+		bool have[3] = { false, false, false };
+
+		for (unsigned r = 0; r < a->count; r++) {
+			uint16_t reg = a->profile[r][0], value = a->profile[r][1];
+
+			if (reg == AW_SYSCTRL) {
+				a->sysctrl = value;
+				have[0] = true;
+			} else if (reg == AW_I2SCTRL3) {
+				a->i2sctrl3 = value;
+				have[1] = true;
+			} else if (reg == AW_SYSCTRL2) {
+				/* the driver's aw_pid_2113_reg_val_to_db() */
+				a->volume_at = (uint16_t)(((value & 0x3ff) >> 6) * VOLUME_STEP + (value & 0x3f));
+				have[2] = true;
+			} else if (reg == AW_ID || reg >= 0x70) {
+				say("speaker: device %u's Music profile writes register %#x, which is not one of the configuration's\n",
+				    a->device, reg);
+				return false;
+			}
+		}
+		if (a->count == 0 || !have[0] || !have[1] || !have[2] || a->volume_at >= VOLUME_LOWEST) {
+			say("speaker: no usable Music profile for device %u (the amplifier at %#x) in the configuration file\n",
+			    a->device, a->address);
+			return false;
+		}
+		say("speaker: the amplifier %s: Music profile of %u registers; Android's volume there is -%u.%03u dB (%#x)\n", a->where,
+		    a->count, a->volume_at / 8, a->volume_at % 8 * 125, a->volume_at);
+	}
+	return true;
+}
+
+/* Both powered down at once, without the driver's ceremony: a fault, or a value that did not stick. */
+static void
+power_down_now(const char *why)
+{
+	broken = true;
+	say("speaker: %s: BOTH AMPLIFIERS ARE POWERED DOWN AT ONCE (0x04: amplifier power-down and power-down set)\n", why);
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+		uint16_t value = 0, after = 0;
+
+		if (!a->prepared && !a->started) {
+			continue;
+		}
+		if (!register_read(a->address, AW_SYSCTRL, &value)) {
+			value = a->sysctrl;
+		}
+		value |= SYSCTRL_PWDN | SYSCTRL_AMPPD | SYSCTRL_HMUTE;
+		if (!register_write(a->address, AW_SYSCTRL, value) || !register_read(a->address, AW_SYSCTRL, &after)) {
+			say("speaker: the amplifier %s: 0x04 <- %#06x NOT ACKNOWLEDGED\n", a->where, value);
+		} else {
+			say("speaker: the amplifier %s: 0x04 <- %#06x, reads %#06x\n", a->where, value, after);
+		}
+		a->started = false;
+	}
+}
+
+/* One register written, said and read back; false (and both powered down) if it did not stick. */
+static bool
+put(struct amplifier *a, uint8_t reg, uint16_t value)
+{
+	uint16_t after = 0;
+
+	if (broken) {
+		return false;
+	}
+	if (!register_write(a->address, reg, value)) {
+		say("speaker: the amplifier %s: %#04x <- %#06x NOT ACKNOWLEDGED\n", a->where, reg, value);
+		power_down_now("a write was not acknowledged");
+		return false;
+	}
+	if (!register_read(a->address, reg, &after)) {
+		say("speaker: the amplifier %s: %#04x <- %#06x, NOT READ BACK\n", a->where, reg, value);
+		power_down_now("a register could not be read back");
+		return false;
+	}
+	say("speaker: the amplifier %s: %#04x <- %#06x, reads %#06x%s\n", a->where, reg, value, after, after == value ? "" :
+	    ": NOT AS WRITTEN");
+	if (after != value) {
+		power_down_now("a register did not read back as written");
+		return false;
+	}
+	return true;
+}
+
+static bool
+get(struct amplifier *a, uint8_t reg, uint16_t *value)
+{
+	if (!register_read(a->address, reg, value)) {
+		say("speaker: the amplifier %s: %#04x NOT READ\n", a->where, reg);
+		return false;
+	}
+	return true;
+}
+
+/* The bits of 0x04 named in `bits' set or cleared, the rest as they read. */
+static bool
+sysctrl(struct amplifier *a, uint16_t bits, bool set)
+{
+	uint16_t value;
+
+	if (broken || !get(a, AW_SYSCTRL, &value)) {
+		return false;
+	}
+	return put(a, AW_SYSCTRL, set ? (value | bits) : (value & ~bits));
+}
+
+/* The volume register at `volume' eighths of a dB of attenuation (the driver's aw_pid_2113_set_volume()). */
+static bool
+set_volume(struct amplifier *a, uint16_t volume)
+{
+	uint16_t value;
+
+	if (volume > VOLUME_LOWEST) {
+		volume = VOLUME_LOWEST;
+	}
+	if (volume < a->volume_at) {
+		volume = a->volume_at;  /* never louder than Android */
+	}
+	if (broken || !get(a, AW_SYSCTRL2, &value)) {
+		return false;
+	}
+	if (!put(a, AW_SYSCTRL2, (uint16_t)((value & 0xfc00) | (volume / VOLUME_STEP) << 6 | volume % VOLUME_STEP))) {
+		return false;
+	}
+	a->volume = volume;
+	return true;
+}
+
+/* What the status register says, and whether it says a fault. */
+static bool
+faulty(struct amplifier *a, uint16_t *status)
+{
+	if (!get(a, AW_SYSST, status)) {
+		return true;
+	}
+	return (*status & SYSST_FAULTS) != 0;
+}
+
+bool
+redwood_speaker_prepare(const uint8_t *acf, uint64_t size)
+{
+	if (tlmm == 0) {
+		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	}
+	broken = false;
+	say("speaker: the amplifiers are prepared as Android's driver prepares them; the I2C pins as found:\n");
+	show_pins();
+	if (!acf_profiles(acf, size)) {
+		return false;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+		uint16_t id = 0, h4 = 0, h3 = 0, l4 = 0, l3 = 0, icalk_bits, vcalk_bits;
+		int icalk, vcalk;
+		uint16_t vcalb, ef_or = 0;
+
+		if (!get(a, AW_ID, &id)) {
+			say("speaker: nobody at I2C address %#x: not powered, or not there\n", a->address);
+			power_down_now("an amplifier does not answer");
+			return false;
+		}
+		say("speaker: the amplifier %s: chip ID %#06x, %s\n", a->where, id, amplifier_name(id));
+		if (id != AW_ID_AW88261) {
+			return false;
+		}
+		if (!get(a, AW_EFRH4, &h4) || !get(a, AW_EFRH3, &h3) || !get(a, AW_EFRL4, &l4) || !get(a, AW_EFRL3, &l3)) {
+			return false;
+		}
+		for (unsigned r = 0; r < a->count; r++) {
+			if (a->profile[r][0] == AW_DBGCTRL) {
+				ef_or = a->profile[r][1] & DBGCTRL_EF_OR;
+			}
+		}
+		/* the driver's aw_dev_get_icalk(), aw_dev_get_vcalk() and aw_dev_set_vcalb() */
+		icalk_bits = ef_or ? ((h4 & 0x3ff) | (l4 & 0x3ff)) : ((h4 & 0x3ff) & (l4 & 0x3ff));
+		vcalk_bits = ef_or ? ((h3 & 0x3ff) | (l3 & 0x3ff)) : ((h3 & 0x3ff) & (l3 & 0x3ff));
+		icalk = 1000 + ((icalk_bits & 0x200) ? (int)icalk_bits - 0x400 : (int)icalk_bits);
+		vcalk = 1000 + ((vcalk_bits & 0x200) ? (int)vcalk_bits - 0x400 : (int)vcalk_bits);
+		if (vcalk <= 0 || icalk <= 0) {
+			say("speaker: the amplifier %s: fuses %#x %#x %#x %#x make no sense\n", a->where, h4, h3, l4, l3);
+			return false;
+		}
+		vcalb = (uint16_t)(8192 * icalk / vcalk);
+		say("speaker: the amplifier %s: fuses %#06x %#06x %#06x %#06x: icalk %d, vcalk %d, so 0x50 is to be %#06x\n", a->where,
+		    h4, h3, l4, l3, icalk, vcalk, vcalb);
+
+		say("speaker: the amplifier %s: soft reset (0x00 <- 0x55aa), as the driver does it first\n", a->where);
+		a->prepared = true;
+		if (!register_write(a->address, AW_ID, AW_SOFT_RESET)) {
+			power_down_now("the soft reset was not acknowledged");
+			return false;
+		}
+		wait_ms(2);
+		for (unsigned r = 0; r < a->count; r++) {
+			uint8_t reg = (uint8_t)a->profile[r][0];
+			uint16_t value = a->profile[r][1], now;
+
+			switch (reg) {
+			case AW_SYSINTM:
+				value = SYSINTM_DEFAULT;
+				break;
+			case AW_SYSCTRL:
+				/* the three power and mute bits stay as they are; the power stage's mute on */
+				if (!get(a, AW_SYSCTRL, &now)) {
+					power_down_now("0x04 could not be read");
+					return false;
+				}
+				value = (uint16_t)((value & ~(SYSCTRL_PWDN | SYSCTRL_AMPPD | SYSCTRL_HMUTE)) |
+				    (now & (SYSCTRL_PWDN | SYSCTRL_AMPPD | SYSCTRL_HMUTE)) | SYSCTRL_ULS_HMUTE);
+				break;
+			case AW_I2SCTRL3:
+				value &= (uint16_t)~I2SCTRL3_TXEN;
+				break;
+			case AW_VSNTM1:
+				continue;
+			}
+			if (!put(a, reg, value)) {
+				return false;
+			}
+		}
+		if (!put(a, AW_VSNTM1, vcalb) || !set_volume(a, VOLUME_LOWEST)) {
+			return false;
+		}
+	}
+	say("speaker: BOTH AMPLIFIERS ARE CONFIGURED as Android's Music profile has them: powered down, muted, at the lowest volume\n");
+	return true;
+}
+
+bool
+redwood_speaker_start(void)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+		uint16_t status = 0, interrupts = 0;
+		unsigned tries;
+
+		if (broken || !a->prepared) {
+			return false;
+		}
+		say("speaker: the amplifier %s: power-down off\n", a->where);
+		a->started = true;
+		if (!sysctrl(a, SYSCTRL_PWDN, false)) {
+			return false;
+		}
+		wait_ms(2);
+		for (tries = 0; tries < STATUS_TRIES; tries++) {
+			if (!get(a, AW_SYSST, &status)) {
+				power_down_now("the status could not be read");
+				return false;
+			}
+			if ((status & SYSST_PLL_CHECK) == SYSST_PLL_CHECK) {
+				break;
+			}
+			wait_ms(2);
+		}
+		say("speaker: the amplifier %s: status %#06x: its PLL %s\n", a->where, status, tries < STATUS_TRIES ?
+		    "IS LOCKED to the bit clock" : "DOES NOT LOCK: no clock?");
+		if (tries == STATUS_TRIES) {
+			power_down_now("an amplifier's PLL does not lock");
+			return false;
+		}
+		say("speaker: the amplifier %s: amplifier power-down off\n", a->where);
+		if (!sysctrl(a, SYSCTRL_AMPPD, false)) {
+			return false;
+		}
+		wait_ms(1);
+		for (tries = 0; tries < STATUS_TRIES; tries++) {
+			if (faulty(a, &status)) {
+				break;
+			}
+			if ((status & SYSST_CHECK) == SYSST_CHECK) {
+				break;
+			}
+			wait_ms(2);
+		}
+		say("speaker: the amplifier %s: status %#06x\n", a->where, status);
+		if ((status & SYSST_FAULTS) != 0 || (status & SYSST_CHECK) != SYSST_CHECK) {
+			power_down_now((status & SYSST_FAULTS) ? "an amplifier reports a fault" : "an amplifier's status is not as "
+			    "the driver wants it");
+			return false;
+		}
+		if (!put(a, AW_I2SCTRL3, a->i2sctrl3) ||        /* the feedback on, as the profile has it */
+		    !sysctrl(a, SYSCTRL_ULS_HMUTE, false) || !sysctrl(a, SYSCTRL_HMUTE, false)) {
+			return false;
+		}
+		if (!get(a, AW_SYSINT, &interrupts) || !get(a, AW_SYSINT, &interrupts) || !put(a, AW_SYSINTM, SYSINTM_DEFAULT)) {
+			power_down_now("the interrupts could not be read");
+			return false;
+		}
+		if (faulty(a, &status)) {
+			say("speaker: the amplifier %s: status %#06x\n", a->where, status);
+			power_down_now("an amplifier reports a fault");
+			return false;
+		}
+		say("speaker: THE AMPLIFIER %s RUNS, unmuted at the lowest volume (status %#06x)\n", a->where, status);
+	}
+	return true;
+}
+
+bool
+redwood_speaker_volume(uint32_t below)
+{
+	uint16_t status;
+
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+		uint32_t target = a->volume_at + below;
+
+		if (broken || !a->started) {
+			return false;
+		}
+		if (target > VOLUME_LOWEST) {
+			target = VOLUME_LOWEST;
+		}
+		say("speaker: the amplifier %s: the volume to -%u.%03u dB (Android's level less %u.%03u dB), 6 dB a step\n", a->where,
+		    target / 8, target % 8 * 125, (target - a->volume_at) / 8, (target - a->volume_at) % 8 * 125);
+	}
+	/* both together, a step every 50 ms, the status looked at after every step */
+	for (;;) {
+		bool moved = false;
+
+		for (unsigned i = 0; i < 2; i++) {
+			struct amplifier *a = &amplifiers[i];
+			uint32_t target = a->volume_at + below, next;
+
+			if (target > VOLUME_LOWEST) {
+				target = VOLUME_LOWEST;
+			}
+			if (a->volume == target) {
+				continue;
+			}
+			next = a->volume > target ? (a->volume - target > VOLUME_STEP ? a->volume - VOLUME_STEP : target) :
+			    (target - a->volume > VOLUME_STEP ? a->volume + VOLUME_STEP : target);
+			if (!set_volume(a, (uint16_t)next)) {
+				return false;
+			}
+			if (faulty(a, &status)) {
+				say("speaker: the amplifier %s: status %#06x\n", a->where, status);
+				power_down_now("an amplifier reports a fault");
+				return false;
+			}
+			moved = true;
+		}
+		if (!moved) {
+			break;
+		}
+		wait_ms(50);
+	}
+	return true;
+}
+
+bool
+redwood_speaker_healthy(void)
+{
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+		uint16_t status;
+
+		if (broken) {
+			return false;
+		}
+		if (!a->started) {
+			continue;
+		}
+		if (faulty(a, &status)) {
+			say("speaker: the amplifier %s: status %#06x\n", a->where, status);
+			power_down_now("an amplifier reports a fault");
+			return false;
+		}
+	}
+	return true;
+}
+
+void
+redwood_speaker_stop(void)
+{
+	if (broken) {
+		return;                 /* (already powered down) */
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		struct amplifier *a = &amplifiers[i];
+
+		if (!a->started) {
+			continue;
+		}
+		say("speaker: the amplifier %s is stopped as Android's driver stops it\n", a->where);
+		if (!sysctrl(a, SYSCTRL_ULS_HMUTE, true)) {
+			return;
+		}
+		while (a->volume < VOLUME_LOWEST) {
+			if (!set_volume(a, (uint16_t)(a->volume + VOLUME_STEP > VOLUME_LOWEST ? VOLUME_LOWEST : a->volume +
+			    VOLUME_STEP))) {
+				return;
+			}
+			wait_ms(1);
+		}
+		if (!sysctrl(a, SYSCTRL_HMUTE, true) || !put(a, AW_I2SCTRL3, (uint16_t)(a->i2sctrl3 & ~I2SCTRL3_TXEN))) {
+			return;
+		}
+		wait_ms(1);
+		if (!sysctrl(a, SYSCTRL_AMPPD, true) || !sysctrl(a, SYSCTRL_PWDN, true)) {
+			return;
+		}
+		a->started = false;
+		say("speaker: THE AMPLIFIER %s IS POWERED DOWN\n", a->where);
+	}
+}
+
+void
+redwood_speaker_quiesce(void)
+{
+	bool any = false;
+
+	for (unsigned i = 0; i < 2; i++) {
+		any |= amplifiers[i].started;
+	}
+	if (!any || tlmm == 0) {
+		return;
+	}
+	leaving = true;
+	power_down_now("the kernel is on its way out");
+}
+
+/* ---- speaker_probe=N: a look ------------------------------------------------------------------------ */
+
 static void
 show_amplifiers(void)
 {
-	static const struct {
-		uint8_t address;
-		const char *where;
-	} amplifiers[] = { { 0x34, "bottom" }, { 0x35, "top" } };
 	/* the chip ID, then registers that every chip of the family has at the same place and that reading does not change */
 	static const struct {
 		uint8_t reg;
 		const char *name;
 	} more[] = { { 0x01, "status" }, { 0x04, "system control" }, { 0x06, "I2S control" } };
-	const unsigned first = PIN_SDA, second = PIN_SCL;
-	uint32_t first_cfg = rd(GPIO_CFG(first)), second_cfg = rd(GPIO_CFG(second));
-	uint32_t first_io = rd(GPIO_IO(first)), second_io = rd(GPIO_IO(second));
-	unsigned found = 0;
 
-	line(PIN_SDA, true);
-	line(PIN_SCL, true);
-	delay_for_interval(1, NSEC_PER_MSEC);
-	if (!level(PIN_SDA) || !level(PIN_SCL)) {
-		/* nothing of ours on a bus that is not at rest: its supply may be off, and then so are the amplifiers */
-		printf("speaker: the I2C bus is not idle (gpio%u reads %u, gpio%u reads %u): no supply for its pull-ups? Not touched\n",
-		    PIN_SDA, level(PIN_SDA), PIN_SCL, level(PIN_SCL));
-	} else {
-		/* as the pins should be, and if nobody answers, the other way round */
-		for (int attempt = 0; attempt < 2 && found == 0; attempt++) {
-			if (attempt == 1) {
-				PIN_SDA = second;
-				PIN_SCL = first;
-				printf("speaker: once more with gpio%u as the data line and gpio%u as the clock\n", PIN_SDA, PIN_SCL);
-			}
-			for (unsigned i = 0; i < sizeof(amplifiers) / sizeof(amplifiers[0]); i++) {
-				uint16_t id = 0, value = 0;
+	for (unsigned i = 0; i < 2; i++) {
+		uint16_t id = 0, value = 0;
 
-				if (!amplifier_read(amplifiers[i].address, 0x00, &id)) {
-					printf("speaker: nobody at I2C address %#x (the %s amplifier): not powered, or not there\n",
-					    amplifiers[i].address, amplifiers[i].where);
-					continue;
-				}
-				found++;
-				printf("speaker: the %s amplifier (I2C address %#x) is there: chip ID %#06x, %s\n", amplifiers[i].where,
-				    amplifiers[i].address, id, amplifier_name(id));
-				for (unsigned r = 0; r < sizeof(more) / sizeof(more[0]); r++) {
-					if (amplifier_read(amplifiers[i].address, more[r].reg, &value)) {
-						printf("speaker:   register %#04x (%s) = %#06x\n", more[r].reg, more[r].name, value);
-					}
-				}
+		if (!register_read(amplifiers[i].address, AW_ID, &id)) {
+			say("speaker: nobody at I2C address %#x: not powered, or not there\n", amplifiers[i].address);
+			continue;
+		}
+		say("speaker: the amplifier %s is there: chip ID %#06x, %s\n", amplifiers[i].where, id, amplifier_name(id));
+		for (unsigned r = 0; r < sizeof(more) / sizeof(more[0]); r++) {
+			if (register_read(amplifiers[i].address, more[r].reg, &value)) {
+				say("speaker:   register %#04x (%s) = %#06x\n", more[r].reg, more[r].name, value);
 			}
 		}
 	}
-	/* as the firmware left them */
-	wr(GPIO_IO(first), first_io & 2);
-	wr(GPIO_IO(second), second_io & 2);
-	wr(GPIO_CFG(first), first_cfg);
-	wr(GPIO_CFG(second), second_cfg);
 }
 
-/* ---- power and clock of the audio subsystem --------------------------------------------------------- */
+/* ---- power names of the audio subsystem ------------------------------------------------------------- */
 
 #define CMD_DB_PHYS             0x80860000UL
 #define CMD_DB_SIZE             0x20000UL
 #define GCC_PHYS                0x00100000UL
 #define GCC_SIZE                0x60000UL
-#define GCC_CFG_NOC_LPASS_CBCR  (gcc + 0x47020)         /* bit 0: asked for, bit 31: off */
 
 struct cmd_db_slave {
 	uint16_t id, header_offset, data_offset, count, version, reserved[3];
@@ -336,9 +1004,9 @@ show_power(void)
 		uint32_t address = rpmh_address(supplies[i]);
 
 		if (address) {
-			printf("speaker: supply \"%s\" can be asked for at RPMh address %#x\n", supplies[i], address);
+			say("speaker: supply \"%s\" can be asked for at RPMh address %#x\n", supplies[i], address);
 		} else {
-			printf("speaker: no supply \"%s\" in the command database\n", supplies[i]);
+			say("speaker: no supply \"%s\" in the command database\n", supplies[i]);
 		}
 	}
 	/*
@@ -351,16 +1019,18 @@ show_power(void)
 static void
 probe_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	if (tlmm == 0) {
+		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	}
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
-	printf("speaker: a look at the phone's sound hardware (level %u; nothing is switched on)\n", probe_level);
+	say("speaker: a look at the phone's sound hardware (level %u; nothing is switched on)\n", probe_level);
 	show_pins();
 	show_power();
 	if (probe_level >= 2) {
 		show_amplifiers();
 	}
-	printf("speaker: done\n");
+	say("speaker: done\n");
 	thread_terminate(current_thread());
 }
 

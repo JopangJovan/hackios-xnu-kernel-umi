@@ -52,6 +52,10 @@
  *  11  talks   APR, on the channel apr_audio_svc that the DSP opens and we answer as well: whether
  *              the audio services are up, and which there are (see step_apr())
  *
+ * Once everything is up with adsp=1, the sound's path takes over (redwood_sound.c, boot-arg sound=N):
+ * redwood_adsp_apr() is how it speaks to the audio services (any service, port and token; what
+ * nobody waits for goes to its handler of events), and it is stopped before the DSP is.
+ *
  * What is started is stopped: when the steps are over (unless adsp_keep=1, and then when the run
  * ends), and on a panic's way back to the loader. The DSP is asked first (bit 0 of our entry
  * "master-kernel"), then TrustZone shuts it down, then the always-on processor hears "adsp: off".
@@ -89,6 +93,7 @@
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
 #include <vm/vm_kern.h>
+#include <sys/redwood_audio.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
@@ -1028,6 +1033,21 @@ root_file(const char *name, uint64_t *size)
 }
 
 static bool from_root;                  /* the image is in memory of ours (root_file()), to be given back once written */
+
+/* For the sound (redwood_sound.c): a file of /fw on the root, read whole into memory of ours, and given back. */
+const uint8_t *
+redwood_adsp_fw_file(const char *name, uint64_t *size)
+{
+	return root_file(name, size);
+}
+
+void
+redwood_adsp_fw_free(const uint8_t *data, uint64_t size)
+{
+	uint8_t *ours = __DECONST(uint8_t *, data);
+
+	kfree_data(ours, size);
+}
 
 /* A file of fw/ in the small image (ADSP=1 userland/build.sh puts fw-audio/ there), else of /fw on the root (above). */
 static const uint8_t *
@@ -2474,6 +2494,9 @@ static struct {
 } apr_answer;
 static uint32_t apr_in, apr_out, apr_next_token = 1;
 static bool audio_up;                   /* the core service has said that the audio services are up (step 11) */
+static uint32_t apr_waited_for;         /* the token a question waits for the answer to; 0: none */
+static redwood_apr_events_t apr_events; /* the sound's (redwood_sound.c): what nobody waits for */
+static LCK_MTX_DECLARE(apr_lock, &adsp_lock_group);     /* one question at a time */
 
 /* A packet from the DSP's audio services. From the link's thread. */
 static void
@@ -2494,6 +2517,17 @@ apr_input(const uint8_t *data, uint32_t length)
 	}
 	payload = (header.size < length ? header.size : length) - header_length;
 	apr_in++;
+	if (header.token != apr_waited_for || apr_waited_for == 0) {
+		redwood_apr_events_t events = apr_events;
+		uint32_t words[64];
+
+		bzero(words, sizeof(words));
+		memcpy(words, data + header_length, payload < sizeof(words) ? payload : sizeof(words));
+		if (events != NULL && events(header.from_service, header.from_port, header.opcode, header.token, words,
+		    payload < sizeof(words) ? payload : sizeof(words))) {
+			return;
+		}
+	}
 	if (apr_in <= 40) {
 		uint32_t w[4] = { 0, 0, 0, 0 };
 
@@ -2510,16 +2544,21 @@ apr_input(const uint8_t *data, uint32_t length)
 	apr_answer.there = true;
 }
 
-/* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_answer, if it came. */
-static bool
-apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms)
+/*
+ * A command to one of the DSP's services (and its answer waited for, with ms): true when it was
+ * sent and, if waited for, answered; the answer is in apr_answer and, if asked for, in *answer.
+ * The port is the service's own numbering of what the command is for (ASM: session << 8 | stream).
+ */
+bool
+redwood_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
+    uint32_t ms, struct redwood_apr_answer *answer)
 {
 	uint8_t packet[sizeof(struct apr_header) + 256];
 	struct apr_header *header = (struct apr_header *)packet;
-	uint32_t token = apr_next_token++;
+	bool answered = false;
 	int error;
 
-	if (length > sizeof(packet) - sizeof(*header)) {
+	if (length > sizeof(packet) - sizeof(*header) || !glink.channel[CHANNEL_APR].open) {
 		return false;
 	}
 	bzero(packet, sizeof(packet));
@@ -2527,27 +2566,66 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 	header->size = (uint16_t)(sizeof(*header) + length);
 	header->from_service = service;
 	header->from_domain = APR_DOMAIN_APPS;
+	header->from_port = port;
 	header->to_service = service;
 	header->to_domain = APR_DOMAIN_ADSP;
-	header->token = token;
+	header->to_port = port;
 	header->opcode = opcode;
 	if (length != 0) {
 		memcpy(packet + sizeof(*header), payload, length);
 	}
+	if (ms == 0) {
+		/* (sent and not waited for: what comes back is the events' handler's) */
+		header->token = token;
+		error = glink_send(&glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length);
+		apr_out += error == 0;
+		return error == 0;
+	}
+	lck_mtx_lock(&apr_lock);
+	if (token == 0) {
+		token = apr_next_token++;
+		if (apr_next_token >= 0x01000000u) {
+			apr_next_token = 1;
+		}
+	}
+	header->token = token;
 	apr_answer.there = false;
+	apr_waited_for = token;
 	error = glink_send(&glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length);
 	if (error != 0) {
 		printf("adsp: apr: > opcode %#x to service %u: NOT SENT (%d)\n", opcode, service, error);
-		return false;
-	}
-	apr_out++;
-	for (uint32_t waited = 0; waited < ms; waited++) {
-		if (apr_answer.there && apr_answer.token == token) {
-			return true;
+	} else {
+		apr_out++;
+		for (uint32_t waited = 0; waited < ms && !answered; waited++) {
+			if (apr_answer.there && apr_answer.token == token) {
+				answered = true;
+				if (answer != NULL) {
+					answer->opcode = apr_answer.opcode;
+					answer->token = apr_answer.token;
+					answer->length = apr_answer.length;
+					memcpy(answer->words, apr_answer.words, sizeof(answer->words));
+				}
+				break;
+			}
+			sleep_ms(1);
 		}
-		sleep_ms(1);
 	}
-	return false;
+	apr_waited_for = 0;
+	lck_mtx_unlock(&apr_lock);
+	return answered;
+}
+
+void
+redwood_adsp_apr_events(redwood_apr_events_t handler)
+{
+	apr_events = handler;
+}
+
+/* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_answer, if it came. */
+static bool
+apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms)
+{
+	return redwood_adsp_apr(service, 0, 0, opcode, payload, length, ms, NULL);
 }
 
 /* ---- the link's thread ----------------------------------------------------------------------------- */
@@ -2824,6 +2902,7 @@ steps_over(uint32_t done)
 void
 redwood_adsp_stop(void)
 {
+	redwood_sound_dsp_down();               /* the amplifiers, the stream and the port first, while the DSP still listens */
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started) {
 		unsigned services = 0;
@@ -2846,6 +2925,7 @@ redwood_adsp_stop(void)
 void
 redwood_adsp_quiesce(void)
 {
+	redwood_sound_quiesce();                /* the amplifiers off, whatever the DSP's state */
 	if (!dsp_started) {
 		return;
 	}
@@ -2890,6 +2970,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	if (step == STEPS && dsp_started) {
 		tell("adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
 		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
+		redwood_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, redwood_sound.c) */
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
