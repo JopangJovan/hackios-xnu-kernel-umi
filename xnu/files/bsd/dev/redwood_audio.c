@@ -335,4 +335,5 @@ redwood_audio_init(void)
 	audio_recording_init();
 	redwood_virtio_sound_init();
 	redwood_speaker_init();
+	redwood_haptic_init();
 }

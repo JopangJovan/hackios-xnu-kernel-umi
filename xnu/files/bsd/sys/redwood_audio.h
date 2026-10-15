@@ -52,6 +52,8 @@ bool redwood_audio_volume(uint32_t *below, bool *muted, uint32_t *generation);
 void redwood_audio_init(void);
 void redwood_virtio_sound_init(void);   /* boot-arg virtio_sound=1: QEMU's virtio sound device */
 void redwood_speaker_init(void);        /* boot-arg speaker_probe=N: a look at the phone's speaker amplifiers */
+void redwood_haptic_init(void);         /* boot-arg haptic=N: the phone's vibration motor (bsd/dev/redwood_haptic.c) */
+void redwood_haptic_quiesce(void);      /* its chip back into reset: at the run's end and on a panic's way out */
 
 /*
  * The phone's speakers (bsd/dev/redwood_speaker.c): its two Awinic amplifiers, set up as

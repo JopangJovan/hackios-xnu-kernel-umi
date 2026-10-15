@@ -220,6 +220,12 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	rm -f root/fw/network
 	[ -f ../fw-wifi/network ] && install -m 0600 ../fw-wifi/network root/fw/network
 fi
+# ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
+# (bsd/dev/redwood_haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
+if [ -f ../fw-haptic/aw8697_haptic.bin ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-haptic/aw8697_haptic.bin root/fw/
+fi
 # ... and with ADSP=1 the image of the audio DSP, from the same place into ../fw-audio (bsd/dev/redwood_adsp.c):
 # adsp.mdt and adsp.b02 to adsp.b36, 20 MB. Only when asked for: beside GL=1 the payload would be more than the 64 MB
 # the loader takes.
