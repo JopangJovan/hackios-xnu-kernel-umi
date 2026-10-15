@@ -1410,6 +1410,13 @@ static const char halve_fragment[] =
  * With the function's second number set (inputNormalizeEdges, it seems), what the blur drew in
  * from outside the picture -- nothing, transparent -- is made up for by dividing by the opacity,
  * as the edges of an ordinary blur are.
+ * The colour's opacity is the blurring layer's (Spotlight's strip fades so while the gesture that
+ * dismisses Search is under way), and CoreAnimation puts what this draws on the screen as it is,
+ * without blending: so the opacity is how much of the blur is shown over the picture itself, not a
+ * darkening. Multiplied in, the strip went dark with it -- to a quarter, in four frames, at each
+ * start of that gesture -- and stayed dark whenever the gesture ended between two of the window
+ * server's renderings of the strip: it reuses the last one until what is behind the strip changes
+ * (the dark strip in Search, rc.jobs.strip).
  */
 static const char vblur_draw_vertex[] =
     "#version 300 es\n"
@@ -1461,8 +1468,12 @@ static const char vblur_fragment[] =
     "  highp vec4 c = mix(level(k, at), level(min(k + 1, levels - 1), at), lod - float(k));\n"
     "  if (normalize_edges > 0.5) {\n"
     "    c = c.a > 0.004 ? vec4(c.rgb / c.a, 1.0) : vec4(0.0);\n"
+    "    highp vec4 sharp = texture(level0, at);\n"
+    "    sharp = sharp.a > 0.004 ? vec4(sharp.rgb / sharp.a, 1.0) : c;\n"
+    "    result = vec4(mix(sharp.rgb, c.rgb, color.a), 1.0);\n"
+    "  } else {\n"
+    "    result = color * c;\n"
     "  }\n"
-    "  result = color * c;\n"
     "  if (paint != 0) {\n"
     "    highp float t = m;\n"
     "    result = vec4(t, 0.25 * c.g, 1.0 - t, 1.0);\n"
