@@ -4,9 +4,16 @@
 # SpringBoard draw the Calendar's icon anew, for a date that may have changed (with wifi=1 the network
 # setting the clock does the same, now and then, which is how it was first seen). With gpu=1 about half
 # of the screenshots taken meanwhile show the icon with square corners in its top 16 rows and a line
-# under it; the software renderer never does. The window server's copy of the new picture is right in
-# the 16K pages that lie wholly inside it and still the picture without its rounded mask in the two
-# pages it shares with the memory around it (the icon's 180 x 180 at 720 bytes a row starts 4224 bytes
-# into a page: the first page holds rows 0-16, the last rows 176-179), and it stays so.
+# under it; the software renderer never does.
+# What is known: each refresh gives two 180 x 180 pictures (720 bytes a row); the one whose bytes start
+# 4224 into a 16K page is wrong in exactly its first and last pages, the ones it shares with what is
+# around it (rows 0-16 and 176-179 still without the rounded mask, the rest masked), and the screen
+# shows it. It is so already in SpringBoard's own memory (the CGImage's bytes, looked at from inside
+# SpringBoard), with gpu=1 only: with the software renderer the same picture is right there too. The
+# window server only shows what it is sent: the pages it holds for its surface around the picture and
+# what it reads at that address agree, at creation and at every lock, and holding them for reading
+# only changes nothing; one processor (no cpus=4) changes nothing. Copy-on-write in the kernel passes
+# every case of src/cow_test.c (rc.jobs.cow), the window server's own way of holding a picture among
+# them. Why SpringBoard's picture comes out so when the window server draws with the GPU is not known.
 /redwood/bin/rwtouch wait 40 swipe 0.5 0.985 0.5 0.3 200 wait 10 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3
 /redwood/bin/rwtouch notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3 notify SignificantTimeChangeNotification wait 3

@@ -1,0 +1,4 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# Copy-on-write in the kernel (RC_JOBS=rc.jobs.cow, a run of a minute): see src/cow_test.c. Every line
+# it writes should end with no page wrong.
+/redwood/bin/cow_test
