@@ -49,6 +49,8 @@
  *              from here a thread of ours listens to the DSP
  *  10  talks   QRTR on that channel: hello both ways, and the services the DSP tells of, written
  *              down for adsp_listen seconds (default 3)
+ *  11  talks   APR, on the channel apr_audio_svc that the DSP opens and we answer as well: whether
+ *              the audio services are up, and which there are (see step_apr())
  *
  * What is started is stopped: when the steps are over (unless adsp_keep=1, and then when the run
  * ends), and on a panic's way back to the loader. The DSP is asked first (bit 0 of our entry
@@ -104,7 +106,7 @@ extern lck_mtx_t redwood_smem_alloc_lock;
 
 static LCK_GRP_DECLARE(adsp_lock_group, "redwood-adsp");
 
-#define STEPS                   10
+#define STEPS                   11
 #define REDWOOD_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin */
 
 static uint32_t last_step, pause_ms = 2200, listen_seconds = 3;
@@ -1793,8 +1795,6 @@ enum {
 };
 #define GLINK_VERSION_1         1
 #define GLINK_INTENT_REUSE      1u
-#define GLINK_CHANNEL           "IPCRTR"
-#define GLINK_US                1
 
 struct glink_message {
 	uint16_t command, param1;
@@ -1806,28 +1806,62 @@ struct glink_packet {
 	uint8_t data[];
 };
 
+/*
+ * The channels we answer when the DSP opens them, each with our number for it and the intents
+ * we give it when it is open both ways (how many buffers of which size the DSP may send into):
+ * IPCRTR, which carries QRTR (dt: qcom,intents of qcom,adsp_qrtr), and apr_audio_svc, which
+ * carries APR, the audio services' own protocol (below; Android's apr_tal_rpmsg.c asks for no
+ * particular intents: what the DSP sends there is a few hundred bytes, up to a few kilobytes).
+ */
+enum { CHANNEL_QRTR, CHANNEL_APR, CHANNELS };
+
+struct glink_channel {
+	const char *name;
+	uint32_t ours;                          /* our number for it */
+	struct {
+		uint32_t size, count;
+	} intents[3];
+	uint32_t theirs;                        /* the DSP's number for it; 0: it has not opened it */
+	bool asked, acknowledged, open;         /* our open sent; acknowledged; both ways done and our intents told */
+	bool request_answered, request_granted; /* our last request for an intent */
+	struct {
+		uint32_t id, size;
+		bool there, in_use;
+	} their_intents[64];                    /* what we may send into */
+	struct {
+		uint32_t size, fill;
+		uint8_t *data;
+	} our_intents[24];                      /* what the DSP may send into; an intent's number is its place here + 1 */
+	uint32_t our_intent_count;
+	struct glink_packet *first, *last;      /* received, in order */
+};
+
 static LCK_MTX_DECLARE(glink_lock, &adsp_lock_group);
 static struct {
 	uint32_t descriptor, ours, ours_size, theirs, theirs_size;
 	bool up, broken;
 	uint32_t features;
 	bool agreed;
-	uint32_t their_channel;
-	bool asked, acknowledged, open;
-	bool request_answered, request_granted;
-	struct {
-		uint32_t id, size;
-		bool there, in_use;
-	} their_intents[64];
-	struct {
-		uint32_t size, fill;
-		uint8_t *data;
-	} our_intents[24];
-	uint32_t our_intent_count;
-	struct glink_packet *first, *last;
+	struct glink_channel channel[CHANNELS];
 	uint32_t said, heard, trace;
 	char others[4][33];                     /* the channels the DSP opens that nobody here speaks (for the log) */
-} glink;
+} glink = {
+	.channel = {
+		[CHANNEL_QRTR] = { .name = "IPCRTR", .ours = 1, .intents = { { 0x800, 5 }, { 0x2000, 3 }, { 0x4400, 2 } } },
+		[CHANNEL_APR] = { .name = "apr_audio_svc", .ours = 2, .intents = { { 0x200, 8 }, { 0x1000, 4 }, { 0x2000, 2 } } },
+	},
+};
+
+static struct glink_channel *
+glink_theirs(uint32_t theirs)
+{
+	for (unsigned c = 0; c < CHANNELS; c++) {
+		if (glink.channel[c].theirs != 0 && glink.channel[c].theirs == theirs) {
+			return &glink.channel[c];
+		}
+	}
+	return NULL;
+}
 
 static bool
 glink_find(void)
@@ -1949,23 +1983,23 @@ glink_say(unsigned command, uint32_t param1, uint32_t param2, const void *more, 
 }
 
 static bool
-glink_offer(uint32_t size)
+glink_offer(struct glink_channel *channel, uint32_t size)
 {
-	uint32_t words[2] = { size, glink.our_intent_count + 1 }, i = glink.our_intent_count;
+	uint32_t words[2] = { size, channel->our_intent_count + 1 }, i = channel->our_intent_count;
 
-	if (i >= sizeof(glink.our_intents) / sizeof(glink.our_intents[0]) || size == 0 || size > 0x10000) {
+	if (i >= sizeof(channel->our_intents) / sizeof(channel->our_intents[0]) || size == 0 || size > 0x10000) {
 		return false;
 	}
-	if (glink.our_intents[i].data == NULL || glink.our_intents[i].size != size) {
-		glink.our_intents[i].data = kalloc_data(size, Z_WAITOK | Z_ZERO);
+	if (channel->our_intents[i].data == NULL || channel->our_intents[i].size != size) {
+		channel->our_intents[i].data = kalloc_data(size, Z_WAITOK | Z_ZERO);
 	}
-	if (glink.our_intents[i].data == NULL) {
+	if (channel->our_intents[i].data == NULL) {
 		return false;
 	}
-	glink.our_intents[i].size = size;
-	glink.our_intents[i].fill = 0;
-	glink.our_intent_count++;
-	glink_say(GLINK_INTENT, GLINK_US, 1, words, sizeof(words));
+	channel->our_intents[i].size = size;
+	channel->our_intents[i].fill = 0;
+	channel->our_intent_count++;
+	glink_say(GLINK_INTENT, channel->ours, 1, words, sizeof(words));
 	return true;
 }
 
@@ -1973,10 +2007,8 @@ glink_offer(uint32_t size)
 static void
 glink_pump(void)
 {
-	static const struct {
-		uint32_t size, count;
-	} intents[] = { { 0x800, 5 }, { 0x2000, 3 }, { 0x4400, 2 } };           /* dt: qcom,intents of qcom,adsp_qrtr */
 	struct glink_message message;
+	struct glink_channel *channel;
 	uint32_t words[4];
 	char name[33];
 
@@ -2009,7 +2041,8 @@ glink_pump(void)
 			return;
 		}
 		glink.heard++;
-		if (glink.trace > 0 && message.command != GLINK_DATA && message.command != GLINK_DATA_MORE) {
+		if (glink.trace > 0 && message.command != GLINK_DATA && message.command != GLINK_DATA_MORE &&
+		    message.command != GLINK_INTENT && message.command != GLINK_DONE_REUSE) {
 			glink.trace--;
 			printf("adsp: glink: < %s %u %#x\n", glink_name(message.command), message.param1, message.param2);
 		}
@@ -2034,7 +2067,13 @@ glink_pump(void)
 			bzero(name, sizeof(name));
 			glink_peek(name, sizeof(message), message.param2 < sizeof(name) - 1 ? message.param2 : sizeof(name) - 1);
 			glink_advance(length);
-			if (strcmp(name, GLINK_CHANNEL) != 0) {
+			channel = NULL;
+			for (unsigned c = 0; c < CHANNELS; c++) {
+				if (strcmp(name, glink.channel[c].name) == 0) {
+					channel = &glink.channel[c];
+				}
+			}
+			if (channel == NULL) {
 				printf("adsp: glink: the DSP opens \"%s\" as its channel %u: left unanswered, nobody here speaks it\n", name,
 				    message.param1);
 				for (unsigned i = 0; i < 4; i++) {
@@ -2046,31 +2085,36 @@ glink_pump(void)
 				break;
 			}
 			printf("adsp: glink: the DSP opens \"%s\" as its channel %u: acknowledged, and opened from our side as channel %u\n",
-			    name, message.param1, GLINK_US);
-			glink.their_channel = message.param1;
-			glink_say(GLINK_OPEN_ACK, glink.their_channel, 0, NULL, 0);
-			if (!glink.asked) {
+			    name, message.param1, channel->ours);
+			channel->theirs = message.param1;
+			glink_say(GLINK_OPEN_ACK, channel->theirs, 0, NULL, 0);
+			if (!channel->asked) {
+				uint32_t size = (uint32_t)strlen(channel->name) + 1;
+
 				bzero(name, sizeof(name));
-				strlcpy(name, GLINK_CHANNEL, sizeof(name));
-				glink_say(GLINK_OPEN, GLINK_US, sizeof(GLINK_CHANNEL), name, (sizeof(GLINK_CHANNEL) + 7) & ~7u);
-				glink.asked = true;
+				strlcpy(name, channel->name, sizeof(name));
+				glink_say(GLINK_OPEN, channel->ours, size, name, (size + 7) & ~7u);
+				channel->asked = true;
 			}
 			break;
 		case GLINK_OPEN_ACK:
 			glink_advance(length);
-			if (message.param1 == GLINK_US) {
-				glink.acknowledged = true;
+			for (unsigned c = 0; c < CHANNELS; c++) {
+				if (message.param1 == glink.channel[c].ours) {
+					glink.channel[c].acknowledged = true;
+				}
 			}
 			break;
 		case GLINK_INTENT:
-			for (uint32_t i = 0; i < message.param2 && message.param1 == glink.their_channel; i++) {
+			channel = glink_theirs(message.param1);
+			for (uint32_t i = 0; channel != NULL && i < message.param2; i++) {
 				glink_peek(words, 8 + 8 * i, 8);
-				for (unsigned n = 0; n < sizeof(glink.their_intents) / sizeof(glink.their_intents[0]); n++) {
-					if (!glink.their_intents[n].there || glink.their_intents[n].id == words[1]) {
-						glink.their_intents[n].there = true;
-						glink.their_intents[n].in_use = false;
-						glink.their_intents[n].size = words[0];
-						glink.their_intents[n].id = words[1];
+				for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
+					if (!channel->their_intents[n].there || channel->their_intents[n].id == words[1]) {
+						channel->their_intents[n].there = true;
+						channel->their_intents[n].in_use = false;
+						channel->their_intents[n].size = words[0];
+						channel->their_intents[n].id = words[1];
 						break;
 					}
 				}
@@ -2079,57 +2123,63 @@ glink_pump(void)
 			break;
 		case GLINK_DONE:
 		case GLINK_DONE_REUSE:
-			for (unsigned n = 0; n < sizeof(glink.their_intents) / sizeof(glink.their_intents[0]); n++) {
-				if (glink.their_intents[n].there && glink.their_intents[n].id == message.param2) {
-					glink.their_intents[n].in_use = false;
-					glink.their_intents[n].there = message.command == GLINK_DONE_REUSE;
+			channel = glink_theirs(message.param1);
+			for (unsigned n = 0; channel != NULL && n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
+				if (channel->their_intents[n].there && channel->their_intents[n].id == message.param2) {
+					channel->their_intents[n].in_use = false;
+					channel->their_intents[n].there = message.command == GLINK_DONE_REUSE;
 				}
 			}
 			glink_advance(length);
 			break;
 		case GLINK_INTENT_REQUEST:
 			glink_advance(length);
-			if (message.param1 == glink.their_channel) {
-				bool granted = glink_offer(message.param2);
+			if ((channel = glink_theirs(message.param1)) != NULL) {
+				bool granted = glink_offer(channel, message.param2);
 
-				glink_say(GLINK_INTENT_REQUEST_ACK, GLINK_US, granted, NULL, 0);
+				glink_say(GLINK_INTENT_REQUEST_ACK, channel->ours, granted, NULL, 0);
 			}
 			break;
 		case GLINK_INTENT_REQUEST_ACK:
 			glink_advance(length);
-			glink.request_answered = true;
-			glink.request_granted = message.param2 != 0;
+			for (unsigned c = 0; c < CHANNELS; c++) {
+				if (message.param1 == glink.channel[c].theirs || message.param1 == glink.channel[c].ours) {
+					glink.channel[c].request_answered = true;
+					glink.channel[c].request_granted = message.param2 != 0;
+				}
+			}
 			break;
 		case GLINK_DATA:
 		case GLINK_DATA_MORE: {
 			uint32_t intent = message.param2 - 1;
 
-			if (message.param1 != glink.their_channel || intent >= glink.our_intent_count ||
-			    words[0] > glink.our_intents[intent].size - glink.our_intents[intent].fill) {
+			channel = glink_theirs(message.param1);
+			if (channel == NULL || intent >= channel->our_intent_count ||
+			    words[0] > channel->our_intents[intent].size - channel->our_intents[intent].fill) {
 				printf("adsp: glink: < data of %u bytes on channel %u for intent %u: NOT OURS OR TOO MUCH, dropped\n", words[0],
 				    message.param1, message.param2);
 				glink_advance(length);
 				break;
 			}
-			glink_peek(glink.our_intents[intent].data + glink.our_intents[intent].fill, 16, words[0]);
-			glink.our_intents[intent].fill += words[0];
+			glink_peek(channel->our_intents[intent].data + channel->our_intents[intent].fill, 16, words[0]);
+			channel->our_intents[intent].fill += words[0];
 			glink_advance(length);
 			if (words[1] == 0) {
-				struct glink_packet *packet = kalloc_data(sizeof(*packet) + glink.our_intents[intent].fill, Z_WAITOK);
+				struct glink_packet *packet = kalloc_data(sizeof(*packet) + channel->our_intents[intent].fill, Z_WAITOK);
 
 				if (packet != NULL) {
 					packet->next = NULL;
-					packet->length = glink.our_intents[intent].fill;
-					memcpy(packet->data, glink.our_intents[intent].data, packet->length);
-					if (glink.last != NULL) {
-						glink.last->next = packet;
+					packet->length = channel->our_intents[intent].fill;
+					memcpy(packet->data, channel->our_intents[intent].data, packet->length);
+					if (channel->last != NULL) {
+						channel->last->next = packet;
 					} else {
-						glink.first = packet;
+						channel->first = packet;
 					}
-					glink.last = packet;
+					channel->last = packet;
 				}
-				glink.our_intents[intent].fill = 0;
-				glink_say(GLINK_DONE_REUSE, GLINK_US, message.param2, NULL, 0);
+				channel->our_intents[intent].fill = 0;
+				glink_say(GLINK_DONE_REUSE, channel->ours, message.param2, NULL, 0);
 			}
 			break;
 		}
@@ -2140,10 +2190,10 @@ glink_pump(void)
 		case GLINK_CLOSE:
 			glink_advance(length);
 			glink_say(GLINK_CLOSE_ACK, message.param1, 0, NULL, 0);
-			if (message.param1 == glink.their_channel) {
-				printf("adsp: glink: THE DSP CLOSES \"%s\"\n", GLINK_CHANNEL);
-				glink.open = false;
-				glink.their_channel = 0;
+			if ((channel = glink_theirs(message.param1)) != NULL) {
+				printf("adsp: glink: THE DSP CLOSES \"%s\"\n", channel->name);
+				channel->open = false;
+				channel->theirs = 0;
 			}
 			break;
 		case GLINK_CLOSE_ACK:
@@ -2156,27 +2206,30 @@ glink_pump(void)
 			glink.broken = true;
 			return;
 		}
-		if (glink.their_channel != 0 && glink.acknowledged && !glink.open) {
-			glink.open = true;
-			printf("adsp: glink: THE CHANNEL \"%s\" IS OPEN both ways (ours %u, the DSP's %u); telling the DSP our intents\n",
-			    GLINK_CHANNEL, GLINK_US, glink.their_channel);
-			for (unsigned i = 0; i < sizeof(intents) / sizeof(intents[0]); i++) {
-				for (unsigned n = 0; n < intents[i].count; n++) {
-					glink_offer(intents[i].size);
+		for (unsigned c = 0; c < CHANNELS; c++) {
+			channel = &glink.channel[c];
+			if (channel->theirs != 0 && channel->acknowledged && !channel->open) {
+				channel->open = true;
+				printf("adsp: glink: THE CHANNEL \"%s\" IS OPEN both ways (ours %u, the DSP's %u); telling the DSP our intents\n",
+				    channel->name, channel->ours, channel->theirs);
+				for (unsigned i = 0; i < 3; i++) {
+					for (unsigned n = 0; n < channel->intents[i].count; n++) {
+						glink_offer(channel, channel->intents[i].size);
+					}
 				}
 			}
 		}
 	}
 }
 
-/* One whole message to the DSP on the channel; waits up to five seconds for an intent of the DSP's that it fits. */
+/* One whole message to the DSP on a channel; waits up to five seconds for an intent of the DSP's that it fits. */
 static int
-glink_send(const void *data, uint32_t length)
+glink_send(struct glink_channel *channel, const void *data, uint32_t length)
 {
 	struct {
 		struct glink_message message;
 		uint32_t size, left;
-	} header = { { GLINK_DATA, GLINK_US, 0 }, length, 0 };
+	} header = { { GLINK_DATA, (uint16_t)channel->ours, 0 }, length, 0 };
 	bool asked = false, fits;
 	int found = -1;
 
@@ -2187,18 +2240,19 @@ glink_send(const void *data, uint32_t length)
 	}
 	for (unsigned waited = 0;; waited++) {
 		glink_pump();
-		if (!glink.up || !glink.open || glink.broken) {
+		if (!glink.up || !channel->open || glink.broken) {
 			lck_mtx_unlock(&glink_lock);
 			return ENOTCONN;
 		}
 		found = -1;
 		fits = false;
-		for (unsigned n = 0; n < sizeof(glink.their_intents) / sizeof(glink.their_intents[0]); n++) {
-			if (!glink.their_intents[n].there || glink.their_intents[n].size < length) {
+		for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
+			if (!channel->their_intents[n].there || channel->their_intents[n].size < length) {
 				continue;
 			}
 			fits = true;
-			if (!glink.their_intents[n].in_use && (found < 0 || glink.their_intents[n].size < glink.their_intents[found].size)) {
+			if (!channel->their_intents[n].in_use &&
+			    (found < 0 || channel->their_intents[n].size < channel->their_intents[found].size)) {
 				found = (int)n;
 			}
 		}
@@ -2206,11 +2260,11 @@ glink_send(const void *data, uint32_t length)
 			break;
 		}
 		if (!fits && !asked) {
-			glink.request_answered = false;
-			glink_say(GLINK_INTENT_REQUEST, GLINK_US, length, NULL, 0);
+			channel->request_answered = false;
+			glink_say(GLINK_INTENT_REQUEST, channel->ours, length, NULL, 0);
 			asked = true;
 		}
-		if (waited >= 5000 || (!fits && asked && glink.request_answered && !glink.request_granted)) {
+		if (waited >= 5000 || (!fits && asked && channel->request_answered && !channel->request_granted)) {
 			lck_mtx_unlock(&glink_lock);
 			return found < 0 ? ENOBUFS : EAGAIN;
 		}
@@ -2218,8 +2272,8 @@ glink_send(const void *data, uint32_t length)
 		sleep_ms(1);
 		lck_mtx_lock(&glink_lock);
 	}
-	glink.their_intents[found].in_use = true;
-	header.message.param2 = glink.their_intents[found].id;
+	channel->their_intents[found].in_use = true;
+	header.message.param2 = channel->their_intents[found].id;
 	glink_put(&header, sizeof(header), data, length);
 	lck_mtx_unlock(&glink_lock);
 	return 0;
@@ -2265,7 +2319,7 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
 	packet->to_node = to_node;
 	packet->to_port = to_port;
 	memcpy(packet + 1, data, length);
-	error = glink_send(packet, (uint32_t)sizeof(*packet) + padded);
+	error = glink_send(&glink.channel[CHANNEL_QRTR], packet, (uint32_t)sizeof(*packet) + padded);
 	kfree_data(packet, sizeof(*packet) + padded);
 	qrtr_out += error == 0;
 	return error;
@@ -2382,6 +2436,120 @@ qrtr_input(const uint8_t *data, uint32_t length)
 	    header.from_node, header.from_port, header.to_port);
 }
 
+/* ---- APR: the audio services' protocol, on the channel apr_audio_svc ------------------------------------- */
+
+/*
+ * What Android's audio drivers say to the DSP's audio services (Linux: drivers/soc/qcom/apr.c,
+ * include/linux/soc/qcom/apr.h; Android's q6core.c): a packet of a header of eight words -- a
+ * word of kind, header length and version and the packet's length, who it is from and to (a
+ * service, a domain, a port each: we are domain 5, the DSP 4), a token the answer carries back,
+ * an opcode -- and what the opcode takes. The DSP's core service (3) answers whether the audio
+ * services are up (AVCS_CMD_ADSP_EVENT_GET_STATE, which Android asks again and again after the DSP
+ * has started, until the answer is 1) and which services it has and in which versions.
+ */
+#define APR_DOMAIN_ADSP                 4
+#define APR_DOMAIN_APPS                 5
+#define APR_SVC_ADSP_CORE               3
+#define APR_MSG_TYPE_SEQ_CMD            2
+#define APR_HDR_FIELD(type, bytes)      ((uint16_t)((type) << 8 | ((bytes) / 4) << 4))      /* version 0 */
+#define APR_BASIC_RSP_RESULT            0x000110e8u
+#define AVCS_GET_VERSIONS               0x00012905u
+#define AVCS_GET_VERSIONS_RSP           0x00012906u
+#define AVCS_CMD_ADSP_EVENT_GET_STATE   0x0001290cu
+#define AVCS_CMDRSP_ADSP_EVENT_GET_STATE 0x0001290du
+
+struct apr_header {
+	uint16_t field, size;
+	uint8_t from_service, from_domain;
+	uint16_t from_port;
+	uint8_t to_service, to_domain;
+	uint16_t to_port;
+	uint32_t token, opcode;
+};
+
+static struct {
+	uint32_t opcode, token, length;
+	uint32_t words[64];
+	volatile bool there;
+} apr_answer;
+static uint32_t apr_in, apr_out, apr_next_token = 1;
+static bool audio_up;                   /* the core service has said that the audio services are up (step 11) */
+
+/* A packet from the DSP's audio services. From the link's thread. */
+static void
+apr_input(const uint8_t *data, uint32_t length)
+{
+	struct apr_header header;
+	uint32_t header_length, payload;
+
+	if (length < sizeof(header)) {
+		printf("adsp: apr: %u bytes, no APR packet\n", length);
+		return;
+	}
+	memcpy(&header, data, sizeof(header));
+	header_length = ((header.field >> 4) & 0xf) * 4;
+	if (header_length < sizeof(header) || header_length > length) {
+		printf("adsp: apr: a header of %u bytes in a packet of %u: dropped\n", header_length, length);
+		return;
+	}
+	payload = (header.size < length ? header.size : length) - header_length;
+	apr_in++;
+	if (apr_in <= 40) {
+		uint32_t w[4] = { 0, 0, 0, 0 };
+
+		memcpy(w, data + header_length, payload < sizeof(w) ? payload : sizeof(w));
+		printf("adsp: apr: < from service %u of domain %u (port %u) to %u of %u (port %u): opcode %#x, token %u, %u bytes: %#x %#x "
+		    "%#x %#x\n", header.from_service, header.from_domain, header.from_port, header.to_service, header.to_domain,
+		    header.to_port, header.opcode, header.token, payload, w[0], w[1], w[2], w[3]);
+	}
+	bzero(apr_answer.words, sizeof(apr_answer.words));
+	memcpy(apr_answer.words, data + header_length, payload < sizeof(apr_answer.words) ? payload : sizeof(apr_answer.words));
+	apr_answer.length = payload;
+	apr_answer.opcode = header.opcode;
+	apr_answer.token = header.token;
+	apr_answer.there = true;
+}
+
+/* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_answer, if it came. */
+static bool
+apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms)
+{
+	uint8_t packet[sizeof(struct apr_header) + 256];
+	struct apr_header *header = (struct apr_header *)packet;
+	uint32_t token = apr_next_token++;
+	int error;
+
+	if (length > sizeof(packet) - sizeof(*header)) {
+		return false;
+	}
+	bzero(packet, sizeof(packet));
+	header->field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, sizeof(*header));
+	header->size = (uint16_t)(sizeof(*header) + length);
+	header->from_service = service;
+	header->from_domain = APR_DOMAIN_APPS;
+	header->to_service = service;
+	header->to_domain = APR_DOMAIN_ADSP;
+	header->token = token;
+	header->opcode = opcode;
+	if (length != 0) {
+		memcpy(packet + sizeof(*header), payload, length);
+	}
+	apr_answer.there = false;
+	error = glink_send(&glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length);
+	if (error != 0) {
+		printf("adsp: apr: > opcode %#x to service %u: NOT SENT (%d)\n", opcode, service, error);
+		return false;
+	}
+	apr_out++;
+	for (uint32_t waited = 0; waited < ms; waited++) {
+		if (apr_answer.there && apr_answer.token == token) {
+			return true;
+		}
+		sleep_ms(1);
+	}
+	return false;
+}
+
 /* ---- the link's thread ----------------------------------------------------------------------------- */
 
 static volatile bool link_wanted, link_runs;
@@ -2408,18 +2576,29 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 		}
 		for (;;) {
+			unsigned from = CHANNELS;
+
 			lck_mtx_lock(&glink_lock);
 			glink_pump();
-			packet = glink.first;
-			if (packet != NULL) {
-				glink.first = packet->next;
-				glink.last = glink.first == NULL ? NULL : glink.last;
+			packet = NULL;
+			for (unsigned c = 0; c < CHANNELS && packet == NULL; c++) {
+				struct glink_channel *channel = &glink.channel[c];
+
+				if ((packet = channel->first) != NULL) {
+					channel->first = packet->next;
+					channel->last = channel->first == NULL ? NULL : channel->last;
+					from = c;
+				}
 			}
 			lck_mtx_unlock(&glink_lock);
 			if (packet == NULL) {
 				break;
 			}
-			qrtr_input(packet->data, packet->length);
+			if (from == CHANNEL_QRTR) {
+				qrtr_input(packet->data, packet->length);
+			} else {
+				apr_input(packet->data, packet->length);
+			}
 			kfree_data(packet, sizeof(*packet) + packet->length);
 		}
 	}
@@ -2437,17 +2616,22 @@ link_stop(void)
 		for (unsigned ms = 0; ms < 2000 && link_runs; ms++) {
 			sleep_ms(1);
 		}
-		printf("adsp: link: %s; GLINK said %u and heard %u messages, QRTR sent %u and received %u datagrams; its doorbells heard: "
-		    "GLINK %u, SMP2P %u\n", link_runs ? "THE THREAD DOES NOT END" : "down", glink.said, glink.heard, qrtr_out, qrtr_in,
-		    doorbell.glink, doorbell.smp2p);
+		printf("adsp: link: %s; GLINK said %u and heard %u messages, QRTR sent %u and received %u datagrams, APR %u and %u "
+		    "packets; its doorbells heard: GLINK %u, SMP2P %u\n", link_runs ? "THE THREAD DOES NOT END" : "down", glink.said,
+		    glink.heard, qrtr_out, qrtr_in, apr_out, apr_in, doorbell.glink, doorbell.smp2p);
 	}
 	lck_mtx_lock(&glink_lock);
-	glink.up = glink.open = false;
-	while ((packet = glink.first) != NULL) {
-		glink.first = packet->next;
-		kfree_data(packet, sizeof(*packet) + packet->length);
+	glink.up = false;
+	for (unsigned c = 0; c < CHANNELS; c++) {
+		struct glink_channel *channel = &glink.channel[c];
+
+		channel->open = false;
+		while ((packet = channel->first) != NULL) {
+			channel->first = packet->next;
+			kfree_data(packet, sizeof(*packet) + packet->length);
+		}
+		channel->last = NULL;
 	}
-	glink.last = NULL;
 	lck_mtx_unlock(&glink_lock);
 	bzero(qrtr_servers, sizeof(qrtr_servers));
 	qrtr_peer = 0;
@@ -2507,9 +2691,17 @@ step_link(void)
 	snprintf(last_write, sizeof(last_write), "step %u took up GLINK", step);
 	lck_mtx_lock(&glink_lock);
 	glink.features = GLINK_INTENT_REUSE;
-	glink.agreed = glink.asked = glink.acknowledged = glink.open = glink.broken = false;
-	glink.their_channel = glink.our_intent_count = glink.said = glink.heard = 0;
-	bzero(glink.their_intents, sizeof(glink.their_intents));
+	glink.agreed = glink.broken = false;
+	glink.said = glink.heard = 0;
+	for (unsigned c = 0; c < CHANNELS; c++) {
+		struct glink_channel *channel = &glink.channel[c];
+
+		channel->asked = channel->acknowledged = channel->open = false;
+		channel->theirs = channel->our_intent_count = 0;
+		bzero(channel->their_intents, sizeof(channel->their_intents));
+	}
+	apr_in = apr_out = 0;
+	audio_up = false;
 	bzero(glink.others, sizeof(glink.others));
 	glink.trace = 60;
 	glink.up = true;
@@ -2524,14 +2716,15 @@ step_link(void)
 		return false;
 	}
 	thread_deallocate(thread);
-	for (unsigned ms = 0; ms < 5000 && !glink.open && !glink.broken; ms++) {
+	for (unsigned ms = 0; ms < 5000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
 		sleep_ms(1);
 	}
 	sleep_ms(50);
-	printf("adsp: %u: %llu ms after our version: versions %s (features %#x); the channel \"%s\" is %s; the DSP also opened "
-	    "\"%s\" \"%s\" \"%s\" \"%s\"\n", step, (now_us() - began) / 1000, glink.agreed ? "agreed" : "NOT AGREED", glink.features,
-	    GLINK_CHANNEL, glink.open ? "OPEN" : "NOT OPEN", glink.others[0], glink.others[1], glink.others[2], glink.others[3]);
-	return glink.open;
+	printf("adsp: %u: %llu ms after our version: versions %s (features %#x); the channel \"IPCRTR\" is %s, \"apr_audio_svc\" %s; "
+	    "the DSP also opened \"%s\" \"%s\" \"%s\" \"%s\"\n", step, (now_us() - began) / 1000, glink.agreed ? "agreed" :
+	    "NOT AGREED", glink.features, glink.channel[CHANNEL_QRTR].open ? "OPEN" : "NOT OPEN",
+	    glink.channel[CHANNEL_APR].open ? "OPEN" : "NOT OPEN", glink.others[0], glink.others[1], glink.others[2], glink.others[3]);
+	return glink.channel[CHANNEL_QRTR].open;
 }
 
 /* ---- step 10: QRTR ---------------------------------------------------------------------------------- */
@@ -2541,7 +2734,7 @@ step_qrtr(void)
 {
 	unsigned services = 0;
 
-	if (!glink.open) {
+	if (!glink.channel[CHANNEL_QRTR].open) {
 		return false;
 	}
 	PE_parse_boot_argn("adsp_listen", &listen_seconds, sizeof(listen_seconds));
@@ -2558,11 +2751,59 @@ step_qrtr(void)
 	return qrtr_hellos != 0;
 }
 
+/* ---- step 11: APR ---------------------------------------------------------------------------------- */
+
+static bool
+step_apr(void)
+{
+	uint32_t wait_seconds = 10, asked = 0, state = 0;
+	uint64_t began = now_us();
+
+	PE_parse_boot_argn("adsp_apr_wait", &wait_seconds, sizeof(wait_seconds));
+	announce("ask the audio DSP's core service over APR whether the audio services are up (again and again, as Android "
+	    "does), then which services it has");
+	for (unsigned ms = 0; ms < 3000 && !glink.channel[CHANNEL_APR].open; ms++) {
+		sleep_ms(1);
+	}
+	if (!glink.channel[CHANNEL_APR].open) {
+		printf("adsp: %u: the channel \"apr_audio_svc\" is not open: the DSP has not opened it\n", step);
+		return false;
+	}
+	while (now_us() - began < wait_seconds * 1000000ull) {
+		asked++;
+		if (apr_ask(APR_SVC_ADSP_CORE, AVCS_CMD_ADSP_EVENT_GET_STATE, NULL, 0, 500) &&
+		    apr_answer.opcode == AVCS_CMDRSP_ADSP_EVENT_GET_STATE) {
+			state = apr_answer.words[0];
+			if (state == 1) {
+				break;
+			}
+		}
+		sleep_ms(200);
+	}
+	audio_up = state == 1;
+	printf("adsp: %u: %s after %llu ms and %u questions (the last answer: opcode %#x, %u bytes, %#x)\n", step, state == 1 ?
+	    "THE AUDIO SERVICES ARE UP" : "THE AUDIO SERVICES DO NOT SAY THEY ARE UP", (now_us() - began) / 1000, asked,
+	    apr_answer.opcode, apr_answer.length, apr_answer.words[0]);
+	if (apr_ask(APR_SVC_ADSP_CORE, AVCS_GET_VERSIONS, NULL, 0, 1000)) {
+		char line[400];
+		int at = 0;
+
+		for (uint32_t i = 0; i < apr_answer.length / 4 && i < 64 && at < (int)sizeof(line) - 12; i++) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %#x", apr_answer.words[i]);
+		}
+		printf("adsp: %u: the services and their versions (opcode %#x, %u bytes):%s\n", step, apr_answer.opcode,
+		    apr_answer.length, line);
+	} else {
+		printf("adsp: %u: no answer to the question of the services' versions\n", step);
+	}
+	return state == 1;
+}
+
 /* ---- the steps, and their end ----------------------------------------------------------------------- */
 
 static bool (*const steps[STEPS])(void) = {
 	step_survey, step_firmware, step_mailbox, step_header, step_image, step_our_item, step_start, step_queues, step_link,
-	step_qrtr,
+	step_qrtr, step_apr,
 };
 
 static bool keep;                       /* the DSP and the link stay up while the system runs (adsp_keep, adsp=1) */
@@ -2594,9 +2835,9 @@ redwood_adsp_stop(void)
 		}
 		down = dsp_shutdown("the run is about to end");
 		/* (said again at the end: a long run's log keeps its beginning and its end, and the middle may be gone) */
-		tell("adsp: the audio DSP is off: it had been up%s (node %u, %u services), it %s, and TrustZone %s\n", node ?
-		    " and linked" : ", NOT LINKED", node, services, stopped_by_its_word ? "stopped when asked" :
-		    "DID NOT SAY IT HAD STOPPED", down ? "has shut it down" : "DID NOT SHUT IT DOWN");
+		tell("adsp: the audio DSP is off: it had been up%s (node %u, %u services; audio services %s), it %s, and TrustZone %s\n",
+		    node ? " and linked" : ", NOT LINKED", node, services, audio_up ? "up" : "NOT UP", stopped_by_its_word ?
+		    "stopped when asked" : "DID NOT SAY IT HAD STOPPED", down ? "has shut it down" : "DID NOT SHUT IT DOWN");
 	}
 	lck_mtx_unlock(&dsp_lock);
 }
@@ -2647,8 +2888,8 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		services += qrtr_servers[i].there;
 	}
 	if (step == STEPS && dsp_started) {
-		tell("adsp: THE AUDIO DSP IS UP AND LINKED, %llu ms after the kernel began on it (the root's waited for included): node "
-		    "%u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
+		tell("adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
+		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
