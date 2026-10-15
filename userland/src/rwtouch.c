@@ -5,6 +5,8 @@
  *   wait SECONDS                 pause
  *   tap X Y                      a short touch
  *   swipe X0 Y0 X1 Y1 [MS]       drag from one point to the other in MS milliseconds (default 300)
+ *   drag X0 Y0 X1 Y1 MS HOLD     the same, then stay at the end HOLD milliseconds before letting go
+ *                                (what is dragged is held where it was taken, neither flung nor sprung back)
  *   hold X Y MS                  touch and stay
  *   button NAME [MS]             press a button: home, lock, volup, voldown
  *   read                         print the samples that arrive, forever (to watch the queue)
@@ -54,7 +56,7 @@ button(uint32_t which, int ms)
 }
 
 static void
-drag(double x0, double y0, double x1, double y1, int ms)
+drag(double x0, double y0, double x1, double y1, int ms, int hold)
 {
 	int steps = ms / 16 > 2 ? ms / 16 : 2;          /* a sample per display frame */
 
@@ -64,6 +66,13 @@ drag(double x0, double y0, double x1, double y1, int ms)
 		post(REDWOOD_TOUCH_MOVE, x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
 	}
 	usleep(16000);
+	if (hold > 0) {
+		/* (a sample now and then, as a finger that stays still still gives) */
+		for (int waited = 0; waited < hold; waited += 100) {
+			usleep(100000);
+			post(REDWOOD_TOUCH_MOVE, x1, y1);
+		}
+	}
 	post(REDWOOD_TOUCH_UP, x1, y1);
 }
 
@@ -114,8 +123,11 @@ main(int argc, char **argv)
 		} else if (strcmp(step, "swipe") == 0 && left >= 4) {
 			int ms = left >= 5 && argv[i + 5][0] >= '0' && argv[i + 5][0] <= '9' ? atoi(argv[i + 5]) : 0;
 
-			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), ms ? ms : 300);
+			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), ms ? ms : 300, 0);
 			i += ms ? 5 : 4;
+		} else if (strcmp(step, "drag") == 0 && left >= 6) {
+			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), atoi(argv[i + 5]), atoi(argv[i + 6]));
+			i += 6;
 		} else if (strcmp(step, "notify") == 0 && left >= 1) {
 			uint32_t status = notify_post(argv[i + 1]);
 
