@@ -127,6 +127,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 struct eagl;
 static int eagl_tracing;                /* this frame's calls are written down (boot-arg gltrace=FIRST-LAST) */
 static int frame_lines;                 /* boot-arg glframes=1: a line for every frame (see frame_end()) */
+static int latency_lines;               /* boot-arg touch_lat=1: when every frame began and ended (see frame_end()) */
 static void eagl_trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static void eagl_trace_floats(const float *values, int count);
 static void eagl_enter(struct eagl *e, unsigned offset);
@@ -811,6 +812,10 @@ frame_end(struct eagl *e, bool finished)
 	after = now_us();
 	e->in_frame = false;
 	e->frames++;
+	if (latency_lines) {
+		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
+		say("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
+	}
 	if (frame_lines) {
 		/*
 		 * One line a frame, for matching with a screen recording (the kernel's rec_ring, whose log
@@ -2982,6 +2987,7 @@ install(void)
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
+		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {

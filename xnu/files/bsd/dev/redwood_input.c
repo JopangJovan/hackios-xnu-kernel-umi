@@ -12,8 +12,29 @@
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
+#include <pexpert/pexpert.h>
 
 #define TOUCH_QUEUE     512             /* records; a power of two */
+
+/*
+ * Boot-arg touch_lat=1: for measuring how long a touch takes to reach the panel, a line for every
+ * sample posted ("tl: p TYPE FINGER X Y at US", the time in microseconds of mach_absolute_time),
+ * to be matched with the window server's lines about reading it (userland/src/inject.c), drawing
+ * (eagl.c) and the display driver's about the frame (MiniIOMobileFramebuffer.cpp): see
+ * tools/latency.py.
+ */
+static uint32_t touch_lat = 2;          /* 2: not yet looked up */
+
+static bool
+latency_lines(void)
+{
+	if (touch_lat == 2) {
+		uint32_t on = 0;
+
+		touch_lat = PE_parse_boot_argn("touch_lat", &on, sizeof(on)) && on != 0;
+	}
+	return touch_lat != 0;
+}
 
 static LCK_GRP_DECLARE(touch_lck_grp, "redwood-touch");
 static LCK_MTX_DECLARE(touch_lock, &touch_lck_grp);
@@ -76,6 +97,12 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	}
 	t = &touch_queue[touch_tail++ % TOUCH_QUEUE];
 	t->time = mach_absolute_time();
+	if (latency_lines()) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(t->time, &ns);
+		printf("tl: p %u %u %u %u at %llu\n", type, finger, x, y, ns / 1000);
+	}
 	t->type = type;
 	t->finger = finger;
 	t->x = x > 65535 ? 65535 : x;

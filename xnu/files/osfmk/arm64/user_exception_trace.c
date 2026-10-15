@@ -326,7 +326,7 @@ ustacks_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 
 	if (strcmp(ustacks_name, "top") == 0) {
 		ustacks_top();
-		return;
+		goto again;
 	}
 	lck_mtx_lock(&tasks_threads_lock);
 	queue_iterate(&tasks, task, task_t, tasks) {
@@ -349,6 +349,7 @@ ustacks_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		}
 		task_deallocate(found[i]);
 	}
+again:
 	if (ustacks_every != 0) {
 		uint64_t deadline;
 

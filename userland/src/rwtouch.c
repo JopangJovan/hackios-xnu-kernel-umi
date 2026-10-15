@@ -8,6 +8,9 @@
  *   drag X0 Y0 X1 Y1 MS HOLD     the same, then stay at the end HOLD milliseconds before letting go
  *                                (what is dragged is held where it was taken, neither flung nor sprung back)
  *   hold X Y MS                  touch and stay
+ *   zigzag X Y0 Y1 MS N [STEP]   touch at Y0, go to Y1 in MS milliseconds and back again, N times, then let go;
+ *                                a sample every STEP milliseconds (default 8, what the touch screen gives):
+ *                                for measuring how far behind the finger the screen is (tools/latency.py)
  *   button NAME [MS]             press a button: home, lock, volup, voldown
  *   read                         print the samples that arrive, forever (to watch the queue)
  *   notify NAME                  post a Darwin notification (com.redwood.unlock: see inject_sb.c)
@@ -76,6 +79,38 @@ drag(double x0, double y0, double x1, double y1, int ms, int hold)
 	post(REDWOOD_TOUCH_UP, x1, y1);
 }
 
+static void
+zigzag(double x, double y0, double y1, int ms, int times, int step_ms)
+{
+	uint64_t start, legs = (uint64_t)times * 2, total_us = legs * (uint64_t)ms * 1000;
+	mach_timebase_info_data_t base;
+
+	mach_timebase_info(&base);
+	post(REDWOOD_TOUCH_DOWN, x, y0);
+	start = mach_absolute_time();
+	for (uint64_t at = (uint64_t)step_ms * 1000; at <= total_us; at += (uint64_t)step_ms * 1000) {
+		uint64_t leg = at / ((uint64_t)ms * 1000), within = at % ((uint64_t)ms * 1000);
+		double part = (double)within / (ms * 1000.0), y;
+		uint64_t now_us;
+
+		if (leg >= legs) {
+			leg = legs - 1;
+			part = 1;
+		}
+		y = leg % 2 == 0 ? y0 + (y1 - y0) * part : y1 + (y0 - y1) * part;
+		/* on a clock of its own, not one sleep after another: the samples keep their pace */
+		do {
+			now_us = (mach_absolute_time() - start) * base.numer / base.denom / 1000;
+			if (now_us < at) {
+				usleep((useconds_t)(at - now_us));
+			}
+		} while (now_us < at);
+		post(REDWOOD_TOUCH_MOVE, x, y);
+	}
+	usleep(16000);
+	post(REDWOOD_TOUCH_UP, x, y0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -100,6 +135,11 @@ main(int argc, char **argv)
 			usleep(60000);
 			post(REDWOOD_TOUCH_UP, x, y);
 			i += 2;
+		} else if (strcmp(step, "zigzag") == 0 && left >= 5) {
+			int step_ms = left >= 6 && atoi(argv[i + 6]) > 0 ? atoi(argv[i + 6]) : 8;
+
+			zigzag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atoi(argv[i + 4]), atoi(argv[i + 5]), step_ms);
+			i += left >= 6 && atoi(argv[i + 6]) > 0 ? 6 : 5;
 		} else if (strcmp(step, "hold") == 0 && left >= 3) {
 			double x = atof(argv[i + 1]), y = atof(argv[i + 2]);
 

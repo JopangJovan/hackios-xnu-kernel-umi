@@ -18,7 +18,10 @@
  *   chip     Goodix: find where it keeps the touch report, then read it when the IRQ line signals;
  *            FocalTech: read the report at register 0x01 with FTS 5.x SPI framing (cmd 0xC1 for
  *            read, 0xC0 for write, two-byte CRC-16/Kermit)
- * No interrupt is used: a thread looks at the interrupt line 125 times a second.
+ * No interrupt is used: a thread looks at the interrupt line 125 times a second (boot-arg
+ * touch_poll_us=N: every N microseconds instead of 8000). With touch_lat=1 a line for every report
+ * read ("tl: c before US seen US read US": the look before, the look that found the line low, the
+ * report read), for measuring how long a touch takes to show (tools/latency.py).
  *
  * Register layouts: Linux drivers/spi/spi-geni-qcom.c, drivers/soc/qcom/{qcom-geni-se,rpmh-rsc,
  * cmd-db}.c, drivers/clk/qcom/gcc-sc7280.c, drivers/pinctrl/qcom/pinctrl-sc7280.c,
@@ -597,7 +600,8 @@ static bool (*spi_transfer)(const uint8_t *tx, uint8_t *rx, uint32_t length);
 #define GOODIX_REQUEST_RESET    3
 
 static uint8_t spi_tx[8 + GOODIX_MAX_READ], spi_rx[8 + GOODIX_MAX_READ];
-static uint32_t touch_address;
+static uint32_t touch_address, command_address;
+static const char *report_rate = "240";        /* what the status line says (touch_rate=480) */
 static uint32_t max_x = 10800, max_y = 24000;   /* the device tree's; the chip may say otherwise */
 
 static bool
@@ -717,6 +721,7 @@ goodix_probe(bool verbose)
 		return false;
 	}
 	touch_address = le32(info + offset + 44);
+	command_address = le32(info + offset + 0);      /* (the "misc" part: the command buffer comes first) */
 	if (offset + 122 + 20 + 2 <= length) {
 		uint16_t x = le16(info + offset + 122 + 16), y = le16(info + offset + 122 + 18);
 
@@ -727,6 +732,51 @@ goodix_probe(bool verbose)
 	}
 	printf("goodix: touch report at %#x, coordinates up to %u x %u\n", touch_address, max_x, max_y);
 	return touch_address != 0;
+}
+
+/*
+ * A command to the chip (Android's brl_send_cmd(): goodix_brl_hw.c of the phone's kernel): sixteen
+ * bytes at the command address -- state, acknowledgement, length, command, its data, and the sum of
+ * the bytes from the length on -- then the acknowledgement looked for, 0x80 when done.
+ */
+#define GOODIX_CMD_HIGH_RATE    0xc0            /* data 1: report 480 times a second instead of 240 (Xiaomi's game mode) */
+#define GOODIX_ACK_OK           0x80
+#define GOODIX_ACK_BUSY         0x02
+
+static bool
+goodix_command(uint8_t command, uint8_t data)
+{
+	uint8_t buffer[16], answer[16];
+	uint32_t sum;
+
+	if (command_address == 0) {
+		return false;
+	}
+	memset(buffer, 0, sizeof(buffer));
+	buffer[2] = 5;
+	buffer[3] = command;
+	buffer[4] = data;
+	sum = buffer[2] + buffer[3] + buffer[4];
+	buffer[5] = (uint8_t)sum;
+	buffer[6] = (uint8_t)(sum >> 8);
+	for (int attempt = 0; attempt < 6; attempt++) {
+		if (!goodix_write(command_address, buffer, sizeof(buffer))) {
+			return false;
+		}
+		for (int look = 0; look < 6; look++) {
+			if (!goodix_read(command_address, answer, sizeof(answer))) {
+				return false;
+			}
+			if (answer[1] == GOODIX_ACK_OK) {
+				return true;
+			}
+			sleep_ms(1);
+			if (answer[1] != GOODIX_ACK_BUSY && answer[1] != 0) {
+				break;
+			}
+		}
+	}
+	return false;
 }
 
 /* What has been seen so far: said once a minute, so that the end of the log always tells. */
@@ -1234,6 +1284,7 @@ focaltech_poll(void)
 
 	seen.polls++;
 	if (!focaltech_read(FOCALTECH_TOUCH_DATA, report, sizeof(report))) {
+		seen.bad++;
 		if (bad++ < 8) {
 			printf("focaltech: SPI read failed for touch report\n");
 		}
@@ -1332,7 +1383,15 @@ bring_up(void)
 	if (clocks_on()) {
 		printf("goodix: serial engine: firmware %#x, interface %#x, parameters %#x, source clock %u Hz (select %u)\n",
 		    rd(GENI_FW_REVISION_RO), rd(GENI_IF_DISABLE_RO), rd(SE_HW_PARAM_0), se_source_hz, se_clock_select);
-		problem = geni_spi_init(1000000);
+		uint32_t spi_hz = 1000000;
+
+		/* boot-arg touch_spi_hz=N: the bus at N Hz (Android's device tree gives the chip 5 MHz) */
+		PE_parse_boot_argn("touch_spi_hz", &spi_hz, sizeof(spi_hz));
+		if (spi_hz < 100000 || spi_hz > 10000000) {
+			spi_hz = 1000000;
+		}
+		printf("goodix: the bus at %u Hz\n", spi_hz);
+		problem = geni_spi_init(spi_hz);
 	}
 	if (problem == NULL) {
 		use_engine_pins();
@@ -1361,10 +1420,28 @@ bring_up(void)
 	return false;
 }
 
+static uint64_t
+micros_now(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000;
+}
+
 static void
 goodix_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	unsigned idle = 0;
+	unsigned idle = 0, idle_looks;
+	uint32_t poll_us = 8000, latency = 0, reads = 0;
+	uint64_t before = 0, reading = 0;
+
+	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
+	PE_parse_boot_argn("touch_lat", &latency, sizeof(latency));
+	if (poll_us < 250 || poll_us > 100000) {
+		poll_us = 8000;
+	}
+	idle_looks = 80000 / poll_us;   /* a report read every 80 ms even with the line high, in case it is missed */
 
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
@@ -1377,19 +1454,46 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
-	printf("goodix: %s touch screen ready\n", chip_name());
+	printf("goodix: %s touch screen ready; the interrupt line is looked at every %u us\n", chip_name(), poll_us);
+	{
+		uint32_t rate = 0;
+
+		/* boot-arg touch_rate=480: the chip reports twice as often (Xiaomi's game mode; 240 otherwise) */
+		if (PE_parse_boot_argn("touch_rate", &rate, sizeof(rate)) && rate == 480 && touch_chip == TOUCH_GOODIX) {
+			bool done = goodix_command(GOODIX_CMD_HIGH_RATE, 1);
+
+			report_rate = done ? "480 (acknowledged)" : "240 (480 NOT ACKNOWLEDGED)";
+			printf("goodix: reports 480 times a second (command %#x at %#x): %s\n", GOODIX_CMD_HIGH_RATE, command_address,
+			    done ? "acknowledged" : "NOT ACKNOWLEDGED");
+		}
+	}
 	for (unsigned tick = 1;; tick++) {
+		uint64_t looked = micros_now(), read_at;
+
 		/* the interrupt line is low while a report waits; look anyway every 80 ms in case it is missed */
-		if (!gpio_get(PIN_INT) || ++idle >= 10) {
+		if (!gpio_get(PIN_INT)) {
 			idle = 0;
 			chip_poll();
+			read_at = micros_now();
+			reads++;
+			reading += read_at - looked;
+			if (latency) {
+				printf("tl: c before %llu seen %llu read %llu\n", before, looked, read_at);
+			}
+		} else if (++idle >= idle_looks) {
+			idle = 0;
+			chip_poll();
+			reads++;
+			reading += micros_now() - looked;
 		}
-		if (tick % (60 * 125) == 0) {
+		before = looked;
+		if (tick % (60 * (1000000 / poll_us)) == 0) {
 			printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
-			    "interrupt line %s\n", chip_name(), seen.reports, seen.polls, seen.bad, seen.touches,
-			    seen.last_x, seen.last_y, gpio_get(PIN_INT) ? "high" : "low");
+			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second\n",
+			    chip_name(), seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
+			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
 		}
-		sleep_ms(8);
+		sleep_us(poll_us);
 	}
 }
 

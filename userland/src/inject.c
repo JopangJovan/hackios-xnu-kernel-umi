@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <notify.h>
 #include <objc/runtime.h>
 #include <pthread.h>
@@ -627,6 +628,20 @@ send_button(IOHIDServiceClientRef buttons, const struct redwood_touch *t)
 	CFRelease(event);
 }
 
+/*
+ * Boot-arg touch_lat=1: a line for every touch sample, "tl: i TYPE posted US read US sent US" -- when
+ * the kernel stamped it, when this thread had it, when the event system had the event -- in
+ * microseconds of mach_absolute_time, the kernel's own time (tools/latency.py).
+ */
+static bool touch_latency;
+static mach_timebase_info_data_t timebase;
+
+static uint64_t
+micros(uint64_t absolute)
+{
+	return absolute * timebase.numer / timebase.denom / 1000;
+}
+
 static void *
 input_thread(__unused void *arg)
 {
@@ -638,6 +653,15 @@ input_thread(__unused void *arg)
 	int device;
 
 	pthread_setname_np("redwood input");
+	{
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+			touch_latency = strstr(arguments, "touch_lat=1") != NULL;
+		}
+		mach_timebase_info(&timebase);
+	}
 	device = open(REDWOOD_TOUCH_DEVICE, O_RDONLY);
 	if (device < 0) {
 		say("redwood: input: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
@@ -667,6 +691,8 @@ input_thread(__unused void *arg)
 	}
 
 	while (read(device, &t, sizeof(t)) == (ssize_t)sizeof(t)) {
+		uint64_t read_at = mach_absolute_time();
+
 		if (count++ < 4) {
 			say("redwood: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
 		}
@@ -691,6 +717,10 @@ input_thread(__unused void *arg)
 			}
 		} else {
 			send_touch(screen, &t);
+			if (touch_latency) {
+				say("tl: i %u posted %llu read %llu sent %llu\n", t.type, micros(t.time), micros(read_at),
+				    micros(mach_absolute_time()));
+			}
 		}
 	}
 	say("redwood: input: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
