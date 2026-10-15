@@ -25,6 +25,10 @@
  *            up, started once the clock runs, faded in to sound_below eighths of a dB under
  *            Android's own level (default 240: 30 dB under, the least it may be is 0), faded
  *            out and powered down at the end. Audible.
+ *   sound=4  what iOS plays (/dev/redwood-audio, redwood_audio.c), until the run ends: the port
+ *            and the stream as above, kept running (silence when iOS writes nothing); the
+ *            amplifiers set up once and powered down, started and faded in (the driver's quick
+ *            fade) whenever a write is not silence, stopped after three seconds of silence
  *
  * The numbers are Android's own, from the phone's live device tree (qcom,msm-dai-tdm-pri-rx and
  * its port, the pins pri_tdm_*_active), its mixer paths (the speaker: PRI_TDM_RX_0 at 48 kHz,
@@ -716,6 +720,7 @@ space_off(void)
 #define PCM_CHANNEL_FL                          1
 #define PCM_CHANNEL_FR                          2
 
+static volatile bool stopping;          /* the run is ending: whatever plays stops */
 static bool mapped, copp_open, stream_open;
 static uint32_t map_handle, copp;
 static volatile uint32_t returned;      /* the periods the DSP has said it is done with (a bit each) */
@@ -919,7 +924,7 @@ play(uint32_t ms, bool amplifiers)
 				sent++;
 			}
 		}
-		if (!tone_over && now - began >= ms * 1000ull) {
+		if (!tone_over && (now - began >= ms * 1000ull || stopping)) {
 			tone_over = true;
 		}
 		if (tone_over && written_done - done_before >= sent) {
@@ -961,6 +966,149 @@ play(uint32_t ms, bool amplifiers)
 	return ok;
 }
 
+/* ---- sound=4: what iOS plays ------------------------------------------------------------------------------ */
+
+/*
+ * /dev/redwood-audio's writer (the audio server's real-time thread, redwood_audio.c) puts frames
+ * into a ring and does not wait; the feeder, a thread of ours, takes them from there into each
+ * period the DSP gives back (and silence when there is nothing), so the stream never stops
+ * while the run lasts. The amplifiers are only on while there is sound: the watcher starts them
+ * (and fades them in to sound_below) when a write is not silence, and stops them after three
+ * seconds of silence or no writes.
+ */
+#define RING_FRAMES             32768           /* 0.68 s; a power of two, the indices run on and wrap */
+#define SILENCE                 8               /* samples no larger than this are silence (as redwood_audio.c's) */
+#define QUIET_BEFORE_OFF_US     3000000ull
+
+static int16_t ring[RING_FRAMES * 2];
+static volatile uint32_t ring_head, ring_tail;  /* frames: written by the sink, taken by the feeder */
+static volatile uint64_t last_sound_us;         /* when the latest write that was not silence came */
+static volatile bool feeder_runs, watcher_runs;
+static uint64_t fed_frames, silent_frames, ios_frames;
+
+/* From the writer's thread, under redwood_audio.c's lock: never waits. */
+static uint32_t
+ios_sink(const int16_t *frames, uint32_t count)
+{
+	uint32_t head = ring_head, room = RING_FRAMES - (head - ring_tail), taken = count < room ? count : room;
+	bool sound = false;
+
+	for (uint32_t i = 0; i < taken; i++) {
+		int16_t left = frames[2 * i], right = frames[2 * i + 1];
+
+		ring[2 * ((head + i) % RING_FRAMES)] = left;
+		ring[2 * ((head + i) % RING_FRAMES) + 1] = right;
+		sound |= left > SILENCE || left < -SILENCE || right > SILENCE || right < -SILENCE;
+	}
+	OSMemoryBarrier();
+	ring_head = head + taken;
+	ios_frames += taken;
+	if (sound) {
+		last_sound_us = now_us();
+	}
+	return taken;
+}
+
+/* A period from the ring, the rest of it silence. */
+static void
+period_fill_ios(unsigned period)
+{
+	int16_t *samples = (int16_t *)(buffer + 4096 * period);
+	uint32_t tail = ring_tail, available = ring_head - tail, n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
+
+	OSMemoryBarrier();
+	for (uint32_t i = 0; i < n; i++) {
+		samples[2 * i] = ring[2 * ((tail + i) % RING_FRAMES)];
+		samples[2 * i + 1] = ring[2 * ((tail + i) % RING_FRAMES) + 1];
+	}
+	bzero(samples + 2 * n, (PERIOD_FRAMES - n) * 4);
+	OSMemoryBarrier();
+	ring_tail = tail + n;
+	fed_frames += n;
+	silent_frames += PERIOD_FRAMES - n;
+	for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + PERIOD_BYTES; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+}
+
+static void
+feeder_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint32_t sent = 0, failed = 0;
+
+	returned = 0;
+	for (unsigned p = 0; p < PERIODS; p++) {
+		period_fill_ios(p);
+		sent += period_write(p);
+	}
+	while (!stopping) {
+		uint32_t back = returned;
+
+		if (back != 0) {
+			OSBitAndAtomic(~back, &returned);
+			for (unsigned p = 0; p < PERIODS; p++) {
+				if (back & 1u << p) {
+					period_fill_ios(p);
+					if (period_write(p)) {
+						sent++;
+					} else {
+						failed++;
+					}
+				}
+			}
+		}
+		sleep_ms(2);
+	}
+	say("sound: the feeder stops: %u periods written (%u could not be sent), %u given back (%u with an error), %u underflows; "
+	    "from iOS %llu frames came, %llu went to the DSP, %llu of silence filled in\n", sent, failed, written_done, write_errors,
+	    underflows, ios_frames, fed_frames, silent_frames);
+	feeder_runs = false;
+	thread_terminate(current_thread());
+}
+
+/* The amplifiers on while there is sound; their status looked at every 200 ms while they are. On the sound's thread. */
+static void
+watch(void)
+{
+	bool on = false, given_up = false;
+	uint64_t last_look = 0;
+	uint32_t starts = 0;
+
+	while (!stopping) {
+		uint64_t now = now_us(), sounded = last_sound_us;
+
+		if (!on && !given_up && sounded != 0 && now - sounded < 100000) {
+			say_when("iOS plays: the amplifiers are started");
+			starts++;
+			if (!redwood_speaker_start() || !redwood_speaker_volume(below, 1)) {
+				say("sound: THE AMPLIFIERS DID NOT START; iOS's sound goes on to the DSP, unheard\n");
+				given_up = true;
+			} else {
+				on = true;
+				last_look = now_us();
+				/* (what is written now is heard after the periods already queued at the DSP: PERIODS x 20 ms) */
+				say("sound: the amplifiers are up %llu ms after the first write that was not silence; that write reaches "
+				    "them %u ms after it was made, behind the periods queued at the DSP\n", (last_look - sounded) / 1000,
+				    PERIODS * PERIOD_FRAMES / 48);
+			}
+		} else if (on && now - sounded > QUIET_BEFORE_OFF_US) {
+			say_when("three seconds of silence: the amplifiers are stopped");
+			redwood_speaker_stop();
+			on = false;
+		} else if (on && now - last_look >= 200000) {
+			last_look = now;
+			if (!redwood_speaker_healthy()) {
+				on = false;
+				given_up = true;
+			}
+		}
+		sleep_ms(5);
+	}
+	say("sound: the watcher stops; the amplifiers were started %u times%s\n", starts, given_up ? ", and then given up on" : "");
+	watcher_runs = false;
+}
+
 /* ---- the whole ---------------------------------------------------------------------------------------- */
 
 static bool running, taken_down;
@@ -968,6 +1116,13 @@ static bool running, taken_down;
 static void
 take_down(void)
 {
+	stopping = true;
+	if (level >= 4) {
+		redwood_audio_set_sink("nothing", NULL);
+	}
+	for (unsigned ms = 0; ms < 3000 && (feeder_runs || watcher_runs); ms++) {
+		sleep_ms(1);
+	}
 	lck_mtx_lock(&sound_lock);
 	if (running && !taken_down) {
 		taken_down = true;
@@ -997,9 +1152,13 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		lck_mtx_unlock(&sound_lock);
 		thread_terminate(current_thread());
 	}
-	say("sound: level %u: %s, for %u s\n", level, level == 1 ? "the speakers' TDM port" : level == 2 ?
-	    "the port and a stream with a test tone, the amplifiers off" : "the port, a stream with a test tone, and the amplifiers",
-	    seconds);
+	if (level == 4) {
+		say("sound: level 4: what iOS plays, through the port, a stream and the amplifiers, until the run ends\n");
+	} else {
+		say("sound: level %u: %s, for %u s\n", level, level == 1 ? "the speakers' TDM port" : level == 2 ?
+		    "the port and a stream with a test tone, the amplifiers off" :
+		    "the port, a stream with a test tone, and the amplifiers", seconds);
+	}
 	if (level >= 3) {
 		acf = redwood_adsp_fw_file("aw882xx_acf.bin", &acf_size);
 		if (acf == NULL) {
@@ -1050,6 +1209,30 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	if (!stream_on()) {
 		goto out;
 	}
+	if (level == 4) {
+		thread_t feeder;
+
+		announce("the amplifiers, set up from Android's Music profile, powered down until iOS plays");
+		if (!redwood_speaker_prepare(acf, acf_size)) {
+			goto out;
+		}
+		redwood_adsp_fw_free(acf, acf_size);
+		acf = NULL;
+		feeder_runs = true;
+		if (kernel_thread_start(feeder_thread, NULL, &feeder) != KERN_SUCCESS) {
+			feeder_runs = false;
+			say("sound: no thread for the feeder\n");
+			goto out;
+		}
+		thread_deallocate(feeder);
+		watcher_runs = true;
+		redwood_audio_set_sink("the speakers (the audio DSP, redwood_sound.c)", ios_sink);
+		say("sound: WHAT IOS PLAYS GOES TO THE SPEAKERS from here on, %u.%03u dB under Android's level, until the run ends\n",
+		    below / 8, below % 8 * 125);
+		lck_mtx_unlock(&sound_lock);
+		watch();
+		thread_terminate(current_thread());
+	}
 	if (level >= 3) {
 		/* the clock runs (the port is started, the stream as well): the amplifiers can lock to it */
 		announce("the amplifiers, set up from Android's Music profile, then started at the lowest volume");
@@ -1058,7 +1241,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 	/* (the amplifiers are faded in before the tone begins: they fade in on silence, and the tone starts at that level) */
-	if (level >= 3 && !redwood_speaker_volume(below)) {
+	if (level >= 3 && !redwood_speaker_volume(below, 50)) {
 		goto out;
 	}
 	if (level >= 3) {
@@ -1087,13 +1270,13 @@ redwood_sound_dsp_up(void)
 	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 3) {
-		level = 3;
+	if (level > 4) {
+		level = 4;
 	}
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));
 	PE_parse_boot_argn("sound_below", &below, sizeof(below));
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
-	if (level >= 2 && seconds > 3) {
+	if (level >= 2 && level <= 3 && seconds > 3) {
 		seconds = 3;            /* the test tone: three seconds at most */
 	}
 	running = true;

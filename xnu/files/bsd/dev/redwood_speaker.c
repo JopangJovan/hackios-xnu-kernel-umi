@@ -39,8 +39,9 @@
  *            and 4); amplifier power-down off, 1 ms, the status as the driver wants it (bits 0, 4,
  *            8, 9); the feedback on; the two mutes off; the interrupts read away; the volume
  *            stays at the lowest
- *   volume   stepwise, 6 dB a step, to `below' eighths of a dB under Android's own level (the
- *            profile's 0x05, -2.1 dB, with Android's aw_dev_N_volume 0) and never above it
+ *   volume   stepwise, 6 dB a step (the driver takes one every 100 us), to `below' eighths of a dB
+ *            under Android's own level (the profile's 0x05, -2.1 dB, with Android's
+ *            aw_dev_N_volume 0) and never above it
  *   stop     the power stage muted, the volume stepped down to the lowest, muted, the feedback
  *            off, 1 ms, amplifier power-down, power-down
  *
@@ -53,7 +54,7 @@
  * watch of battery voltage and temperature, which only ever turns the volume down -- whoever
  * plays through this keeps the level low.
  *
- * I2C is done by hand: a pin is either pulled low or let go (and the pull-ups raise it), at 50
+ * I2C is done by hand: a pin is either pulled low or let go (and the pull-ups raise it), at 100
  * kHz at most. For each register read or written the two pins are taken from the serial engine
  * (function qup03) as GPIOs and given back as they were found right after.
  *
@@ -171,7 +172,7 @@ show_pins(void)
 static void
 half_bit(void)
 {
-	spin_us(10);                    /* 50 kHz at most; the bus does not mind slower */
+	spin_us(5);                     /* 100 kHz at most, I2C's standard mode; the bus does not mind slower */
 }
 
 /* A line is pulled low (the pin drives 0) or let go (the pin is an input and the pull-up raises it). */
@@ -408,6 +409,7 @@ struct amplifier {
 	uint16_t i2sctrl3;
 	uint16_t volume_at;             /* Android's level: from the profile's 0x05, in eighths of a dB of attenuation */
 	uint16_t volume;                /* where it is now */
+	uint16_t volume_high;           /* the profile's bits 15:10 of 0x05, which the volume leaves as they are */
 	bool prepared, started;
 };
 
@@ -505,6 +507,7 @@ acf_profiles(const uint8_t *acf, uint64_t size)
 			} else if (reg == AW_SYSCTRL2) {
 				/* the driver's aw_pid_2113_reg_val_to_db() */
 				a->volume_at = (uint16_t)(((value & 0x3ff) >> 6) * VOLUME_STEP + (value & 0x3f));
+				a->volume_high = value & 0xfc00;
 				have[2] = true;
 			} else if (reg == AW_ID || reg >= 0x70) {
 				say("speaker: device %u's Music profile writes register %#x, which is not one of the configuration's\n",
@@ -611,10 +614,9 @@ set_volume(struct amplifier *a, uint16_t volume)
 	if (volume < a->volume_at) {
 		volume = a->volume_at;  /* never louder than Android */
 	}
-	if (broken || !get(a, AW_SYSCTRL2, &value)) {
-		return false;
-	}
-	if (!put(a, AW_SYSCTRL2, (uint16_t)((value & 0xfc00) | (volume / VOLUME_STEP) << 6 | volume % VOLUME_STEP))) {
+	/* (the other bits as the profile has them and as they were written: not read first, for a quick fade) */
+	value = (uint16_t)(a->volume_high | (volume / VOLUME_STEP) << 6 | volume % VOLUME_STEP);
+	if (broken || !put(a, AW_SYSCTRL2, value)) {
 		return false;
 	}
 	a->volume = volume;
@@ -793,7 +795,7 @@ redwood_speaker_start(void)
 }
 
 bool
-redwood_speaker_volume(uint32_t below)
+redwood_speaker_volume(uint32_t below, uint32_t step_ms)
 {
 	uint16_t status;
 
@@ -807,10 +809,10 @@ redwood_speaker_volume(uint32_t below)
 		if (target > VOLUME_LOWEST) {
 			target = VOLUME_LOWEST;
 		}
-		say("speaker: the amplifier %s: the volume to -%u.%03u dB (Android's level less %u.%03u dB), 6 dB a step\n", a->where,
-		    target / 8, target % 8 * 125, (target - a->volume_at) / 8, (target - a->volume_at) % 8 * 125);
+		say("speaker: the amplifier %s: the volume to -%u.%03u dB (Android's level less %u.%03u dB), 6 dB a step every %u ms\n",
+		    a->where, target / 8, target % 8 * 125, (target - a->volume_at) / 8, (target - a->volume_at) % 8 * 125, step_ms);
 	}
-	/* both together, a step every 50 ms, the status looked at after every step */
+	/* both together, a step every step_ms, the status looked at after every step */
 	for (;;) {
 		bool moved = false;
 
@@ -829,7 +831,8 @@ redwood_speaker_volume(uint32_t below)
 			if (!set_volume(a, (uint16_t)next)) {
 				return false;
 			}
-			if (faulty(a, &status)) {
+			/* (a slow fade looks at the status after every step, a quick one once it is over) */
+			if (step_ms >= 10 && faulty(a, &status)) {
 				say("speaker: the amplifier %s: status %#06x\n", a->where, status);
 				power_down_now("an amplifier reports a fault");
 				return false;
@@ -839,9 +842,11 @@ redwood_speaker_volume(uint32_t below)
 		if (!moved) {
 			break;
 		}
-		wait_ms(50);
+		if (step_ms) {
+			wait_ms(step_ms);
+		}
 	}
-	return true;
+	return redwood_speaker_healthy();
 }
 
 bool

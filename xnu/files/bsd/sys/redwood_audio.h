@@ -43,7 +43,7 @@ void redwood_speaker_init(void);        /* boot-arg speaker_probe=N: a look at t
  */
 bool redwood_speaker_prepare(const uint8_t *acf, uint64_t size);       /* found, reset, configured: powered down, muted */
 bool redwood_speaker_start(void);       /* powered up and unmuted at the lowest volume: only while the I2S clock runs */
-bool redwood_speaker_volume(uint32_t below);    /* below Android's level, in eighths of a dB; stepwise */
+bool redwood_speaker_volume(uint32_t below, uint32_t step_ms); /* below Android's level, in eighths of a dB; 6 dB a step */
 bool redwood_speaker_healthy(void);     /* no fault reported; on one, both are powered down at once */
 void redwood_speaker_stop(void);        /* faded out, muted, powered down, in Android's order */
 void redwood_speaker_quiesce(void);     /* powered down at once, without sleeping: on a panic's way out */
