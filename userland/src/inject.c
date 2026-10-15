@@ -845,6 +845,26 @@ redwood_init(void)
 			setenv("CA_FORCE_TIMER", "1", 1);
 			say("redwood: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
 		}
+		/*
+		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
+		 * CoreAnimation's own switches (CA_LOG_TRIPLE_BUFFERING=1, CA_FORCE_DOUBLE_BUFFERING=1 ...).
+		 */
+		for (const char *argument = arguments; (argument = strstr(argument, "caenv=")) != NULL; argument += 6) {
+			char setting[128];
+			size_t length = strcspn(argument + 6, " ");
+			char *equals;
+
+			if ((argument != arguments && argument[-1] != ' ') || length == 0 || length >= sizeof(setting)) {
+				continue;
+			}
+			memcpy(setting, argument + 6, length);
+			setting[length] = 0;
+			if ((equals = strchr(setting, '=')) != NULL) {
+				*equals = 0;
+				setenv(setting, equals + 1, 1);
+				say("redwood: caenv: %s=%s for the window server\n", setting, equals + 1);
+			}
+		}
 		opengl_es();
 		window_server_fixes();
 		/*

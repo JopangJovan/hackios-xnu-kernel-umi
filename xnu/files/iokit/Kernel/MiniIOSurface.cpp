@@ -116,7 +116,9 @@ static struct {
 	IOBufferMemoryDescriptor *      memory;
 	bool                            clear;          /* cleared since it was last a surface's */
 	bool                            busy;           /* being cleared right now */
+	uint64_t                        since;          /* when it was kept */
 } gSurfaceKept[SURFACE_KEPT];
+static uint32_t         gSurfacesNotKept[2];    /* memory not kept: somebody else had it too; it put out a piece kept longer */
 static IOLock *         gSurfaceKeptLock;
 static thread_call_t    gSurfaceClearing;
 static uint32_t         gSurfacesGivenAgain;    /* for MiniIOSurfaceCost() */
@@ -185,21 +187,46 @@ surfaceMemory(vm_size_t bytes)
 	return memory;
 }
 
-/* A surface is gone: its memory is kept for the next, if it is big and nobody else has it. */
+/*
+ * A surface is gone: its memory is kept for the next, if it is big and nobody else has it. When
+ * all the places are taken, it takes the place of the piece kept longest: pieces of a size nobody
+ * asks for again (a big picture made once) once stayed there for good, and then no frame's memory
+ * was kept any more -- each made afresh and freed (2 to 4 ms, and 1 to 2) instead of 0.3 and 0.05.
+ */
 static void
 surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
 {
+	IOBufferMemoryDescriptor * evicted = NULL;
+
+	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() != 1) {
+		OSIncrementAtomic(&gSurfacesNotKept[0]);
+	}
 	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() == 1 && gSurfaceKeptLock != NULL) {
+		int oldest = -1;
+
 		IOLockLock(gSurfaceKeptLock);
-		for (unsigned i = 0; i < SURFACE_KEPT; i++) {
+		for (unsigned i = 0; i < SURFACE_KEPT && memory != NULL; i++) {
 			if (gSurfaceKept[i].memory == NULL) {
 				gSurfaceKept[i].memory = memory;
 				gSurfaceKept[i].clear = gSurfaceKept[i].busy = false;
+				gSurfaceKept[i].since = mach_absolute_time();
 				memory = NULL;
-				break;
+			} else if (!gSurfaceKept[i].busy && (oldest < 0 || gSurfaceKept[i].since < gSurfaceKept[oldest].since)) {
+				oldest = (int) i;
 			}
 		}
+		if (memory != NULL && oldest >= 0) {
+			evicted = gSurfaceKept[oldest].memory;
+			gSurfaceKept[oldest].memory = memory;
+			gSurfaceKept[oldest].clear = gSurfaceKept[oldest].busy = false;
+			gSurfaceKept[oldest].since = mach_absolute_time();
+			memory = NULL;
+			gSurfacesNotKept[1]++;
+		}
 		IOLockUnlock(gSurfaceKeptLock);
+		if (evicted != NULL) {
+			evicted->release();
+		}
 		if (memory == NULL) {
 			if (gSurfaceClear) {
 				AbsoluteTime deadline;
@@ -1072,7 +1099,9 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 		OSSafeReleaseNULL(obj);
 		return kIOReturnBadArgument;
 	}
+	uint64_t made_at = mach_absolute_time();
 	s = surfaceCreate(props, &ret);
+	made_at = mach_absolute_time() - made_at;
 	if (s == NULL) {
 		IOLog("MiniIOSurface: create failed 0x%x: %ux%u format 0x%x alloc %u\n", ret,
 		    dictNumber(props, "IOSurfaceWidth", 0), dictNumber(props, "IOSurfaceHeight", 0),
@@ -1092,6 +1121,7 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 		    (int) (s->info.pixelFormat & 0xff), s->info.bytesPerRow, s->info.planeCount, s->info.allocSize);
 	}
 
+	uint64_t mapped_at = mach_absolute_time();
 	IOLockLock(gSurfaceLock);
 	ref = addRef(s);
 	ret = ref ? returnSurface(ref, false, args) : kIOReturnNoMemory;
@@ -1100,8 +1130,37 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 	}
 	surfaceUnhold(s);                       /* the creator's hold; the client's own is in the ref */
 	IOLockUnlock(gSurfaceLock);
+	mapped_at = mach_absolute_time() - mapped_at;
 	OSAddAtomic64((SInt64) (mach_absolute_time() - began), (SInt64 *) &gSurfaceMaking);
 	OSIncrementAtomic(&gSurfacesMade);
+	if (s->info.allocSize >= SURFACE_KEEP_FROM) {
+		/* the big ones (the window server's of the whole display): where the time to make one goes, every 5 s */
+		static uint64_t since, all, making, mapping;
+		static uint32_t count;
+		uint64_t now = mach_absolute_time(), ns;
+
+		count++;
+		all += now - began;
+		making += made_at;
+		mapping += mapped_at;
+		absolutetime_to_nanoseconds(now - since, &ns);
+		if (since == 0) {
+			since = now;
+		} else if (ns >= 5 * NSEC_PER_SEC) {
+			uint64_t a, m, p;
+
+			absolutetime_to_nanoseconds(all, &a);
+			absolutetime_to_nanoseconds(making, &m);
+			absolutetime_to_nanoseconds(mapping, &p);
+			IOLog("MiniIOSurface: %u big surfaces made, %llu us each: %llu getting the memory and the surface, %llu mapping it "
+			    "for its maker; memory not kept as somebody else had it %u times, a piece kept longer put out for it %u times\n",
+			    count, a / 1000 / count, m / 1000 / count, p / 1000 / count, OSBitAndAtomic(0, &gSurfacesNotKept[0]),
+			    OSBitAndAtomic(0, &gSurfacesNotKept[1]));
+			since = now;
+			count = 0;
+			all = making = mapping = 0;
+		}
+	}
 	return ret;
 }
 

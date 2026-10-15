@@ -63,12 +63,14 @@ say(const char *format, ...)
 
 /*
  * Boot-arg touch_lat=1: a line for every turn of SpringBoard's main run loop -- when it woke up (a
- * touch, a timer, the display link ...) and when it went to sleep again, CoreAnimation's commit of
- * what that turn changed done (its observer comes before ours) -- in microseconds of
- * mach_absolute_time, as the other "tl:" lines (tools/latency.py, tools/frames.py):
- *   tl: a WOKE SLEPT
+ * touch, a timer, the display link ...), when CoreAnimation's commit of what that turn changed
+ * began and when it was done (our observers just before and after its own, of order 2000000), in
+ * microseconds of mach_absolute_time, as the other "tl:" lines (tools/latency.py, tools/frames.py):
+ *   tl: a WOKE COMMIT DONE
+ * (a commit with nothing in it takes some microseconds; one that sends changes, a good deal more)
  */
-static uint64_t main_woke;
+#define CA_COMMIT_ORDER 2000000
+static uint64_t main_woke, commit_began;
 static mach_timebase_info_data_t timebase;
 
 static uint64_t
@@ -78,12 +80,14 @@ now_us(void)
 }
 
 static void
-main_loop_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, __unused void *info)
+main_loop_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info)
 {
 	if (activity == kCFRunLoopAfterWaiting) {
 		main_woke = now_us();
+	} else if (activity == kCFRunLoopBeforeWaiting && info == NULL) {
+		commit_began = now_us();
 	} else if (activity == kCFRunLoopBeforeWaiting && main_woke != 0) {
-		say("tl: a %llu %llu\n", main_woke, now_us());
+		say("tl: a %llu %llu %llu\n", main_woke, commit_began, now_us());
 		main_woke = 0;
 	}
 }
@@ -102,8 +106,14 @@ watch_main_loop(void)
 	mach_timebase_info(&timebase);
 	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, LONG_MIN,
 	    main_loop_turn, NULL), kCFRunLoopCommonModes);
-	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true, LONG_MAX,
+	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true, CA_COMMIT_ORDER - 1,
 	    main_loop_turn, NULL), kCFRunLoopCommonModes);
+	{
+		CFRunLoopObserverContext after = { .info = (void *)1 };
+
+		CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true,
+		    CA_COMMIT_ORDER + 1, main_loop_turn, &after), kCFRunLoopCommonModes);
+	}
 }
 
 /* ---- methods of SpringBoard's classes, replaced --------------------------------------------------- */

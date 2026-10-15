@@ -51,6 +51,7 @@ extern void redwood_wifi_stop(void);
 extern void redwood_wifi_quiesce(void);
 extern void redwood_adsp_stop(void);
 extern void redwood_adsp_quiesce(void);
+extern void redwood_ddr_stop(void);
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -426,6 +427,7 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 		redwood_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
 		redwood_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
 		redwood_adsp_stop();            /* and the audio DSP */
+		redwood_ddr_stop();             /* and the memory's bandwidth vote put as it is to stay */
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
 	    cpu_xcall((int)cpu, loader_return_test, (void *)(uintptr_t)(as_panic ? 2 : 1)) == KERN_SUCCESS) {
@@ -471,6 +473,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		redwood_adreno_stop();
 		redwood_wifi_stop();
 		redwood_adsp_stop();
+		redwood_ddr_stop();
 		loader_return();
 	}
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);

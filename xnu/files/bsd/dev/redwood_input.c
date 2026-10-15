@@ -32,6 +32,7 @@ extern void loader_log_line(const char *line);
  * log keeps only the last of a run, and a live look at the loader's (XL_FOLLOW) then misses nothing.
  */
 void redwood_tl(const char *format, ...) __printflike(1, 2);
+extern void redwood_ddr_stop(void);
 
 void
 redwood_tl(const char *format, ...)
@@ -79,6 +80,7 @@ exit_hold_elapsed(__unused thread_call_param_t p0, __unused thread_call_param_t 
 {
 	printf("\n--- %d fingers held on the screen for %d ms: back to the loader ---\n", EXIT_FINGERS, EXIT_HOLD_MS);
 	redwood_adreno_stop();
+	redwood_ddr_stop();
 	loader_return();
 }
 
