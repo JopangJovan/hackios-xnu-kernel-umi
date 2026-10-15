@@ -6,7 +6,8 @@
  * to the application processor. It is the audio DSP's -- a Hexagon of its own inside LPASS,
  * Android's "adsp" -- which stays in reset until somebody loads it, exactly as the Wi-Fi's does
  * (redwood_wifi.c): the phone's own signed image, adsp.mdt and adsp.b02 to adsp.b36 from
- * /vendor/firmware_mnt/image of its Android, goes into the 64 MB reserved for it, TrustZone is
+ * /vendor/firmware_mnt/image of its Android (20 MB: in the system image under /fw, or with ADSP=1 in
+ * the small one, see image_file()), goes into the 64 MB reserved for it, TrustZone is
  * asked to authenticate and start it, and from there everything is conversation through the
  * shared memory: SMP2P for "up", "given up", "stopped"; GLINK for channels; QRTR on the channel
  * "IPCRTR" for the services the DSP offers. (Reading an LPASS clock register from here ends the
@@ -80,8 +81,11 @@
 #include <miscfs/packfs/packfs.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
+#include <sys/kauth.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
+#include <sys/vnode.h>
+#include <sys/vnode_internal.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -974,7 +978,56 @@ image_entry(const uint8_t *image, const struct packfs_super *super, const struct
 	return NULL;
 }
 
-/* A file of fw/ in the small image (userland/build.sh puts fw-audio/ there), or in the system image. */
+/*
+ * A file of /fw on the root file system, read whole into memory of ours: the system image, where
+ * userland/build.sh puts fw-audio/ when it makes that image. It is compressed there, which the file
+ * system undoes and the reading of the small image's memory below does not; and it is there only
+ * once the root is mounted, so only adsp=1, which waits for that on its own thread, finds it so.
+ */
+static const uint8_t *
+root_file(const char *name, uint64_t *size)
+{
+	char path[64];
+	vfs_context_t context = vfs_context_kernel();
+	vnode_t vnode = NULLVP;
+	struct vnode_attr attributes;
+	uint8_t *data;
+	int left = 0, error;
+
+	if (rootvnode == NULLVP) {
+		return NULL;
+	}
+	snprintf(path, sizeof(path), "/fw/%s", name);
+	if (vnode_lookup(path, 0, &vnode, context) != 0) {
+		return NULL;
+	}
+	VATTR_INIT(&attributes);
+	VATTR_WANTED(&attributes, va_data_size);
+	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size == 0 ||
+	    attributes.va_data_size > ADSP_MEMORY_SIZE) {
+		vnode_put(vnode);
+		return NULL;
+	}
+	data = kalloc_data(attributes.va_data_size, Z_WAITOK);
+	if (data == NULL) {
+		vnode_put(vnode);
+		return NULL;
+	}
+	error = vn_rdwr(UIO_READ, vnode, (caddr_t)data, (int)attributes.va_data_size, 0, UIO_SYSSPACE, 0,
+	    vfs_context_ucred(context), &left, vfs_context_proc(context));
+	vnode_put(vnode);
+	if (error != 0 || left != 0) {
+		printf("adsp: %u: %s: read error %d, %d bytes left\n", step, path, error, left);
+		kfree_data(data, attributes.va_data_size);
+		return NULL;
+	}
+	*size = attributes.va_data_size;
+	return data;
+}
+
+static bool from_root;                  /* the image is in memory of ours (root_file()), to be given back once written */
+
+/* A file of fw/ in the small image (ADSP=1 userland/build.sh puts fw-audio/ there), else of /fw on the root (above). */
 static const uint8_t *
 image_file(const char *name, uint64_t *size)
 {
@@ -1004,10 +1057,19 @@ image_file(const char *name, uint64_t *size)
 			return (const uint8_t *)base + file->pd_data;
 		}
 	}
-	printf("adsp: %u: no fw/%s in the small image: put the phone's /vendor/firmware_mnt/image/%s into fw-audio/ and run "
-	    "userland/build.sh\n", step, name, name);
+	{
+		const uint8_t *data = root_file(name, size);
+
+		if (data != NULL) {
+			from_root = true;
+			return data;
+		}
+	}
+	printf("adsp: %u: no fw/%s in the small image nor on the root: put the phone's /vendor/firmware_mnt/image/%s into "
+	    "fw-audio/ and run SYSTEM=1 userland/build.sh (or ADSP=1, for the small image)\n", step, name, name);
 	return NULL;
 }
+
 
 #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)
 #define MAX_SEGMENTS            48
@@ -1028,6 +1090,29 @@ static struct {
 	uint32_t size;
 } image;
 
+/* The image's files given back, if they were read into memory of ours. */
+static void
+image_forget(void)
+{
+	if (!from_root) {
+		return;
+	}
+	if (image.header != NULL) {
+		void *data = (void *)(uintptr_t)image.header;
+
+		kfree_data(data, image.header_size);
+	}
+	for (unsigned s = 0; s < image.segments; s++) {
+		if (image.segment[s].file != NULL) {
+			void *data = (void *)(uintptr_t)image.segment[s].file;
+
+			kfree_data(data, image.segment[s].file_size);
+		}
+	}
+	bzero(&image, sizeof(image));
+	from_root = false;
+}
+
 static bool
 step_firmware(void)
 {
@@ -1036,17 +1121,20 @@ step_firmware(void)
 	uint64_t size = 0, files = 0;
 	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
 
-	announce("find the audio DSP's image in the small image, and check it against its own header");
+	announce("find the audio DSP's image in the small image or on the root, and check it against its own header");
+	image_forget();
 	image.segments = 0;
 	header = image_file("adsp.mdt", &size);
 	if (header == NULL) {
 		return false;
 	}
+	image.header = header;
+	image.header_size = size;
 	count = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
 	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > PAGE_SIZE) {
 		printf("adsp: %u: fw/adsp.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, header[0],
 		    header[1], header[2], header[3], count, size);
-		return false;
+		goto fail;
 	}
 	for (uint32_t i = 0; i < count; i++) {
 		char name[16];
@@ -1062,7 +1150,7 @@ step_firmware(void)
 		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)ADSP_MEMORY + ADSP_MEMORY_SIZE) {
 			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
 			    segment.memory_size);
-			return false;
+			goto fail;
 		}
 		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
 		image.segment[image.segments].file_size = segment.file_size;
@@ -1074,11 +1162,12 @@ step_firmware(void)
 			snprintf(name, sizeof(name), "adsp.b%02u", i);
 			image.segment[image.segments].file = image_file(name, &file_size);
 			if (image.segment[image.segments].file == NULL) {
-				return false;
+				goto fail;
 			}
 			if (file_size != segment.file_size) {
 				printf("adsp: %u: fw/%s has %llu bytes, the header says %u\n", step, name, file_size, segment.file_size);
-				return false;
+				image.segments++;               /* (for its file to be given back) */
+				goto fail;
 			}
 			files += file_size;
 		}
@@ -1089,15 +1178,19 @@ step_firmware(void)
 	if (image.segments == 0 || lowest != ADSP_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
-		image.segments = 0;
-		return false;
+		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
 	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
-	printf("adsp: %u: the image is whole: a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x bytes "
-	    "of the DSP's %#x from %#x\n", step, size, hashes, image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
+	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
+	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
+	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
 	return true;
+fail:
+	image_forget();
+	image.segments = 0;
+	return false;
 }
 
 /* ---- step 3: the mailbox --------------------------------------------------------------------------- */
@@ -1403,6 +1496,7 @@ step_image(void)
 	settle();
 	ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
 	image_written = wrong == 0;
+	image_forget();                         /* (it is in the DSP's memory now: what was read of the root, given back) */
 	return image_written;
 }
 
@@ -2544,13 +2638,17 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	uint64_t began = now_us();
 	unsigned services = 0;
 
+	/* (the firmware may be on the root file system, which is not mounted yet when this begins: a minute at most) */
+	for (unsigned waited = 0; waited < 300 && rootvnode == NULLVP; waited++) {
+		sleep_ms(200);
+	}
 	run_steps();
 	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 		services += qrtr_servers[i].there;
 	}
 	if (step == STEPS && dsp_started) {
-		tell("adsp: THE AUDIO DSP IS UP AND LINKED, %llu ms after the kernel began on it: node %u, %u services; it stays on\n",
-		    (now_us() - began) / 1000, qrtr_peer, services);
+		tell("adsp: THE AUDIO DSP IS UP AND LINKED, %llu ms after the kernel began on it (the root's waited for included): node "
+		    "%u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);

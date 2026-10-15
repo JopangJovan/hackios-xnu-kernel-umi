@@ -31,8 +31,9 @@
 #                                   GL=test: only the library and bin/gl_test (a triangle, src/gl_test.c;
 #                                   RC_JOBS=rc.jobs.gltest runs it); the window server stays as it is.
 #                      ADSP=1       with the audio DSP's firmware from ../fw-audio in fw/ (20 MB; for the
-#                                   kernel's adsp=1 / adsp_step=N, bsd/dev/redwood_adsp.c). Not beside GL=1:
-#                                   the two do not fit the 64 MB the loader takes with the kernel.
+#                                   kernel's adsp_step=N, bsd/dev/redwood_adsp.c, which runs before the root is
+#                                   mounted). Not beside GL=1: the two do not fit the 64 MB the loader takes with
+#                                   the kernel. adsp=1 needs none of it: the system image has the firmware in /fw.
 #   system.packfs    the system image, the root filesystem (second RAM disk, /dev/md1): the part of
 #                    iOS 16.5 chosen by ../ios165/select-system.py at its real paths, the dyld
 #                    shared cache, and src/stage0.c as /sbin/launchd (the real one is
@@ -237,6 +238,12 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	fi
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.ios
 	cp obj/stage0 sysroot/sbin/launchd
+	# the audio DSP's firmware, the phone's own from ../fw-audio (never in the repository), where the kernel reads
+	# it once the root is mounted (bsd/dev/redwood_adsp.c, adsp=1): 20 MB that do not fit beside GL=1 in the small image
+	if [ -f ../fw-audio/adsp.mdt ]; then
+		mkdir -p sysroot/fw
+		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] sysroot/fw/
+	fi
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
 	ln -s /redwood/lib/RedwoodAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
