@@ -325,6 +325,15 @@ struct cmd_db_bcm {                             /* a BCM's auxiliary data (Linux
 	uint8_t vcd, reserved;
 };
 
+/* (the same condition as the cores' clocks: the addresses are this phone's) */
+static bool
+cpufreq_wanted(void)
+{
+	uint32_t on = 0;
+
+	return PE_parse_boot_argn("cpufreq", &on, sizeof(on)) && on != 0;
+}
+
 static void
 ddr_look(void)
 {
@@ -392,20 +401,28 @@ ddr_slots(void)
 }
 
 /*
- * Boot-arg ddr=2: votes for the memory's bandwidth -- the most there is -- on the bus clock managers
- * of the memory controller (MC0: the memory's clock) and of the shared hub in front of it with
- * the system cache (SH0), as Linux's interconnect driver does for a busy GPU (icc-bcm-voter.c: a
- * BCM command is commit, valid, the average and the peak, 14 bits each, in the BCM's units; the
- * BCM takes the highest of its levels the vote reaches), and the memory kept on for this
- * processor (ACV, bit 3, which the boot loader's firmware had set already). ddr_vote=N: N instead
- * of the most (16383). At the end of the run the votes go to ddr_rest=N (default 16383: the
- * memory stays at the clock it was raised to; what the firmware had asked for cannot be read back).
+ * The memory's bandwidth (on by default; boot-arg ddr=0: not): a vote through RPMh -- the most there
+ * is -- on the bus clock managers of the memory controller (MC0: the memory's clock) and of the
+ * shared hub in front of it with the system cache (SH0), as Linux's interconnect driver casts for
+ * a busy GPU (icc-bcm-voter.c: a BCM command is commit, valid, the average and the peak, 14 bits each,
+ * in the BCM's units; the BCM takes the highest of its levels the vote reaches), and the memory kept
+ * on for this processor (ACV, bit 3, which the boot loader's firmware had set already, the same).
+ * All cores together got 12.4 GB/s writing without it (membench=2: what one core gets alone), 14.8
+ * with it; frames over 16.7 ms 28% instead of 34-36%. ddr_vote=N: N instead of the most (16383).
+ * When the kernel goes back to the loader (redwood_ddr_quiesce(), on every way back, a panic's too)
+ * the vote goes down to ddr_rest=N (default 1024). What the firmware had voted cannot be read back,
+ * but what the cores get from memory can be measured (membench=2, writing): with any vote from 4
+ * to 4096 12.0 to 12.4 GB/s, as before the first vote (12.4); with the most, 15.4; with none at all
+ * ("no request", valid clear: what Linux sends for nothing) 0.2 -- the memory at its floor, and the
+ * loader's USB transfers at 8 MB/s instead of 30. So the firmware had a vote of its own in our name,
+ * of that middle range, and one from the middle of it is left.
  */
 #define BCM_COMMIT              (1u << 30)
 #define BCM_VALID               (1u << 29)
 #define BCM_VOTE(x, y)          (BCM_COMMIT | BCM_VALID | ((uint32_t)(x) & 0x3fff) << 14 | ((uint32_t)(y) & 0x3fff))
 #define TCS_REG(reg)            (ddr_rsc + 0xd00 + (reg))       /* command slot set 0, an "active" one */
 #define BCM_ACV_APPS            8
+#define DDR_REST                1024            /* the vote left for the loader (ddr_rest=N); see redwood_ddr_quiesce() */
 
 static vm_offset_t ddr_rsc;
 static uint32_t ddr_mc0, ddr_sh0, ddr_acv;
@@ -509,23 +526,25 @@ ddr_raise(void)
 	tell("ddr: memory bandwidth vote %u on MC0 (%#x) and SH0 (%#x)%s\n", vote, ddr_mc0, ddr_sh0, ddr_voted ? "" : ": FAILED");
 }
 
-/* At the end of the run (osfmk/arm64/loader_return.c). */
-void redwood_ddr_stop(void);
+/* On the way back to the loader (osfmk/arm64/loader_return.c: loader_return(), whatever the reason; the other processors are stopped) */
+void redwood_ddr_quiesce(void);
 
 void
-redwood_ddr_stop(void)
+redwood_ddr_quiesce(void)
 {
-	uint32_t rest = 0x3fff;
+	uint32_t address[2] = { ddr_mc0, ddr_sh0 };
+	uint32_t rest = DDR_REST, data[2];
+	bool done;
 
 	if (!ddr_voted) {
 		return;
 	}
-	PE_parse_boot_argn("ddr_rest", &rest, sizeof(rest));
-	if (rest == 0 || rest > 0x3fff) {
-		rest = 0x3fff;
-	}
 	ddr_voted = false;
-	printf("ddr: memory bandwidth vote %u for after the run: %s\n", rest, ddr_vote(rest) ? "done" : "FAILED");
+	PE_parse_boot_argn("ddr_rest", &rest, sizeof(rest));
+	rest = MIN(rest, 0x3fff);
+	data[0] = data[1] = rest != 0 ? BCM_VOTE(rest, rest) : BCM_COMMIT;     /* 0: no request */
+	done = ddr_rpmh_write(address, data, 2);
+	tell("ddr: memory bandwidth vote %u for the loader: %s\n", rest, done ? "done" : "FAILED");
 }
 
 void
@@ -535,10 +554,12 @@ redwood_cpufreq_init(void)
 	uint32_t enabled = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
 
 	load_start();
-	if (PE_parse_boot_argn("ddr", &enabled, sizeof(enabled)) && enabled == 1) {
+	enabled = 2;
+	PE_parse_boot_argn("ddr", &enabled, sizeof(enabled));
+	if (enabled == 1) {
 		ddr_look();
 		ddr_slots();
-	} else if (enabled == 2) {
+	} else if (enabled == 2 && cpufreq_wanted()) {
 		ddr_raise();
 	}
 	enabled = 0;
