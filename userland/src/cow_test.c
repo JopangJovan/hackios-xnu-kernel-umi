@@ -1,19 +1,25 @@
 /*
- * cow_test: is memory that is copied really a copy? For each of the ways a picture's bytes can go
- * from one place to another -- sent out of line with a virtual copy, vm_copy() into memory that is
- * there already -- a buffer of an icon's size (180 x 180 x 4) is filled, copied, and the source
- * written over afterwards; the copy must still be what the source was, in every 16K page of it.
- * Page-aligned and 4224 bytes into a page (where the broken Calendar icon's bytes lie: its first
- * and last pages shared with what is around it), from memory of our own, from malloc, from
- * purgeable memory, with the source or the destination wired (mlock), and with the received copy
- * made read-only and wired, or with a surface made around it the way CoreAnimation's window server
- * makes one around a picture (src/... IOSurfaceAddress; kernel: MiniIOSurface.cpp).
- * Run by RC_JOBS=rc.jobs.cow; every line should end with 0 pages wrong.
+ * cow_test: is what is copied really a copy, and what is written really seen? For each of the ways
+ * a picture's bytes go from one place to another -- sent out of line with a virtual copy, vm_copy()
+ * into memory that is there already, a memory entry made as a copy (how XPC hands large data over),
+ * a file written with write() while it is mapped -- a buffer of an icon's size (180 x 180 x 4) is
+ * filled, copied or written, and the source written over afterwards; every 16K page of the result
+ * must be what it should be. Page-aligned and 4224 bytes into a page (where the broken Calendar
+ * icon's bytes lay: its first and last pages shared with what is around it), from memory of our
+ * own, from malloc, from purgeable memory, with the source or the destination wired (mlock), with
+ * the received copy made read-only and then wired or with a surface made around it the way
+ * CoreAnimation's window server makes one around a picture (MiniIOSurface.cpp), and with a file's
+ * mapping wired before it is written: that last one is the Calendar icon's case, which the ramfs
+ * got wrong (it threw cached pages away after a write and could not throw away wired ones; see
+ * ramfs_refresh_cache()).
+ * Run by RC_JOBS=rc.jobs.cow ("cow_test files": only the file cases). Every line should end with
+ * no page wrong.
  */
 #include <mach/mach.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -172,7 +178,7 @@ three(const char *what, unsigned char *buffer, size_t size, int surface_mode)
 		const unsigned char *got = g.message.data.address;
 		uintptr_t start = (uintptr_t)got;
 
-		vm_protect(mach_task_self(), (vm_address_t)got & ~(page - 1), size + page, 0, VM_PROT_READ);
+		vm_protect(mach_task_self(), (vm_address_t)got & ~(page - 1), ((start + size + page - 1) & ~(page - 1)) - (start & ~(page - 1)), 0, VM_PROT_READ);
 		if (!surface_mode) {
 			locked = mlock((const void *)((uintptr_t)got & ~(page - 1)), ((start + size + page - 1) & ~(page - 1)) - (start & ~(page - 1)));
 		} else {
@@ -224,13 +230,147 @@ three(const char *what, unsigned char *buffer, size_t size, int surface_mode)
 	mach_port_destroy(mach_task_self(), port);
 }
 
+/* a memory entry made as a copy of memory (what XPC hands large data over with), mapped, and the source written after */
+static void
+four(const char *what, unsigned char *buffer, size_t size, int flags)
+{
+	size_t page = (size_t)getpagesize(), changed = 0, pages = 0;
+	memory_object_size_t entry_size = size;
+	mach_port_t entry = MACH_PORT_NULL;
+	vm_address_t mapped = 0;
+	kern_return_t kr, km = KERN_FAILURE;
+	char line[512] = "";
+	size_t used = 0, offset = (uintptr_t)buffer & (page - 1);
+
+	memset(buffer, 0x11, size);
+	kr = mach_make_memory_entry_64(mach_task_self(), &entry_size, (memory_object_offset_t)(uintptr_t)buffer,
+	    VM_PROT_READ | flags, &entry, MACH_PORT_NULL);
+	if (kr == KERN_SUCCESS) {
+		km = vm_map(mach_task_self(), &mapped, entry_size, 0, VM_FLAGS_ANYWHERE, entry, 0, 0, VM_PROT_READ, VM_PROT_READ,
+		    VM_INHERIT_NONE);
+	}
+	memset(buffer, 0x22, size);
+	if (km == KERN_SUCCESS) {
+		/* where the bytes are in the mapping: at the entry's own offset if the entry starts on a page, else at 0 */
+		const unsigned char *got = (const unsigned char *)mapped + (entry_size >= size + offset ? offset : 0);
+		uintptr_t start = (uintptr_t)got;
+
+		for (size_t at = 0; at < size;) {
+			size_t next = ((start + at) & ~(page - 1)) + page - start, end = next < size ? next : size, bad = 0;
+
+			for (size_t i = at; i < end; i++) {
+				bad += got[i] != 0x11;
+			}
+			if (bad != 0 && used < sizeof(line) - 40) {
+				used += (size_t)snprintf(line + used, sizeof(line) - used, " page %zu (bytes %zu-%zu): %zu", pages, at, end, bad);
+			}
+			changed += bad != 0;
+			pages++;
+			at = end;
+		}
+		vm_deallocate(mach_task_self(), mapped, entry_size);
+	}
+	printf("cow_test: memory entry, %s (%zu bytes, %zu into its page): entry %#x, %llu bytes, mapped %#x; %zu of %zu pages show "
+	    "what was written after%s\n", what, size, offset, kr, (unsigned long long)entry_size, km, changed, pages, line);
+	if (entry != MACH_PORT_NULL) {
+		mach_port_deallocate(mach_task_self(), entry);
+	}
+}
+
+/*
+ * A file that one program has mapped while another writes it (an icon cache read by SpringBoard and
+ * written by iconservicesagent): written with write() at a place that does not start on a page, the
+ * mapping must show what was written, in every page of it. `touch`: which pages of the mapping were
+ * read before the write (0 none, 1 the first and the last, 2 all).
+ */
+static void
+five(const char *what, const char *path, size_t offset, size_t size, int touch, int twice, int wire)
+{
+	size_t page = (size_t)getpagesize(), file_size = 16 * page, changed = 0, pages = 0;
+	unsigned char *data = malloc(size), *zero = calloc(1, file_size);
+	const unsigned char *map;
+	char line[512] = "";
+	size_t used = 0;
+	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+
+	if (fd < 0 || data == NULL || zero == NULL) {
+		printf("cow_test: file, %s: cannot open %s\n", what, path);
+		return;
+	}
+	write(fd, zero, file_size);
+	map = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+	if (map == MAP_FAILED) {
+		printf("cow_test: file, %s: cannot map\n", what);
+		close(fd);
+		return;
+	}
+	if (twice) {
+		memset(data, 0x33, size);               /* a first version, read through the mapping, then the second */
+		pwrite(fd, data, size, (off_t)offset);
+		for (size_t at = 0; at < size; at += page / 2) {
+			(void)*(volatile const unsigned char *)(map + offset + at);
+		}
+	}
+	for (size_t at = 0; touch && at < file_size; at += page) {
+		if (touch == 2 || at == (offset & ~(page - 1)) || at == ((offset + size - 1) & ~(page - 1))) {
+			(void)*(volatile const unsigned char *)(map + at);
+		}
+	}
+	if (wire) {
+		/* the mapping's pages held in memory, as a surface made around them holds them */
+		mlock(map, file_size);
+	}
+	memset(data, 0x11, size);
+	pwrite(fd, data, size, (off_t)offset);
+	for (size_t at = 0; at < size;) {
+		size_t next = ((offset + at) & ~(page - 1)) + page - offset, end = next < size ? next : size, bad = 0;
+
+		for (size_t i = at; i < end; i++) {
+			bad += map[offset + i] != 0x11;
+		}
+		if (bad != 0 && used < sizeof(line) - 40) {
+			used += (size_t)snprintf(line + used, sizeof(line) - used, " page %zu (bytes %zu-%zu): %zu", pages, at, end, bad);
+		}
+		changed += bad != 0;
+		pages++;
+		at = end;
+	}
+	printf("cow_test: file, %s (%zu bytes at %zu in %s): %zu of %zu pages of the mapping do not show what was written%s\n",
+	    what, size, offset, path, changed, pages, line);
+	if (wire) {
+		munlock(map, file_size);
+	}
+	munmap((void *)map, file_size);
+	close(fd);
+	unlink(path);
+	free(data);
+	free(zero);
+}
+
+static void
+files(size_t size)
+{
+	five("mapped, nothing read, then written", "/private/var/tmp/cow_test.data", 4224, size, 0, 0, 0);
+	five("mapped, its first and last page read, then written", "/private/var/tmp/cow_test.data", 4224, size, 1, 0, 0);
+	five("mapped, all read, then written", "/private/var/tmp/cow_test.data", 4224, size, 2, 0, 0);
+	five("written, read through the mapping, written again", "/private/var/tmp/cow_test.data", 4224, size, 0, 1, 0);
+	five("written, read through the mapping, written again (aligned)", "/private/var/tmp/cow_test.data", 0, size, 0, 1, 0);
+	five("mapped, wired, then written", "/private/var/tmp/cow_test.data", 4224, size, 2, 0, 1);
+	five("written, read, wired, written again", "/private/var/tmp/cow_test.data", 4224, size, 0, 1, 1);
+}
+
 int
-main(void)
+main(int argc, char **argv)
 {
 	size_t size = 180 * 720, page = (size_t)getpagesize();
 	vm_address_t region = 0;
 
+	setvbuf(stdout, NULL, _IONBF, 0);
 	printf("cow_test: pages of %zu bytes\n", page);
+	files(size);                    /* (first: the rest makes surfaces, which a kernel that breaks may not survive) */
+	if (argc > 1 && strcmp(argv[1], "files") == 0) {
+		return 0;
+	}
 	vm_allocate(mach_task_self(), &region, size + 4 * page, VM_FLAGS_ANYWHERE);
 	one("a region of our own, page-aligned", (unsigned char *)region, size, 0);
 	one("a region of our own, 4224 bytes in", (unsigned char *)region + 4224, size, 0);
@@ -271,6 +411,9 @@ main(void)
 			three("OOL from a purgeable region, received, a surface made around it, then the source written (4224 in)",
 			    (unsigned char *)p + 4224, size, 1);
 		}
+		four("a copy (MAP_MEM_VM_COPY), aligned", (unsigned char *)a, size, MAP_MEM_VM_COPY);
+		four("a copy (MAP_MEM_VM_COPY), 4224 in", (unsigned char *)a + 4224, size, MAP_MEM_VM_COPY);
+		four("a copy (MAP_MEM_VM_COPY), 2816 in", (unsigned char *)a + 2816, size, MAP_MEM_VM_COPY);
 		printf("cow_test: the source locked in memory (wired): mlock %d\n", mlock((void *)a, size + 4 * page));
 		two("wired source, aligned, source written after", (unsigned char *)a, (unsigned char *)b, size, 1);
 		two("wired source, 4224 in both, source written after", (unsigned char *)a + 4224, (unsigned char *)b + 4224, size, 1);

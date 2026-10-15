@@ -10,7 +10,9 @@
  * are just two entries naming one node. File contents are kept in
  * individually allocated pages hanging off the node. That copy is the truth:
  * read() and write() go straight to it, and the page cache is used only for
- * mmap, with page-in and page-out copying between the two.
+ * mmap, with page-in and page-out copying between the two. After a write(),
+ * the pages of the page cache that hold what was written are brought up to
+ * date in place (ramfs_refresh_cache()).
  *
  * One mutex per mount guards all of it. It is never held while user memory
  * is touched (a fault there could come back to this filesystem as a
@@ -441,6 +443,56 @@ ramfs_resize(struct ramfs_node *node, uint64_t size)
 	}
 	node->rn_size = size;
 	ramfs_touch(node, true);
+}
+
+/*
+ * What a write() has changed, into the pages of the page cache that hold it, where there are such
+ * pages: each is filled anew from the file, in place. Throwing them away instead, for the next
+ * page-in to fetch again, is not enough: the page cache cannot throw away a page that somebody
+ * holds wired, and that page goes on showing the file as it was. A surface made around memory that
+ * maps a file wires the pages under it (MiniIOSurface.cpp; CoreAnimation's window server makes one
+ * around every picture it shows, and the pictures of the home screen's icons are memory that maps
+ * IconServices' cache, a file here). When SpringBoard wrote the Calendar's new icon into that
+ * cache, the pages of the icon that it shares with the icons next to it were still held by those
+ * icons' surfaces: they kept the old icon, in the top 16 rows and the bottom 4 of the new one, and
+ * SpringBoard's own mapping of the cache, being of those very pages, showed the same.
+ */
+static void
+ramfs_refresh_cache(vnode_t vp, struct ramfs_node *node, uint64_t start, uint64_t end)
+{
+	struct ramfs_mount *rm = node->rn_mount;
+
+	for (uint64_t page = trunc_page_64(start); page < end; page += PAGE_SIZE) {
+		upl_t upl = NULL;
+		upl_page_info_t *pl = NULL;
+		vm_offset_t addr;
+		int flags = 0;
+
+		if (ubc_page_op(vp, (off_t)page, 0, NULL, &flags) != KERN_SUCCESS) {
+			continue;                       /* not in the page cache: the next page-in fetches it */
+		}
+		if (ubc_create_upl_kernel(vp, (off_t)page, PAGE_SIZE, &upl, &pl, UPL_SET_LITE | UPL_WILL_MODIFY,
+		    VM_KERN_MEMORY_FILE) != KERN_SUCCESS || upl == NULL) {
+			continue;
+		}
+		if (!upl_page_present(pl, 0) || ubc_upl_map(upl, &addr) != KERN_SUCCESS) {
+			/* (gone meanwhile: the page the request made is thrown away again) */
+			ubc_upl_abort_range(upl, 0, PAGE_SIZE, UPL_ABORT_FREE_ON_EMPTY);
+			continue;
+		}
+		lck_mtx_lock(&rm->rm_lock);
+		if (page < node->rn_size) {
+			size_t len = (size_t)MIN((uint64_t)PAGE_SIZE, node->rn_size - page);
+
+			ramfs_fetch(node, page, (void *)addr, len);
+			bzero((void *)(addr + len), PAGE_SIZE - len);
+		} else {
+			bzero((void *)addr, PAGE_SIZE);
+		}
+		lck_mtx_unlock(&rm->rm_lock);
+		ubc_upl_unmap(upl);
+		ubc_upl_commit_range(upl, 0, PAGE_SIZE, UPL_COMMIT_CLEAR_DIRTY | UPL_COMMIT_FREE_ON_EMPTY);
+	}
 }
 
 /* A mapping may hold changes that have not been paged out to us yet: get them. */
@@ -1000,10 +1052,9 @@ ramfs_write(struct vnop_write_args *ap)
 		if (new_size != old_size) {
 			(void)ubc_setsize(vp, (off_t)new_size);
 		}
-		/* cached pages of the range are stale now; they will be paged in again when wanted */
+		/* cached pages of the range are stale now: brought up to date in place */
 		if (ubc_pages_resident(vp)) {
-			(void)ubc_msync(vp, (off_t)trunc_page_64(start), (off_t)round_page_64((uint64_t)uio_offset(uio)), NULL,
-			    UBC_INVALIDATE);
+			ramfs_refresh_cache(vp, node, start, (uint64_t)uio_offset(uio));
 		}
 		/* a partial write is a success */
 		if (error == ENOSPC) {
