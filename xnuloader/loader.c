@@ -412,11 +412,22 @@ dt_prop_padded(struct dt_writer *w, const char *name, const char *value, uint32_
 	dt_prop(w, name, field, size);
 }
 
-/* Properties copied from the iPhone's device tree (identity.h). */
+/*
+ * Properties copied from the iPhone's device tree (identity.h), but one: the iPhone X's display is a
+ * wide-gamut one ("artwork-display-gamut" P3), and with it iOS takes the screen for one that shows
+ * extended colour (MobileGestalt's HasExtendedColorDisplay): WebKit then draws a page's tiles into
+ * surfaces of ten bits a colour ('w30r', 'b3a8'), which neither the kernel's surfaces nor the window
+ * server's renderer here do (eight bits, BGRA), and every page comes out black. Here the screen is
+ * what the framebuffer is: sRGB.
+ */
 static void
 dt_identity(struct dt_writer *w, const struct identity_prop *props, uint32_t count, const unsigned char *data)
 {
 	for (uint32_t i = 0; i < count; i++) {
+		if (str_eq(props[i].name, "artwork-display-gamut")) {
+			dt_prop(w, props[i].name, "sRGB", 5);
+			continue;
+		}
 		dt_prop(w, props[i].name, data + props[i].offset, props[i].length);
 	}
 }

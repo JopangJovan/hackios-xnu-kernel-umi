@@ -123,6 +123,7 @@ public:
 	OSDictionary *                  values;
 	uint32_t                        useCount[2];
 	uint32_t                        purgeable;
+	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
 
 	virtual bool
 	init(void) APPLE_KEXT_OVERRIDE

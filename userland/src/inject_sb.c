@@ -33,6 +33,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
+#include <fcntl.h>
 #include <mach/mach_time.h>
 #include <notify.h>
 #include <objc/message.h>
@@ -44,6 +45,9 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+
+/* where what is said goes: the standard error, which is the console's for SpringBoard (an application's is nowhere) */
+static int say_fd = 2;
 
 static void
 say(const char *format, ...)
@@ -58,7 +62,7 @@ say(const char *format, ...)
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
 	}
-	write(2, line, (size_t)n);
+	write(say_fd, line, (size_t)n);
 }
 
 /*
@@ -666,6 +670,38 @@ layer_line(id layer, const char *role, int depth)
 	}
 }
 
+/* Every WKWebView under a view: whether WebKit takes it for one in the background, its web process and whether that answers. */
+static void
+web_views(id view, int depth)
+{
+	Class web = objc_getClass("WKWebView");
+	id subviews;
+	bool is_web = false;
+
+	if (view == NULL || depth > 40) {
+		return;
+	}
+
+	for (Class c = object_getClass(view); web != NULL && c != NULL && !is_web; c = class_getSuperclass(c)) {
+		is_web = c == web;
+	}
+	if (is_web) {
+		SEL background = sel_registerName("_isBackground"), pid = sel_registerName("_webProcessIdentifier");
+		SEL responsive = sel_registerName("_webProcessIsResponsive");
+
+		say("redwood: layers%s: a WKWebView %p: in the background %s, web process %d, responsive %s, in a window %s, hidden %s\n",
+		    layers_of, (void *)view, class_respondsToSelector(object_getClass(view), background) ?
+		    (SEND(BOOL, view, "_isBackground") ? "YES" : "no") : "?", class_respondsToSelector(object_getClass(view), pid) ?
+		    SEND(int, view, "_webProcessIdentifier") : -1, class_respondsToSelector(object_getClass(view), responsive) ?
+		    (SEND(BOOL, view, "_webProcessIsResponsive") ? "yes" : "NO") : "?", SEND(id, view, "window") ? "yes" : "NO",
+		    SEND(BOOL, view, "isHidden") ? "YES" : "no");
+	}
+	subviews = SEND(id, view, "subviews");
+	for (long i = 0; subviews != NULL && i < SEND(long, subviews, "count"); i++) {
+		web_views(SEND1(id, subviews, "objectAtIndex:", long, i), depth + 1);
+	}
+}
+
 static void
 layers(void)
 {
@@ -693,6 +729,13 @@ layers(void)
 		    scene ? text_of(SEND(id, scene, "_persistenceIdentifier")) : "none", scene ? SEND(long, scene, "activationState") : -1L);
 		layer_line(SEND(id, w, "layer"), "", 1);
 	}
+	if (application != NULL) {
+		say("redwood: layers%s: the application's state %ld (0 active, 1 inactive, 2 in the background)\n", layers_of,
+		    SEND(long, application, "applicationState"));
+	}
+	for (long i = 0; windows != NULL && i < SEND(long, windows, "count"); i++) {
+		web_views(SEND1(id, windows, "objectAtIndex:", long, i), 0);
+	}
 	say("redwood: layers%s: end\n", layers_of);
 }
 
@@ -713,6 +756,10 @@ redwood_springboard_init(void)
 
 		snprintf(who, sizeof(who), " of %s", name);
 		layers_of = who;
+		if ((say_fd = open("/dev/console", O_WRONLY | O_NOCTTY)) < 0) {
+			say_fd = 2;
+		}
+		say("redwood: in %s[%d]: its layers are said on the notification com.redwood.layers\n", name, getpid());
 		notify_register_dispatch("com.redwood.layers", &token, dispatch_get_main_queue(), ^(__unused int t) {
 			layers();
 		});

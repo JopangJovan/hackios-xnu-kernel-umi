@@ -10,12 +10,15 @@
  */
 
 #include <IOKit/IOLib.h>
+#include <pexpert/pexpert.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSUnserialize.h>
 #include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSCollectionIterator.h>
+#include <libkern/c++/OSSymbol.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSBoolean.h>
@@ -91,6 +94,30 @@ static uint64_t         gSurfaceLogged[2];                      /* selectors alr
 /* Boot-arg surftrace=N: log the first N surfaces created (default 24). */
 static TUNABLE(uint32_t, gSurfaceTrace, "surftrace", 24);
 static uint32_t         gSurfaceTraced;                         /* (a tunable is read-only after boot) */
+/*
+ * Boot-arg surftrace_of=NAME: only the surfaces made by programs whose name begins with NAME count for
+ * surftrace (then up to N of theirs), and what becomes of them is said as well: the ports made for them
+ * and who looks them up from a port (another program, which shows it: the window server for a layer).
+ */
+static char             gSurfaceTraceOf[32];
+
+extern "C" void loader_log_line(const char *line);
+
+/* A line about a traced surface: to the loader's log too, where it outlives the kernel's own, short log. */
+static void
+traceLine(const char * format, ...)
+{
+	char line[256];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	if (gSurfaceTraceOf[0] != 0) {
+		loader_log_line(line);
+	}
+	IOLog("%s", line);
+}
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -244,6 +271,17 @@ void
 MiniIOSurface::free(void)
 {
 	uint64_t began = mach_absolute_time();
+
+	if (traced && kpixels != NULL) {
+		uint32_t nonzero = 0, middle = 0;
+
+		for (uint32_t at = 0; at + 4 <= info.allocSize; at += 64) {
+			nonzero += kpixels[at] != 0 || kpixels[at + 1] != 0 || kpixels[at + 2] != 0 || kpixels[at + 3] != 0;
+		}
+		memcpy(&middle, kpixels + (info.allocSize / 2 & ~3u), 4);
+		traceLine("MiniIOSurface: surface %u (%ux%u) goes: of every 64 bytes %u of %u begin with a pixel that is not 0, one in "
+		    "the middle %#010x\n", sid, info.width, info.height, nonzero, info.allocSize / 64, middle);
+	}
 
 	OSSafeReleaseNULL(values);
 	OSSafeReleaseNULL(clientMap);
@@ -804,6 +842,9 @@ MiniIOSurfaceStart(IOService * provider)
 
 	gSurfaceLock = IOLockAlloc();
 	gSurfaceKeptLock = IOLockAlloc();
+	if (!PE_parse_boot_arg_str("surftrace_of", gSurfaceTraceOf, sizeof(gSurfaceTraceOf))) {
+		gSurfaceTraceOf[0] = 0;
+	}
 	gSurfaceClearing = thread_call_allocate(surfaceMemoryClear, NULL);
 	root = OSTypeAlloc(IOCoreSurfaceRoot);
 	if (root == NULL || !root->init() || !root->attach(provider)) {
@@ -1109,13 +1150,47 @@ IOSurfaceRootUserClient::methodCreate(IOExternalMethodArguments * args)
 		props->release();
 		return ret;
 	}
+	{
+		char procname[32] = "?";
+		static unsigned keysSaid;
+
+		proc_selfname(procname, sizeof(procname));
+		/* what a traced program asks for, key by key (the first few surfaces) */
+		if (gSurfaceTraceOf[0] != 0 && strncmp(procname, gSurfaceTraceOf, strlen(gSurfaceTraceOf)) == 0 && keysSaid++ < 6) {
+			OSCollectionIterator * keys = OSCollectionIterator::withCollection(props);
+			char line[256];
+			size_t used = 0;
+			OSSymbol * key;
+
+			line[0] = 0;
+			while (keys != NULL && (key = OSDynamicCast(OSSymbol, keys->getNextObject())) != NULL && used < sizeof(line)) {
+				OSNumber * n = OSDynamicCast(OSNumber, props->getObject(key));
+
+				used += (size_t) snprintf(line + used, sizeof(line) - used, " %s=%lld", key->getCStringNoCopy(),
+				    n ? (long long) n->unsigned64BitValue() : -1LL);
+			}
+			OSSafeReleaseNULL(keys);
+			traceLine("MiniIOSurface: %s asks for a surface with%s\n", procname, line);
+		}
+	}
 	props->release();
-	if (gSurfaceTraced < gSurfaceTrace) {
+	{
+		char procname[32] = "?";
+
+		proc_selfname(procname, sizeof(procname));
+		if (gSurfaceTraceOf[0] != 0 && strncmp(procname, gSurfaceTraceOf, strlen(gSurfaceTraceOf)) != 0) {
+			procname[0] = 0;        /* (not one of those asked about: not counted) */
+		}
+		if (procname[0] != 0 && gSurfaceTraced < gSurfaceTrace) {
+			s->traced = gSurfaceTraceOf[0] != 0;
+		}
+	}
+	if (s->traced || (gSurfaceTraceOf[0] == 0 && gSurfaceTraced < gSurfaceTrace)) {
 		char procname[32] = "?";
 
 		gSurfaceTraced++;
 		proc_selfname(procname, sizeof(procname));
-		IOLog("MiniIOSurface: %s[%d] created surface %u: %ux%u '%c%c%c%c', %u bytes per row, %u planes, %u bytes\n",
+		traceLine("MiniIOSurface: %s[%d] created surface %u: %ux%u '%c%c%c%c', %u bytes per row, %u planes, %u bytes\n",
 		    procname, proc_selfpid(), s->sid, s->info.width, s->info.height, (int) (s->info.pixelFormat >> 24 & 0xff),
 		    (int) (s->info.pixelFormat >> 16 & 0xff), (int) (s->info.pixelFormat >> 8 & 0xff),
 		    (int) (s->info.pixelFormat & 0xff), s->info.bytesPerRow, s->info.planeCount, s->info.allocSize);
@@ -1205,6 +1280,16 @@ IOSurfaceRootUserClient::methodLookupFromPort(IOExternalMethodArguments * args)
 	ret = copyObjectForPortNameInTask(fTask, (mach_port_name_t) args->scalarInput[0], &obj);
 	right = OSDynamicCast(IOSurfaceSendRight, obj);
 	if (ret != kIOReturnSuccess || right == NULL || right->surface == NULL) {
+		static unsigned said;
+
+		if (said++ < 16) {
+			char procname[32] = "?";
+
+			proc_selfname(procname, sizeof(procname));
+			traceLine("MiniIOSurface: %s[%d] looked up a surface from port %#llx: %s\n", procname, proc_selfpid(),
+			    args->scalarInput[0], ret != kIOReturnSuccess ? "no object behind the port" : obj ? "not a surface's port" :
+			    "no surface");
+		}
 		OSSafeReleaseNULL(obj);
 		return kIOReturnBadArgument;
 	}
@@ -1216,6 +1301,26 @@ IOSurfaceRootUserClient::methodLookupFromPort(IOExternalMethodArguments * args)
 	}
 	ret = ref ? returnSurface(ref, known, args) : kIOReturnNoMemory;
 	IOLockUnlock(gSurfaceLock);
+	if (right->surface->traced) {
+		char procname[32] = "?";
+		uint32_t format = right->surface->info.pixelFormat, nonzero = 0, first = 0, middle = 0;
+		const uint8_t * pixels = right->surface->kpixels;
+		uint32_t size = right->surface->info.allocSize;
+
+		/* what is in it by now: how many of its bytes are not zero, its first pixel and one in the middle */
+		for (uint32_t at = 0; pixels != NULL && at < size; at += 64) {
+			nonzero += pixels[at] != 0 || pixels[at + 1] != 0 || pixels[at + 2] != 0 || pixels[at + 3] != 0;
+		}
+		if (pixels != NULL && size >= 8) {
+			memcpy(&first, pixels, 4);
+			memcpy(&middle, pixels + (size / 2 & ~3u), 4);
+		}
+		proc_selfname(procname, sizeof(procname));
+		traceLine("MiniIOSurface: %s[%d] looked up surface %u (%ux%u '%c%c%c%c') from a port: %#x; of every 64 bytes %u of %u "
+		    "begin with a pixel that is not 0, the first %#010x, one in the middle %#010x\n", procname, proc_selfpid(),
+		    right->surface->sid, right->surface->info.width, right->surface->info.height, (int) (format >> 24 & 0xff),
+		    (int) (format >> 16 & 0xff), (int) (format >> 8 & 0xff), (int) (format & 0xff), ret, nonzero, size / 64, first, middle);
+	}
 	obj->release();
 	return ret;
 }
@@ -1260,6 +1365,12 @@ IOSurfaceRootUserClient::methodCreatePort(IOExternalMethodArguments * args)
 		return kIOReturnNotFound;
 	}
 	name = makeSendRight(fTask, s);
+	if (s->traced) {
+		char procname[32] = "?";
+
+		proc_selfname(procname, sizeof(procname));
+		traceLine("MiniIOSurface: %s[%d] made a port for surface %u: %#x\n", procname, proc_selfpid(), s->sid, name);
+	}
 	MiniIOSurfaceDrop(s);
 	args->scalarOutput[0] = name;
 	args->scalarOutputCount = 1;

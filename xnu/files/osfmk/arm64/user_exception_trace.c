@@ -172,6 +172,7 @@ static uint32_t ustacks_threads = USTACKS_MAX_THREADS;  /* boot-arg ustacks_thre
  * the window server's render-server and its other threads), each line with the thread's name and, in
  * the first, the time in microseconds of mach_absolute_time (as the "tl:" lines of tools/latency.py);
  * the lines are few enough then to go to the loader's log as well, where all of a long run is kept.
+ * ustacks_tname=* takes every thread, named or not, and sends them to the loader's log too.
  */
 static char ustacks_tname[32];
 static uint32_t ustacks_count;          /* boot-arg ustacks_count=N: so many times, then no more (0: for ever) */
@@ -217,7 +218,8 @@ ustacks_task(task_t task, struct proc *proc)
 			bsd_getthreadname(get_bsdthread_info(thread), snap[count].name);
 			snap[count].name[63] = 0;
 		}
-		if (ustacks_tname[0] != 0 && strnstr(snap[count].name, ustacks_tname, sizeof(snap[count].name)) == NULL) {
+		if (ustacks_tname[0] != 0 && strcmp(ustacks_tname, "*") != 0 &&
+		    strnstr(snap[count].name, ustacks_tname, sizeof(snap[count].name)) == NULL) {
 			continue;
 		}
 		snap[count].tid = thread_tid(thread);
