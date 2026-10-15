@@ -52,7 +52,8 @@
  * wait_for_frames), glfetch=0 keeps EXT_shader_framebuffer_fetch from CoreAnimation (see
  * fetch_offered), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: FD_MESA_DEBUG=sysmem, say), vblur=0 blurs nothing whose radius varies and
- * vblur=2 paints such blurs by their masks instead (see vblur_on).
+ * vblur=2 paints such blurs by their masks instead (see vblur_on), glframes=1 writes a line for
+ * every frame (see frame_end()).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -125,6 +126,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 
 struct eagl;
 static int eagl_tracing;                /* this frame's calls are written down (boot-arg gltrace=FIRST-LAST) */
+static int frame_lines;                 /* boot-arg glframes=1: a line for every frame (see frame_end()) */
 static void eagl_trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static void eagl_trace_floats(const float *values, int count);
 static void eagl_enter(struct eagl *e, unsigned offset);
@@ -255,6 +257,12 @@ struct eagl {
 		GLenum type;
 	} arrays[8];                    /* the vertex arrays, as given */
 	bool in_frame;
+	struct {                        /* what the line a frame gets with glframes=1 says (frame_end()) */
+		bool taken, boxed;      /* the first draw or clear into the display's picture seen; scissored */
+		GLint box[4];
+		uint32_t surface;       /* that picture's IOSurface */
+		unsigned vrd, vrb, into_display;
+	} line;
 	/* a frame's worth */
 	unsigned calls, draws, triangles, uploads, clears, last_draws;
 	uint64_t upload_bytes, began, attaching, flushing;
@@ -803,6 +811,20 @@ frame_end(struct eagl *e, bool finished)
 	after = now_us();
 	e->in_frame = false;
 	e->frames++;
+	if (frame_lines) {
+		/*
+		 * One line a frame, for matching with a screen recording (the kernel's rec_ring, whose log
+		 * says when it began in the same time): when the frame ended, in the kernel's time; what was
+		 * drawn; into which of the display's surfaces and, of the first draw or clear into it, the
+		 * scissor box -- CoreAnimation draws only what has changed, inside that box, and leaves the
+		 * rest of the surface as it was --; and the draws of the blur whose radius varies.
+		 */
+		say("redwood-gl: f %u at %llu.%03llu s: %u draws, %u clears; display surface %u, %u draws into it, box %s %d,%d %dx%d; "
+		    "vrd %u vrb %u; %u in place, %u copied\n", e->frames, after / 1000000, after / 1000 % 1000, e->draws, e->clears,
+		    e->line.surface, e->line.into_display, e->line.boxed ? "on" : "off", e->line.box[0], e->line.box[1], e->line.box[2],
+		    e->line.box[3], e->line.vrd, e->line.vrb, in_place, copied);
+		bzero(&e->line, sizeof(e->line));
+	}
 	if (in_place == 0 && copied == 0 && e->draws != 0 && unfollowed < 8) {
 		/* (whatever it was drawn into is shown as it is, drawn or not: this is to be seen in the log) */
 		unfollowed++;
@@ -851,6 +873,16 @@ drawing(struct eagl *e)
 	frame_begin(e);
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
 		image->drawn = image->painted = true;
+		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
+			/* the display's picture (a surface of its size): where this frame first draws into it */
+			e->line.into_display++;
+			if (!e->line.taken) {
+				e->line.taken = true;
+				e->line.boxed = glIsEnabled(GL_SCISSOR_TEST);
+				glGetIntegerv(GL_SCISSOR_BOX, e->line.box);
+				e->line.surface = IOSurfaceGetID(image->surface);
+			}
+		}
 	}
 }
 
@@ -1903,6 +1935,11 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 	GLint rows = 0;
 	GLuint program;
 
+	if (e->program == 0) {
+		e->line.vrd += function == FUNCTION_VARIABLE_DOWNSAMPLE;
+		e->line.vrb += function == FUNCTION_VARIABLE_BLUR;
+	}
+
 	if (e->unclear != 0 && reads_what_it_writes(e)) {
 		e->unclear = 0;
 	}
@@ -2933,6 +2970,7 @@ install(void)
 		}
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
 		census_on = strstr(arguments, "glcensus=1") != NULL;
+		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {

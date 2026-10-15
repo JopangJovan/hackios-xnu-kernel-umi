@@ -157,7 +157,8 @@ recording() { # recording [file.mp4]
 	local out=${1:-logs/recording.mp4}
 	fb oem recording | grep -q OKAY || { echo "xl: the last run left no recording (boot-arg rec_secs=N)"; return 1; }
 	FB_TIMEOUT=120 fb get_staged logs/recording.raw >/dev/null
-	tools/recording.py logs/recording.raw "$out" && rm -f logs/recording.raw
+	# (XL_REC_KEEP=1: the recording itself stays in logs/recording.raw, for tools/recording.py --frames)
+	tools/recording.py logs/recording.raw "$out" && { [ -n "$XL_REC_KEEP" ] || rm -f logs/recording.raw; }
 }
 
 ramdisk() { # ramdisk [<file>|none]
