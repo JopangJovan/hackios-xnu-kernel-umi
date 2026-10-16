@@ -57,6 +57,8 @@ void redwood_haptic_quiesce(void);      /* its chip back into reset: at the run'
 void redwood_haptic_pretend(uint32_t peak); /* a test's stand-in for iOS's waveform: as if a write of this loudness came */
 void redwood_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (bsd/dev/redwood_torch.c) */
 void redwood_torch_quiesce(void);       /* the light off: at the run's end and on a panic's way out */
+void redwood_camera_init(void);         /* boot-arg cam=N: the phone's cameras (bsd/dev/redwood_camera.c) */
+void redwood_camera_quiesce(void);      /* whatever of them was switched on, off: at the run's end and on a panic's way out */
 
 /*
  * The phone's speakers (bsd/dev/redwood_speaker.c): its two Awinic amplifiers, set up as

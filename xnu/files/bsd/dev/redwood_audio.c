@@ -350,4 +350,5 @@ redwood_audio_init(void)
 	redwood_speaker_init();
 	redwood_haptic_init();
 	redwood_torch_init();
+	redwood_camera_init();
 }
