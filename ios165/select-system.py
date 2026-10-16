@@ -186,11 +186,14 @@ def main():
             # a symlink costs nothing: keep every one that lives where we take anything at all
             keep = '/' not in path or path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX)
         else:
+            # (the sound plug-ins' too: Library/Audio is skipped but for AUDIO, and without its en.lproj the
+            # virtual audio device's port names came out NULL -- mediaserverd died naming the microphone)
             lproj = re.search(r'/([^/]+)\.lproj$', path)
             keep = '/' not in path or path in ('private/var', 'private/tmp', 'private/etc', 'private/preboot',
                                                'private/xarts', 'private') or \
-                bool(lproj) and lproj.group(1) in KEEP_LANG and path.startswith(WHOLE) and \
-                not path.startswith(SKIP_PREFIX)
+                bool(lproj) and lproj.group(1) in KEEP_LANG and \
+                (path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX) or
+                 path.startswith(AUDIO) and not path.startswith(SKIP_AUDIO))
         if keep:
             chosen.add(path)
     # every directory on the way to something chosen
