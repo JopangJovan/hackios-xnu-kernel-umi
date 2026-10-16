@@ -1528,7 +1528,12 @@ frames_alloc(uint32_t width, uint32_t height, uint32_t stride, uint32_t source)
 	h->height = height;
 	h->stride = stride;
 	h->format = 1;
-	h->bayer = source ? 2 : 0;       /* (the OV02B10's own colour bars, cam_pattern=1, read as GBRG; the CSID's test pattern as RGGB) */
+	/*
+	 * RGGB: the CSID's test pattern, and the OV02B10's picture as it comes here (the two sites of a 2x2
+	 * cell that track each other, the greens, are its second and third; red against blue by the light
+	 * of a room). The sensor's own colour bars (cam_pattern=1) come a line off that: GBRG.
+	 */
+	h->bayer = 0;
 	h->frame_bytes = frame_bytes;
 	h->source = source;
 	strlcpy(h->sensor, source ? "OV02B10" : "CSID TPG", sizeof(h->sensor));
@@ -2275,28 +2280,34 @@ settle_count(uint64_t bits_per_second)
  * The exposure: the module file's table that sets it (page 1: analog gain 0x22, the frame's extra
  * lines 0x14/0x15, the exposure in lines 0x0e/0x0f, 0x9b, then 0xfe = 2 to apply it; "holdon" here),
  * as Android's camera stack writes its first one. Boot-args cam_shutter=LINES and cam_gain=N (the
- * value of 0x22: 16 is 1x) write those two instead, the same way, for a look in other light.
+ * value of 0x22: 16 is 1x) write those two instead, the same way, for a look in other light, and
+ * cam_vblank=LINES (0x14/0x15) makes the frame that much longer, for a longer exposure.
  */
 static bool
 exposure(void)
 {
-	uint32_t shutter = 0, gain = 0;
+	uint32_t shutter = 0, gain = 0, vblank = 0;
 	uint8_t page1[2] = { 0xfd, 0x01 }, apply[2] = { 0xfe, 0x02 }, page0[2] = { 0xfd, 0x00 };
 
 	(void)PE_parse_boot_argn("cam_shutter", &shutter, sizeof(shutter));
 	(void)PE_parse_boot_argn("cam_gain", &gain, sizeof(gain));
-	if (shutter == 0 && gain == 0) {
+	(void)PE_parse_boot_argn("cam_vblank", &vblank, sizeof(vblank));
+	if (shutter == 0 && gain == 0 && vblank == 0) {
 		return true;
 	}
-	if (shutter > 1200) {
-		shutter = 1200;         /* (within the frame's 1237 lines) */
+	vblank = vblank > 0x3fff ? 0x3fff : vblank;
+	if (shutter > 1200 + vblank) {
+		shutter = 1200 + vblank;        /* (within the frame's lines: 1237, and the extra ones of cam_vblank) */
 	}
 	if (gain > 0xf8) {
 		gain = 0xf8;
 	}
 	uint8_t high[2] = { 0x0e, (uint8_t)(shutter >> 8) }, low[2] = { 0x0f, (uint8_t)shutter }, g[2] = { 0x22, (uint8_t)gain };
+	uint8_t vb_high[2] = { 0x14, (uint8_t)(vblank >> 8) }, vb_low[2] = { 0x15, (uint8_t)vblank };
 
 	if (!i2c_transfer(&cci_bus, OV02B10_ADDRESS, page1, 2, NULL, 0) ||
+	    (vblank != 0 && (!i2c_transfer(&cci_bus, OV02B10_ADDRESS, vb_high, 2, NULL, 0) ||
+	    !i2c_transfer(&cci_bus, OV02B10_ADDRESS, vb_low, 2, NULL, 0))) ||
 	    (shutter != 0 && (!i2c_transfer(&cci_bus, OV02B10_ADDRESS, high, 2, NULL, 0) ||
 	    !i2c_transfer(&cci_bus, OV02B10_ADDRESS, low, 2, NULL, 0))) ||
 	    (gain != 0 && !i2c_transfer(&cci_bus, OV02B10_ADDRESS, g, 2, NULL, 0)) ||
@@ -2304,7 +2315,7 @@ exposure(void)
 		give_up("a sensor write nobody acknowledged");
 		return false;
 	}
-	say("camera: the exposure set to %u lines, gain %#x\n", shutter, gain);
+	say("camera: the exposure set to %u lines, gain %#x, %u extra lines a frame\n", shutter, gain, vblank);
 	return true;
 }
 
@@ -2343,7 +2354,9 @@ capture_sensor(void)
 	}
 	show_paths("configured");
 	h = (struct cam_header *)frames;
-	if ((!PE_parse_boot_argn("cam_pattern", &pattern, sizeof(pattern)) || pattern == 0 || sensor_table("tpgon")) &&
+	(void)PE_parse_boot_argn("cam_pattern", &pattern, sizeof(pattern));
+	h->bayer = pattern ? 2 : 0;
+	if ((pattern == 0 || sensor_table("tpgon")) &&
 	    sensor_table("on") && sensor_table("holdon") && exposure()) {
 		/* frames one after the other into the two places, the last of `wanted' kept (the first ones come before the exposure) */
 		for (unsigned ms = 0, done = 0; ms < 5000 && done < wanted; ms += 10) {

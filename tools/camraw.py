@@ -11,9 +11,10 @@ four, their low two bits together in the fifth. Each frame becomes PREFIX-N.png,
 taking each 2x2 cell (bayer 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR) as one pixel -- half the resolution, no
 interpolation -- with a plain grey-world white balance and a gamma of 2.2: a first look, not a
 finished photograph; PREFIX-N-raw.png is the frame's raw values as they are (grey, 8 bits).
---bayer N takes the frames for that order instead of the header's (the OV02B10 is GBRG: its own
-colour bars, cam_pattern=1, come out as clean primaries and secondaries only that way, and its
-module file says 2, Android's code for GBRG).
+--bayer N takes the frames for that order instead of the header's. The OV02B10's picture is RGGB
+here (in a picture of a room the second and third sites of each cell track each other, the
+greens; red against blue by plausible colours); its own colour bars (cam_pattern=1) come a line
+off that, GBRG, and the header says so for them.
 """
 import struct
 import sys
