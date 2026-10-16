@@ -328,6 +328,21 @@ format(int sensor_width, int sensor_height, int max_fps, bool binned)
 	put(f, "SensorHeight", number_i(sensor_height));
 	put(f, "ISOBase", number_f(32));
 	put(f, "DefaultAEMaxGain", number_f(64));
+
+	/*
+	 * The sensor crop geometry the capture-graph builder reads off this format to resolve non-zero
+	 * output dimensions (confirmed by a hook: -[FigCaptureSourceVideoFormat sensorCropDimensions] /
+	 * postGDCCropDimensions] return these). Everything spans the full sensor: no GDC crop.
+	 */
+	put(f, "SensorCropWidth", number_i(sensor_width));
+	put(f, "SensorCropHeight", number_i(sensor_height));
+	put(f, "PreGDCSensorCropWidth", number_i(sensor_width));
+	put(f, "PreGDCSensorCropHeight", number_i(sensor_height));
+	put(f, "PostGDCCropWidth", number_i(sensor_width));
+	put(f, "PostGDCCropHeight", number_i(sensor_height));
+	put(f, "GeometricDistortionCorrectedNativeWidth", number_i(sensor_width));
+	put(f, "GeometricDistortionCorrectedNativeHeight", number_i(sensor_height));
+
 	put(outputs, "PrimaryScaler", output_info(sensor_width, sensor_height));
 	put(outputs, "SecondaryScaler", output_info(sensor_width, sensor_height));
 	put(outputs, "StillImage", output_info(sensor_width, sensor_height));
