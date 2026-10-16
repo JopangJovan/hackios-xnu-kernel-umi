@@ -946,6 +946,24 @@ device_request_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef op
 			say_once("device: the request's options", CFSTR("RequestStreams"), options);
 		}
 	}
+	/*
+	 * Requesting a stream is this device's cue to begin producing: mediaserverd's capture graph
+	 * configures the stream (it installs the PrimaryScaler PixelBufferHandler) and then reserves the
+	 * streams through here, but it never calls the FigCaptureStream start method, so start the stream's
+	 * frame worker from the reservation. stream_start is idempotent (it no-ops when already running),
+	 * and relinquish does not stop the worker, so the reservation thrash does not tear it down.
+	 */
+	if (streams != NULL) {
+		CFIndex n = CFArrayGetCount(streams);
+
+		for (CFIndex i = 0; i < n; i++) {
+			CMBaseObjectRef st = (CMBaseObjectRef)CFArrayGetValueAtIndex(streams, i);
+
+			if (st != NULL) {
+				(void)stream_start(st);
+			}
+		}
+	}
 	return 0;
 }
 
