@@ -11,7 +11,8 @@ tree: the root node's model and compatible, and the /product node (screen class,
 scale, product name ...), and the /product/haptics node: what the phone's haptics are (MobileGestalt's
 DeviceSupportsClosedLoopHaptics is its "closed-loop"; with it iOS plays the system's vibrations and
 feedbacks as waveforms on the actuator, and without it looks for an old vibration motor in IOKit,
-which the iPhone X does not have). The loader builds its own device tree for the hardware we really
+which the iPhone X does not have), and of the /product/camera node what the phone here has as well (its
+"flash": MobileGestalt's camera-flash, without which there is no flashlight in Control Center). The loader builds its own device tree for the hardware we really
 have, but copies these properties from the device tree in the iOS firmware so that the
 system believes it is the iPhone its files were built for.
 
@@ -71,6 +72,8 @@ def main():
     emit('identity_product', children['product'][0], ('name', 'AAPL,phandle'))
     product = {name_of(c): c for c in children['product'][1]}
     emit('identity_haptics', product['haptics'][0], ('name', 'AAPL,phandle'))
+    # (the camera's: the loader takes from it what the hardware here has, the flash so far)
+    emit('identity_camera', product['camera'][0], ('name', 'AAPL,phandle'))
 
 
 if __name__ == '__main__':

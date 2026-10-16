@@ -54,6 +54,8 @@ void redwood_virtio_sound_init(void);   /* boot-arg virtio_sound=1: QEMU's virti
 void redwood_speaker_init(void);        /* boot-arg speaker_probe=N: a look at the phone's speaker amplifiers */
 void redwood_haptic_init(void);         /* boot-arg haptic=N: the phone's vibration motor (bsd/dev/redwood_haptic.c) */
 void redwood_haptic_quiesce(void);      /* its chip back into reset: at the run's end and on a panic's way out */
+void redwood_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (bsd/dev/redwood_torch.c) */
+void redwood_torch_quiesce(void);       /* the light off: at the run's end and on a panic's way out */
 
 /*
  * The phone's speakers (bsd/dev/redwood_speaker.c): its two Awinic amplifiers, set up as

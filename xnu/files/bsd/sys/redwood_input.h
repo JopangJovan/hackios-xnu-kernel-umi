@@ -43,6 +43,10 @@ void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virti
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
+int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
+/* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */
+void redwood_spmi_lock(void);
+void redwood_spmi_unlock(void);
 /*
  * How the battery is, as the audio DSP's battery manager says (bsd/dev/redwood_adsp.c, with adsp=1):
  * handed to bsd/dev/redwood_battery.c, which keeps it for the sysctls kern.redwood.battery_* and

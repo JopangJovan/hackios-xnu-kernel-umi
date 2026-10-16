@@ -43,6 +43,7 @@
  * and the phone's own device tree (qcom,spmi@c440000, pon_hlos@1300, gpio_keys).
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -122,6 +123,26 @@ wr(vm_offset_t address, uint32_t value)
 
 static vm_offset_t arb_core, arb_cnfg, arb_observer;
 
+/*
+ * One transfer at a time through the arbiter for this system, whoever asks (the flashlight's
+ * driver, bsd/dev/redwood_torch.c, as well): with two at once the arbiter drops one ("the transfer
+ * was dropped"), as Linux never lets happen (one lock for the bus).
+ */
+static LCK_GRP_DECLARE(spmi_lck_grp, "redwood-spmi");
+static LCK_SPIN_DECLARE(spmi_lock, &spmi_lck_grp);
+
+void
+redwood_spmi_lock(void)
+{
+	lck_spin_lock(&spmi_lock);
+}
+
+void
+redwood_spmi_unlock(void)
+{
+	lck_spin_unlock(&spmi_lock);
+}
+
 struct peripheral {
 	const char *    name;
 	uint16_t        id;             /* slave << 8 | peripheral: the high byte of its register addresses */
@@ -149,11 +170,15 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 	const char *problem = NULL;
 
 	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	redwood_spmi_lock();
 	wr(channel + OBSERVER_COMMAND, COMMAND_READ | (uint32_t)reg << 4 | (count - 1));
 	do {
 		status = rd(channel + OBSERVER_STATUS);
 		now = mach_absolute_time();
 	} while (!(status & STATUS_DONE) && now - start < interval);
+	data[0] = rd(channel + OBSERVER_DATA0);
+	data[1] = count > 4 ? rd(channel + OBSERVER_DATA1) : 0;
+	redwood_spmi_unlock();
 
 	if (!(status & STATUS_DONE)) {
 		problem = "no answer from the arbiter";
@@ -164,8 +189,6 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 	} else if (status & STATUS_DROPPED) {
 		problem = "the transfer was dropped";
 	} else {
-		data[0] = rd(channel + OBSERVER_DATA0);
-		data[1] = count > 4 ? rd(channel + OBSERVER_DATA1) : 0;
 		for (uint32_t i = 0; i < count; i++) {
 			bytes[i] = (uint8_t)(data[i / 4] >> (8 * (i % 4)));
 		}

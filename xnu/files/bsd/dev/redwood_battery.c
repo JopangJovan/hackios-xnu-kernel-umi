@@ -43,6 +43,13 @@ static int battery_temperature_c = -273, battery_present, battery_charger_presen
 static int battery_charging, battery_soc_estimated, battery_charger_action = -1;
 static uint64_t battery_updates, battery_failures;
 
+/* for others in the kernel (the flashlight's thermal guard): -273 while it is not known */
+int
+redwood_battery_temperature(void)
+{
+	return battery_temperature_c;
+}
+
 SYSCTL_NODE(_kern, OID_AUTO, redwood, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "redwood phone bits");
 SYSCTL_INT(_kern_redwood, OID_AUTO, battery_soc, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_soc_percent, 0, "battery state of charge, 0..100 percent, or -1 if unknown");
