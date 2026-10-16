@@ -1,13 +1,13 @@
 /*
  * The cameras of the POCO X5 Pro (redwood): the macro one, an OmniVision OV02B10 (2 MP, Android's
- * camera 2, "redwood_aac_ov02b10_macro"), and the wide one, a Samsung S5KHM2SD (108 MP, Android's
- * camera 0, "redwood_sunny_s5khm2sd_wide"). Every address and number below belongs to this phone, from
- * Android's own device tree (cam-sensor2 and cam-sensor0 and what they point to), the sensors' module
- * files of Android's camera stack (/vendor/lib64/camera/com.qti.sensormodule.redwood_*.bin: the
+ * camera 2, "redwood_aac_ov02b10_macro"), the wide one, a Samsung S5KHM2SD (108 MP, Android's
+ * camera 0, "redwood_sunny_s5khm2sd_wide"), the front one and the ultra-wide one. Every address and
+ * number below belongs to this phone, from Android's own device tree (cam-sensor0 to cam-sensor3 and
+ * what they point to), the sensors' module files of Android's camera stack (/vendor/lib64/camera/com.qti.sensormodule.redwood_*.bin: the
  * slave address, the chip ID and where it is read, the power sequence, the tables) and the drivers
  * of the phone's kernel (MiCode redwood-s-oss: cam_sensor_util.c, qcom_pm8008-regulator.c,
  * camcc-yupik.c, gdsc-regulator.c, pinctrl-yupik.c, pinctrl-spmi-gpio.c, cam_csiphy_*), read as
- * data. The macro one (the wide one's differences are in sensors[] below and capture_sensor()):
+ * data. The macro one (the others' differences are in sensors[] below and capture_sensor()):
  *
  *   the sensor     on CCI 1, master 0 (GPIO 73 data, 74 clock, function cci_i2c, internal pull-ups),
  *                  slave address 0x3c; done by hand here, as the other drivers do their I2C (the
@@ -34,6 +34,15 @@
  * LDO5 at 1.8 V, VANA a fixed 2.8 V regulator that GPIO 106 switches; three C-PHY trios into
  * CSIPHY 1.
  *
+ * The front one, an OmniVision OV16A1Q (16 MP, cam-sensor1): CCI 0 master 0 (GPIO 69/70), slave
+ * 0x10, chip ID 0x1641 at 0x300b, reset GPIO 20, MCLK0 (GPIO 64); VANA LDO3 at 2.8 V, VDIG LDO2 at
+ * 1.2 V, VIO LDO5 at 1.8 V; four D-PHY lanes into CSIPHY 0.
+ *
+ * The ultra-wide one, a Samsung S5K4H7 (8 MP, cam-sensor3): CCI 1 master 1 (GPIO 75/76), slave
+ * 0x2d, chip ID 0x487b at 0x0000, reset GPIO 78, MCLK3 (GPIO 67) at the 24 MHz its module file
+ * asks for, from camcc's PLL2 (Android's 1440 MHz Zonda configuration); VANA LDO4 at 2.8 V, VIO
+ * LDO5 at 1.8 V, VDIG a fixed 1.2 V regulator that GPIO 108 switches; four D-PHY lanes into CSIPHY 3.
+ *
  * Nothing here is done unless a boot-arg asks for it:
  *
  *   cam=1   a look, reading only: the camera's clocks and power domain as they are, the pins, the
@@ -49,7 +58,8 @@
  * Boot-arg cam_sensor=wide picks the wide sensor; without it, the macro one.
  *
  * Limits, whatever asks: Android's voltages only (the device tree's: 1.8 and 2.8 V for the macro
- * one, 1.0 and 1.8 V for the wide one; nothing else is ever written to the LDOs' set points); only the registers named above are written (a list each, checked at every
+ * one, 1.0 and 1.8 V for the wide one, 1.2, 1.8 and 2.8 V for the front one, 1.8 and 2.8 V for the
+ * ultra-wide one; nothing else is ever written to the LDOs' set points); only the registers named above are written (a list each, checked at every
  * write) and each is read back; any write that does not read back, a regulator that is not ready
  * in time or reports over-current, a byte nobody acknowledges, and everything is switched off again
  * in the power-down's order and nothing more is done. At the run's end (and on a panic's way out)
@@ -163,11 +173,13 @@ give_up(const char *why)
 static vm_offset_t tlmm;
 
 /*
- * The two sensors this knows, as Android's device tree has them (cam-sensor2, the macro; cam-sensor0,
- * the wide): the pins of their CCI master (taken by hand), the reset, MCLK (camcc RCG and branch,
- * the pin and its function 1, cam_mclk, at 4 mA), the supplies the module file's power sequence
- * switches (a PM8008i LDO at the device tree's voltage, or a GPIO that switches a fixed regulator),
- * and the CSIPHY with its clocks. Boot-arg cam_sensor=wide picks the wide one (default: the macro).
+ * The four sensors, as Android's device tree has them (cam-sensor2 the macro, cam-sensor0 the wide,
+ * cam-sensor1 the front, cam-sensor3 the ultra-wide): the pins of their CCI master (taken by hand),
+ * the reset, MCLK (camcc RCG and branch, the pin and its function 1, cam_mclk, at 4 mA), the supplies
+ * the module file's power sequence switches (a PM8008i LDO at the device tree's voltage, or a GPIO
+ * that switches a fixed regulator), the CSIPHY with its clocks, and how the sensor's exposure
+ * registers are laid out. Boot-arg cam_sensor=macro|wide|front|ultra picks one (default: the macro,
+ * and for cam=5 the wide).
  */
 enum { SUPPLY_NONE, SUPPLY_LDO, SUPPLY_GPIO };
 struct supply {
@@ -185,25 +197,50 @@ struct sensor_hw {
 	struct supply   vana, vdig, vio;
 	unsigned        csiphy;
 	uint32_t        phy_cbcr, timer_cmd, timer_cbcr;
-	bool            omnivision;     /* exposure registers: OmniVision's paged ones, or the SMIA ones */
+	uint8_t         regs;           /* the exposure registers: REGS_OV_PAGED, REGS_SMIA or REGS_OV16 */
 	uint8_t         bayer;          /* the picture's order as it comes here (camraw.py's codes: 0 RGGB, 2 GBRG) */
+	uint8_t         pattern_bayer;  /* ... and its own colour bars' (its module file's "tpgon") */
+	const char *    chip;           /* for the frames' header */
+};
+enum {
+	REGS_OV_PAGED,                  /* OmniVision, 8-bit registers in pages (0xfd): exposure 0x0e/0x0f, gain 0x22, VTS 0x14/0x15 */
+	REGS_SMIA,                      /* SMIA: frame length 0x0340, coarse integration 0x0202, analog gain 0x0204, hold 0x0104 */
+	REGS_OV16,                      /* OmniVision, 16-bit addresses: exposure 0x3500.., gain 0x3508, VTS 0x380e, hold 0x3208 */
 };
 static const struct sensor_hw sensors[] = {
 	{       /* cam-sensor2: OV02B10, CCI 1 master 0 (GPIO 73/74), reset GPIO 77, MCLK2 (GPIO 66), csiphy 2 */
 		.name = "macro (OV02B10)", .tab = "camera-ov02b10.tab", .bus_name = "CCI 1 master 0", .sda = 73, .scl = 74, .reset = 77,
 		.mclk_cmd = 0xe038, .mclk_cbcr = 0xe050, .mclk_pin = 66,
 		.vana = { SUPPLY_LDO, 7, 2800, 0, 0 }, .vdig = { SUPPLY_LDO, 6, 1800, 0, 0 }, .vio = { SUPPLY_NONE, 0, 0, 0, 0 },
-		.csiphy = 2, .phy_cbcr = 0xe110, .timer_cmd = 0xe0f4, .timer_cbcr = 0xe10c, .omnivision = true, .bayer = 0,
+		.csiphy = 2, .phy_cbcr = 0xe110, .timer_cmd = 0xe0f4, .timer_cbcr = 0xe10c, .regs = REGS_OV_PAGED, .bayer = 0,
+		.pattern_bayer = 2, .chip = "OV02B10",
 	},
 	{       /* cam-sensor0: S5KHM2SD, CCI 0 master 1 (GPIO 71/72), reset GPIO 21, MCLK1 (GPIO 65), csiphy 1;
 		 * VANA: camera_wide_vana_ldo, a fixed 2.8 V regulator from BOB switched by GPIO 106 (ramp 135 us) */
 		.name = "wide (S5KHM2SD)", .tab = "camera-s5khm2sd.tab", .bus_name = "CCI 0 master 1", .sda = 71, .scl = 72, .reset = 21,
 		.mclk_cmd = 0xe01c, .mclk_cbcr = 0xe034, .mclk_pin = 65,
-		.vana = { SUPPLY_GPIO, 0, 0, 106, 135 }, .vdig = { SUPPLY_LDO, 1, 1000, 0, 0 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
-		.csiphy = 1, .phy_cbcr = 0xe0ec, .timer_cmd = 0xe0d0, .timer_cbcr = 0xe0e8, .omnivision = false, .bayer = 2,
+		.vana = { SUPPLY_GPIO, 0, 2800, 106, 135 }, .vdig = { SUPPLY_LDO, 1, 1000, 0, 0 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
+		.csiphy = 1, .phy_cbcr = 0xe0ec, .timer_cmd = 0xe0d0, .timer_cbcr = 0xe0e8, .regs = REGS_SMIA, .bayer = 2,
+		.pattern_bayer = 2, .chip = "S5KHM2SD",
+	},
+	{       /* cam-sensor1: OV16A1Q, CCI 0 master 0 (GPIO 69/70), reset GPIO 20, MCLK0 (GPIO 64), csiphy 0 */
+		.name = "front (OV16A1Q)", .tab = "camera-ov16a1q.tab", .bus_name = "CCI 0 master 0", .sda = 69, .scl = 70, .reset = 20,
+		.mclk_cmd = 0xe000, .mclk_cbcr = 0xe018, .mclk_pin = 64,
+		.vana = { SUPPLY_LDO, 3, 2800, 0, 0 }, .vdig = { SUPPLY_LDO, 2, 1200, 0, 0 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
+		.csiphy = 0, .phy_cbcr = 0xe0c8, .timer_cmd = 0xe0ac, .timer_cbcr = 0xe0c4, .regs = REGS_OV16, .bayer = 0,
+		.pattern_bayer = 0, .chip = "OV16A1Q",
+	},
+	{       /* cam-sensor3: S5K4H7, CCI 1 master 1 (GPIO 75/76), reset GPIO 78, MCLK3 (GPIO 67, 24 MHz: camcc's PLL2), csiphy 3;
+		 * VDIG: camera_ultra_dvdd_ldo, a fixed 1.2 V regulator from PM7325 S8 switched by GPIO 108 (ramp 135 us) */
+		.name = "ultra-wide (S5K4H7)", .tab = "camera-s5k4h7.tab", .bus_name = "CCI 1 master 1", .sda = 75, .scl = 76, .reset = 78,
+		.mclk_cmd = 0xe054, .mclk_cbcr = 0xe06c, .mclk_pin = 67,
+		.vana = { SUPPLY_LDO, 4, 2800, 0, 0 }, .vdig = { SUPPLY_GPIO, 0, 1200, 108, 135 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
+		.csiphy = 3, .phy_cbcr = 0xe138, .timer_cmd = 0xe11c, .timer_cbcr = 0xe134, .regs = REGS_SMIA, .bayer = 0,
+		.pattern_bayer = 0, .chip = "S5K4H7",
 	},
 };
 static const struct sensor_hw *hw = &sensors[0];
+static unsigned hw_index;
 
 static void
 show_pin(unsigned pin, const char *what)
@@ -217,6 +254,16 @@ show_pin(unsigned pin, const char *what)
 /* The pins written while powered up, as they were found, to be put back: the reset pin, MCLK's, a supply's. */
 static uint32_t found_reset_cfg, found_reset_io, found_mclk_cfg, found_vana_cfg, found_vana_io;
 static bool pins_found;
+
+/* the sensor's reset and MCLK pins as they are now (to be put back when it is powered down) */
+static void
+find_pins(void)
+{
+	found_reset_cfg = rd(GPIO_CFG(hw->reset));
+	found_reset_io = rd(GPIO_IO(hw->reset));
+	found_mclk_cfg = rd(GPIO_CFG(hw->mclk_pin));
+	pins_found = true;
+}
 
 static void
 reset_pin(bool high)
@@ -713,8 +760,26 @@ ldo_off(unsigned n)
 #define GDSC_ON                 (1u << 31)
 
 static vm_offset_t gcc, camcc;
-static uint32_t found_mclk_cfg_rcgr, found_mclk_cbcr, found_gdscr;
-static bool gdsc_switched, mclk_switched;
+static uint32_t found_mclk_cfg_rcgr, found_mclk_cbcr, found_gdscr, found_mclk_mnd[3];
+static bool gdsc_switched, mclk_switched, pll2_switched;
+
+/*
+ * camcc's PLL2 (Zonda), for the 24 MHz MCLK the ultra-wide sensor's module file asks for:
+ * camcc-yupik.c's cam_cc_pll2_config ("1440MHz Configuration"), set as clk_zonda_pll_configure()
+ * and started as clk_zonda_pll_enable() do it; the MCLK RCG takes its early output (source 5)
+ * divided by 10 and by M/N 1/6 (ftbl_cam_cc_mclk0_clk_src's 24 MHz). Taken down as
+ * clk_zonda_pll_disable() does, with the MCLK.
+ */
+#define PLL2_BASE               0x2000
+#define PLL2_MODE               0x00            /* [0] outputs, [1] out of bypass, [2] out of reset, [20] voted, [29] frequency locked, [31] locked */
+#define PLL2_L_VAL              0x04
+#define PLL2_USER_CTL           0x0c            /* [3:0] the outputs */
+#define PLL2_CONFIG_CTL         0x10
+#define PLL2_CONFIG_CTL_U       0x14
+#define PLL2_CONFIG_CTL_U1      0x18
+#define PLL2_TEST_CTL           0x1c            /* [16] stays in CFA (then the frequency lock is what to wait for) */
+#define PLL2_OPMODE             0x28            /* 0 standby, 1 run */
+#define PLL2_STATUS             0x38
 
 static void
 show_clocks(void)
@@ -729,7 +794,8 @@ show_clocks(void)
 static bool
 camcc_put(uint32_t offset, uint32_t value, uint32_t check_mask)
 {
-	if (offset != TITAN_TOP_GDSCR && offset != MCLK_CFG_RCGR && offset != MCLK_CMD_RCGR && offset != MCLK_CBCR) {
+	if (offset != TITAN_TOP_GDSCR && offset != MCLK_CFG_RCGR && offset != MCLK_CMD_RCGR && offset != MCLK_CBCR && offset != MCLK_M &&
+	    offset != MCLK_N && offset != MCLK_D && !(offset >= PLL2_BASE && offset <= PLL2_BASE + PLL2_STATUS)) {
 		give_up("a camcc register that is not to be written");
 		return false;
 	}
@@ -790,15 +856,89 @@ gdsc_off(void)
 
 /* MCLK at 19.2 MHz: the RCG from the crystal, divider 1, no M/N; then the branch; then the pin. */
 static bool
-mclk_on(void)
+pll2_up(void)
 {
+	uint32_t mode = rd(camcc + PLL2_BASE + PLL2_MODE);
+
+	if (mode & (1u | 1u << 20)) {
+		give_up("camcc's PLL2 is running or voted for already (somebody else's)");
+		return false;
+	}
+	pll2_switched = true;
+	/* clk_zonda_pll_configure() */
+	if (!camcc_put(PLL2_BASE + PLL2_L_VAL, 0x4b, ~0u) || !camcc_put(PLL2_BASE + PLL2_CONFIG_CTL, 0x08200800, ~0u) ||
+	    !camcc_put(PLL2_BASE + PLL2_CONFIG_CTL_U, 0x05022011, ~0u) || !camcc_put(PLL2_BASE + PLL2_CONFIG_CTL_U1, 0x08000000, ~0u) ||
+	    !camcc_put(PLL2_BASE + PLL2_USER_CTL, 0x00000301, ~0u) ||
+	    !camcc_put(PLL2_BASE + PLL2_MODE, rd(camcc + PLL2_BASE + PLL2_MODE) & ~2u, 2) ||
+	    !camcc_put(PLL2_BASE + PLL2_MODE, rd(camcc + PLL2_BASE + PLL2_MODE) & ~1u, 1) ||
+	    !camcc_put(PLL2_BASE + PLL2_OPMODE, 0, 1) ||
+	    !camcc_put(PLL2_BASE + PLL2_MODE, rd(camcc + PLL2_BASE + PLL2_MODE) | 4u, 4)) {
+		return false;
+	}
+	/* clk_zonda_pll_enable(): out of bypass, 1 us, out of reset, run, locked, the outputs on */
+	if (!camcc_put(PLL2_BASE + PLL2_MODE, rd(camcc + PLL2_BASE + PLL2_MODE) | 2u, 2)) {
+		return false;
+	}
+	spin_us(1);
+	if (!camcc_put(PLL2_BASE + PLL2_MODE, rd(camcc + PLL2_BASE + PLL2_MODE) | 4u, 4) || !camcc_put(PLL2_BASE + PLL2_OPMODE, 1, 1)) {
+		return false;
+	}
+	uint32_t lock = rd(camcc + PLL2_BASE + PLL2_TEST_CTL) & (1u << 16) ? 1u << 29 : 1u << 31;
+
+	if (!wait_bits(PLL2_BASE + PLL2_MODE, lock, lock, 1000)) {
+		say("camera: camcc's PLL2 does not lock (mode %#x)\n", rd(camcc + PLL2_BASE + PLL2_MODE));
+		give_up("a PLL that does not lock");
+		return false;
+	}
+	if (!camcc_put(PLL2_BASE + PLL2_USER_CTL, rd(camcc + PLL2_BASE + PLL2_USER_CTL) | 0xf, 0xf) ||
+	    !camcc_put(PLL2_BASE + PLL2_MODE, rd(camcc + PLL2_BASE + PLL2_MODE) | 1u, 1)) {
+		return false;
+	}
+	say("camera: camcc's PLL2 locked at 1440 MHz (mode %#x, user_ctl %#x)\n", rd(camcc + PLL2_BASE + PLL2_MODE),
+	    rd(camcc + PLL2_BASE + PLL2_USER_CTL));
+	return true;
+}
+
+static void
+pll2_down(void)
+{
+	if (!pll2_switched) {
+		return;
+	}
+	wr(camcc + PLL2_BASE + PLL2_MODE, rd(camcc + PLL2_BASE + PLL2_MODE) & ~1u);
+	wr(camcc + PLL2_BASE + PLL2_USER_CTL, rd(camcc + PLL2_BASE + PLL2_USER_CTL) & ~0xfu);
+	wr(camcc + PLL2_BASE + PLL2_MODE, rd(camcc + PLL2_BASE + PLL2_MODE) & ~6u);
+	wr(camcc + PLL2_BASE + PLL2_OPMODE, 0);
+	pll2_switched = false;
+	say("camera: camcc's PLL2 off (mode %#x)\n", rd(camcc + PLL2_BASE + PLL2_MODE));
+}
+
+/* MCLK at 19.2 MHz from the crystal itself, or at 24 MHz from PLL2 (khz: the module file's rate) */
+static bool
+mclk_on(uint32_t khz)
+{
+	bool pll = khz == 24000;
+
 	found_mclk_cfg_rcgr = rd(camcc + MCLK_CFG_RCGR);
 	found_mclk_cbcr = rd(camcc + MCLK_CBCR);
+	found_mclk_mnd[0] = rd(camcc + MCLK_M);
+	found_mclk_mnd[1] = rd(camcc + MCLK_N);
+	found_mclk_mnd[2] = rd(camcc + MCLK_D);
 	if (found_mclk_cbcr & 1) {
 		give_up("MCLK is on already (somebody else's)");
 		return false;
 	}
-	if (!camcc_put(MCLK_CFG_RCGR, (found_mclk_cfg_rcgr & ~0x371fu) | (0u << 8) | 1u, 0x371f) ||
+	if (pll) {
+		/* __clk_rcg2_configure(): M 1, N as ~(n - m), D as ~2d (2d = n), then source 5, divider 2 * 10 - 1, dual-edge M/N */
+		if (!pll2_up() || !camcc_put(MCLK_M, (found_mclk_mnd[0] & ~0xffu) | 1, 0xff) ||
+		    !camcc_put(MCLK_N, (found_mclk_mnd[1] & ~0xffu) | (~(6u - 1) & 0xff), 0xff) ||
+		    !camcc_put(MCLK_D, (found_mclk_mnd[2] & ~0xffu) | (~6u & 0xff), 0xff)) {
+			mclk_switched = true;
+			return false;
+		}
+	}
+	mclk_switched = true;
+	if (!camcc_put(MCLK_CFG_RCGR, (found_mclk_cfg_rcgr & ~0x371fu) | (pll ? 5u << 8 | 2u << 12 | 19u : 0u << 8 | 1u), 0x371f) ||
 	    !camcc_put(MCLK_CMD_RCGR, rd(camcc + MCLK_CMD_RCGR) | CMD_UPDATE, 0)) {
 		return false;
 	}
@@ -807,7 +947,6 @@ mclk_on(void)
 		give_up("an RCG that does not update");
 		return false;
 	}
-	mclk_switched = true;
 	if (!camcc_put(MCLK_CBCR, found_mclk_cbcr | 1, 1)) {
 		return false;
 	}
@@ -817,7 +956,8 @@ mclk_on(void)
 		return false;
 	}
 	wr(GPIO_CFG(hw->mclk_pin), CFG_FUNCTION(1) | CFG_DRIVE_MA(4));    /* cam_mclk, no pull, 4 mA: cam_macro_mclk_active, cam_wide_mclk_active */
-	say("camera: MCLK on at 19.2 MHz (RCG cfg %#x, branch %#x)\n", rd(camcc + MCLK_CFG_RCGR), rd(camcc + MCLK_CBCR));
+	say("camera: MCLK on at %u.%u MHz (RCG cfg %#x, branch %#x)\n", khz / 1000, khz % 1000 / 100, rd(camcc + MCLK_CFG_RCGR),
+	    rd(camcc + MCLK_CBCR));
 	return true;
 }
 
@@ -835,6 +975,12 @@ mclk_off(void)
 	wr(camcc + MCLK_CFG_RCGR, found_mclk_cfg_rcgr);
 	wr(camcc + MCLK_CMD_RCGR, rd(camcc + MCLK_CMD_RCGR) | CMD_UPDATE);
 	(void)wait_bits(MCLK_CMD_RCGR, CMD_UPDATE, 0, 500);
+	if (pll2_switched) {
+		wr(camcc + MCLK_M, found_mclk_mnd[0]);
+		wr(camcc + MCLK_N, found_mclk_mnd[1]);
+		wr(camcc + MCLK_D, found_mclk_mnd[2]);
+		pll2_down();
+	}
 	mclk_switched = false;
 	say("camera: MCLK off (branch %#x, RCG cfg %#x as found)\n", rd(camcc + MCLK_CBCR), rd(camcc + MCLK_CFG_RCGR));
 }
@@ -863,6 +1009,18 @@ struct ctab_entry {
 
 static const struct ctab_head *ctab;
 static const struct ctab_mode *ctab_modes;
+
+/* the sensor the rest works on: its descriptor, its CCI master's pins (its tables are loaded afresh: ctab_load()) */
+static void
+select_sensor(unsigned i)
+{
+	hw_index = i;
+	hw = &sensors[i];
+	cci_bus.name = hw->bus_name;
+	cci_bus.sda = hw->sda;
+	cci_bus.scl = hw->scl;
+	ctab = NULL;
+}
 static const uint8_t *ctab_power, *ctab_tables;
 static uint64_t ctab_size;
 
@@ -938,7 +1096,7 @@ sensor_address(void)
 
 static bool chip_enable_switched, powered, reset_driven, vana_gpio_switched;
 
-/* A GPIO-switched supply (the wide sensor's VANA): the pin a high output (GPIO, no pull, 2 mA: cam_sensor_active_wide). */
+/* A GPIO-switched supply (the wide sensor's VANA, the ultra-wide's VDIG): the pin a high output (GPIO, no pull, 2 mA: cam_sensor_active_*). */
 static bool
 supply_on(const struct supply *s)
 {
@@ -956,7 +1114,7 @@ supply_on(const struct supply *s)
 			return false;
 		}
 		spin_us(s->ramp_us);
-		say("camera: gpio%u high: the fixed 2.8 V regulator on\n", s->gpio);
+		say("camera: gpio%u high: the fixed %u.%u V regulator on\n", s->gpio, s->mv / 1000, s->mv % 1000 / 100);
 		return true;
 	}
 	give_up("a supply this sensor does not have");
@@ -1000,12 +1158,12 @@ power_step(const struct ctab_entry *e, bool up)
 		reset_pin(e->data != 0);
 		break;
 	case 0:
-		if (e->data != 0 && e->data != 19200) {
+		if (e->data != 0 && e->data != 19200 && e->data != 24000) {
 			give_up("an MCLK rate not known here");
 			return false;
 		}
 		if (e->data != 0) {
-			if (!up || !gdsc_on() || !mclk_on()) {
+			if (!up || !gdsc_on() || !mclk_on(e->data)) {
 				return false;
 			}
 		} else {
@@ -1768,6 +1926,8 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern lck_mtx_t redwood_smmu_lock;
 
 static vm_offset_t frames, smmu_second, smmu_context, page_tables;
+static vm_offset_t keep;                /* memory in one piece, taken at boot (redwood_camera_init()) */
+static uint64_t keep_bytes;
 static uint64_t frames_bytes;
 static uint32_t smmu_match = ~0u, smmu_context_n, smmu_old_smr, smmu_old_s2cr, smmu_pages_size, smmu_pages;
 static bool smmu_on;
@@ -1779,7 +1939,10 @@ frames_alloc(uint32_t width, uint32_t height, uint32_t stride, uint32_t source)
 	uint32_t frame_bytes = stride * height;
 
 	frames_bytes = round_page(CAM_HEADER_BYTES + (uint64_t)CAM_FRAMES * frame_bytes);
-	if (kmem_alloc_contig(kernel_map, &frames, frames_bytes, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	if (keep != 0 && keep_bytes >= frames_bytes) {
+		frames = keep;                  /* (the piece taken at boot: redwood_camera_init()) */
+		bzero((void *)frames, CAM_HEADER_BYTES);
+	} else if (kmem_alloc_contig(kernel_map, &frames, frames_bytes, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		say("camera: no memory for %u frames (%llu KB)\n", CAM_FRAMES, frames_bytes >> 10);
 		return false;
@@ -1793,7 +1956,7 @@ frames_alloc(uint32_t width, uint32_t height, uint32_t stride, uint32_t source)
 	h->bayer = 0;                   /* (RGGB: the CSID's test pattern; a sensor's picture: capture_sensor()) */
 	h->frame_bytes = frame_bytes;
 	h->source = source;
-	strlcpy(h->sensor, !source ? "CSID TPG" : hw->omnivision ? "OV02B10" : "S5KHM2SD", sizeof(h->sensor));
+	strlcpy(h->sensor, !source ? "CSID TPG" : hw->chip, sizeof(h->sensor));
 	/* (what the processor wrote out of its caches; the IFE writes past them) */
 	for (vm_offset_t line = frames; line < frames + frames_bytes; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
@@ -2266,11 +2429,16 @@ paths_down(void)
 static bool
 titan_up(void)
 {
+	static vm_offset_t csiphys[4];
+
 	if (csid == 0) {
 		csid = ml_io_map(CSID_PHYS, 0x1000);
 		ife = ml_io_map(IFE_PHYS, 0x4000);
-		csiphy = ml_io_map(CSIPHY_PHYS(hw->csiphy), 0x2000);
 	}
+	if (csiphys[hw->csiphy] == 0) {
+		csiphys[hw->csiphy] = ml_io_map(CSIPHY_PHYS(hw->csiphy), 0x2000);
+	}
+	csiphy = csiphys[hw->csiphy];   /* (the sensor's: another one after a change of sensor) */
 	if (!(rd(camcc + TITAN_TOP_GDSCR) & GDSC_ON) && !gdsc_on()) {
 		return false;
 	}
@@ -2581,14 +2749,16 @@ csiphy_down(void)
  * its tables leave it. Boot-args for a look in other light, written the sensor's way: cam_shutter=
  * LINES, cam_gain=N (OV02B10: 0x22, 16 is 1x; S5KHM2SD: 0x0204, 32 is 1x), cam_vblank=LINES (the
  * frame that much longer: OV02B10 0x14/0x15; S5KHM2SD 0x0340, the frame length, by as many lines),
- * the S5KHM2SD's between its group hold on and off (0x0104, its "holdon"/"holdoff" tables).
+ * the S5KHM2SD's between its group hold on and off (0x0104, its "holdon"/"holdoff" tables). The
+ * other two sensors (the S5K4H7 has the SMIA registers too) start as their tables leave them; the
+ * boot-args are for the macro and the wide one.
  */
 static bool
 sensor_write(uint16_t address, uint16_t value, bool sixteen)
 {
 	uint8_t out[4] = { (uint8_t)(address >> 8), (uint8_t)address, (uint8_t)(value >> 8), (uint8_t)value };
 
-	if (hw->omnivision) {
+	if (hw->regs == REGS_OV_PAGED) {
 		out[0] = (uint8_t)address;
 		out[1] = (uint8_t)value;
 		return i2c_transfer(&cci_bus, sensor_address(), out, 2, NULL, 0);
@@ -2606,17 +2776,22 @@ exposure(const struct ctab_mode *mode)
 	(void)PE_parse_boot_argn("cam_shutter", &shutter, sizeof(shutter));
 	(void)PE_parse_boot_argn("cam_gain", &gain, sizeof(gain));
 	(void)PE_parse_boot_argn("cam_vblank", &vblank, sizeof(vblank));
-	if (hw->omnivision && !sensor_table("holdon")) {
+	if (hw->regs == REGS_OV_PAGED && !sensor_table("holdon")) {
 		return false;
 	}
 	if (shutter == 0 && gain == 0 && vblank == 0) {
+		return true;
+	}
+	if (hw->regs != REGS_OV_PAGED && hw != &sensors[1]) {
+		say("camera: cam_shutter, cam_gain and cam_vblank are for the macro and the wide camera: the %s one's exposure is "
+		    "its tables'\n", hw->name);
 		return true;
 	}
 	vblank = vblank > 0x3fff ? 0x3fff : vblank;
 	if (shutter > mode->frame_length + vblank - 40) {
 		shutter = mode->frame_length + vblank - 40;     /* (within the frame's lines, as the sensors want) */
 	}
-	if (hw->omnivision) {
+	if (hw->regs == REGS_OV_PAGED) {
 		gain = gain > 0xf8 ? 0xf8 : gain;
 		ok = sensor_write(0xfd, 0x01, false) && (vblank == 0 || (sensor_write(0x14, (uint16_t)(vblank >> 8), false) &&
 		    sensor_write(0x15, (uint16_t)(vblank & 0xff), false))) && (shutter == 0 ||
@@ -2695,9 +2870,17 @@ capture_sensor(void)
 	 * In a picture of a room the two sites of a 2x2 cell that track each other are the greens: the
 	 * OV02B10's second and third, the S5KHM2SD's first and fourth; red against blue by the two
 	 * cameras' raw levels under the same warm light (red the higher of the two). The OV02B10's own
-	 * colour bars (cam_pattern=1) come a line off its picture: GBRG.
+	 * colour bars (cam_pattern=1) come a line off its picture: GBRG. A sensor whose module file has
+	 * no colour bars (the wide one's and the ultra-wide's have none) gives its picture instead.
 	 */
-	h->bayer = pattern && hw->omnivision ? 2 : hw->bayer;
+	uint32_t tpg_count = 0;
+	const struct ctab_entry *tpgon = ctab_find("tpgon", &tpg_count);
+
+	if (pattern && (tpgon == NULL || tpg_count == 0 || tpgon[0].address == 0)) {
+		say("camera: cam_pattern=1: the %s sensor's module file has no colour bars of its own: its picture\n", hw->name);
+		pattern = 0;
+	}
+	h->bayer = pattern ? hw->pattern_bayer : hw->bayer;
 	if ((pattern == 0 || sensor_table("tpgon")) && sensor_table("on") && exposure(mode)) {
 		/* frames one after the other into the two places, the last of `wanted' kept (the first ones come before the exposure) */
 		for (unsigned ms = 0, done = 0; ms < 5000 && done < wanted; ms += 2) {
@@ -2751,12 +2934,12 @@ capture_sensor(void)
  * cam=4's. The frames go into three places in turn (kernel memory, mapped page by page through the
  * SMMU): one the IFE writes, one a read may be copying, one ready.
  *
- * Which place the IFE writes: when one is done, the next place's address goes to the write master,
- * which takes it at the next start of frame (the register update, latched at RDI 0's SOF). Polled
- * every millisecond: a frame done and the next frame's SOF seen in the same look mean the address
- * came too late, and the frame just done is being written over (the write master's frame increment
- * is 0 here: without a new address it writes the next frame where the last went, not past it) --
- * it is not given out, and the next one done there is. The exposure the program asks for is written between two frames, after
+ * Which place the IFE writes: at each start of frame (RDI 0's SOF, polled every millisecond) the
+ * address of the place for the frame after it goes to the write master, which takes it at the next
+ * SOF (the register update is latched there): a whole frame's time to give it in, not the blanking
+ * between two frames. Should no address be waiting at an SOF (the write master's frame increment is
+ * 0 here: it then writes the frame where the last one went, not past it), that frame is counted as
+ * written over. The exposure the program asks for is written between two frames, after
  * the address, in the sensor's group hold; it counts from the second frame after.
  *
  * A picture for the host (REDWOOD_CAMERA_KEEP: what the program made of a frame) goes into one
@@ -2791,8 +2974,6 @@ static volatile bool ios_open, ios_streaming, ios_wanted;  /* open; frames comin
 static uint64_t ios_last_read, ios_given, ios_frames_done, ios_writes_late;
 static struct { uint32_t lines, gain, frame_lines; bool pending; } ios_ask;
 static struct { uint32_t lines, gain, frame_lines; uint64_t from; } ios_now, ios_next;
-static vm_offset_t keep;
-static uint64_t keep_bytes;
 /*
  * What the frames are (boot-arg cam_pattern): 0 the sensor's picture; 1 colour bars -- the sensor's own,
  * where its module file has a table for them (Android's "testPatternData"), else the CSID's; 2 the
@@ -2801,6 +2982,9 @@ static uint64_t keep_bytes;
  */
 enum { SOURCE_SENSOR, SOURCE_SENSOR_PATTERN, SOURCE_CSID_TPG };
 static int ios_source = SOURCE_SENSOR;
+/* REDWOOD_CAMERA_SENSOR: the sensor (and mode) to change to, taken between sessions */
+static volatile unsigned ios_switch_to;         /* 1 + the sensor's index; 0: none asked for */
+static uint32_t ios_switch_mode;
 
 static uint64_t
 ios_ms(void)
@@ -2953,7 +3137,7 @@ ios_start(void)
 	ios_ask.pending = false;
 	lck_mtx_unlock(&ios_lock);
 	exposure_limits(&lines, &gain, &frame_lines);
-	if (!sensor_table("on") || !exposure_write(lines, gain, frame_lines)) {
+	if (!sensor_table("on") || (hw->regs == REGS_SMIA && !exposure_write(lines, gain, frame_lines))) {
 		return false;
 	}
 	ios_now.lines = ios_next.lines = lines;
@@ -2968,7 +3152,7 @@ ios_start(void)
 static void
 ios_session(void)
 {
-	int writing = 0, next = -1;
+	int writing = 0, next = 0;      /* (place 0's address is the write master's from ife_config(): taken at the first SOF) */
 	uint64_t last_frame;
 
 	if (!ios_start()) {
@@ -2983,7 +3167,7 @@ ios_session(void)
 	ios_streaming = true;
 	ios_last_read = ios_ms();
 	lck_mtx_unlock(&ios_lock);
-	while (!broken && ios_open) {
+	while (!broken && ios_open && ios_switch_to == 0) {
 		uint32_t top, bus;
 		uint64_t now;
 
@@ -3030,14 +3214,13 @@ ios_session(void)
 		}
 		if (top & RDI0_SOF) {
 			if (next >= 0) {
-				writing = next;
+				writing = next;         /* (the address given at the last SOF, taken at this one) */
 				next = -1;
-			} else if (bus & WM0_DONE) {
-				ios_writes_late++;      /* the address came after this SOF: the frame just done is written over */
+			} else {
+				ios_writes_late++;      /* no address waiting: this frame goes where the last one went */
 			}
 			place[writing].state = PLACE_WRITING;
-		}
-		if ((bus & WM0_DONE) && next < 0) {
+			/* the address for the frame after this one, taken at the next SOF: a whole frame's time to give it in */
 			for (int i = 0; i < RING; i++) {
 				int c = (writing + 1 + i) % RING;
 
@@ -3058,7 +3241,7 @@ ios_session(void)
 		if (bus & WM0_DONE) {
 			wakeup(&ios_frames_done);
 		}
-		if (ask && ios_source != SOURCE_CSID_TPG) {
+		if (ask && ios_source != SOURCE_CSID_TPG && hw->regs == REGS_SMIA) {
 			exposure_limits(&lines, &gain, &frame_lines);
 			if (lines != ios_now.lines || gain != ios_now.gain || frame_lines != ios_now.frame_lines) {
 				if (!exposure_write(lines, gain, frame_lines)) {
@@ -3086,7 +3269,7 @@ ios_session(void)
 			}
 		}
 	}
-	ios_stop(broken ? "a fault" : !ios_open ? "closed" : "nobody reads");
+	ios_stop(broken ? "a fault" : !ios_open ? "closed" : ios_switch_to != 0 ? "another sensor asked for" : "nobody reads");
 }
 
 static const char *
@@ -3149,6 +3332,10 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 			lck_mtx_unlock(&ios_lock);
 			return EAGAIN;
 		}
+		if (!ios_streaming && !ios_wanted) {
+			ios_wanted = true;      /* (the frames stopped meanwhile: another sensor) */
+			wakeup(&ios_open);
+		}
 		struct timespec ts = { 0, 100 * NSEC_PER_MSEC };
 		error = msleep(&ios_frames_done, &ios_lock, PZERO | PCATCH, "redwood-camera", &ts);
 		if (error != 0 && error != EWOULDBLOCK) {
@@ -3166,7 +3353,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	f.height = ios_mode->height;
 	f.stride = RAW10_STRIDE(ios_mode->width);
 	f.format = 1;
-	f.bayer = ios_source == SOURCE_CSID_TPG ? 0 : ios_source == SOURCE_SENSOR_PATTERN && hw->omnivision ? 2 : hw->bayer;
+	f.bayer = ios_source == SOURCE_CSID_TPG ? 0 : ios_source == SOURCE_SENSOR_PATTERN ? hw->pattern_bayer : hw->bayer;
 	f.black = 64;
 	f.sequence = place[b].sequence;
 	f.time = place[b].time;
@@ -3179,6 +3366,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	f.frame_lines_min = ios_mode->frame_length;
 	f.frame_lines_max = FRAME_LINES_MAX;
 	f.margin = EXPOSURE_MARGIN;
+	f.sensor = hw_index;
 	lck_mtx_unlock(&ios_lock);
 
 	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
@@ -3272,6 +3460,17 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	if (c.command == REDWOOD_CAMERA_KEEP) {
 		return keep_picture(&c, uio);
 	}
+	if (c.command == REDWOOD_CAMERA_SENSOR) {
+		if (c.a >= sizeof(sensors) / sizeof(sensors[0])) {
+			return EINVAL;
+		}
+		lck_mtx_lock(&ios_lock);
+		ios_switch_mode = c.b;
+		ios_switch_to = c.a + 1;
+		lck_mtx_unlock(&ios_lock);
+		wakeup(&ios_open);
+		return 0;
+	}
 	return EINVAL;
 }
 
@@ -3295,25 +3494,40 @@ camdev_make(void)
 	camdev_made = major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-camera") != NULL;
 }
 
-/* cam=5: a session whenever a read wants frames, until a fault. */
-static void
-serve_ios(void)
+/*
+ * The sensor (and its mode) the sessions take: its tables, the mode asked for or else the one with
+ * the most pixels of those at 4:3, at most 30 frames a second and 13 megapixels (the wide one's
+ * 4000x3000, the front one's 2304x1728, the ultra-wide's 3264x2448, the macro's 1600x1200), the
+ * colour bars' source (cam_pattern), the first exposure. False if the sensor cannot be used.
+ */
+static bool
+ios_select(unsigned index, uint32_t mode_n)
 {
-	uint32_t mode_n = 1;
-
+	select_sensor(index);
+	find_pins();
 	if (!ctab_load()) {
-		return;
+		return false;
 	}
-	(void)PE_parse_boot_argn("cam_mode", &mode_n, sizeof(mode_n));
 	if (mode_n >= ctab->modes) {
+		uint64_t best = 0;
+
 		mode_n = 0;
+		for (uint32_t m = 0; m < ctab->modes; m++) {
+			const struct ctab_mode *o = &ctab_modes[m];
+			uint64_t pixels = (uint64_t)o->width * o->height;
+
+			if (o->width * 3 == o->height * 4 && o->fps_milli <= 31000 && pixels <= 13000000 && pixels > best) {
+				best = pixels;
+				mode_n = m;
+			}
+		}
 	}
 	ios_mode_n = mode_n;
 	ios_mode = &ctab_modes[mode_n];
 	if (ios_mode->lanes < 1 || ios_mode->lanes > (ios_mode->cphy ? 3u : 4u) || ios_mode->data_type != RAW10_DT ||
 	    ios_mode->width % 4 != 0 || ios_mode->fps_milli == 0 || ios_mode->frame_length == 0) {
 		say("camera: mode %u is not what this is written for\n", mode_n);
-		return;
+		return false;
 	}
 	ios_line_ns = (uint32_t)(1000000000000ull / ((uint64_t)ios_mode->fps_milli * ios_mode->frame_length));
 	uint32_t pattern = 0, count = 0;
@@ -3333,22 +3547,48 @@ serve_ios(void)
 	ios_ask.frame_lines = 0;
 	(void)PE_parse_boot_argn("cam_shutter", &ios_ask.lines, sizeof(ios_ask.lines));
 	(void)PE_parse_boot_argn("cam_gain", &ios_ask.gain, sizeof(ios_ask.gain));
+	say("camera: /dev/redwood-camera: the %s camera's frames (mode %u: %ux%u, %u.%03u frames/s at the most), whenever it is "
+	    "read\n", hw->name, mode_n, ios_mode->width, ios_mode->height, ios_mode->fps_milli / 1000, ios_mode->fps_milli % 1000);
+	return true;
+}
+
+/* cam=5: a session whenever a read wants frames, another sensor whenever one is asked for, until a fault. */
+static void
+serve_ios(void)
+{
+	uint32_t mode_n = ~0u;
+
 	if (!camdev_made) {
 		say("camera: /dev/redwood-camera cannot be made\n");
 		return;
 	}
-	say("camera: /dev/redwood-camera: the %s camera's frames for iOS (mode %u: %ux%u, %u.%03u frames/s at the most), whenever it "
-	    "is read\n", hw->name, mode_n, ios_mode->width, ios_mode->height, ios_mode->fps_milli / 1000, ios_mode->fps_milli % 1000);
+	(void)PE_parse_boot_argn("cam_mode", &mode_n, sizeof(mode_n));
+	if (!ios_select(hw_index, mode_n)) {
+		return;
+	}
 	while (!broken) {
 		lck_mtx_lock(&ios_lock);
-		while (!broken && !(ios_open && ios_wanted)) {
+		while (!broken && !(ios_open && ios_wanted) && ios_switch_to == 0) {
 			(void)msleep(&ios_open, &ios_lock, PZERO, "redwood-camera-idle", NULL);
 		}
-		ios_wanted = false;
+		unsigned to = ios_switch_to;
+
+		ios_switch_to = 0;
 		lck_mtx_unlock(&ios_lock);
 		if (broken) {
 			break;
 		}
+		if (to != 0) {
+			/* (the last session is over: everything is down) */
+			if (!ios_select(to - 1, ios_switch_mode)) {
+				give_up("a sensor that cannot be used");
+				break;
+			}
+			continue;
+		}
+		lck_mtx_lock(&ios_lock);
+		ios_wanted = false;
+		lck_mtx_unlock(&ios_lock);
 		ios_session();
 	}
 	say("camera: /dev/redwood-camera: no more frames in this run\n");
@@ -3417,21 +3657,21 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
-	if ((PE_parse_boot_arg_str("cam_sensor", which, sizeof(which)) && strcmp(which, "wide") == 0) || level == 5) {
-		hw = &sensors[1];       /* (cam=5 is the wide one's: its exposure registers are the SMIA ones) */
+	select_sensor(level == 5 ? 1 : 0);
+	if (PE_parse_boot_arg_str("cam_sensor", which, sizeof(which))) {
+		for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
+			if (strncmp(which, sensors[i].name, strlen(which)) == 0 && (sensors[i].name[strlen(which)] == ' ' ||
+			    sensors[i].name[strlen(which)] == '-')) {
+				select_sensor(i);
+			}
+		}
 	}
-	cci_bus.name = hw->bus_name;
-	cci_bus.sda = hw->sda;
-	cci_bus.scl = hw->scl;
 	say("camera: cam=%u: the %s camera%s\n", level, hw->name, level == 5 ? ": its frames for iOS" :
 	    level == 4 ? ": its frames through its CSIPHY and RDI 0 into memory" :
 	    level == 3 ? ": the CSID's test pattern through RDI 0 into memory" :
 	    level == 2 ? ": powered up, its chip ID read, powered down" : ": a look, reading only");
 	pgpio_find();
-	found_reset_cfg = rd(GPIO_CFG(hw->reset));
-	found_reset_io = rd(GPIO_IO(hw->reset));
-	found_mclk_cfg = rd(GPIO_CFG(hw->mclk_pin));
-	pins_found = true;
+	find_pins();
 	look();
 	look_around();
 	if (level == 3) {
@@ -3465,10 +3705,11 @@ redwood_camera_init(void)
 		return;
 	}
 	level = level > 5 ? 5 : level;
-	if (level == 5) {
+	if (level >= 3) {
 		/*
-		 * The memory for a picture for the host (cam_keep_mb, default 24: a 12-megapixel NV12 picture), in
-		 * one piece: taken now, while the system's memory still is in large pieces.
+		 * Memory in one piece for the host (cam_keep_mb, default 24: a 12-megapixel NV12 picture of cam=5,
+		 * or two frames of cam=3 and cam=4 up to 12 MB each), taken now, while the system's memory still
+		 * is in large pieces.
 		 */
 		uint32_t keep_mb = 24;
 
