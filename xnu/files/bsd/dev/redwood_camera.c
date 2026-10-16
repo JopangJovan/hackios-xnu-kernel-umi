@@ -201,6 +201,7 @@ struct sensor_hw {
 	uint8_t         bayer;          /* the picture's order as it comes here (camraw.py's codes: 0 RGGB, 2 GBRG) */
 	uint8_t         pattern_bayer;  /* ... and its own colour bars' (its module file's "tpgon") */
 	const char *    chip;           /* for the frames' header */
+	uint16_t        gain_unity, gain_max;   /* the analog gain register's 1x, and the most it is given */
 };
 enum {
 	REGS_OV_PAGED,                  /* OmniVision, 8-bit registers in pages (0xfd): exposure 0x0e/0x0f, gain 0x22, VTS 0x14/0x15 */
@@ -213,7 +214,7 @@ static const struct sensor_hw sensors[] = {
 		.mclk_cmd = 0xe038, .mclk_cbcr = 0xe050, .mclk_pin = 66,
 		.vana = { SUPPLY_LDO, 7, 2800, 0, 0 }, .vdig = { SUPPLY_LDO, 6, 1800, 0, 0 }, .vio = { SUPPLY_NONE, 0, 0, 0, 0 },
 		.csiphy = 2, .phy_cbcr = 0xe110, .timer_cmd = 0xe0f4, .timer_cbcr = 0xe10c, .regs = REGS_OV_PAGED, .bayer = 0,
-		.pattern_bayer = 2, .chip = "OV02B10",
+		.pattern_bayer = 2, .chip = "OV02B10", .gain_unity = 16, .gain_max = 0xf8,
 	},
 	{       /* cam-sensor0: S5KHM2SD, CCI 0 master 1 (GPIO 71/72), reset GPIO 21, MCLK1 (GPIO 65), csiphy 1;
 		 * VANA: camera_wide_vana_ldo, a fixed 2.8 V regulator from BOB switched by GPIO 106 (ramp 135 us) */
@@ -221,22 +222,22 @@ static const struct sensor_hw sensors[] = {
 		.mclk_cmd = 0xe01c, .mclk_cbcr = 0xe034, .mclk_pin = 65,
 		.vana = { SUPPLY_GPIO, 0, 2800, 106, 135 }, .vdig = { SUPPLY_LDO, 1, 1000, 0, 0 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
 		.csiphy = 1, .phy_cbcr = 0xe0ec, .timer_cmd = 0xe0d0, .timer_cbcr = 0xe0e8, .regs = REGS_SMIA, .bayer = 2,
-		.pattern_bayer = 2, .chip = "S5KHM2SD",
+		.pattern_bayer = 2, .chip = "S5KHM2SD", .gain_unity = 32, .gain_max = 0x800,
 	},
 	{       /* cam-sensor1: OV16A1Q, CCI 0 master 0 (GPIO 69/70), reset GPIO 20, MCLK0 (GPIO 64), csiphy 0 */
 		.name = "front (OV16A1Q)", .tab = "camera-ov16a1q.tab", .bus_name = "CCI 0 master 0", .sda = 69, .scl = 70, .reset = 20,
 		.mclk_cmd = 0xe000, .mclk_cbcr = 0xe018, .mclk_pin = 64,
 		.vana = { SUPPLY_LDO, 3, 2800, 0, 0 }, .vdig = { SUPPLY_LDO, 2, 1200, 0, 0 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
 		.csiphy = 0, .phy_cbcr = 0xe0c8, .timer_cmd = 0xe0ac, .timer_cbcr = 0xe0c4, .regs = REGS_OV16, .bayer = 0,
-		.pattern_bayer = 0, .chip = "OV16A1Q",
+		.pattern_bayer = 0, .chip = "OV16A1Q", .gain_unity = 0x100, .gain_max = 0xf80,
 	},
 	{       /* cam-sensor3: S5K4H7, CCI 1 master 1 (GPIO 75/76), reset GPIO 78, MCLK3 (GPIO 67, 24 MHz: camcc's PLL2), csiphy 3;
 		 * VDIG: camera_ultra_dvdd_ldo, a fixed 1.2 V regulator from PM7325 S8 switched by GPIO 108 (ramp 135 us) */
 		.name = "ultra-wide (S5K4H7)", .tab = "camera-s5k4h7.tab", .bus_name = "CCI 1 master 1", .sda = 75, .scl = 76, .reset = 78,
 		.mclk_cmd = 0xe054, .mclk_cbcr = 0xe06c, .mclk_pin = 67,
 		.vana = { SUPPLY_LDO, 4, 2800, 0, 0 }, .vdig = { SUPPLY_GPIO, 0, 1200, 108, 135 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
-		.csiphy = 3, .phy_cbcr = 0xe138, .timer_cmd = 0xe11c, .timer_cbcr = 0xe134, .regs = REGS_SMIA, .bayer = 0,
-		.pattern_bayer = 0, .chip = "S5K4H7",
+		.csiphy = 3, .phy_cbcr = 0xe138, .timer_cmd = 0xe11c, .timer_cbcr = 0xe134, .regs = REGS_SMIA, .bayer = 2,
+		.pattern_bayer = 2, .chip = "S5K4H7", .gain_unity = 32, .gain_max = 0x200,
 	},
 };
 static const struct sensor_hw *hw = &sensors[0];
@@ -2950,8 +2951,8 @@ capture_sensor(void)
 #define IDLE_MS                 1000
 #define FRAME_TIMEOUT_MS        1500
 #define EXPOSURE_MARGIN         40
-#define GAIN_UNITY              32              /* the S5KHM2SD's 0x0204: 32 is 1x (cam=4) */
-#define GAIN_MAX                0x800
+#define GAIN_UNITY              (hw->gain_unity)
+#define GAIN_MAX                (hw->gain_max)
 #define FRAME_LINES_MAX         0xfff0
 #define RDI0_SOF                (1u << 27)      /* IFE_IRQ_STATUS0 (cam_vfe_lite16x.h: sof_irq_mask of RDI 0) */
 #define WM0_DONE                1u              /* BUS_IRQ_STATUS1 */
@@ -3012,11 +3013,42 @@ exposure_limits(uint32_t *lines, uint32_t *gain, uint32_t *frame_lines)
 	}
 }
 
+/*
+ * The exposure, gain and frame length, written the sensor's way in its group hold (its module file's
+ * "holdon" and "holdoff" tables; the OV02B10's page 1 and its 0xfe = 2):
+ *   SMIA      0x0340 frame length, 0x0202 coarse integration (lines), 0x0204 analog gain (32 is 1x)
+ *   OV16A1Q   0x380e/0x380f frame length (VTS), 0x3500..0x3502 exposure (lines, 20 bits), 0x3508/0x3509
+ *             gain (0x100 is 1x) -- the registers its tables set the first exposure in
+ *   OV02B10   0x14/0x15 the frame's extra lines, 0x0e/0x0f exposure (lines), 0x22 gain (16 is 1x)
+ */
 static bool
 exposure_write(uint32_t lines, uint32_t gain, uint32_t frame_lines)
 {
-	if (!sensor_table("holdon") || !sensor_write(0x0340, (uint16_t)frame_lines, true) || !sensor_write(0x0202, (uint16_t)lines, true) ||
-	    !sensor_write(0x0204, (uint16_t)gain, true) || !sensor_table("holdoff")) {
+	bool ok;
+
+	switch (hw->regs) {
+	case REGS_SMIA:
+		ok = sensor_table("holdon") && sensor_write(0x0340, (uint16_t)frame_lines, true) && sensor_write(0x0202, (uint16_t)lines, true) &&
+		    sensor_write(0x0204, (uint16_t)gain, true) && sensor_table("holdoff");
+		break;
+	case REGS_OV16:
+		ok = sensor_table("holdon") && sensor_write(0x380e, (uint16_t)(frame_lines >> 8), false) &&
+		    sensor_write(0x380f, (uint16_t)(frame_lines & 0xff), false) && sensor_write(0x3500, (uint16_t)(lines >> 16 & 0xf), false) &&
+		    sensor_write(0x3501, (uint16_t)(lines >> 8 & 0xff), false) && sensor_write(0x3502, (uint16_t)(lines & 0xff), false) &&
+		    sensor_write(0x3508, (uint16_t)(gain >> 8 & 0x1f), false) && sensor_write(0x3509, (uint16_t)(gain & 0xff), false) &&
+		    sensor_table("holdoff");
+		break;
+	default: {
+		uint32_t extra = frame_lines - ios_mode->frame_length;
+
+		ok = sensor_write(0xfd, 0x01, false) && sensor_write(0x14, (uint16_t)(extra >> 8), false) &&
+		    sensor_write(0x15, (uint16_t)(extra & 0xff), false) && sensor_write(0x0e, (uint16_t)(lines >> 8), false) &&
+		    sensor_write(0x0f, (uint16_t)(lines & 0xff), false) && sensor_write(0x22, (uint16_t)gain, false) &&
+		    sensor_write(0xfe, 0x02, false) && sensor_write(0xfd, 0x00, false);
+		break;
+	}
+	}
+	if (!ok) {
 		give_up("a sensor write nobody acknowledged");
 		return false;
 	}
@@ -3137,7 +3169,7 @@ ios_start(void)
 	ios_ask.pending = false;
 	lck_mtx_unlock(&ios_lock);
 	exposure_limits(&lines, &gain, &frame_lines);
-	if (!sensor_table("on") || (hw->regs == REGS_SMIA && !exposure_write(lines, gain, frame_lines))) {
+	if (!sensor_table("on") || !exposure_write(lines, gain, frame_lines)) {
 		return false;
 	}
 	ios_now.lines = ios_next.lines = lines;
@@ -3241,7 +3273,7 @@ ios_session(void)
 		if (bus & WM0_DONE) {
 			wakeup(&ios_frames_done);
 		}
-		if (ask && ios_source != SOURCE_CSID_TPG && hw->regs == REGS_SMIA) {
+		if (ask && ios_source != SOURCE_CSID_TPG) {
 			exposure_limits(&lines, &gain, &frame_lines);
 			if (lines != ios_now.lines || gain != ios_now.gain || frame_lines != ios_now.frame_lines) {
 				if (!exposure_write(lines, gain, frame_lines)) {
