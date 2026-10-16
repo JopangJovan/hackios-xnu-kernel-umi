@@ -771,11 +771,11 @@ layers(void)
  * whole only at full opacity: the strokes of the media controls, orientation lock, screen mirroring
  * and Focus came in only when the springs had settled, at the end of the presentation. (On an iPhone
  * they are whole all along.) So in Control Center's window an opacity animation is replaced with an
- * eased-out fade of CC_FADE_MS between the same values: the modules still fade in and out, and are at
- * full opacity, glyphs whole, after a few frames. Boot-arg cc_fade=MS sets the fade, cc_fade=0 leaves
- * iOS's animations alone.
+ * eased-out fade of cc_fade=MS between the same values: the modules still fade in and out, and are at
+ * full opacity, glyphs whole, after a few frames. Off by default (iOS's own animations stay as they
+ * are; the real fix belongs in the drawing, not in the animations): a workaround, for checks only.
  */
-#define CC_FADE_MS      100
+#define CC_FADE_MS      0
 static void (*original_add_animation_cc)(id self, SEL selector, id animation, id key);
 static double cc_fade_s = CC_FADE_MS / 1000.0;
 static unsigned cc_fades;
