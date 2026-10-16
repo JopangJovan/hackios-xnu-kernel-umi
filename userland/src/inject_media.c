@@ -22,6 +22,12 @@
  * by where it calls from -- is given one of ours, with a device and a stream whose torch level goes
  * to the kernel (see flashlight_*() below). Everybody else still gets none, as before.
  *
+ * The camera (only where the kernel has one: cam=5, /dev/redwood-camera): the vendor is made for
+ * everybody, with the create function of our capture device (camera_device.c) in place of the
+ * one H10ISP.mediacapture would give for the iPhone's ISP. NOT FINISHED: no frames reach
+ * applications yet (see camera_device.c). Its stream takes the torch level too, so FigFlashlight
+ * would need nothing of its own then (not tried yet).
+ *
  * CMCapture is not loaded yet when this library is: the methods are replaced when its image
  * arrives.
  */
@@ -30,6 +36,7 @@
 #include <mach-o/dyld.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -67,6 +74,8 @@ prewarm_portrait_filter(__unused id self, __unused SEL selector, __unused int ve
 /* ---- the flashlight ------------------------------------------------------------------------------- */
 
 static int torch = -1;                  /* /dev/redwood-torch */
+static bool camera;                     /* /dev/redwood-camera is there */
+extern int redwood_camera_device_create(const void *allocator, const void *options, void **out);
 static Class vendor_class, device_class, stream_class;
 static IMP original_shared_vendor;
 static unsigned torch_said;
@@ -81,16 +90,34 @@ static const struct { uintptr_t from, to; } flashlight_code[] = {
 
 /* +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor] */
 static id
-flashlight_shared_vendor(id self, SEL selector)
+shared_vendor(id self, SEL selector)
 {
 	uintptr_t caller = (uintptr_t)__builtin_return_address(0) - slide;
 	id vendor = ((id (*)(id, SEL))original_shared_vendor)(self, selector);
-	static id ours;
+	static id ours, camera_vendor;
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 	if (vendor != NULL) {
 		return vendor;
 	}
-	for (size_t i = 0; i < sizeof(flashlight_code) / sizeof(flashlight_code[0]); i++) {
+	if (!camera && access("/dev/redwood-camera", F_OK) == 0) {
+		camera = true;          /* (should the kernel have made it after mediaserverd started) */
+		say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera)\n");
+	}
+	if (camera) {
+		pthread_mutex_lock(&lock);
+		if (camera_vendor == NULL) {
+			id made = ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("BWFigCaptureDeviceVendor"), sel_registerName("alloc"));
+
+			camera_vendor = ((id (*)(id, SEL, void *))objc_msgSend)(made, sel_registerName("initWithDeviceCreateFunction:"),
+			    (void *)redwood_camera_device_create);
+			say("redwood: mediaserverd: the camera's device vendor %s\n", camera_vendor ? "made (camera_device.c)" :
+			    "CANNOT BE MADE");
+		}
+		pthread_mutex_unlock(&lock);
+		return camera_vendor;
+	}
+	for (size_t i = 0; torch >= 0 && i < sizeof(flashlight_code) / sizeof(flashlight_code[0]); i++) {
 		if (caller >= flashlight_code[i].from && caller < flashlight_code[i].to) {
 			if (ours == NULL) {
 				ours = class_createInstance(vendor_class, 0);
@@ -217,19 +244,19 @@ flashlight_classes(void)
 /*
  * The class methods replaced, each as soon as its class exists. `expected` is the unslid address
  * of the code in iOS 16.5 (20F66): a method that is not what it was is left alone. `original`, where
- * there is one, keeps what was there; the flashlight's is replaced only where the kernel has one.
+ * there is one, keeps what was there (the vendor's: given as it is wherever there is one, and where
+ * there is none, ours only with the kernel's camera or flashlight).
  */
 static struct replacement {
 	const char *class_name, *selector;
-	bool flashlight;
 	uintptr_t expected;
 	IMP replacement, *original;
 	bool done;
 } replacements[] = {
-	{ "BWCoreImageFilterRenderer", "prewarmPortraitFilterVersion:semanticStyleFilters:", false, 0x1a2115c0cUL,
+	{ "BWCoreImageFilterRenderer", "prewarmPortraitFilterVersion:semanticStyleFilters:", 0x1a2115c0cUL,
 	  (IMP)prewarm_portrait_filter, NULL, false },
-	{ "BWFigCaptureDeviceVendor", "sharedCaptureDeviceVendor", true, 0x1a1ef0d04UL,
-	  (IMP)flashlight_shared_vendor, &original_shared_vendor, false },
+	{ "BWFigCaptureDeviceVendor", "sharedCaptureDeviceVendor", 0x1a1ef0d04UL,
+	  (IMP)shared_vendor, &original_shared_vendor, false },
 };
 
 static void
@@ -241,7 +268,7 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 		Method method;
 		IMP original;
 
-		if (r->done || (r->flashlight && torch < 0) || (cls = objc_getClass(r->class_name)) == NULL) {
+		if (r->done || (cls = objc_getClass(r->class_name)) == NULL) {
 			continue;
 		}
 		r->done = true;
@@ -272,9 +299,13 @@ redwood_media_init(void)
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	torch = open("/dev/redwood-torch", O_WRONLY);
+	camera = access("/dev/redwood-camera", F_OK) == 0;
 	if (torch >= 0) {
 		flashlight_classes();
 		say("redwood: mediaserverd: the kernel has a flashlight (/dev/redwood-torch)\n");
+	}
+	if (camera) {
+		say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera)\n");
 	}
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
 }

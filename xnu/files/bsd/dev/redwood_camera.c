@@ -2793,6 +2793,14 @@ static struct { uint32_t lines, gain, frame_lines; bool pending; } ios_ask;
 static struct { uint32_t lines, gain, frame_lines; uint64_t from; } ios_now, ios_next;
 static vm_offset_t keep;
 static uint64_t keep_bytes;
+/*
+ * What the frames are (boot-arg cam_pattern): 0 the sensor's picture; 1 colour bars -- the sensor's own,
+ * where its module file has a table for them (Android's "testPatternData"), else the CSID's; 2 the
+ * CSID's colour bars (no sensor at all). The wide camera's module file has no colour bars of the
+ * sensor's (its one test pattern table is empty), so cam_pattern=1 gives it the CSID's.
+ */
+enum { SOURCE_SENSOR, SOURCE_SENSOR_PATTERN, SOURCE_CSID_TPG };
+static int ios_source = SOURCE_SENSOR;
 
 static uint64_t
 ios_ms(void)
@@ -2878,7 +2886,7 @@ ios_stop(const char *why)
 	}
 	lck_mtx_unlock(&ios_lock);
 	wakeup(&ios_frames_done);
-	if (!broken) {
+	if (!broken && ios_source != SOURCE_CSID_TPG) {
 		(void)sensor_table("off");
 	}
 	show_paths("at the end");
@@ -2903,12 +2911,35 @@ ios_start(void)
 	if (!ring_alloc(RAW10_STRIDE(ios_mode->width) * ios_mode->height)) {
 		return false;
 	}
+	if (ios_source == SOURCE_CSID_TPG) {
+		/* the CSID's colour bars in the mode's size, as cam=3 makes them: no sensor, no CSIPHY */
+		if (!titan_up() || !smmu_up() || !csid_reset() ||
+		    !csid_config(-1, 4, 0x3210, TPG_VC, ios_mode->width, ios_mode->height, false) ||
+		    !ife_config(FRAME_ADDRESSES, ring_frame_bytes, 0) || !tpg_start()) {
+			return false;
+		}
+		lck_mtx_lock(&ios_lock);
+		for (int i = 0; i < RING; i++) {
+			place[i].state = PLACE_FREE;
+		}
+		place[0].state = PLACE_WRITING;
+		lck_mtx_unlock(&ios_lock);
+		ios_now.lines = ios_next.lines = ios_mode->frame_length - EXPOSURE_MARGIN;
+		ios_now.gain = ios_next.gain = GAIN_UNITY;
+		ios_now.frame_lines = ios_next.frame_lines = ios_mode->frame_length;
+		ios_next.from = 0;
+		say("camera: the frames for iOS: the CSID's colour bars, %ux%u (no sensor)\n", ios_mode->width, ios_mode->height);
+		return true;
+	}
 	if (!power_up() || !healthy() || !read_chip_id() || !sensor_table("init") || !sensor_table(ios_res()) || !healthy() ||
 	    !titan_up() || !smmu_up() || !csid_reset() ||
 	    !csid_config((int)hw->csiphy, ios_mode->lanes, ctab->lane_assign & ((1u << (4 * ios_mode->lanes)) - 1), 0, ios_mode->width,
 	    ios_mode->height, ios_mode->cphy != 0) || !ife_config(FRAME_ADDRESSES, ring_frame_bytes, 0) ||
 	    !csiphy_up(ios_mode->lanes, ios_mode->cphy != 0, ctab->lane_assign, ios_mode->settle,
 	    (uint64_t)ios_mode->pixel_clock * 10 / ios_mode->lanes)) {
+		return false;
+	}
+	if (ios_source == SOURCE_SENSOR_PATTERN && !sensor_table("tpgon")) {
 		return false;
 	}
 	lck_mtx_lock(&ios_lock);
@@ -3027,7 +3058,7 @@ ios_session(void)
 		if (bus & WM0_DONE) {
 			wakeup(&ios_frames_done);
 		}
-		if (ask) {
+		if (ask && ios_source != SOURCE_CSID_TPG) {
 			exposure_limits(&lines, &gain, &frame_lines);
 			if (lines != ios_now.lines || gain != ios_now.gain || frame_lines != ios_now.frame_lines) {
 				if (!exposure_write(lines, gain, frame_lines)) {
@@ -3135,7 +3166,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	f.height = ios_mode->height;
 	f.stride = RAW10_STRIDE(ios_mode->width);
 	f.format = 1;
-	f.bayer = hw->bayer;
+	f.bayer = ios_source == SOURCE_CSID_TPG ? 0 : ios_source == SOURCE_SENSOR_PATTERN && hw->omnivision ? 2 : hw->bayer;
 	f.black = 64;
 	f.sequence = place[b].sequence;
 	f.time = place[b].time;
@@ -3250,11 +3281,24 @@ static const struct cdevsw camdev_cdevsw = {
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
-/* cam=5: the device, and a session whenever a read wants frames, until a fault. */
+/*
+ * The device node, made as the thread starts (before mediaserverd does: its capture stack looks for
+ * cameras once, when it starts); reads wait until serve_ios() is there to answer them.
+ */
+static bool camdev_made;
+
+static void
+camdev_make(void)
+{
+	int major = cdevsw_add(-1, &camdev_cdevsw);
+
+	camdev_made = major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-camera") != NULL;
+}
+
+/* cam=5: a session whenever a read wants frames, until a fault. */
 static void
 serve_ios(void)
 {
-	int major;
 	uint32_t mode_n = 1;
 
 	if (!ctab_load()) {
@@ -3272,14 +3316,24 @@ serve_ios(void)
 		return;
 	}
 	ios_line_ns = (uint32_t)(1000000000000ull / ((uint64_t)ios_mode->fps_milli * ios_mode->frame_length));
+	uint32_t pattern = 0, count = 0;
+	const struct ctab_entry *tpgon;
+
+	(void)PE_parse_boot_argn("cam_pattern", &pattern, sizeof(pattern));
+	tpgon = ctab_find("tpgon", &count);
+	ios_source = pattern == 0 ? SOURCE_SENSOR : pattern == 1 && tpgon != NULL && count > 0 && tpgon[0].address != 0 ?
+	    SOURCE_SENSOR_PATTERN : SOURCE_CSID_TPG;
+	if (pattern != 0) {
+		say("camera: cam_pattern=%u: %s\n", pattern, ios_source == SOURCE_SENSOR_PATTERN ? "the sensor's colour bars (its tpgon table)" :
+		    "the CSID's colour bars");
+	}
 	/* the first exposure, until the program asks for its own: boot-args as cam=4's, else a room's */
 	ios_ask.lines = ios_mode->frame_length - EXPOSURE_MARGIN;
 	ios_ask.gain = 8 * GAIN_UNITY;
 	ios_ask.frame_lines = 0;
 	(void)PE_parse_boot_argn("cam_shutter", &ios_ask.lines, sizeof(ios_ask.lines));
 	(void)PE_parse_boot_argn("cam_gain", &ios_ask.gain, sizeof(ios_ask.gain));
-	major = cdevsw_add(-1, &camdev_cdevsw);
-	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-camera") == NULL) {
+	if (!camdev_made) {
 		say("camera: /dev/redwood-camera cannot be made\n");
 		return;
 	}
@@ -3353,6 +3407,9 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	char which[16] = "";
 
 	(void)PE_parse_boot_argn("cam_after", &secs, sizeof(secs));
+	if (level == 5) {
+		camdev_make();
+	}
 	wait_ms(secs * 1000);           /* (the system up first: nothing else is on these buses then) */
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	gcc = ml_io_map(GCC_PHYS, 0x30000);

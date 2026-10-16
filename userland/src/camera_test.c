@@ -129,7 +129,7 @@ raw(int frames, bool ae, bool keep_raw)
 	uint8_t *y = (uint8_t *)(keep + 1);
 	uint64_t t0 = mach_absolute_time();
 
-	isp_render_nv12(&isp, f, (const uint8_t *)f + f->header_bytes, y, w, y + (size_t)w * h, w, w, h, 0, h);
+	isp_render_nv12(&isp, f, (const uint8_t *)f + f->header_bytes, y, w, y + (size_t)w * h, w, w, h, 0, h, false);
 	printf("camera_test: the picture (%ux%u NV12) made in %.1f ms\n", w, h, ms_since(t0));
 	memset(keep, 0, sizeof(*keep));
 	keep->command = REDWOOD_CAMERA_KEEP;

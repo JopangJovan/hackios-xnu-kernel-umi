@@ -1737,6 +1737,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int more_cores = 0, battery_requested = 0;
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
 	int torch_requested = 0;
+	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
+	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
@@ -1747,6 +1749,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
+		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
 	}
 	if (battery_requested) {
@@ -1994,11 +1997,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_end(&w);
 	/*
 	 * and of its camera what is here: with torch=N the flash (MobileGestalt's camera-flash; without
-	 * it Control Center has no flashlight). The rest of the iPhone's camera is not here, nor said to be.
+	 * it Control Center has no flashlight); with cam=5 the node itself, for a camera there is (with it
+	 * MobileGestalt's video-camera). The rest of the iPhone's camera is not here, nor said to be.
 	 */
-	if (torch_requested) {
+	if (torch_requested || camera_requested) {
 		dt_begin(&w, "camera");
-		dt_identity_one(&w, identity_camera, sizeof(identity_camera) / sizeof(identity_camera[0]), identity_camera_data, "flash");
+		if (torch_requested) {
+			dt_identity_one(&w, identity_camera, sizeof(identity_camera) / sizeof(identity_camera[0]), identity_camera_data, "flash");
+		}
 		dt_end(&w);
 	}
 	dt_end(&w);
@@ -2078,6 +2084,16 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop(&w, "ranges", ranges, sizeof(ranges));
 	dt_prop_u32(&w, "#address-cells", 2);
 	dt_prop_u32(&w, "#size-cells", 2);
+	/*
+	 * With cam=5, where MobileGestalt looks for the cameras (IODeviceTree:/arm-io/isp, its still-camera and
+	 * rear-facing-camera, by which SpringBoard shows Camera.app): the iPhone's ISP node, of its
+	 * properties only the camera at the back. Neither a compatible nor a device_type: no driver matches it.
+	 */
+	if (camera_requested) {
+		dt_begin(&w, "isp");
+		dt_prop_u32(&w, "camera-rear", 1);
+		dt_end(&w);
+	}
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
 	dt_prop_str(&w, "compatible", "arm,gic-v3");

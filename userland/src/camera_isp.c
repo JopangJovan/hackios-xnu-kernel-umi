@@ -215,8 +215,10 @@ render_line(const struct isp *isp, const struct redwood_camera_frame *f, const u
 
 void
 isp_render_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
-    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row)
+    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
 {
+	/* video range: luma 16 to 235, chroma 16 to 240 (219 and 224 steps of the full 255) */
+	int ly = video_range ? 219 : 256, lc = video_range ? 224 : 256, oy = video_range ? 16 : 0;
 	uint8_t line[2][3 * 8192];
 
 	if (width > 8192) {
@@ -230,7 +232,7 @@ isp_render_nv12(const struct isp *isp, const struct redwood_camera_frame *f, con
 			const uint8_t *p = line[l];
 
 			for (uint32_t x = 0; x < width; x++, p += 3) {
-				out[x] = (uint8_t)((77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8);
+				out[x] = (uint8_t)(oy + (((77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8) * ly >> 8));
 			}
 		}
 		uint8_t *o = uv + (size_t)(row / 2) * uv_stride;
@@ -240,7 +242,7 @@ isp_render_nv12(const struct isp *isp, const struct redwood_camera_frame *f, con
 			int R = line[0][3 * x] + line[0][3 * x1] + line[1][3 * x] + line[1][3 * x1];
 			int G = line[0][3 * x + 1] + line[0][3 * x1 + 1] + line[1][3 * x + 1] + line[1][3 * x1 + 1];
 			int B = line[0][3 * x + 2] + line[0][3 * x1 + 2] + line[1][3 * x + 2] + line[1][3 * x1 + 2];
-			int cb = ((-43 * R - 85 * G + 128 * B) >> 10) + 128, cr = ((128 * R - 107 * G - 21 * B) >> 10) + 128;
+			int cb = (((-43 * R - 85 * G + 128 * B) >> 10) * lc >> 8) + 128, cr = (((128 * R - 107 * G - 21 * B) >> 10) * lc >> 8) + 128;
 
 			o[x] = (uint8_t)(cb < 0 ? 0 : cb > 255 ? 255 : cb);
 			o[x + 1] = (uint8_t)(cr < 0 ? 0 : cr > 255 ? 255 : cr);
