@@ -336,7 +336,7 @@ index 95192dd62449..b00da803b5b4 100644
  
  	/*
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 1d71c66629fb..024ead8a529a 100644
+index 1d71c66629fb..828cb840fba1 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1157,6 +1157,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -532,7 +532,32 @@ index 1d71c66629fb..024ead8a529a 100644
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
-@@ -7538,6 +7676,11 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -6636,7 +6774,23 @@ handle_mac_transition:
+ 	}
+ 
+ 	/* Update the process' identity version and set the security token */
+-	proc_setpidversion(p, OSIncrementAtomic(&nextpidversion));
++	{
++		/*
++		 * (redwood) Except when xpcproxy becomes the service it was spawned for: then the process keeps
++		 * xpcproxy's identity version, as if launchd had spawned the service itself, which is what launchd
++		 * means by eliding xpcproxy ("service will attempt to elide xpcproxy"; here it spawns xpcproxy
++		 * all the same). RunningBoard keeps the audit token of such a process from before the exec and
++		 * never takes the newer one: every entitlement check it made for it failed (SecTaskLoadEntitlements
++		 * error 3, a thousand times a minute with Safari open), and Safari's web processes got no
++		 * assertions ("target is not running or doesn't have entitlement
++		 * com.apple.runningboard.assertions.webkit"). Boot-arg xpcproxy_idversion=1: a new version, as XNU.
++		 */
++		static TUNABLE(uint32_t, xpcproxy_idversion, "xpcproxy_idversion", 0);
++
++		if (xpcproxy_idversion || strncmp(p->p_comm, "xpcproxy", sizeof(p->p_comm)) != 0) {
++			proc_setpidversion(p, OSIncrementAtomic(&nextpidversion));
++		}
++	}
+ 	task_set_uniqueid(task);
+ 	set_security_token_task_internal(p, task);
+ 
+@@ -7538,6 +7692,11 @@ process_signature(proc_t p, struct image_params *imgp)
  	}
  
  done:
