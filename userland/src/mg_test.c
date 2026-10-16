@@ -1,11 +1,15 @@
 /*
  * mg_test: what MobileGestalt says about this device (the answers iOS builds its idea of the
  * hardware from).   usage: mg_test [KEY...]
+ * A key may also be one of the obfuscated names programs ask by; "MGGetProductType" gives the number
+ * MGGetProductType() returns (what programs tell the models apart by).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
+#include <string.h>
 
 extern CFTypeRef MGCopyAnswer(CFStringRef key);
+extern uint64_t MGGetProductType(void);
 
 static const char *const keys[] = {
 	"DeviceClass", "DeviceClassNumber", "DeviceName", "ProductType", "HWModelStr", "ModelNumber", "ProductName",
@@ -22,6 +26,10 @@ main(int argc, char **argv)
 
 	for (int i = 0; i < count; i++) {
 		const char *name = argc > 1 ? argv[i + 1] : keys[i];
+		if (strcmp(name, "MGGetProductType") == 0) {
+			printf("mg_test: MGGetProductType() = %#llx\n", (unsigned long long)MGGetProductType());
+			continue;
+		}
 		CFStringRef key = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 		CFTypeRef answer = MGCopyAnswer(key);
 		CFStringRef text = answer ? CFCopyDescription(answer) : NULL;
