@@ -115,6 +115,11 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_FRAGMENT_SHADER              0x8b30
 #define GL_TEXTURE                      0x1702
 #define GL_READ_FRAMEBUFFER             0x8ca8
+#define GL_DRAW_FRAMEBUFFER             0x8ca9
+#define GL_READ_FRAMEBUFFER_BINDING     0x8caa
+#define GL_DRAW_FRAMEBUFFER_BINDING     0x8ca6
+#define GL_COLOR_BUFFER_BIT             0x4000
+#define GL_NEAREST                      0x2600
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE 0x8cd0
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME 0x8cd1
 #define GL_COLOR_ATTACHMENT0            0x8ce0
@@ -209,6 +214,7 @@ struct image {
 	bool target;                    /* drawn into (attachImage) rather than shown (texImageIOSurface) */
 	bool invert, drawn;
 	bool shared;                    /* the texture is the surface's memory: nothing to copy */
+	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
 	bool alpha_first;               /* its pixels are opacity, blue, green, red in memory: see my_attachImage() */
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
@@ -229,6 +235,7 @@ struct eagl {
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
+	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
 	GLuint plain, lookup;           /* programs of ours for when that is none (plain_draw_begin()) */
 	GLint plain_matrix, plain_textured, lookup_matrix;
@@ -299,6 +306,17 @@ static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
+/*
+ * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
+ * GPU copies it into the surface at the frame's end (one blit; the display's driver waits for that
+ * submission, as it waited for the frame's last draw). Drawn into the surface's memory directly,
+ * frames came out with parts of them missing, every other frame for a while -- Control Center's
+ * modules, the home screen's icons -- where CoreAnimation reads the picture it is drawing to draw
+ * over it (EXT_shader_framebuffer_fetch, the colour matrix over what is behind: our vibrant program);
+ * a texture of the library's own does not show that, as a copy by the processor did not (glcopy=1).
+ * Boot-arg glblit=0: the surface's memory, as before.
+ */
+static int blit_targets = 1;
 /*
  * A frame that is handed to the display must have been drawn. The display's driver waits for
  * the GPU itself before it puts a surface on the panel, on a thread of its own, and says so in
@@ -487,6 +505,9 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 		}
 		image = &e->images[e->image_count++];
 	} else {
+		if (image->mirror != 0) {
+			glDeleteTextures(1, &image->mirror);
+		}
 		CFRelease(image->surface);
 	}
 	memset(image, 0, sizeof(*image));
@@ -501,6 +522,9 @@ image_forget(struct eagl *e, GLuint texture)
 	struct image *image = image_of(e, texture);
 
 	if (image != NULL) {
+		if (image->mirror != 0) {
+			glDeleteTextures(1, &image->mirror);
+		}
 		CFRelease(image->surface);
 		*image = e->images[--e->image_count];
 	}
@@ -531,6 +555,36 @@ bytes_a_pixel(GLenum format, GLenum type)
 	default:
 		return 2;                               /* the packed 16-bit kinds */
 	}
+}
+
+/*
+ * For a surface drawn into (blit_targets): a second texture that is the surface's memory, for the
+ * frame to be copied into by the GPU; the texture CoreAnimation draws into stays the library's own.
+ * The texture that is bound is bound again after.
+ */
+static bool
+surface_mirrored(struct eagl *e, struct image *image)
+{
+	IOSurfaceRef surface = image->surface;
+	GLint bound = 0;
+
+	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first ||
+	    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE || image->plane != 0 ||
+	    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
+		return false;
+	}
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	glGenTextures(1, &image->mirror);
+	glBindTexture(GL_TEXTURE_2D, image->mirror);
+	if (!redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+		glDeleteTextures(1, &image->mirror);
+		image->mirror = 0;
+		return false;
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	e->shared++;
+	return true;
 }
 
 /*
@@ -676,6 +730,31 @@ target_to_surface(struct eagl *e, struct image *image)
 	uint8_t *base;
 
 	image->drawn = false;
+	if (image->mirror != 0) {
+		GLint read = 0, draw = 0;
+
+		/* the frame into the surface's memory, by the GPU (blit_targets); upside down if it is drawn so */
+		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+		if (e->reader == 0) {
+			glGenFramebuffers(1, &e->reader);
+		}
+		if (e->writer == 0) {
+			glGenFramebuffers(1, &e->writer);
+		}
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
+		glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? image->height : 0, image->width,
+		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+		if (IOSurfaceLock(surface, 0, NULL) == 0) {
+			IOSurfaceUnlock(surface, 0, NULL);
+		}
+		return;
+	}
 	if (image->shared) {
 		/* whoever looks at the surface's seed is to see that it has changed */
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
@@ -811,6 +890,11 @@ frame_end(struct eagl *e, bool finished)
 	clear_now(e);
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
+		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
+			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
+			in_place++;
+			glFlush();                              /* (also after a glFinish: the copy is new since) */
+		}
 		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
 			in_place++;
 		}
@@ -819,12 +903,12 @@ frame_end(struct eagl *e, bool finished)
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
 	} else if (in_place != 0 && !finished && sync_frames) {
 		/*
-		 * The display's driver waits for the last submission that named the surface -- but Mesa's
-		 * freedreno may still hold the frame's last batch back after glFlush, to merge it with the
-		 * next (submit merging, for small submissions), and then the frame goes to the panel with only
-		 * its earlier batches drawn: the wallpaper without the icons, blocks of an older picture,
-		 * for a frame. A fence that is asked to flush and waited for not at all sends everything held
-		 * back to the kernel now; the GPU is not waited for.
+		 * The display's driver waits for the last submission that named the surface -- and Mesa's
+		 * freedreno may still hold a batch back after glFlush, to merge it with the next (submit
+		 * merging, for small submissions). A fence that is asked to flush and waited for not at all
+		 * sends everything held back to the kernel now; the GPU is not waited for. (Taken once for
+		 * the cause of frames with parts missing; that was drawing into the surface itself, see
+		 * blit_targets.)
 		 */
 		GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
@@ -2915,7 +2999,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * around, to be shown): a texture that is not the surface's memory starts with what the surface holds.
 	 */
 	began = now_us();
-	if (!surface_shared(e, image)) {
+	if (surface_mirrored(e, image) || !surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	}
@@ -2923,7 +3007,8 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	if (attached++ < 24) {
 		say("redwood-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
-		    IOSurfaceGetBytesPerRow(surface), inverted ? ", drawn inverted" : "", image->shared ? ": its memory" : ": a copy");
+		    IOSurfaceGetBytesPerRow(surface), inverted ? ", drawn inverted" : "", image->shared ? ": its memory" :
+		    image->mirror != 0 ? ": a texture, copied into its memory by the GPU" : ": a copy");
 	}
 	eagl_leave(e, 0x970);
 	return YES;
@@ -3043,6 +3128,7 @@ install(void)
 			shown_texture = (GLuint)strtoul(argument + 7, NULL, 10);
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
