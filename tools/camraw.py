@@ -2,7 +2,7 @@
 """Make pictures of the frames the kernel's camera driver left in memory (boot-arg cam=3 and up;
 bsd/dev/redwood_camera.c), as the loader hands them over ("xl camera").
 
-usage: camraw.py CAMERA.raw PREFIX
+usage: camraw.py CAMERA.raw PREFIX [--bayer N]
 
 CAMERA.raw is a header { "RWCAM001", width, height, stride, format, bayer, frames, frame_bytes,
 source, sensor[16], last } in its first 4096 bytes (last: which place holds the last frame written), then the frames, frame_bytes each. Format 1 is MIPI
@@ -11,6 +11,9 @@ four, their low two bits together in the fifth. Each frame becomes PREFIX-N.png,
 taking each 2x2 cell (bayer 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR) as one pixel -- half the resolution, no
 interpolation -- with a plain grey-world white balance and a gamma of 2.2: a first look, not a
 finished photograph; PREFIX-N-raw.png is the frame's raw values as they are (grey, 8 bits).
+--bayer N takes the frames for that order instead of the header's (the OV02B10 is GBRG: its own
+colour bars, cam_pattern=1, come out as clean primaries and secondaries only that way, and its
+module file says 2, Android's code for GBRG).
 """
 import struct
 import sys
@@ -48,6 +51,8 @@ def main():
     magic, width, height, stride, fmt, bayer, frames, frame_bytes, source = struct.unpack_from('<8s8I', data, 0)
     sensor = data[40:56].split(b'\0')[0].decode(errors='replace')
     last = struct.unpack_from('<I', data, 56)[0]
+    if '--bayer' in sys.argv:
+        bayer = int(sys.argv[sys.argv.index('--bayer') + 1])
     if magic != b'RWCAM001':
         sys.exit('camraw.py: not frames of the camera driver')
     print(f'camraw.py: {sensor}: {width}x{height}, stride {stride}, format {fmt}, bayer {bayer}, {frames} frame(s) written whole, '
