@@ -118,6 +118,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework IOSurface -o obj/cg_test src/cg_test.c
 		$DYN -o obj/shm_test src/shm_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
+		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
@@ -160,6 +161,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
 	[ -f obj/shm_test ] && cp obj/shm_test root/bin/
 	[ -f obj/snap_test ] && cp obj/snap_test root/bin/
+	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
