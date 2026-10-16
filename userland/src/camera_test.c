@@ -1,15 +1,17 @@
 /*
  * camera_test: the wide camera's frames as a program gets them (cam=5).
  *
- * usage: camera_test raw [FRAMES] [noae] [noawb] [keepraw] [sensor N]
+ * usage: camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]
  *        camera_test cycle [FRAMES]
  *        camera_test noise [SENSOR|all]
  *   raw: reads FRAMES frames (default 150) from the kernel's /dev/redwood-camera, with src/camera_isp.c's
  *   exposure (unless noae: the kernel's, boot-args cam_shutter and cam_gain) and white balance working
  *   on them, says what came and how fast, and leaves the last one as a picture for the host (xl
- *   camera: logs/, never the repository): one pixel a cell, NV12, or with keepraw the frame itself.
+ *   camera: logs/, never the repository): one pixel a cell, NV12, or with full every pixel (bilinear
+ *   demosaic, at the sensor's size), or with keepraw the frame itself.
  *   With sensor N, another sensor first (0 the macro, 1 the wide, 2 the front, 3 the ultra-wide); with
- *   noawb, no white balance (gains of 1: for colour bars, whose colours are known).
+ *   noawb, no white balance (gains of 1: for colour bars, whose colours are known); with ccm M, the
+ *   colour matrix M (nine numbers, row by row, separated by commas: a check of the matrix's path).
  *   cycle: each of the four sensors in turn, FRAMES frames each (default 30), the kernel's exposure:
  *   what came of each, and how long the change from one to the next took.
  *   noise: the sensor's black level and noise in the dark (the lens covered, or a dark room): at the
@@ -18,6 +20,7 @@
  *   over the square root of 2), the fixed pattern (what is left of the two frames' mean), the rows'
  *   noise (how much whole lines move together); for one sensor (0 to 3) or all four.
  */
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -266,8 +269,28 @@ noise(const char *which)
 	return failures ? 1 : 0;
 }
 
+/* a piece of a picture of every pixel (one of 8 bands of lines, each an even number of them) */
+struct full_job {
+	const struct isp *isp;
+	const struct redwood_camera_frame *f;
+	const uint8_t *raw;
+	uint8_t *y, *uv;
+	uint32_t width;
+};
+
+static void
+full_piece(void *context, size_t i)
+{
+	struct full_job *j = context;
+	uint32_t rows = (j->f->height / 8 + 1) & ~1u, first = (uint32_t)i * rows, end = i == 7 ? j->f->height : first + rows;
+
+	isp_render_full_nv12(j->isp, j->f, j->raw, j->y, j->width, j->uv, j->width, first, end, false);
+}
+
+static float ccm[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+
 static int
-raw(int frames, bool ae, bool awb, bool keep_raw, int sensor)
+raw(int frames, bool ae, bool awb, bool keep_raw, bool full, int sensor)
 {
 	struct redwood_camera_frame head, *f;
 	struct isp isp;
@@ -297,6 +320,7 @@ raw(int frames, bool ae, bool awb, bool keep_raw, int sensor)
 	bytes = sizeof(head) + (size_t)head.stride * head.height;
 	f = malloc(bytes);
 	isp_init(&isp);
+	isp_set_ccm(&isp, ccm);
 	while (got < frames && failures < 5) {
 		struct redwood_camera_command c;
 		uint64_t t0 = mach_absolute_time();
@@ -354,15 +378,21 @@ raw(int frames, bool ae, bool awb, bool keep_raw, int sensor)
 		close(device);
 		return 0;
 	}
-	/* the last one, as a picture for the host: one pixel per cell, NV12 */
-	uint32_t w = f->width / 2, h = f->height / 2;
+	/* the last one, as a picture for the host: one pixel per cell, or every pixel; NV12 */
+	uint32_t w = full ? f->width : f->width / 2, h = full ? f->height : f->height / 2;
 	size_t picture = (size_t)w * h * 3 / 2;
 	struct redwood_camera_command *keep = malloc(sizeof(*keep) + picture);
 	uint8_t *y = (uint8_t *)(keep + 1);
 	uint64_t t0 = mach_absolute_time();
 
-	isp_render_nv12(&isp, f, (const uint8_t *)f + f->header_bytes, y, w, y + (size_t)w * h, w, w, h, 0, h, false);
-	printf("camera_test: the picture (%ux%u NV12) made in %.1f ms\n", w, h, ms_since(t0));
+	if (full) {
+		struct full_job job = { &isp, f, (const uint8_t *)f + f->header_bytes, y, y + (size_t)w * h, w };
+
+		dispatch_apply_f(8, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job, full_piece);
+	} else {
+		isp_render_nv12(&isp, f, (const uint8_t *)f + f->header_bytes, y, w, y + (size_t)w * h, w, w, h, 0, h, false);
+	}
+	printf("camera_test: the picture (%ux%u NV12%s) made in %.1f ms\n", w, h, full ? ", every pixel" : "", ms_since(t0));
 	memset(keep, 0, sizeof(*keep));
 	keep->command = REDWOOD_CAMERA_KEEP;
 	keep->bytes = (uint32_t)picture;
@@ -384,18 +414,30 @@ main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	if (argc >= 2 && strcmp(argv[1], "raw") == 0) {
-		bool ae = true, awb = true, keep_raw = false;
+		bool ae = true, awb = true, keep_raw = false, full = false;
 		int sensor = -1;
 
 		for (int i = 3; i < argc; i++) {
 			ae = ae && strcmp(argv[i], "noae") != 0;
 			awb = awb && strcmp(argv[i], "noawb") != 0;
 			keep_raw = keep_raw || strcmp(argv[i], "keepraw") == 0;
+			full = full || strcmp(argv[i], "full") == 0;
+			if (strcmp(argv[i], "ccm") == 0 && i + 1 < argc) {
+				const char *at = argv[++i];
+
+				for (int k = 0; k < 9 && at != NULL; k++) {
+					ccm[k] = strtof(at, NULL);
+					at = strchr(at, ',');
+					at = at != NULL ? at + 1 : NULL;
+				}
+				printf("camera_test: the colour matrix %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f\n", ccm[0], ccm[1],
+				    ccm[2], ccm[3], ccm[4], ccm[5], ccm[6], ccm[7], ccm[8]);
+			}
 			if (strcmp(argv[i], "sensor") == 0 && i + 1 < argc) {
 				sensor = atoi(argv[++i]);
 			}
 		}
-		return raw(argc >= 3 ? atoi(argv[2]) : 150, ae, awb, keep_raw, sensor);
+		return raw(argc >= 3 ? atoi(argv[2]) : 150, ae, awb, keep_raw, full, sensor);
 	}
 	if (argc >= 2 && strcmp(argv[1], "noise") == 0) {
 		return noise(argc >= 3 ? argv[2] : "all");
@@ -403,6 +445,6 @@ main(int argc, char **argv)
 	if (argc >= 2 && strcmp(argv[1], "cycle") == 0) {
 		return cycle(argc >= 3 ? atoi(argv[2]) : 30);
 	}
-	fprintf(stderr, "usage: camera_test raw [FRAMES] [noae] [noawb] [keepraw] [sensor N]\n       camera_test cycle [FRAMES]\n       camera_test noise [SENSOR|all]\n");
+	fprintf(stderr, "usage: camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]\n       camera_test cycle [FRAMES]\n       camera_test noise [SENSOR|all]\n");
 	return 2;
 }
