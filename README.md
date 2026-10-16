@@ -512,8 +512,12 @@ fastboot boot ──► UEFI (Mu-Silicium, redwood) ──► xnuloader (EFI-п�
                               модуль CoreAudio), которое пишет смикшированный звук в /dev/redwood-audio
 ```
 
-Userland не изменён ни в одном байте: всё, чего ему не хватает, либо делает ядро (замены драйверов), либо
-библиотека, которую ядро подсовывает через `DYLD_INSERT_LIBRARIES` (sysctl `kern.exec_inject`).
+Программы и библиотеки iOS (исполняемые файлы, фреймворки, общий кэш dyld) не изменены ни в одном байте: всё, чего
+им не хватает, либо делает ядро (замены драйверов), либо библиотека, которую ядро подсовывает через
+`DYLD_INSERT_LIBRARIES` (sysctl `kern.exec_inject`) в backboardd, SpringBoard, mediaserverd и containermanagerd и
+которая меняет там кое-что только в памяти. Из файлов iOS изменены два шрифта: `AppleColorEmoji-160px.ttc` и
+`PingFang.ttc` урезаны по размеру (`tools/font_trim.py`, лишние размеры и начертания выброшены), чтобы поместиться в
+образ. Задания launchd собирает `userland/mkjobs.py` из заданий iOS, а настройки в `userland/var` — наши файлы.
 
 ## Что где лежит
 
