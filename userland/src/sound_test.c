@@ -18,6 +18,10 @@
  *   file PATH                          a sound file, played as a system sound
  *   route                              where iOS says its sound goes: the audio session's outputs and volume,
  *                                      and the devices of the system's output context
+ *   haptic [SECONDS]                   haptics the way an application (and UIKit's feedback generators) plays
+ *                                      them, through CoreHaptics: a tap, then a vibration of SECONDS (default
+ *                                      0.3, at most 3: the kernel cuts a vibration at 1 s) at half strength, then
+ *                                      three taps of falling strength
  *   restart                            kill the audio server (launchd starts it again when it is next asked for):
  *                                      what every program then sees as "media services were reset"
  *
@@ -26,6 +30,7 @@
  */
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
@@ -242,6 +247,110 @@ route(void)
 	}
 }
 
+/* CoreHaptics' constants (NSString *) by name, the framework opened when first asked for */
+static id
+haptics_constant(const char *name)
+{
+	static void *framework;
+	id *constant;
+
+	if (framework == NULL) {
+		framework = dlopen("/System/Library/Frameworks/CoreHaptics.framework/CoreHaptics", RTLD_NOW);
+	}
+	constant = framework ? dlsym(framework, name) : NULL;
+	return constant ? *constant : NULL;
+}
+
+static id
+haptic_parameter(const char *name, float value)
+{
+	id parameter = send((id)objc_getClass("CHHapticEventParameter"), "alloc");
+
+	return ((id (*)(id, SEL, id, float))objc_msgSend)(parameter, sel_registerName("initWithParameterID:value:"),
+	           haptics_constant(name), value);
+}
+
+/* A haptic event: transient (a tap) when `duration' is 0, otherwise continuous for that long. */
+static id
+haptic_event(double at, double duration, float intensity, float sharpness)
+{
+	const void *parameters[2] = {
+		haptic_parameter("CHHapticEventParameterIDHapticIntensity", intensity),
+		haptic_parameter("CHHapticEventParameterIDHapticSharpness", sharpness),
+	};
+	CFArrayRef list = CFArrayCreate(NULL, parameters, 2, &kCFTypeArrayCallBacks);
+	id event = send((id)objc_getClass("CHHapticEvent"), "alloc");
+
+	if (duration > 0) {
+		event = ((id (*)(id, SEL, id, id, double, double))objc_msgSend)(event,
+		    sel_registerName("initWithEventType:parameters:relativeTime:duration:"),
+		    haptics_constant("CHHapticEventTypeHapticContinuous"), (id)list, at, duration);
+	} else {
+		event = ((id (*)(id, SEL, id, id, double))objc_msgSend)(event, sel_registerName("initWithEventType:parameters:relativeTime:"),
+		    haptics_constant("CHHapticEventTypeHapticTransient"), (id)list, at);
+	}
+	CFRelease(list);
+	return event;
+}
+
+static int
+haptic(double seconds)
+{
+	id error = NULL, engine, pattern, player;
+	const void *events[5];
+	CFArrayRef list, none = CFArrayCreate(NULL, NULL, 0, &kCFTypeArrayCallBacks);
+	BOOL started;
+
+	if (haptics_constant("CHHapticEventTypeHapticTransient") == NULL) {
+		printf("sound_test: haptic: no CoreHaptics\n");
+		return 1;
+	}
+	{
+		/* what an application asks first, and what UIKit's feedback generators go by */
+		id capabilities = send((id)objc_getClass("CHHapticEngine"), "capabilitiesForHardware");
+		SEL first = sel_registerName("supports1stPartyHaptics");
+		BOOL answers = capabilities && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(capabilities,
+		    sel_registerName("respondsToSelector:"), first);
+
+		printf("sound_test: haptic: the hardware %s haptics%s\n", capabilities && ((BOOL (*)(id, SEL))objc_msgSend)(capabilities,
+		    sel_registerName("supportsHaptics")) ? "supports" : "DOES NOT SUPPORT", !answers ? "" :
+		    ((BOOL (*)(id, SEL))objc_msgSend)(capabilities, first) ? " (also the system's own, as UIKit's feedbacks)" :
+		    " (but NOT the system's own, as UIKit's feedbacks)");
+	}
+	engine = ((id (*)(id, SEL, id *))objc_msgSend)(send((id)objc_getClass("CHHapticEngine"), "alloc"),
+	    sel_registerName("initAndReturnError:"), &error);
+	if (engine == NULL) {
+		printf("sound_test: haptic: no engine: %s\n", text(send(error, "description")));
+		return 1;
+	}
+	started = ((BOOL (*)(id, SEL, id *))objc_msgSend)(engine, sel_registerName("startAndReturnError:"), &error);
+	printf("sound_test: haptic: the engine %s%s\n", started ? "has started" : "DOES NOT START: ",
+	    started ? "" : text(send(error, "description")));
+	if (!started) {
+		return 1;
+	}
+	events[0] = haptic_event(0, 0, 1.0f, 0.5f);
+	events[1] = haptic_event(0.3, seconds, 0.5f, 0.3f);
+	events[2] = haptic_event(0.6 + seconds, 0, 1.0f, 0.8f);
+	events[3] = haptic_event(0.8 + seconds, 0, 0.6f, 0.8f);
+	events[4] = haptic_event(1.0 + seconds, 0, 0.3f, 0.8f);
+	list = CFArrayCreate(NULL, events, 5, &kCFTypeArrayCallBacks);
+	pattern = ((id (*)(id, SEL, id, id, id *))objc_msgSend)(send((id)objc_getClass("CHHapticPattern"), "alloc"),
+	    sel_registerName("initWithEvents:parameters:error:"), (id)list, (id)none, &error);
+	player = pattern ? ((id (*)(id, SEL, id, id *))objc_msgSend)(engine, sel_registerName("createPlayerWithPattern:error:"),
+	    pattern, &error) : NULL;
+	if (player == NULL ||
+	    !((BOOL (*)(id, SEL, double, id *))objc_msgSend)(player, sel_registerName("startAtTime:error:"), 0.0, &error)) {
+		printf("sound_test: haptic: the pattern does not play: %s\n", text(send(error, "description")));
+		return 1;
+	}
+	printf("sound_test: haptic: playing a tap, %.2f s of vibration at half strength, three taps\n", seconds);
+	usleep((useconds_t)((1.5 + seconds) * 1e6));
+	((void (*)(id, SEL, id))objc_msgSend)(engine, sel_registerName("stopWithCompletionHandler:"), NULL);
+	printf("sound_test: haptic: done\n");
+	return 0;
+}
+
 extern int proc_listallpids(void *buffer, int size);
 extern int proc_name(int pid, void *buffer, uint32_t size);
 
@@ -277,6 +386,10 @@ main(int argc, char **argv)
 			route();
 		} else if (strcmp(argv[i], "restart") == 0) {
 			restart();
+		} else if (strcmp(argv[i], "haptic") == 0) {
+			double seconds = i + 1 < argc && atof(argv[i + 1]) > 0 ? atof(argv[++i]) : 0.3;
+
+			failed |= haptic(seconds > 3 ? 3 : seconds);
 		} else if (strcmp(argv[i], "tone") == 0 && i + 1 < argc) {
 			double seconds = atof(argv[++i]);
 

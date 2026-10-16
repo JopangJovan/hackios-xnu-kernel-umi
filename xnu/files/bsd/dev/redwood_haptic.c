@@ -27,6 +27,16 @@
  *   haptic=3   ... and Android's configuration written (every write read back), Android's
  *              waveforms loaded into its RAM and read back; then standby. Nothing moves.
  *   haptic=4   ... and one short effect played (haptic_effect=N, default 1: Android's effect 0)
+ *   haptic=5   ... configured and loaded as for 3, and instead of the effect the motor for iOS until
+ *              the run ends: what iOS plays on its "Actuator" device (the HAL plug-in's,
+ *              userland/src/audio_plugin.c: the system's feedbacks and vibrations, CoreHaptics'
+ *              patterns, UIKit's feedbacks) is written to /dev/redwood-haptic as samples of one
+ *              channel, and the motor plays Android's waveforms by it: each waveform of iOS's (a
+ *              stretch of samples after a pause) a short tap (waveform 1), and one that goes on for
+ *              longer than a tap the waveform Android loops for vibrations (11), until it ends -- or
+ *              for HAPTIC_MAX_MS at most, after which the motor rests for as long before it plays
+ *              again. The gain is as loud as iOS's waveform: Android's own (0x80) at full scale,
+ *              never above it.
  *
  * Limits, whatever asks: Android's own values only (its gain 0x80, its boost and drive levels, its
  * waveforms); no effect longer than HAPTIC_MAX_MS, and the chip is told to stop and put into
@@ -42,7 +52,10 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <miscfs/devfs/devfs.h>
+#include <sys/conf.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 #include <sys/redwood_audio.h>
 #include <sys/redwood_input.h>
 
@@ -645,12 +658,250 @@ play_effect(unsigned effect)
 	return healthy("after playing");
 }
 
+/* ---- haptic=5: the motor for iOS ------------------------------------------------------------------- */
+
+#define ACTIVE_US               30000           /* a write that was not silence counts for this long */
+#define SILENT_BELOW            256             /* of 32768: samples no larger are silence */
+#define TAP_US                  60000           /* longer than this, and it is a vibration, not a tap */
+#define SETTLE_US               8000            /* how long iOS's waveform is listened to before a tap: its loudness */
+#define FOLLOW_US               20000           /* how often a vibration's strength follows iOS's */
+
+#define TOLD_EVENTS             24              /* the first so many taps and vibrations are each said */
+
+static volatile uint64_t heard_us;              /* when the last write that was not silence came */
+static volatile uint64_t quiet_us;              /* when the last write that was silence came */
+static volatile uint64_t onset_us;              /* when iOS's last waveform began: the first write not silence after a pause */
+static volatile uint32_t heard_peak;            /* the largest sample of that waveform, or since the service last looked */
+static uint64_t written_frames;
+static unsigned taps, loops, capped;            /* what has been played, for the run's end */
+
+static uint64_t
+now_us(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / NSEC_PER_USEC;
+}
+
+/* From the audio server's I/O thread: never waits. */
+static int
+haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	int16_t samples[256];
+	int error = 0;
+
+	while (uio_resid(uio) >= 2) {
+		user_ssize_t bytes = uio_resid(uio);
+		uint32_t peak = 0;
+
+		if (bytes > (user_ssize_t)sizeof(samples)) {
+			bytes = sizeof(samples);
+		}
+		bytes &= ~(user_ssize_t)1;
+		if ((error = uiomove((caddr_t)samples, (int)bytes, uio)) != 0) {
+			break;
+		}
+		for (unsigned i = 0; i < bytes / 2; i++) {
+			uint32_t v = samples[i] < 0 ? (uint32_t)-(int32_t)samples[i] : (uint32_t)samples[i];
+
+			peak = v > peak ? v : peak;
+		}
+		written_frames += (uint64_t)bytes / 2;
+		if (peak > SILENT_BELOW) {
+			uint64_t now = now_us();
+
+			if (heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US) {
+				onset_us = now;
+				heard_peak = 0;
+			}
+			heard_us = now;
+			if (peak > heard_peak) {
+				heard_peak = peak;
+			}
+		} else {
+			quiet_us = now_us();
+		}
+	}
+	return error;
+}
+
+static int
+haptic_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	return 0;
+}
+
+static const struct cdevsw haptic_cdevsw = {
+	.d_open = haptic_open, .d_close = haptic_open, .d_read = eno_rdwrt, .d_write = haptic_write,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/* Start a waveform without waiting for it: once, or (`forever') until stopped. */
+static bool
+start_waveform(unsigned waveform, bool forever, uint8_t gain)
+{
+	uint8_t go = 0x01;
+
+	if (!put(AW_PLAYCFG3, 0x04) || !put(AW_WAVCFG1, (uint8_t)waveform) || !put(AW_WAVCFG2, 0x00) ||
+	    !put(AW_WAVCFG9, forever ? 0xf0 : 0x00) || !put(AW_PLAYCFG2, gain)) {
+		return false;
+	}
+	if (!regs_write(AW_PLAYCFG4, &go, 1)) {
+		give_up("the start was not acknowledged");
+		return false;
+	}
+	return true;
+}
+
+static bool
+stop_waveform(void)
+{
+	uint8_t stop = 0x02;
+
+	if (!regs_write(AW_PLAYCFG4, &stop, 1) || !wait_standby(50)) {
+		give_up("it does not stop");
+		return false;
+	}
+	return true;
+}
+
+/* the chip's state (GLBRD5: 0 standby, 7 and 11 seen while a waveform plays), 0xff if it cannot be read */
+static unsigned
+chip_state(void)
+{
+	uint8_t state = 0xff;
+
+	return get(AW_GLBRD5, &state) ? state & 0x0f : 0xff;
+}
+
+static void
+serve(void)
+{
+	enum { IDLE, TAP, LOOP, REST } state = IDLE;
+	uint64_t since = 0, rest_until = 0, last_look = 0, tap_onset = 0, followed = 0;
+	uint8_t playing_gain = 0;
+	unsigned follows = 0;                   /* how often the vibration playing now has changed strength */
+	int major = cdevsw_add(-1, &haptic_cdevsw);
+
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic") == NULL) {
+		say("haptic: /dev/redwood-haptic cannot be made\n");
+		return;
+	}
+	say("haptic: THE MOTOR PLAYS WHAT IOS PLAYS ON ITS ACTUATOR (/dev/redwood-haptic) from here on, until the run ends\n");
+	while (!broken) {
+		uint64_t now = now_us();
+		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
+		uint32_t peak = heard_peak;
+		/* (the gain as loud as iOS's waveform, Android's 0x80 at full scale and never above) */
+		uint8_t gain = (uint8_t)(peak >= 32767 ? android_regs[AW_PLAYCFG2] : (uint32_t)android_regs[AW_PLAYCFG2] * peak / 32767);
+
+		switch (state) {
+		case IDLE:
+		case TAP:
+			/*
+			 * A waveform of iOS's that has begun (after a pause: a tap of a series is a tap of its own) is
+			 * a tap -- once its first milliseconds are heard: a waveform begins softly, and they say how
+			 * loud it is; one that goes on without a pause, a vibration.
+			 */
+			if (active && onset_us != tap_onset && now - onset_us >= SETTLE_US) {
+				uint64_t began = onset_us;
+
+				if (state == TAP && !wait_standby(0) && !stop_waveform()) {
+					break;
+				}
+				if (!start_waveform(1, false, gain ? gain : 1)) {
+					break;
+				}
+				state = TAP;
+				since = now;
+				tap_onset = began;
+				taps++;
+				if (taps + loops <= TOLD_EVENTS) {
+					wait_ms(4);
+					say("haptic: tap %u: iOS's waveform peaks at %u of 32768: Android's waveform 1 at gain %#04x; the "
+					    "chip's state %u\n", taps, peak, gain ? gain : 1, chip_state());
+				}
+				break;
+			}
+			if (state == IDLE) {
+				break;
+			}
+			if (active && quiet_us < tap_onset && now - since > TAP_US) {
+				if (stop_waveform() && start_waveform(11, true, gain ? gain : 1)) {
+					state = LOOP;
+					since = followed = now;
+					playing_gain = gain ? gain : 1;
+					follows = 0;
+					loops++;
+					heard_peak = 0;
+					if (taps + loops <= TOLD_EVENTS) {
+						wait_ms(4);
+						say("haptic: vibration %u: iOS goes on playing (peak %u): Android's waveform 11 over and over at "
+						    "gain %#04x, %u ms at most; the chip's state %u\n", loops, peak, gain ? gain : 1,
+						    HAPTIC_MAX_MS, chip_state());
+					}
+				}
+			} else if (!active && now - since > TAP_US) {
+				state = wait_standby(0) || stop_waveform() ? IDLE : state;
+			}
+			break;
+		case LOOP:
+			/* as strong as iOS's waveform is now (Android's gain at full scale, never more) */
+			if (active && now - followed >= FOLLOW_US) {
+				followed = now;
+				heard_peak = 0;
+				if (gain != 0 && (gain > playing_gain + 8 || gain + 8 < playing_gain)) {
+					if (!put(AW_PLAYCFG2, gain)) {
+						break;
+					}
+					playing_gain = gain;
+					follows++;
+				}
+			}
+			if (!active || now - since > HAPTIC_MAX_MS * 1000ull) {
+				bool cut = now - since > HAPTIC_MAX_MS * 1000ull;
+
+				if (cut) {
+					capped++;
+					rest_until = now + HAPTIC_MAX_MS * 1000ull;
+				}
+				if (stop_waveform()) {
+					state = rest_until > now ? REST : IDLE;
+					if (taps + loops <= TOLD_EVENTS + 1) {
+						say("haptic: vibration %u: %s after %llu ms (its strength changed %u times, last to gain %#04x); "
+						    "the chip is in standby\n", loops, cut ? "CUT at the limit" : "iOS stopped, and so does the motor",
+						    (now - since) / 1000, follows, playing_gain);
+					}
+				}
+			}
+			break;
+		case REST:
+			if (now >= rest_until) {
+				state = IDLE;
+			}
+			break;
+		}
+		if (state != IDLE && state != REST && now - last_look > 50000) {
+			last_look = now;
+			if (!healthy("while playing")) {
+				break;
+			}
+		}
+		wait_ms(4);
+	}
+	say("haptic: the motor is given up on (%u taps and %u vibrations played, %u cut at %u ms)\n", taps, loops, capped,
+	    HAPTIC_MAX_MS);
+}
+
 static void
 haptic_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	say("haptic: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the reset released, registers read" :
-	    level == 3 ? "the chip configured and its waveforms loaded, nothing played" : "one effect played");
+	    level == 3 ? "the chip configured and its waveforms loaded, nothing played" : level == 4 ? "one effect played" :
+	    "the motor for iOS");
 	show_pins();
 	if (level >= 2 && !((rd(GPIO_CFG(PIN_RESET)) & CFG_OUTPUT) && (rd(GPIO_IO(PIN_RESET)) & 2))) {
 		/* (Android's driver: the pin low, 5 ms, high, and the chip ready for I2C 8 ms later) */
@@ -668,7 +919,7 @@ haptic_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	} else {
 		show_registers();
-		if (level >= 3 && configure() && load_waveforms() && level >= 4) {
+		if (level >= 3 && configure() && load_waveforms() && level == 4) {
 			uint32_t effect = 1;
 
 			PE_parse_boot_argn("haptic_effect", &effect, sizeof(effect));
@@ -676,6 +927,8 @@ haptic_thread(__unused void *parameter, __unused wait_result_t result)
 				effect = 1;     /* (the short ones only) */
 			}
 			(void)play_effect(effect);
+		} else if (level == 5 && !broken) {
+			serve();
 		}
 	}
 	say("haptic: done\n");
@@ -690,8 +943,8 @@ redwood_haptic_init(void)
 	if (!PE_parse_boot_argn("haptic", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 4) {
-		level = 4;
+	if (level > 5) {
+		level = 5;
 	}
 	if (kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
@@ -705,5 +958,9 @@ redwood_haptic_quiesce(void)
 	if (released && tlmm != 0) {
 		leaving = true;
 		reset_pin(false);
+		if (level == 5) {
+			say("haptic: at the run's end: %u taps and %u vibrations played (%u cut at %u ms), from %llu frames iOS "
+			    "wrote; the chip is held in reset\n", taps, loops, capped, HAPTIC_MAX_MS, written_frames);
+		}
 	}
 }

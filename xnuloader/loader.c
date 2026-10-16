@@ -1964,6 +1964,15 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* the product: screen class, artwork scale, name ... as on the real phone */
 	dt_begin(&w, "product");
 	dt_identity(&w, identity_product, sizeof(identity_product) / sizeof(identity_product[0]), identity_product_data);
+	/*
+	 * and its haptics: "closed-loop" (MobileGestalt's DeviceSupportsClosedLoopHaptics) makes iOS play
+	 * its vibrations and feedbacks as waveforms on the "Actuator" audio device (the audio plug-in
+	 * hands them to the kernel's motor driver); without it iOS looks for an IOKit vibration motor
+	 * that the iPhone X does not have, and nothing vibrates.
+	 */
+	dt_begin(&w, "haptics");
+	dt_identity(&w, identity_haptics, sizeof(identity_haptics) / sizeof(identity_haptics[0]), identity_haptics_data);
+	dt_end(&w);
 	dt_end(&w);
 
 	/* IOKit publishes its NVRAM object on this node; without it IOKit asserts. */

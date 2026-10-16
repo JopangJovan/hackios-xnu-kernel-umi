@@ -14,7 +14,7 @@
  * through which everything in iOS is routed. It knows an iPhone's own devices by their names
  * (their UIDs) and makes a port of each: "Speaker" becomes the speaker port, the route an iPhone
  * with nothing plugged in plays through, with a volume, the volume display and the place in
- * Control Center that go with it. So this presents two devices under those names:
+ * Control Center that go with it. So this presents three devices under those names:
  *
  *   "Speaker"   a stereo output whose samples are written to /dev/redwood-audio, where the
  *               kernel takes them to whatever can play them (see sys/redwood_audio.h), and a
@@ -23,6 +23,9 @@
  *               speaker route without a second virtual device of its own (its type 'vhaw', a
  *               mandatory companion of the default one in the iPhone X's routing tables) whose
  *               only port is this input; without it everything stays on the null port.
+ *   "Actuator"  one output of one channel: the iPhone's Taptic Engine, on which iOS plays its
+ *               haptics as waveforms (through the chain 'd22_actuator_general'); its samples go to
+ *               the kernel's motor driver, /dev/redwood-haptic (see actuator_write())
  *
  * CoreAudio's own null device ("Null_Device", described in the framework's Info.plist, playing
  * into nowhere) stays as it is: it is the only device the virtual audio device takes while it
@@ -183,6 +186,7 @@ enum {
 	OBJECT_PLUGIN = 1,
 	OBJECT_SPEAKER, OBJECT_SPEAKER_OUTPUT, OBJECT_SPEAKER_INPUT,
 	OBJECT_HAWKING, OBJECT_HAWKING_INPUT,
+	OBJECT_ACTUATOR, OBJECT_ACTUATOR_OUTPUT,
 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
 	OBJECT_LAST = OBJECT_SPEAKER_VOLUME
 };
@@ -193,7 +197,7 @@ struct device {
 	AudioObjectID object;
 	CFStringRef uid;                /* the name the virtual audio device knows it by */
 	AudioObjectID output, input;    /* its streams; 0 = none */
-	UInt32 input_channels;
+	UInt32 output_channels, input_channels;
 	/* its clock, running while anybody does I/O */
 	unsigned running;               /* how many clients have started I/O */
 	UInt64 anchor;                  /* mach_absolute_time() when the first of them did */
@@ -202,8 +206,9 @@ struct device {
 
 static struct device devices[] = {
 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
-	  .input_channels = 2 },
+	  .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 2 },
 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
+	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
 };
 #define DEVICES                 (sizeof(devices) / sizeof(devices[0]))
 
@@ -283,7 +288,7 @@ static AudioStreamBasicDescription
 format_of(AudioObjectID stream)
 {
 	const struct device *d = device_of(stream);
-	UInt32 channels = stream == d->output ? REDWOOD_AUDIO_CHANNELS : d->input_channels;
+	UInt32 channels = stream == d->output ? d->output_channels : d->input_channels;
 
 	return (AudioStreamBasicDescription) {
 		       .mSampleRate = REDWOOD_AUDIO_RATE, .mFormatID = kAudioFormatLinearPCM,
@@ -799,6 +804,41 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
 	return 0;
 }
 
+/*
+ * What iOS plays on the actuator -- the haptics: the system's feedbacks and the ringer's vibration,
+ * CoreHaptics' patterns, UIKit's feedbacks, as waveforms of one channel -- goes to the kernel's motor
+ * driver (/dev/redwood-haptic, bsd/dev/redwood_haptic.c, haptic=5), which plays Android's own
+ * waveforms on the phone's motor by it. (iOS plays on this device at all only because the device
+ * tree says the phone's haptics are "closed-loop": see mkidentity.py.) Said the first times, with
+ * how loud.
+ */
+static int haptic = -1;          /* the motor driver; -2: not there (the kernel runs without haptic=5) */
+static unsigned haptic_said;
+
+static void
+actuator_write(const int16_t *samples, UInt32 frames)
+{
+	int peak = 0;
+
+	for (UInt32 i = 0; i < frames; i++) {
+		int v = samples[i] < 0 ? -samples[i] : samples[i];
+
+		peak = v > peak ? v : peak;
+	}
+	if (haptic == -1) {
+		haptic = open("/dev/redwood-haptic", O_WRONLY | O_NONBLOCK);
+		haptic = haptic >= 0 ? haptic : -2;
+	}
+	if (haptic >= 0) {
+		(void)write(haptic, samples, (size_t)frames * 2);
+	}
+	if (peak > 0 && haptic_said < 12) {
+		haptic_said++;
+		say("redwood: audio: the actuator plays: %u frames, peak %d of 32768%s\n", (unsigned)frames, peak,
+		    haptic >= 0 ? "" : " (no /dev/redwood-haptic: not felt)");
+	}
+}
+
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
     __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
@@ -812,6 +852,8 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	if (operation == kAudioServerPlugInIOOperationReadInput) {
 		/* nobody is listening on this machine: silence */
 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
+		actuator_write(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
 		/* the kernel takes it all or leaves it: this thread must not wait */
 		if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {

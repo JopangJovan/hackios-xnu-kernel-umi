@@ -103,3 +103,12 @@ static const unsigned char identity_product_data[] = {
 	0x00, 0xea, 0x3f, 0x00, 0x00, 0xe8, 0x03, 0x00, 0x00,
 };
 
+/* 2 properties */
+static const struct identity_prop identity_haptics[] = {
+	{ "closed-loop", 0, 4 },
+	{ "supports-3rd-party-haptics", 4, 4 },
+};
+static const unsigned char identity_haptics_data[] = {
+	0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+};
+

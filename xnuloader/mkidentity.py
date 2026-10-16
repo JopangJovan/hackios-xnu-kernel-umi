@@ -8,7 +8,10 @@ of the IPSW, decompressed: "ipsw img4 im4p extract DeviceTree.d22ap.im4p -o Devi
 
 iOS user space (MobileGestalt above all) decides what device it runs on from the device
 tree: the root node's model and compatible, and the /product node (screen class, artwork
-scale, product name ...). The loader builds its own device tree for the hardware we really
+scale, product name ...), and the /product/haptics node: what the phone's haptics are (MobileGestalt's
+DeviceSupportsClosedLoopHaptics is its "closed-loop"; with it iOS plays the system's vibrations and
+feedbacks as waveforms on the actuator, and without it looks for an old vibration motor in IOKit,
+which the iPhone X does not have). The loader builds its own device tree for the hardware we really
 have, but copies these properties from the device tree in the iOS firmware so that the
 system believes it is the iPhone its files were built for.
 
@@ -66,6 +69,8 @@ def main():
     emit('identity_root', root[0], ('name', '#address-cells', '#size-cells', 'AAPL,phandle', 'clock-frequency',
                                     'platform-name', 'time-stamp', 'secure-root-prefix'))
     emit('identity_product', children['product'][0], ('name', 'AAPL,phandle'))
+    product = {name_of(c): c for c in children['product'][1]}
+    emit('identity_haptics', product['haptics'][0], ('name', 'AAPL,phandle'))
 
 
 if __name__ == '__main__':
