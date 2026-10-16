@@ -1,11 +1,13 @@
 /*
- * The cameras of the POCO X5 Pro (redwood), first the macro one: an OmniVision OV02B10 (2 MP,
- * Android's camera 2, "redwood_aac_ov02b10_macro"). Every address and number below belongs to this
- * phone, from Android's own device tree (cam-sensor2 and what it points to), the sensor's module
- * file of Android's camera stack (/vendor/lib64/camera/com.qti.sensormodule.redwood_aac_ov02b10_
- * macro.bin: the slave address, the chip ID and where it is read, the power sequence) and the
- * drivers of the phone's kernel (MiCode redwood-s-oss: cam_sensor_util.c, qcom_pm8008-regulator.c,
- * camcc-yupik.c, gdsc-regulator.c, pinctrl-yupik.c, pinctrl-spmi-gpio.c), read as data:
+ * The cameras of the POCO X5 Pro (redwood): the macro one, an OmniVision OV02B10 (2 MP, Android's
+ * camera 2, "redwood_aac_ov02b10_macro"), and the wide one, a Samsung S5KHM2SD (108 MP, Android's
+ * camera 0, "redwood_sunny_s5khm2sd_wide"). Every address and number below belongs to this phone, from
+ * Android's own device tree (cam-sensor2 and cam-sensor0 and what they point to), the sensors' module
+ * files of Android's camera stack (/vendor/lib64/camera/com.qti.sensormodule.redwood_*.bin: the
+ * slave address, the chip ID and where it is read, the power sequence, the tables) and the drivers
+ * of the phone's kernel (MiCode redwood-s-oss: cam_sensor_util.c, qcom_pm8008-regulator.c,
+ * camcc-yupik.c, gdsc-regulator.c, pinctrl-yupik.c, pinctrl-spmi-gpio.c, cam_csiphy_*), read as
+ * data. The macro one (the wide one's differences are in sensors[] below and capture_sensor()):
  *
  *   the sensor     on CCI 1, master 0 (GPIO 73 data, 74 clock, function cci_i2c, internal pull-ups),
  *                  slave address 0x3c; done by hand here, as the other drivers do their I2C (the
@@ -25,27 +27,35 @@
  *                  PM8350C GPIO 3 (output high, as Android's pinctrl "pm8008i_active" has it)
  *   power-up       (the module file's): reset low, 1 ms; VDIG on; VANA on, 2 ms; MCLK on, 4 ms;
  *                  reset high, 9 ms. Power-down: MCLK off; reset low, 1 ms; VANA off, 7 ms; VDIG off.
+ *                  (Both are read from the sensor's table at run time, as the wide one's are.)
+ *
+ * The wide one: CCI 0 master 1 (GPIO 71/72), slave address 0x20, chip ID 0xfad2 at 0x0000, reset
+ * GPIO 21, MCLK1 (RCG 0xe01c, branch 0xe034, GPIO 65); VDIG the PM8008i's LDO1 at 1.0 V, VIO its
+ * LDO5 at 1.8 V, VANA a fixed 2.8 V regulator that GPIO 106 switches; three C-PHY trios into
+ * CSIPHY 1.
  *
  * Nothing here is done unless a boot-arg asks for it:
  *
  *   cam=1   a look, reading only: the camera's clocks and power domain as they are, the pins, the
  *           PM8008i's reset pin, and if it is out of reset the PM8008i itself (its chip enable and
  *           the two LDOs)
- *   cam=2   ... and the macro sensor powered up as Android powers it, its chip ID read, and powered
+ *   cam=2   ... and the sensor powered up as Android powers it, its chip ID read, and powered
  *           down again (every write read back)
  *   cam=3   the CSID's test pattern through RDI 0 and IFE-lite 0 into memory, which the loader hands
  *           to the host after the run (xl camera): the camera subsystem's rails, PLL, clocks, SMMU
  *           and blocks without the sensor (capture_tpg() below)
- *   cam=4   the macro sensor's own frames that way, through CSIPHY 2 (capture_sensor() below)
+ *   cam=4   the sensor's own frames that way, through its CSIPHY (capture_sensor() below)
  *
- * Limits, whatever asks: Android's voltages only (1.8 and 2.8 V; nothing else is ever written to
- * the LDOs' set points); only the registers named above are written (a list each, checked at every
+ * Boot-arg cam_sensor=wide picks the wide sensor; without it, the macro one.
+ *
+ * Limits, whatever asks: Android's voltages only (the device tree's: 1.8 and 2.8 V for the macro
+ * one, 1.0 and 1.8 V for the wide one; nothing else is ever written to the LDOs' set points); only the registers named above are written (a list each, checked at every
  * write) and each is read back; any write that does not read back, a regulator that is not ready
  * in time or reports over-current, a byte nobody acknowledges, and everything is switched off again
  * in the power-down's order and nothing more is done. At the run's end (and on a panic's way out)
  * whatever was switched on is switched off. Everything that was found switched on is left on.
- * The camera subsystem's own registers (camcc's PLL0 and the clocks named there, CSIPHY 2, CSID-lite
- * 0, IFE-lite 0, one match register and context of the SMMU) are written the same way, read back
+ * The camera subsystem's own registers (camcc's PLL0 and the clocks named there, the sensor's CSIPHY,
+ * CSID-lite 0, IFE-lite 0, one match register and context of the SMMU) are written the same way, read back
  * where they keep what they are given, and taken back in the reverse order.
  */
 #include <kern/clock.h>
@@ -145,12 +155,51 @@ give_up(const char *why)
 
 #define PIN_PMIC_SDA            4       /* the serial engine 1's I2C: the PM8008i */
 #define PIN_PMIC_SCL            5
-#define PIN_MCLK                66      /* function 1: cam_mclk */
-#define PIN_CCI_SDA             73      /* CCI 1 master 0 (function 1: cci_i2c) */
-#define PIN_CCI_SCL             74
-#define PIN_RESET               77
 
 static vm_offset_t tlmm;
+
+/*
+ * The two sensors this knows, as Android's device tree has them (cam-sensor2, the macro; cam-sensor0,
+ * the wide): the pins of their CCI master (taken by hand), the reset, MCLK (camcc RCG and branch,
+ * the pin and its function 1, cam_mclk, at 4 mA), the supplies the module file's power sequence
+ * switches (a PM8008i LDO at the device tree's voltage, or a GPIO that switches a fixed regulator),
+ * and the CSIPHY with its clocks. Boot-arg cam_sensor=wide picks the wide one (default: the macro).
+ */
+enum { SUPPLY_NONE, SUPPLY_LDO, SUPPLY_GPIO };
+struct supply {
+	uint8_t         kind, ldo;      /* SUPPLY_LDO: PM8008i LDO n ... */
+	uint16_t        mv;             /* ... at this set point (the device tree's) */
+	uint16_t        gpio, ramp_us;  /* SUPPLY_GPIO: the pin, active high, and the regulator's ramp */
+};
+struct sensor_hw {
+	const char *    name;
+	const char *    tab;            /* in fw/ of the small image (tools/camsensor.py) */
+	const char *    bus_name;
+	unsigned        sda, scl, reset;
+	uint32_t        mclk_cmd, mclk_cbcr;
+	unsigned        mclk_pin;
+	struct supply   vana, vdig, vio;
+	unsigned        csiphy;
+	uint32_t        phy_cbcr, timer_cmd, timer_cbcr;
+	bool            omnivision;     /* exposure registers: OmniVision's paged ones, or the SMIA ones */
+	uint8_t         bayer;          /* the picture's order as it comes here (camraw.py's codes: 0 RGGB, 2 GBRG) */
+};
+static const struct sensor_hw sensors[] = {
+	{       /* cam-sensor2: OV02B10, CCI 1 master 0 (GPIO 73/74), reset GPIO 77, MCLK2 (GPIO 66), csiphy 2 */
+		.name = "macro (OV02B10)", .tab = "camera-ov02b10.tab", .bus_name = "CCI 1 master 0", .sda = 73, .scl = 74, .reset = 77,
+		.mclk_cmd = 0xe038, .mclk_cbcr = 0xe050, .mclk_pin = 66,
+		.vana = { SUPPLY_LDO, 7, 2800, 0, 0 }, .vdig = { SUPPLY_LDO, 6, 1800, 0, 0 }, .vio = { SUPPLY_NONE, 0, 0, 0, 0 },
+		.csiphy = 2, .phy_cbcr = 0xe110, .timer_cmd = 0xe0f4, .timer_cbcr = 0xe10c, .omnivision = true, .bayer = 0,
+	},
+	{       /* cam-sensor0: S5KHM2SD, CCI 0 master 1 (GPIO 71/72), reset GPIO 21, MCLK1 (GPIO 65), csiphy 1;
+		 * VANA: camera_wide_vana_ldo, a fixed 2.8 V regulator from BOB switched by GPIO 106 (ramp 135 us) */
+		.name = "wide (S5KHM2SD)", .tab = "camera-s5khm2sd.tab", .bus_name = "CCI 0 master 1", .sda = 71, .scl = 72, .reset = 21,
+		.mclk_cmd = 0xe01c, .mclk_cbcr = 0xe034, .mclk_pin = 65,
+		.vana = { SUPPLY_GPIO, 0, 0, 106, 135 }, .vdig = { SUPPLY_LDO, 1, 1000, 0, 0 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
+		.csiphy = 1, .phy_cbcr = 0xe0ec, .timer_cmd = 0xe0d0, .timer_cbcr = 0xe0e8, .omnivision = false, .bayer = 2,
+	},
+};
+static const struct sensor_hw *hw = &sensors[0];
 
 static void
 show_pin(unsigned pin, const char *what)
@@ -161,15 +210,15 @@ show_pin(unsigned pin, const char *what)
 	    (((cfg >> 6) & 7) + 1) * 2, (cfg & CFG_OUTPUT) ? (io & 2 ? "drives high" : "drives low") : "input", io & 1);
 }
 
-/* The pins written while powered up, as they were found, to be put back: the reset pin and MCLK's. */
-static uint32_t found_reset_cfg, found_reset_io, found_mclk_cfg;
+/* The pins written while powered up, as they were found, to be put back: the reset pin, MCLK's, a supply's. */
+static uint32_t found_reset_cfg, found_reset_io, found_mclk_cfg, found_vana_cfg, found_vana_io;
 static bool pins_found;
 
 static void
 reset_pin(bool high)
 {
-	wr(GPIO_IO(PIN_RESET), high ? 2 : 0);
-	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT | CFG_DRIVE_MA(2));         /* GPIO, no pull, 2 mA: Android's cam_sensor_active_macro */
+	wr(GPIO_IO(hw->reset), high ? 2 : 0);
+	wr(GPIO_CFG(hw->reset), CFG_OUTPUT | CFG_DRIVE_MA(2));         /* GPIO, no pull, 2 mA: Android's cam_sensor_active_* */
 }
 
 /* ---- I2C by hand (as in redwood_haptic.c) ---------------------------------------------------------- */
@@ -180,7 +229,7 @@ struct bus {
 	uint32_t        cfg[2], io[2];  /* the pins as they were found, while taken */
 };
 static struct bus pmic_bus = { .name = "the PM8008i's I2C", .sda = PIN_PMIC_SDA, .scl = PIN_PMIC_SCL };
-static struct bus cci_bus = { .name = "CCI 1 master 0", .sda = PIN_CCI_SDA, .scl = PIN_CCI_SCL };
+static struct bus cci_bus;              /* the sensor's (from hw) */
 
 static void
 half_bit(void)
@@ -504,10 +553,20 @@ pgpio_read_all(uint8_t *regs)
 #define LDO_VSET_UB             0x41    /* ... high byte */
 #define LDO_MODE_CTL1           0x45    /* [2:0] 7 normal, 4 low power */
 #define LDO_ENABLE              0x46    /* [7] */
-#define LDO_VDIG                6
-#define LDO_VANA                7
-#define VDIG_MV                 1800    /* the device tree's (pm8008i_l6, 1.8 V; a multiple of the 8 mV step) */
-#define VANA_MV                 2800    /* (pm8008i_l7 for cam-sensor2: 2.8 V) */
+
+/* LDO n is one of the sensor's supplies, at that set point. */
+static bool
+sensor_ldo(unsigned n, unsigned mv)
+{
+	const struct supply *all[3] = { &hw->vana, &hw->vdig, &hw->vio };
+
+	for (int i = 0; i < 3; i++) {
+		if (all[i]->kind == SUPPLY_LDO && all[i]->ldo == n && (mv == 0 || all[i]->mv == mv)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 static bool
 pm8008_get(uint8_t address, uint16_t reg, uint8_t *values, unsigned count)
@@ -517,14 +576,14 @@ pm8008_get(uint8_t address, uint16_t reg, uint8_t *values, unsigned count)
 	return i2c_transfer(&pmic_bus, address, where, 2, values, count);
 }
 
-/* The registers the PM8008i may be written in: the chip enable, and the set point, mode and enable of LDO6 and LDO7. */
+/* The registers the PM8008i may be written in: the chip enable, and the set point, mode and enable of the sensor's LDOs. */
 static bool
 pm8008_put(uint8_t address, uint16_t reg, uint8_t value, bool force)
 {
 	uint8_t out[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, value }, back = 0xff;
 	uint16_t base = reg & 0xff00, offset = reg & 0xff;
 	bool allowed = (address == PM8008_CHIP && reg == MISC_CHIP_ENABLE) ||
-	    (address == PM8008_REGULATORS && (base == LDO_BASE(LDO_VDIG) || base == LDO_BASE(LDO_VANA)) &&
+	    (address == PM8008_REGULATORS && base >= LDO_BASE(1) && base <= LDO_BASE(7) && sensor_ldo((base - LDO_BASE(1)) / 0x100 + 1, 0) &&
 	    (offset == LDO_MODE_CTL1 || offset == LDO_ENABLE || offset == LDO_VSET_LB || offset == LDO_VSET_UB));
 
 	if ((broken && !force) || !allowed) {
@@ -569,7 +628,7 @@ ldo_on(unsigned n, unsigned mv)
 	uint16_t base = (uint16_t)LDO_BASE(n);
 	uint8_t enable = 0, mode = 0, status = 0;
 
-	if ((n != LDO_VDIG || mv != VDIG_MV) && (n != LDO_VANA || mv != VANA_MV)) {
+	if (!sensor_ldo(n, mv)) {
 		give_up("a voltage that is not Android's");
 		return false;
 	}
@@ -637,12 +696,12 @@ ldo_off(unsigned n)
 #define GCC_CAMERA_XO_CBCR      0x26028
 #define CAMCC_PHYS              0x0ad00000UL
 #define CAMCC_SIZE              0x20000UL
-#define MCLK2_CMD_RCGR          0xe038          /* [0] update, [31] the root is off */
-#define MCLK2_CFG_RCGR          0xe03c          /* [4:0] divider (2n - 1), [10:8] source (0: the crystal), [13:12] M/N mode */
-#define MCLK2_M                 0xe040
-#define MCLK2_N                 0xe044
-#define MCLK2_D                 0xe048
-#define MCLK2_CBCR              0xe050          /* [0] enable, [31] the clock is off */
+#define MCLK_CMD_RCGR           (hw->mclk_cmd)          /* [0] update, [31] the root is off */
+#define MCLK_CFG_RCGR           (hw->mclk_cmd + 4)      /* [4:0] divider (2n - 1), [10:8] source (0: the crystal), [13:12] M/N mode */
+#define MCLK_M                  (hw->mclk_cmd + 8)
+#define MCLK_N                  (hw->mclk_cmd + 12)
+#define MCLK_D                  (hw->mclk_cmd + 16)
+#define MCLK_CBCR               (hw->mclk_cbcr)         /* [0] enable, [31] the clock is off */
 #define TITAN_TOP_GDSCR         0xc194          /* [0] collapse, [11] keep the registers, [31] on */
 #define CBCR_OFF                (1u << 31)
 #define CMD_UPDATE              1u
@@ -657,16 +716,16 @@ static void
 show_clocks(void)
 {
 	say("camera: GCC: camera AHB %#x, camera XO %#x\n", rd(gcc + GCC_CAMERA_AHB_CBCR), rd(gcc + GCC_CAMERA_XO_CBCR));
-	say("camera: camcc: titan top GDSC %#x; mclk2 RCG cmd %#x cfg %#x m %#x n %#x d %#x, branch %#x\n", rd(camcc + TITAN_TOP_GDSCR),
-	    rd(camcc + MCLK2_CMD_RCGR), rd(camcc + MCLK2_CFG_RCGR), rd(camcc + MCLK2_M), rd(camcc + MCLK2_N), rd(camcc + MCLK2_D),
-	    rd(camcc + MCLK2_CBCR));
+	say("camera: camcc: titan top GDSC %#x; the sensor's MCLK RCG cmd %#x cfg %#x m %#x n %#x d %#x, branch %#x\n", rd(camcc + TITAN_TOP_GDSCR),
+	    rd(camcc + MCLK_CMD_RCGR), rd(camcc + MCLK_CFG_RCGR), rd(camcc + MCLK_M), rd(camcc + MCLK_N), rd(camcc + MCLK_D),
+	    rd(camcc + MCLK_CBCR));
 }
 
 /* camcc's registers: only these, each read back (an RCG's update bit and a GDSC's status by waiting for them) */
 static bool
 camcc_put(uint32_t offset, uint32_t value, uint32_t check_mask)
 {
-	if (offset != TITAN_TOP_GDSCR && offset != MCLK2_CFG_RCGR && offset != MCLK2_CMD_RCGR && offset != MCLK2_CBCR) {
+	if (offset != TITAN_TOP_GDSCR && offset != MCLK_CFG_RCGR && offset != MCLK_CMD_RCGR && offset != MCLK_CBCR) {
 		give_up("a camcc register that is not to be written");
 		return false;
 	}
@@ -729,32 +788,32 @@ gdsc_off(void)
 static bool
 mclk_on(void)
 {
-	found_mclk_cfg_rcgr = rd(camcc + MCLK2_CFG_RCGR);
-	found_mclk_cbcr = rd(camcc + MCLK2_CBCR);
+	found_mclk_cfg_rcgr = rd(camcc + MCLK_CFG_RCGR);
+	found_mclk_cbcr = rd(camcc + MCLK_CBCR);
 	if (found_mclk_cbcr & 1) {
-		give_up("MCLK2 is on already (somebody else's)");
+		give_up("MCLK is on already (somebody else's)");
 		return false;
 	}
-	if (!camcc_put(MCLK2_CFG_RCGR, (found_mclk_cfg_rcgr & ~0x371fu) | (0u << 8) | 1u, 0x371f) ||
-	    !camcc_put(MCLK2_CMD_RCGR, rd(camcc + MCLK2_CMD_RCGR) | CMD_UPDATE, 0)) {
+	if (!camcc_put(MCLK_CFG_RCGR, (found_mclk_cfg_rcgr & ~0x371fu) | (0u << 8) | 1u, 0x371f) ||
+	    !camcc_put(MCLK_CMD_RCGR, rd(camcc + MCLK_CMD_RCGR) | CMD_UPDATE, 0)) {
 		return false;
 	}
-	if (!wait_bits(MCLK2_CMD_RCGR, CMD_UPDATE, 0, 500)) {
-		say("camera: MCLK2's RCG does not take its configuration (cmd %#x)\n", rd(camcc + MCLK2_CMD_RCGR));
+	if (!wait_bits(MCLK_CMD_RCGR, CMD_UPDATE, 0, 500)) {
+		say("camera: MCLK's RCG does not take its configuration (cmd %#x)\n", rd(camcc + MCLK_CMD_RCGR));
 		give_up("an RCG that does not update");
 		return false;
 	}
 	mclk_switched = true;
-	if (!camcc_put(MCLK2_CBCR, found_mclk_cbcr | 1, 1)) {
+	if (!camcc_put(MCLK_CBCR, found_mclk_cbcr | 1, 1)) {
 		return false;
 	}
-	if (!wait_bits(MCLK2_CBCR, CBCR_OFF, 0, 500)) {
-		say("camera: MCLK2's branch does not come on (%#x)\n", rd(camcc + MCLK2_CBCR));
+	if (!wait_bits(MCLK_CBCR, CBCR_OFF, 0, 500)) {
+		say("camera: MCLK's branch does not come on (%#x)\n", rd(camcc + MCLK_CBCR));
 		give_up("a clock that does not come on");
 		return false;
 	}
-	wr(GPIO_CFG(PIN_MCLK), CFG_FUNCTION(1) | CFG_DRIVE_MA(4));    /* cam_mclk, no pull, 4 mA: cam_macro_mclk_active */
-	say("camera: MCLK2 on at 19.2 MHz (RCG cfg %#x, branch %#x)\n", rd(camcc + MCLK2_CFG_RCGR), rd(camcc + MCLK2_CBCR));
+	wr(GPIO_CFG(hw->mclk_pin), CFG_FUNCTION(1) | CFG_DRIVE_MA(4));    /* cam_mclk, no pull, 4 mA: cam_macro_mclk_active, cam_wide_mclk_active */
+	say("camera: MCLK on at 19.2 MHz (RCG cfg %#x, branch %#x)\n", rd(camcc + MCLK_CFG_RCGR), rd(camcc + MCLK_CBCR));
 	return true;
 }
 
@@ -765,46 +824,240 @@ mclk_off(void)
 		return;
 	}
 	if (pins_found) {
-		wr(GPIO_CFG(PIN_MCLK), found_mclk_cfg);
+		wr(GPIO_CFG(hw->mclk_pin), found_mclk_cfg);
 	}
-	wr(camcc + MCLK2_CBCR, rd(camcc + MCLK2_CBCR) & ~1u);
-	(void)wait_bits(MCLK2_CBCR, CBCR_OFF, CBCR_OFF, 500);
-	wr(camcc + MCLK2_CFG_RCGR, found_mclk_cfg_rcgr);
-	wr(camcc + MCLK2_CMD_RCGR, rd(camcc + MCLK2_CMD_RCGR) | CMD_UPDATE);
-	(void)wait_bits(MCLK2_CMD_RCGR, CMD_UPDATE, 0, 500);
+	wr(camcc + MCLK_CBCR, rd(camcc + MCLK_CBCR) & ~1u);
+	(void)wait_bits(MCLK_CBCR, CBCR_OFF, CBCR_OFF, 500);
+	wr(camcc + MCLK_CFG_RCGR, found_mclk_cfg_rcgr);
+	wr(camcc + MCLK_CMD_RCGR, rd(camcc + MCLK_CMD_RCGR) | CMD_UPDATE);
+	(void)wait_bits(MCLK_CMD_RCGR, CMD_UPDATE, 0, 500);
 	mclk_switched = false;
-	say("camera: MCLK2 off (branch %#x, RCG cfg %#x as found)\n", rd(camcc + MCLK2_CBCR), rd(camcc + MCLK2_CFG_RCGR));
+	say("camera: MCLK off (branch %#x, RCG cfg %#x as found)\n", rd(camcc + MCLK_CBCR), rd(camcc + MCLK_CFG_RCGR));
 }
 
-/* ---- the macro sensor -------------------------------------------------------------------------------- */
+/* ---- the sensor's tables, its power and its ID ---------------------------------------------------------- */
 
-#define OV02B10_ADDRESS         0x3c            /* the module file's slave address 0x78, as 7 bits */
-#define OV02B10_ID_ADDRESS      0x0203          /* ... read as Android reads it: 16-bit address, 16-bit data */
-#define OV02B10_ID              0x002b
-#define OV02B10_ID_MASK         0xffff
+/*
+ * The sensor's tables are Android's, read at run time from fw/ of the small image, where
+ * userland/build.sh puts what tools/camsensor.py makes of the sensor's module file ("RWCTAB02"):
+ * the slave address and the chip ID's read, the lane assignment, the modes, the power sequences
+ * (Android's cam_sensor kinds: 0 MCLK, 1 VANA, 2 VDIG, 3 VIO, 8 RESET, with their delays) and the
+ * register tables (init, res0.., on, off, ...).
+ */
+struct ctab_head {
+	char            magic[8];       /* "RWCTAB02" */
+	uint32_t        slave, address_bytes, data_bytes, id_address, id, id_mask, lane_assign, modes;
+};
+struct ctab_mode {
+	uint32_t        width, height, x, y, lanes, cphy, settle, pixel_clock, line_length, frame_length, fps_milli, data_type;
+};
+struct ctab_entry {
+	uint16_t        address, data;  /* (a power sequence's: kind, value -- MCLK in kHz) */
+	uint8_t         address_bytes, data_bytes, operation, zero;
+	uint32_t        delay_us;
+};
 
-static bool chip_enable_switched, powered, reset_driven;
+static const struct ctab_head *ctab;
+static const struct ctab_mode *ctab_modes;
+static const uint8_t *ctab_power, *ctab_tables;
+static uint64_t ctab_size;
 
-/* Everything that was switched on, off again in the module file's power-down order (MCLK; reset low, 1 ms; VANA, 7 ms; VDIG). */
+static bool
+ctab_load(void)
+{
+	const uint8_t *at, *end;
+
+	ctab = (const struct ctab_head *)redwood_wifi_file(hw->tab, &ctab_size);
+	if (ctab == NULL || ctab_size < sizeof(*ctab) || memcmp(ctab->magic, "RWCTAB02", 8) != 0 || ctab->modes == 0 ||
+	    ctab->modes > 16) {
+		say("camera: no %s (RWCTAB02) in fw/ of the small image (made from fw-camera/ when it is built)\n", hw->tab);
+		ctab = NULL;
+		return false;
+	}
+	end = (const uint8_t *)ctab + ctab_size;
+	ctab_modes = (const struct ctab_mode *)(ctab + 1);
+	ctab_power = (const uint8_t *)(ctab_modes + ctab->modes);
+	at = ctab_power;
+	for (int p = 0; p < 2; p++) {
+		if (at + 12 > end) {
+			ctab = NULL;
+			return false;
+		}
+		at += 12 + *(const uint32_t *)(at + 8) * sizeof(struct ctab_entry);
+	}
+	ctab_tables = at;
+	if (ctab_tables + 4 > end) {
+		ctab = NULL;
+		return false;
+	}
+	say("camera: the %s sensor's tables: slave %#x, chip ID %#x at %#x, lanes %#x, %u modes, %u tables\n", hw->name, ctab->slave,
+	    ctab->id, ctab->id_address, ctab->lane_assign, ctab->modes, *(const uint32_t *)ctab_tables);
+	for (uint32_t m = 0; m < ctab->modes; m++) {
+		const struct ctab_mode *o = &ctab_modes[m];
+
+		say("camera:   mode %u: %ux%u at %u,%u, %u %s, settle %u, pixel clock %u, line %u, frame %u, %u.%03u frames/s\n", m, o->width,
+		    o->height, o->x, o->y, o->lanes, o->cphy ? "trio(s), C-PHY" : "lane(s), D-PHY", o->settle, o->pixel_clock,
+		    o->line_length, o->frame_length, o->fps_milli / 1000, o->fps_milli % 1000);
+	}
+	return true;
+}
+
+static const struct ctab_entry *
+ctab_block(const uint8_t *at, uint32_t blocks, const char *name, uint32_t *count)
+{
+	const uint8_t *end = (const uint8_t *)ctab + ctab_size;
+
+	for (uint32_t t = 0; t < blocks && at + 12 <= end; t++) {
+		uint32_t n = *(const uint32_t *)(at + 8);
+
+		if (strncmp((const char *)at, name, 8) == 0 && at + 12 + n * sizeof(struct ctab_entry) <= end) {
+			*count = n;
+			return (const struct ctab_entry *)(at + 12);
+		}
+		at += 12 + n * sizeof(struct ctab_entry);
+	}
+	*count = 0;
+	return NULL;
+}
+
+static const struct ctab_entry *
+ctab_find(const char *name, uint32_t *count)
+{
+	return ctab == NULL ? NULL : ctab_block(ctab_tables + 4, *(const uint32_t *)ctab_tables, name, count);
+}
+
+static uint8_t
+sensor_address(void)
+{
+	return (uint8_t)(ctab->slave >> 1);    /* (the module file's is the 8-bit one) */
+}
+
+static bool chip_enable_switched, powered, reset_driven, vana_gpio_switched;
+
+/* A GPIO-switched supply (the wide sensor's VANA): the pin a high output (GPIO, no pull, 2 mA: cam_sensor_active_wide). */
+static bool
+supply_on(const struct supply *s)
+{
+	if (s->kind == SUPPLY_LDO) {
+		return ldo_on(s->ldo, s->mv);
+	}
+	if (s->kind == SUPPLY_GPIO) {
+		found_vana_cfg = rd(GPIO_CFG(s->gpio));
+		found_vana_io = rd(GPIO_IO(s->gpio));
+		vana_gpio_switched = true;
+		wr(GPIO_IO(s->gpio), 2);
+		wr(GPIO_CFG(s->gpio), CFG_OUTPUT | CFG_DRIVE_MA(2));
+		if ((rd(GPIO_CFG(s->gpio)) & 0x3ff) != (CFG_OUTPUT | CFG_DRIVE_MA(2)) || !(rd(GPIO_IO(s->gpio)) & 2)) {
+			give_up("a supply's pin that does not read back");
+			return false;
+		}
+		spin_us(s->ramp_us);
+		say("camera: gpio%u high: the fixed 2.8 V regulator on\n", s->gpio);
+		return true;
+	}
+	give_up("a supply this sensor does not have");
+	return false;
+}
+
+static void
+supply_off(const struct supply *s)
+{
+	if (s->kind == SUPPLY_LDO) {
+		ldo_off(s->ldo);
+	} else if (s->kind == SUPPLY_GPIO && vana_gpio_switched) {
+		wr(GPIO_IO(s->gpio), 0);
+		spin_us(10);
+		wr(GPIO_IO(s->gpio), found_vana_io & 2);
+		wr(GPIO_CFG(s->gpio), found_vana_cfg);
+		vana_gpio_switched = false;
+		say("camera: gpio%u back as it was found: the fixed regulator off\n", s->gpio);
+	}
+}
+
+static void
+sensor_delay(uint32_t us)
+{
+	if (us >= 1000) {
+		wait_ms(us / 1000);
+		us %= 1000;
+	}
+	spin_us(us);
+}
+
+/* One step of the module file's power sequence (`up': part of the power-up, where a fault stops it). */
+static bool
+power_step(const struct ctab_entry *e, bool up)
+{
+	const struct supply *s = e->address == 1 ? &hw->vana : e->address == 2 ? &hw->vdig : e->address == 3 ? &hw->vio : NULL;
+
+	switch (e->address) {
+	case 8:
+		reset_driven = true;
+		reset_pin(e->data != 0);
+		break;
+	case 0:
+		if (e->data != 0 && e->data != 19200) {
+			give_up("an MCLK rate not known here");
+			return false;
+		}
+		if (e->data != 0) {
+			if (!up || !gdsc_on() || !mclk_on()) {
+				return false;
+			}
+		} else {
+			mclk_off();
+		}
+		break;
+	case 1: case 2: case 3:
+		if (s->kind == SUPPLY_NONE) {
+			give_up("a supply the device tree does not give this sensor");
+			return false;
+		}
+		if (e->data != 0) {
+			if (!up || !supply_on(s)) {
+				return false;
+			}
+		} else {
+			supply_off(s);
+		}
+		break;
+	default:
+		say("camera: a power step of kind %u, which this does not know\n", e->address);
+		give_up("a power sequence not understood");
+		return false;
+	}
+	sensor_delay(e->delay_us);
+	return true;
+}
+
+/* Everything that was switched on, off again: the module file's power-down, then the rest as it was found. */
 static void
 power_down(void)
 {
-	bool was = powered || mclk_switched || ldo_switched[LDO_VANA] || ldo_switched[LDO_VDIG] || gdsc_switched || reset_driven ||
-	    chip_enable_switched || pgpio_changed;
+	bool was = powered || mclk_switched || gdsc_switched || reset_driven || chip_enable_switched || pgpio_changed ||
+	    vana_gpio_switched;
+	uint32_t count = 0;
+	const struct ctab_entry *e = ctab != NULL ? ctab_block(ctab_power, 2, "pwrdn", &count) : NULL;
 
+	for (unsigned n = 1; n <= 7; n++) {
+		was |= ldo_switched[n];
+	}
 	if (!was) {
 		return;
 	}
 	say("camera: powering down\n");
+	for (uint32_t i = 0; e != NULL && i < count; i++) {
+		(void)power_step(&e[i], false);
+	}
+	/* (whatever the sequence did not reach) */
 	mclk_off();
-	gdsc_off();
 	if (reset_driven) {
 		reset_pin(false);
-		wait_ms(1);
 	}
-	ldo_off(LDO_VANA);
-	wait_ms(7);
-	ldo_off(LDO_VDIG);
+	supply_off(&hw->vio);
+	supply_off(&hw->vana);
+	supply_off(&hw->vdig);
+	gdsc_off();
 	if (chip_enable_switched) {
 		uint8_t enable = 0;
 
@@ -817,7 +1070,6 @@ power_down(void)
 		chip_enable_switched = false;
 	}
 	if (pgpio_changed) {
-		/* (in the reverse order of the writes: disabled first) */
 		uint8_t now[5];
 		bool all = pgpio_read_all(now);
 
@@ -830,8 +1082,8 @@ power_down(void)
 		pgpio_changed = false;
 	}
 	if (reset_driven && pins_found) {
-		wr(GPIO_IO(PIN_RESET), found_reset_io & 2);
-		wr(GPIO_CFG(PIN_RESET), found_reset_cfg);
+		wr(GPIO_IO(hw->reset), found_reset_io & 2);
+		wr(GPIO_CFG(hw->reset), found_reset_cfg);
 		reset_driven = false;
 	}
 	powered = false;
@@ -850,12 +1102,11 @@ pm8008_up(void)
 	}
 	memcpy(pgpio_found_regs, regs, sizeof(regs));
 	if (!pgpio_active(regs)) {
-		say("camera: the PM8008i is held in reset (GPIO 3 vin, pull, mode, source, enable: %02x %02x %02x %02x %02x): let out as "
-		    "Android lets it out\n", regs[0],
-		    regs[1], regs[2], regs[3], regs[4]);
 		uint8_t want[5] = { (uint8_t)(regs[0] & ~7), (uint8_t)((regs[1] & ~7) | 5), (uint8_t)((regs[2] & ~3) | 1), 0x80,
 			            (uint8_t)(regs[4] | 0x80) };
 
+		say("camera: the PM8008i is held in reset (GPIO 3 vin, pull, mode, source, enable: %02x %02x %02x %02x %02x): let out as "
+		    "Android lets it out\n", regs[0], regs[1], regs[2], regs[3], regs[4]);
 		pgpio_changed = true;
 		for (int i = 0; i < 5; i++) {
 			/* (only what differs, in the order Android's pinctrl driver writes them: the enable last) */
@@ -884,55 +1135,57 @@ pm8008_up(void)
 	return true;
 }
 
-/* The module file's power-up: reset low, 1 ms; VDIG; VANA, 2 ms; MCLK (after the top power domain), 4 ms; reset high, 9 ms. */
+/* The module file's power-up, step by step. */
 static bool
 power_up(void)
 {
+	uint32_t count = 0;
+	const struct ctab_entry *e = ctab != NULL ? ctab_block(ctab_power, 2, "pwrup", &count) : NULL;
+
+	if (e == NULL) {
+		give_up("no power sequence");
+		return false;
+	}
 	powered = true;
 	if (!pm8008_up()) {
 		return false;
 	}
-	reset_driven = true;
-	reset_pin(false);
-	wait_ms(1);
-	if (!ldo_on(LDO_VDIG, VDIG_MV) || !ldo_on(LDO_VANA, VANA_MV)) {
-		return false;
+	for (uint32_t i = 0; i < count; i++) {
+		if (!power_step(&e[i], true)) {
+			return false;
+		}
 	}
-	wait_ms(2);
-	if (!gdsc_on() || !mclk_on()) {
-		return false;
-	}
-	wait_ms(4);
-	reset_pin(true);
-	wait_ms(9);
-	say("camera: the macro sensor powered up\n");
+	say("camera: the %s sensor powered up (%u steps)\n", hw->name, count);
 	return true;
 }
 
 static bool
 read_chip_id(void)
 {
-	uint8_t where[2] = { OV02B10_ID_ADDRESS >> 8, OV02B10_ID_ADDRESS & 0xff }, id[2] = { 0, 0 };
-	uint16_t chip;
+	uint8_t where[2] = { (uint8_t)(ctab->id_address >> 8), (uint8_t)ctab->id_address }, id[4] = { 0, 0, 0, 0 };
+	unsigned out = ctab->address_bytes == 2 ? 2 : 1, in = ctab->data_bytes >= 1 && ctab->data_bytes <= 4 ? ctab->data_bytes : 2;
+	uint32_t chip = 0;
 
-	if (!i2c_transfer(&cci_bus, OV02B10_ADDRESS, where, 2, id, 2)) {
-		say("camera: the macro sensor does not answer at %#04x\n", OV02B10_ADDRESS);
+	if (!i2c_transfer(&cci_bus, sensor_address(), out == 2 ? where : where + 1, out, id, in)) {
+		say("camera: the %s sensor does not answer at %#04x\n", hw->name, sensor_address());
 		return false;
 	}
-	chip = (uint16_t)(id[0] << 8 | id[1]);
-	say("camera: the macro sensor's chip ID: %#06x (%s)\n", chip, (chip & OV02B10_ID_MASK) == OV02B10_ID ?
-	    "an OV02B10, as Android expects" : "NOT what Android expects");
-	return (chip & OV02B10_ID_MASK) == OV02B10_ID;
+	for (unsigned i = 0; i < in; i++) {
+		chip = chip << 8 | id[i];
+	}
+	say("camera: the %s sensor's chip ID: %#06x (%s)\n", hw->name, chip, (chip & ctab->id_mask) == (ctab->id & ctab->id_mask) ?
+	    "as Android expects" : "NOT what Android expects");
+	return (chip & ctab->id_mask) == (ctab->id & ctab->id_mask);
 }
 
-/* While powered up: the two LDOs still ready and not over their current. */
+/* While powered up: the LDOs switched on still ready and not over their current. */
 static bool
 healthy(void)
 {
-	for (unsigned n = LDO_VDIG; n <= LDO_VANA; n++) {
+	for (unsigned n = 1; n <= 7; n++) {
 		uint8_t status = 0;
 
-		if (!ldo_was_on[n] && (!pm8008_get(PM8008_REGULATORS, (uint16_t)(LDO_BASE(n) + LDO_STATUS1), &status, 1) ||
+		if (ldo_switched[n] && (!pm8008_get(PM8008_REGULATORS, (uint16_t)(LDO_BASE(n) + LDO_STATUS1), &status, 1) ||
 		    !(status & 0x80) || (status & 0x20))) {
 			say("camera: PM8008i LDO%u: status %#04x\n", n, status);
 			give_up("an LDO that is no longer well");
@@ -1184,17 +1437,18 @@ look_around(void)
  * after the run ("xl camera"; tools/camraw.py makes pictures of it).
  *
  * What it takes, in Android's order and with Android's numbers (camcc-yupik.c, gcc-yupik.c, the
- * device tree's clock rates at the "svs" level of csid-lite 0, csiphy 2 and cpas):
+ * device tree's clock rates at the "svs" level of csid-lite 0, the sensor's csiphy and cpas):
  *   RPMh   CX at SVS (128) for camcc's clocks at 400 MHz, MX at SVS_L1 (192) for PLL0's 1.2 GHz --
  *          asked through DRV 2's second TCS for requests made at once, as camcc's vdd_cx and vdd_mx
  *          votes are, and given back (position 0) at the end: DRV 2 holds no other vote on them
  *          (cam=1 looks: none of its TCSs has a command for either)
  *   GCC    camera_hf_axi (0x26010), camera_sf_axi (0x2601c)
  *   camcc  PLL0 (Lucid, 1200 MHz: L 0x3e, alpha 0x8000, its config and user values), then the RCGs
- *          slow_ahb 80 MHz, camnoc_axi 150, cphy_rx 400, csi2phytimer 300, ife_lite_0_csid 400,
+ *          slow_ahb 80 MHz, camnoc_axi 150, cphy_rx 400, csiNphytimer 300, ife_lite_0_csid 400,
  *          ife_lite_0 400 (all from PLL0's even (600) or odd (400) output) and the branches
- *          cpas_ahb, camnoc_axi, csiphy2, csi2phytimer, ife_lite_0_csid, ife_lite_0_cphy_rx,
- *          ife_lite_0 (the clocks the device tree gives cpas, csiphy 2 and csid-lite 0)
+ *          cpas_ahb, camnoc_axi, csiphyN, csiNphytimer, ife_lite_0_csid, ife_lite_0_cphy_rx,
+ *          ife_lite_0 (the clocks the device tree gives cpas, the csiphy and csid-lite 0; N is the
+ *          sensor's CSIPHY: 2 for the macro one and for the test pattern, 1 for the wide one)
  * Everything is taken back in the reverse order at the end, and on any fault.
  */
 #define RSC_IRQ_STATUS          (RSC_TCS_BASE + 0x04)
@@ -1368,7 +1622,7 @@ static struct rcg rcgs[] = {
 	{ "slow_ahb 80 MHz", 0x7058, 2, 14 },           /* PLL0 even (600) / 7.5 */
 	{ "camnoc_axi 150 MHz", 0xc124, 2, 7 },         /* / 4 */
 	{ "cphy_rx 400 MHz", 0xa064, 2, 2 },            /* / 1.5 */
-	{ "csi2phytimer 300 MHz", 0xe0f4, 2, 3 },       /* / 2 */
+	{ "csiNphytimer 300 MHz", 0, 2, 3 },            /* / 2 (the sensor's CSIPHY's: hw->timer_cmd) */
 	{ "ife_lite_0_csid 400 MHz", 0xc020, 2, 2 },    /* / 1.5 */
 	{ "ife_lite_0 400 MHz", 0xc004, 3, 1 },         /* PLL0 odd (400) / 1 */
 };
@@ -1380,14 +1634,18 @@ struct branch {
 };
 static struct branch branches[] = {
 	{ "gcc camera_hf_axi", true, 0x26010 }, { "gcc camera_sf_axi", true, 0x2601c },
-	{ "cpas_ahb", false, 0xc11c }, { "camnoc_axi", false, 0xc140 }, { "csiphy2", false, 0xe110 },
-	{ "csi2phytimer", false, 0xe10c },
+	{ "cpas_ahb", false, 0xc11c }, { "camnoc_axi", false, 0xc140 }, { "csiphyN", false, 0 },
+	{ "csiNphytimer", false, 0 },
 	{ "ife_lite_0_csid", false, 0xc038 }, { "ife_lite_0_cphy_rx", false, 0xc040 }, { "ife_lite_0", false, 0xc01c },
 };
 
 static bool
 clocks_up(void)
 {
+	/* (the sensor's CSIPHY: its own branch and timer) */
+	rcgs[3].cmd = hw->timer_cmd;
+	branches[4].cbcr = hw->phy_cbcr;
+	branches[5].cbcr = hw->timer_cbcr;
 	for (unsigned i = 0; i < sizeof(rcgs) / sizeof(rcgs[0]); i++) {
 		struct rcg *r = &rcgs[i];
 		uint32_t cfg = r->cmd + 4;
@@ -1528,15 +1786,10 @@ frames_alloc(uint32_t width, uint32_t height, uint32_t stride, uint32_t source)
 	h->height = height;
 	h->stride = stride;
 	h->format = 1;
-	/*
-	 * RGGB: the CSID's test pattern, and the OV02B10's picture as it comes here (the two sites of a 2x2
-	 * cell that track each other, the greens, are its second and third; red against blue by the light
-	 * of a room). The sensor's own colour bars (cam_pattern=1) come a line off that: GBRG.
-	 */
-	h->bayer = 0;
+	h->bayer = 0;                   /* (RGGB: the CSID's test pattern; a sensor's picture: capture_sensor()) */
 	h->frame_bytes = frame_bytes;
 	h->source = source;
-	strlcpy(h->sensor, source ? "OV02B10" : "CSID TPG", sizeof(h->sensor));
+	strlcpy(h->sensor, !source ? "CSID TPG" : hw->omnivision ? "OV02B10" : "S5KHM2SD", sizeof(h->sensor));
 	/* (what the processor wrote out of its caches; the IFE writes past them) */
 	for (vm_offset_t line = frames; line < frames + frames_bytes; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
@@ -1726,7 +1979,7 @@ smmu_down(void)
 
 #define CSID_PHYS               0x0acc8000UL
 #define IFE_PHYS                0x0acc4000UL
-#define CSIPHY_PHYS             0x0ace4000UL
+#define CSIPHY_PHYS(n)          (0x0ace0000UL + 0x2000UL * (n))
 
 #define CSID_HW_VERSION         0x000
 #define CSID_RST_STROBES        0x010
@@ -1886,11 +2139,12 @@ csid_reset(void)
 
 /* The RX (from a PHY, or the test pattern generator: `phy' -1) and RDI 0, for RAW10 of vc/dt, written as it comes (packed). */
 static bool
-csid_config(int phy, unsigned lanes, uint32_t lane_cfg, uint32_t vc, uint32_t width, uint32_t height)
+csid_config(int phy, unsigned lanes, uint32_t lane_cfg, uint32_t vc, uint32_t width, uint32_t height, bool cphy)
 {
 	uint32_t cfg0 = vc << 22 | RAW10_DT << 16 | 0u << 27 | 0xfu << 12 | 0u << 10 | 1u << 2 | 3u;
 
-	if (!blk_put(csid, "CSID", CSID_CSI2_RX_CFG0, (lanes - 1) | lane_cfg << 4 | 0u << 24 | (uint32_t)(phy < 0 ? 0 : phy & 3) << 20,
+	if (!blk_put(csid, "CSID", CSID_CSI2_RX_CFG0, (lanes - 1) | lane_cfg << 4 | (uint32_t)cphy << 24 |
+	    (uint32_t)(phy < 0 ? 0 : phy & 3) << 20,
 	    true) || !blk_put(csid, "CSID", CSID_CSI2_RX_CFG1, 1u << 6 | 1u, true)) {
 		return false;
 	}
@@ -2006,7 +2260,7 @@ titan_up(void)
 	if (csid == 0) {
 		csid = ml_io_map(CSID_PHYS, 0x1000);
 		ife = ml_io_map(IFE_PHYS, 0x4000);
-		csiphy = ml_io_map(CSIPHY_PHYS, 0x2000);
+		csiphy = ml_io_map(CSIPHY_PHYS(hw->csiphy), 0x2000);
 	}
 	if (!(rd(camcc + TITAN_TOP_GDSCR) & GDSC_ON) && !gdsc_on()) {
 		return false;
@@ -2039,7 +2293,7 @@ capture_tpg(void)
 	struct cam_header *h;
 
 	if (!frames_alloc(width, height, stride, 0) || !titan_up() || !smmu_up() || !csid_reset() ||
-	    !csid_config(-1, 4, 0x3210, TPG_VC, width, height) || !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height)) {
+	    !csid_config(-1, 4, 0x3210, TPG_VC, width, height, false) || !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height)) {
 		titan_down();
 		return;
 	}
@@ -2073,73 +2327,28 @@ capture_tpg(void)
 	}
 }
 
-/* ---- cam=4: the macro sensor's own frames ------------------------------------------------------------- */
+/* ---- cam=4: the sensor's own frames ------------------------------------------------------------------ */
 
 /*
  * The sensor's tables are Android's, read at run time: tools/camsensor.py makes camera-ov02b10.tab
- * out of the module file (userland/build.sh puts it into fw/ of the small image). The sequence is
- * Android's: power up, the chip ID, the initialisation ("init", 108 writes: a soft reset, then its
- * registers page by page), the resolution's own ("res0": 1600x1200 RAW10 on one lane at 665.6 Mbit/s,
- * 30 frames a second); CSIPHY 2, CSID-lite 0's RX from PHY 2 and RDI 0, IFE-lite 0's write master as
- * for cam=3; then "on", the frames, "off" (and its 30 ms), and everything down again. The sensor's
- * writes are not read back (some of its registers start something and clear themselves, a soft
- * reset among them); each byte must be acknowledged.
+ * and camera-s5khm2sd.tab out of the module files (userland/build.sh puts them into fw/ of the small
+ * image). The sequence is Android's: power up, the chip ID, the initialisation ("init": the macro's
+ * 108 writes, a soft reset and then its registers page by page; the wide one's 1441), the mode's own
+ * table ("resN": boot-arg cam_mode=N, or the mode with the fewest pixels: the macro's 1600x1200 RAW10
+ * on one lane at 665.6 Mbit/s, 30 frames a second; the wide one's 1920x1080 RAW10 on three C-PHY
+ * trios at 3.11 Gbit/s each, 120 frames a second); the sensor's CSIPHY, CSID-lite 0's RX from that
+ * PHY and RDI 0, IFE-lite 0's write master as for cam=3; then "on", the frames, "off" (and its 30 ms),
+ * and everything down again. The sensor's writes are not read back (some of its registers start
+ * something and clear themselves, a soft reset among them); each byte must be acknowledged.
  *
- * CSIPHY 2 ("qcom,csiphy-v1.2.1": Android's cam_csiphy_1_2_1_hwreg.h, cam_csiphy_core.c): its reset,
- * the common registers with the lanes to enable (data lane 0 and the clock lane: the module file's
- * lane assignment 0, one lane), then the two-phase (D-PHY) settings of every lane position, the
- * settle count among them, and its interrupts (status only, nothing handled). The settle count is
- * worked out here from the data rate the way the D-PHY specification places it (the middle of the
- * window between HS-PREPARE and HS-PREPARE + HS-ZERO, in periods of the 300 MHz timer): Android's
- * comes from the camera stack and its log does not say it unless the camera has been opened.
- * Boot-arg cam_settle=N sets it instead.
+ * The CSIPHY ("qcom,csiphy-v1.2.1": Android's cam_csiphy_1_2_1_hwreg.h, cam_csiphy_core.c): its reset,
+ * the common registers with the lanes to enable (from the module file's lane assignment: the macro's
+ * data lane 0 and the clock lane; the wide one's three trios), then the two-phase (D-PHY) settings of
+ * every lane position or the three-phase (C-PHY) ones of every trio with the row of the data rate's
+ * table that covers the rate, the settle count among them, and its interrupts (status only, nothing
+ * handled). The settle count is the module file's for the mode (the macro's 20, the wide one's 34,
+ * in periods of the 300 MHz timer). Boot-arg cam_settle=N sets it instead.
  */
-struct ctab_head {
-	char            magic[8];       /* "RWCTAB01" */
-	uint32_t        slave, id_address, id, id_mask, lanes, width, height, data_type, pixel_clock, line_length, frame_length;
-	uint32_t        tables;
-};
-struct ctab_entry {
-	uint16_t        address, data;
-	uint8_t         address_bytes, data_bytes, operation, zero;
-	uint32_t        delay_us;
-};
-
-static const struct ctab_head *ctab;
-static uint64_t ctab_size;
-
-static bool
-ctab_load(void)
-{
-	ctab = (const struct ctab_head *)redwood_wifi_file("camera-ov02b10.tab", &ctab_size);
-	if (ctab == NULL || ctab_size < sizeof(*ctab) || memcmp(ctab->magic, "RWCTAB01", 8) != 0) {
-		say("camera: no camera-ov02b10.tab in fw/ of the small image (made from fw-camera/ when it is built)\n");
-		return false;
-	}
-	say("camera: the macro sensor's tables: %ux%u, data type %#x, %u lane(s), pixel clock %u, line length %u, frame length %u, "
-	    "%u tables\n", ctab->width, ctab->height, ctab->data_type, ctab->lanes, ctab->pixel_clock, ctab->line_length,
-	    ctab->frame_length, ctab->tables);
-	return true;
-}
-
-static const struct ctab_entry *
-ctab_find(const char *name, uint32_t *count)
-{
-	const uint8_t *at = (const uint8_t *)(ctab + 1), *end = (const uint8_t *)ctab + ctab_size;
-
-	for (uint32_t t = 0; t < ctab->tables && at + 12 <= end; t++) {
-		uint32_t n = *(const uint32_t *)(at + 8);
-
-		if (strncmp((const char *)at, name, 8) == 0 && at + 12 + n * sizeof(struct ctab_entry) <= end) {
-			*count = n;
-			return (const struct ctab_entry *)(at + 12);
-		}
-		at += 12 + n * sizeof(struct ctab_entry);
-	}
-	*count = 0;
-	return NULL;
-}
-
 /* One of the sensor's tables written in order, as Android's sensor driver writes it. */
 static bool
 sensor_table(const char *name)
@@ -2169,7 +2378,7 @@ sensor_table(const char *name)
 			out[n++] = (uint8_t)(e[i].data >> 8);
 		}
 		out[n++] = (uint8_t)e[i].data;
-		if (broken || !i2c_transfer(&cci_bus, OV02B10_ADDRESS, out, n, NULL, 0)) {
+		if (broken || !i2c_transfer(&cci_bus, sensor_address(), out, n, NULL, 0)) {
 			say("camera: \"%s\" %u: %#x <- %#x not acknowledged\n", name, i, e[i].address, e[i].data);
 			give_up("a sensor write nobody acknowledged");
 			return false;
@@ -2184,31 +2393,28 @@ sensor_table(const char *name)
 
 static bool csiphy_running;
 
+/* The common part of cam_csiphy_config_dev(): the lanes to enable, then the registers of the PHY's kind. */
 static bool
-csiphy_up(unsigned settle)
+csiphy_common(uint32_t lane_enable, bool cphy)
 {
-	static const uint32_t lanes[5][2] = {           /* each lane position's two blocks: data lane 0, the clock lane, data lanes 1, 2, 3 */
-		{ 0x000, 0x900 }, { 0x700, 0xc80 }, { 0x200, 0xa00 }, { 0x400, 0xb00 }, { 0x600, 0xc00 },
-	};
-	static const uint8_t irq_masks[11] = { 0xff, 0xff, 0xfb, 0xff, 0x7f, 0xff, 0xff, 0xef, 0xff, 0xff, 0xff };
-
-	/* cam_csiphy_reset(): csiphy_reset_reg_1_2_1 */
-	wr(csiphy + 0x814, 0x00);
-	spin_us(5);
-	wr(csiphy + 0x818, 0x00);
-	wr(csiphy + 0x81c, 0x00);
-	wr(csiphy + 0x800, 0x01);
-	spin_us(1);
-	wr(csiphy + 0x800, 0x00);
-	csiphy_running = true;
-	/* cam_csiphy_config_dev(): the common registers (two-phase), lanes: data lane 0 and the clock lane */
-	if (!blk_put(csiphy, "CSIPHY", 0x814, 0x01 | 0x80, true) || !blk_put(csiphy, "CSIPHY", 0x818, 0x01, true) ||
-	    !blk_put(csiphy, "CSIPHY", 0x81c, 0x02, true)) {
+	if (!blk_put(csiphy, "CSIPHY", 0x814, lane_enable, true) || !blk_put(csiphy, "CSIPHY", 0x818, 0x01, true) ||
+	    !blk_put(csiphy, "CSIPHY", 0x81c, cphy ? 0x52 : 0x02, true)) {
 		return false;
 	}
 	wr(csiphy + 0x800, 0x03);
 	spin_us(1);
-	wr(csiphy + 0x800, 0x02);
+	wr(csiphy + 0x800, cphy ? 0x0e : 0x02);
+	return true;
+}
+
+/* D-PHY: csiphy_2ph_v1_2_1_reg, every lane position (data lanes 0..3 and the clock lane) */
+static bool
+csiphy_dphy(unsigned settle)
+{
+	static const uint32_t lanes[5][2] = {           /* each lane position's two blocks: data lane 0, the clock lane, data lanes 1, 2, 3 */
+		{ 0x000, 0x900 }, { 0x700, 0xc80 }, { 0x200, 0xa00 }, { 0x400, 0xb00 }, { 0x600, 0xc00 },
+	};
+
 	for (unsigned l = 0; l < 5; l++) {
 		uint32_t b = lanes[l][0], m = lanes[l][1];
 		bool clock = l == 1;
@@ -2227,13 +2433,107 @@ csiphy_up(unsigned settle)
 			return false;
 		}
 	}
+	return true;
+}
+
+/*
+ * C-PHY: csiphy_3ph_v1_2_1_reg, every trio position (three), then cam_csiphy_cphy_data_rate_config()'s
+ * deltas of data_rate_delta_table_1_2_1 for the first rate that covers this one (its rows go up to
+ * 2.5, 3.5 and 4.5 Gsym/s a trio, 2.28 bits a symbol).
+ */
+static bool
+csiphy_cphy(unsigned settle, uint64_t bits_per_trio)
+{
+	static const uint32_t trios[3][2] = { { 0x100, 0x980 }, { 0x300, 0xa80 }, { 0x500, 0xb80 } };
+	static const struct {
+		uint64_t        bandwidth;
+		uint8_t         r144, r164, r16c, rb4;  /* (rb4: 0 for none) */
+	} rates[3] = {
+		{ 5700000000ull, 0x32, 0x0b, 0x25, 0 }, { 7980000000ull, 0xb2, 0x33, 0x1d, 0x03 }, { 10260000000ull, 0xb2, 0x33, 0x25, 0x02 },
+	};
+	unsigned r = 0;
+
+	for (unsigned t = 0; t < 3; t++) {
+		uint32_t b = trios[t][0], m = trios[t][1];
+
+		if (!blk_put(csiphy, "CSIPHY", m + 0x10, 0x00, true) || !blk_put(csiphy, "CSIPHY", m + 0x14, 0x00, true) ||
+		    !blk_put(csiphy, "CSIPHY", m + 0x18, 0x00, true) || !blk_put(csiphy, "CSIPHY", m + 0x10, 0x08, true) ||
+		    !blk_put(csiphy, "CSIPHY", m + 0x14, 0x08, true) || !blk_put(csiphy, "CSIPHY", m + 0x18, 0x1a, true) ||
+		    !blk_put(csiphy, "CSIPHY", m + 0x0c, 0xaf, true)) {
+			return false;
+		}
+		spin_us(1);
+		if (!blk_put(csiphy, "CSIPHY", b + 0x5c, 0x46, true) || !blk_put(csiphy, "CSIPHY", b + 0x68, 0xa0, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x04, 0x06, true) || !blk_put(csiphy, "CSIPHY", b + 0x0c, settle & 0xff, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x08, (settle >> 8) & 0xff, true) || !blk_put(csiphy, "CSIPHY", b + 0x14, 0x20, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x50, 0x00, true) || !blk_put(csiphy, "CSIPHY", b + 0x88, 0x00, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x8c, 0x7f, true) || !blk_put(csiphy, "CSIPHY", b + 0x90, 0x7f, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x18, 0x3e, true) || !blk_put(csiphy, "CSIPHY", b + 0x1c, 0x41, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x20, 0x41, true) || !blk_put(csiphy, "CSIPHY", b + 0x24, 0x7f, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x28, 0x00, true) || !blk_put(csiphy, "CSIPHY", b + 0x2c, 0x00, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x60, 0x02, true) || !blk_put(csiphy, "CSIPHY", b + 0xcc, 0x41, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0xdc, 0x50, true) || !blk_put(csiphy, "CSIPHY", m + 0x04, 0x20, true) ||
+		    !blk_put(csiphy, "CSIPHY", m + 0x08, 0x05, true) || !blk_put(csiphy, "CSIPHY", m + 0x00, 0x60, true) ||
+		    !blk_put(csiphy, "CSIPHY", m + 0x2c, 0x35, true) || !blk_put(csiphy, "CSIPHY", m + 0x30, 0x01, true) ||
+		    !blk_put(csiphy, "CSIPHY", 0x800, 0x0e, true) || !blk_put(csiphy, "CSIPHY", 0x884, 0x01, true)) {
+			return false;
+		}
+	}
+	while (r < 2 && bits_per_trio > rates[r].bandwidth) {
+		r++;
+	}
+	for (unsigned t = 0; t < 3; t++) {
+		uint32_t b = trios[t][0], m = trios[t][1];
+
+		if (!blk_put(csiphy, "CSIPHY", b + 0x44, rates[r].r144, true) || !blk_put(csiphy, "CSIPHY", b + 0x64, rates[r].r164, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x6c, rates[r].r16c, true) ||
+		    (rates[r].rb4 != 0 && !blk_put(csiphy, "CSIPHY", m + 0x34, rates[r].rb4, true))) {
+			return false;
+		}
+		if (rates[r].rb4 != 0) {
+			spin_us(1);
+		}
+	}
+	say("camera: CSIPHY %u: C-PHY rate row %u (up to %llu bit/s a trio) for %llu\n", hw->csiphy, r, rates[r].bandwidth, bits_per_trio);
+	return true;
+}
+
+/* cam_csiphy_reset(), then the configuration for `lanes' lanes (trios) of the lane assignment, and the interrupt masks. */
+static bool
+csiphy_up(unsigned lanes, bool cphy, uint32_t lane_assign, unsigned settle, uint64_t bits_per_lane)
+{
+	static const uint8_t irq_masks[11] = { 0xff, 0xff, 0xfb, 0xff, 0x7f, 0xff, 0xff, 0xef, 0xff, 0xff, 0xff };
+	uint32_t lane_enable = 0;
+
+	/* cam_csiphy_get_lane_enable(): D-PHY data lane n at bit 2n, the clock lane at 7; C-PHY trio n at bit 2n + 1 */
+	for (unsigned l = 0; l < lanes; l++, lane_assign >>= 4) {
+		unsigned n = lane_assign & 0xf;
+
+		if (n > (cphy ? 2u : 3u)) {
+			give_up("a lane assignment not known here");
+			return false;
+		}
+		lane_enable |= cphy ? 1u << (2 * n + 1) : 1u << (2 * n) | 0x80u;
+	}
+	wr(csiphy + 0x814, 0x00);
+	spin_us(5);
+	wr(csiphy + 0x818, 0x00);
+	wr(csiphy + 0x81c, 0x00);
+	wr(csiphy + 0x800, 0x01);
+	spin_us(1);
+	wr(csiphy + 0x800, 0x00);
+	csiphy_running = true;
+	if (!csiphy_common(lane_enable, cphy) || !(cphy ? csiphy_cphy(settle, bits_per_lane) : csiphy_dphy(settle))) {
+		return false;
+	}
 	for (unsigned i = 0; i < 11; i++) {
 		wr(csiphy + 0x82c + 4 * i, irq_masks[i]);
 		wr(csiphy + 0x858 + 4 * i, 0xff);
 	}
 	wr(csiphy + 0x828, 0x1);
 	wr(csiphy + 0x828, 0x0);
-	say("camera: CSIPHY 2 configured: one data lane, settle count %u\n", settle);
+	say("camera: CSIPHY %u configured: %u %s (lanes enabled %#x), settle count %u\n", hw->csiphy, lanes, cphy ? "trio(s), C-PHY" :
+	    "lane(s), D-PHY", lane_enable, settle);
 	return true;
 }
 
@@ -2241,7 +2541,7 @@ static void
 show_csiphy(const char *when)
 {
 	char line[200];
-	int at = snprintf(line, sizeof(line), "camera: CSIPHY 2 %s, interrupt status:", when);
+	int at = snprintf(line, sizeof(line), "camera: CSIPHY %u %s, interrupt status:", hw->csiphy, when);
 
 	for (unsigned i = 0; i < 11 && at < (int)sizeof(line) - 6; i++) {
 		at += snprintf(line + at, sizeof(line) - (size_t)at, " %02x", rd(csiphy + 0x8b0 + 4 * i) & 0xff);
@@ -2265,53 +2565,62 @@ csiphy_down(void)
 	csiphy_running = false;
 }
 
-/* The settle count the D-PHY specification's window gives at this data rate, in periods of the 300 MHz timer. */
-static unsigned
-settle_count(uint64_t bits_per_second)
-{
-	uint64_t ui_ps = 1000000000000ull / bits_per_second;
-	uint64_t prepare_max_ps = 85000 + 6 * ui_ps, prepare_zero_min_ps = 145000 + 10 * ui_ps;
-	uint64_t settle_ps = (prepare_max_ps + prepare_zero_min_ps) / 2;
-
-	return (unsigned)(settle_ps * 300 / 1000000) - 6;
-}
-
 /*
- * The exposure: the module file's table that sets it (page 1: analog gain 0x22, the frame's extra
- * lines 0x14/0x15, the exposure in lines 0x0e/0x0f, 0x9b, then 0xfe = 2 to apply it; "holdon" here),
- * as Android's camera stack writes its first one. Boot-args cam_shutter=LINES and cam_gain=N (the
- * value of 0x22: 16 is 1x) write those two instead, the same way, for a look in other light, and
- * cam_vblank=LINES (0x14/0x15) makes the frame that much longer, for a longer exposure.
+ * The exposure. The OV02B10's module file has a table that sets it (page 1: analog gain 0x22, the
+ * frame's extra lines 0x14/0x15, the exposure in lines 0x0e/0x0f, 0x9b, then 0xfe = 2 to apply it;
+ * "holdon" here), written as Android's camera stack writes its first one; the S5KHM2SD's starts as
+ * its tables leave it. Boot-args for a look in other light, written the sensor's way: cam_shutter=
+ * LINES, cam_gain=N (OV02B10: 0x22, 16 is 1x; S5KHM2SD: 0x0204, 32 is 1x), cam_vblank=LINES (the
+ * frame that much longer: OV02B10 0x14/0x15; S5KHM2SD 0x0340, the frame length, by as many lines),
+ * the S5KHM2SD's between its group hold on and off (0x0104, its "holdon"/"holdoff" tables).
  */
 static bool
-exposure(void)
+sensor_write(uint16_t address, uint16_t value, bool sixteen)
+{
+	uint8_t out[4] = { (uint8_t)(address >> 8), (uint8_t)address, (uint8_t)(value >> 8), (uint8_t)value };
+
+	if (hw->omnivision) {
+		out[0] = (uint8_t)address;
+		out[1] = (uint8_t)value;
+		return i2c_transfer(&cci_bus, sensor_address(), out, 2, NULL, 0);
+	}
+	return sixteen ? i2c_transfer(&cci_bus, sensor_address(), out, 4, NULL, 0) :
+	       i2c_transfer(&cci_bus, sensor_address(), (uint8_t[]){ out[0], out[1], out[3] }, 3, NULL, 0);
+}
+
+static bool
+exposure(const struct ctab_mode *mode)
 {
 	uint32_t shutter = 0, gain = 0, vblank = 0;
-	uint8_t page1[2] = { 0xfd, 0x01 }, apply[2] = { 0xfe, 0x02 }, page0[2] = { 0xfd, 0x00 };
+	bool ok;
 
 	(void)PE_parse_boot_argn("cam_shutter", &shutter, sizeof(shutter));
 	(void)PE_parse_boot_argn("cam_gain", &gain, sizeof(gain));
 	(void)PE_parse_boot_argn("cam_vblank", &vblank, sizeof(vblank));
+	if (hw->omnivision && !sensor_table("holdon")) {
+		return false;
+	}
 	if (shutter == 0 && gain == 0 && vblank == 0) {
 		return true;
 	}
 	vblank = vblank > 0x3fff ? 0x3fff : vblank;
-	if (shutter > 1200 + vblank) {
-		shutter = 1200 + vblank;        /* (within the frame's lines: 1237, and the extra ones of cam_vblank) */
+	if (shutter > mode->frame_length + vblank - 40) {
+		shutter = mode->frame_length + vblank - 40;     /* (within the frame's lines, as the sensors want) */
 	}
-	if (gain > 0xf8) {
-		gain = 0xf8;
+	if (hw->omnivision) {
+		gain = gain > 0xf8 ? 0xf8 : gain;
+		ok = sensor_write(0xfd, 0x01, false) && (vblank == 0 || (sensor_write(0x14, (uint16_t)(vblank >> 8), false) &&
+		    sensor_write(0x15, (uint16_t)(vblank & 0xff), false))) && (shutter == 0 ||
+		    (sensor_write(0x0e, (uint16_t)(shutter >> 8), false) && sensor_write(0x0f, (uint16_t)(shutter & 0xff), false))) &&
+		    (gain == 0 || sensor_write(0x22, (uint16_t)gain, false)) && sensor_write(0xfe, 0x02, false) &&
+		    sensor_write(0xfd, 0x00, false);
+	} else {
+		gain = gain > 0x1000 ? 0x1000 : gain;
+		ok = sensor_table("holdon") && (vblank == 0 || sensor_write(0x0340, (uint16_t)(mode->frame_length + vblank), true)) &&
+		    (shutter == 0 || sensor_write(0x0202, (uint16_t)shutter, true)) && (gain == 0 || sensor_write(0x0204, (uint16_t)gain, true)) &&
+		    sensor_table("holdoff");
 	}
-	uint8_t high[2] = { 0x0e, (uint8_t)(shutter >> 8) }, low[2] = { 0x0f, (uint8_t)shutter }, g[2] = { 0x22, (uint8_t)gain };
-	uint8_t vb_high[2] = { 0x14, (uint8_t)(vblank >> 8) }, vb_low[2] = { 0x15, (uint8_t)vblank };
-
-	if (!i2c_transfer(&cci_bus, OV02B10_ADDRESS, page1, 2, NULL, 0) ||
-	    (vblank != 0 && (!i2c_transfer(&cci_bus, OV02B10_ADDRESS, vb_high, 2, NULL, 0) ||
-	    !i2c_transfer(&cci_bus, OV02B10_ADDRESS, vb_low, 2, NULL, 0))) ||
-	    (shutter != 0 && (!i2c_transfer(&cci_bus, OV02B10_ADDRESS, high, 2, NULL, 0) ||
-	    !i2c_transfer(&cci_bus, OV02B10_ADDRESS, low, 2, NULL, 0))) ||
-	    (gain != 0 && !i2c_transfer(&cci_bus, OV02B10_ADDRESS, g, 2, NULL, 0)) ||
-	    !i2c_transfer(&cci_bus, OV02B10_ADDRESS, apply, 2, NULL, 0) || !i2c_transfer(&cci_bus, OV02B10_ADDRESS, page0, 2, NULL, 0)) {
+	if (!ok) {
 		give_up("a sensor write nobody acknowledged");
 		return false;
 	}
@@ -2322,32 +2631,50 @@ exposure(void)
 static void
 capture_sensor(void)
 {
-	uint32_t width, height, stride, settle = 0, pattern = 0, wanted = 8;
+	uint32_t width, height, stride, settle = 0, pattern = 0, wanted = 8, mode_n = ~0u;
+	const struct ctab_mode *mode;
 	struct cam_header *h;
+	char res[8];
 	uint64_t rate;
 
 	if (!ctab_load()) {
 		return;
 	}
-	width = ctab->width;
-	height = ctab->height;
+	/* the mode: cam_mode=N, or the one with the fewest pixels */
+	if (!PE_parse_boot_argn("cam_mode", &mode_n, sizeof(mode_n)) || mode_n >= ctab->modes) {
+		mode_n = 0;
+		for (uint32_t m = 1; m < ctab->modes; m++) {
+			if ((uint64_t)ctab_modes[m].width * ctab_modes[m].height <
+			    (uint64_t)ctab_modes[mode_n].width * ctab_modes[mode_n].height) {
+				mode_n = m;
+			}
+		}
+	}
+	mode = &ctab_modes[mode_n];
+	snprintf(res, sizeof(res), "res%u", mode_n);
+	width = mode->width;
+	height = mode->height;
 	stride = width * 10 / 8;
-	rate = (uint64_t)ctab->pixel_clock * 10 / (ctab->lanes ? ctab->lanes : 1);
+	rate = (uint64_t)mode->pixel_clock * 10 / (mode->lanes ? mode->lanes : 1);
 	(void)PE_parse_boot_argn("cam_frames", &wanted, sizeof(wanted));
 	wanted = wanted < 1 ? 1 : wanted > 300 ? 300 : wanted;
 	if (!PE_parse_boot_argn("cam_settle", &settle, sizeof(settle)) || settle == 0) {
-		settle = settle_count(rate);
+		settle = mode->settle;  /* (the module file's, for this mode) */
 	}
-	if (ctab->lanes != 1 || ctab->data_type != RAW10_DT) {
-		say("camera: %u lanes, data type %#x: not what this is written for\n", ctab->lanes, ctab->data_type);
+	if (mode->lanes < 1 || mode->lanes > (mode->cphy ? 3u : 4u) || mode->data_type != RAW10_DT || width % 4 != 0) {
+		say("camera: mode %u: %u lanes, data type %#x: not what this is written for\n", mode_n, mode->lanes, mode->data_type);
 		return;
 	}
+	say("camera: mode %u: %ux%u, %u %s at %llu bit/s each, settle count %u\n", mode_n, width, height, mode->lanes,
+	    mode->cphy ? "trio(s)" : "lane(s)", rate, settle);
 	if (!frames_alloc(width, height, stride, 1)) {
 		return;
 	}
-	if (!power_up() || !healthy() || !read_chip_id() || !sensor_table("init") || !sensor_table("res0") || !healthy() ||
-	    !titan_up() || !smmu_up() || !csid_reset() || !csid_config(2, 1, 0x0, 0, width, height) ||
-	    !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height) || !csiphy_up(settle)) {
+	if (!power_up() || !healthy() || !read_chip_id() || !sensor_table("init") || !sensor_table(res) || !healthy() ||
+	    !titan_up() || !smmu_up() || !csid_reset() ||
+	    !csid_config((int)hw->csiphy, mode->lanes, ctab->lane_assign & ((1u << (4 * mode->lanes)) - 1), 0, width, height,
+	    mode->cphy != 0) || !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height) ||
+	    !csiphy_up(mode->lanes, mode->cphy != 0, ctab->lane_assign, settle, rate)) {
 		csiphy_down();
 		titan_down();
 		return;
@@ -2355,17 +2682,24 @@ capture_sensor(void)
 	show_paths("configured");
 	h = (struct cam_header *)frames;
 	(void)PE_parse_boot_argn("cam_pattern", &pattern, sizeof(pattern));
-	h->bayer = pattern ? 2 : 0;
-	if ((pattern == 0 || sensor_table("tpgon")) &&
-	    sensor_table("on") && sensor_table("holdon") && exposure()) {
+	/*
+	 * In a picture of a room the two sites of a 2x2 cell that track each other are the greens: the
+	 * OV02B10's second and third, the S5KHM2SD's first and fourth; red against blue by the two
+	 * cameras' raw levels under the same warm light (red the higher of the two). The OV02B10's own
+	 * colour bars (cam_pattern=1) come a line off its picture: GBRG.
+	 */
+	h->bayer = pattern && hw->omnivision ? 2 : hw->bayer;
+	if ((pattern == 0 || sensor_table("tpgon")) && sensor_table("on") && exposure(mode)) {
 		/* frames one after the other into the two places, the last of `wanted' kept (the first ones come before the exposure) */
-		for (unsigned ms = 0, done = 0; ms < 5000 && done < wanted; ms += 10) {
-			wait_ms(10);
+		for (unsigned ms = 0, done = 0; ms < 5000 && done < wanted; ms += 2) {
+			sensor_delay(2000);
 			if (!(rd(ife + BUS_IRQ_STATUS1) & 1)) {
 				continue;
 			}
 			done++;
-			say("camera: frame %u written, %u ms after the sensor was started\n", done, ms + 10);
+			if (done <= 3 || done == wanted) {
+				say("camera: frame %u written, %u ms after the sensor was started\n", done, ms + 2);
+			}
 			blk_put(ife, "IFE", BUS_IRQ_CLEAR1, 1, false);
 			blk_put(ife, "IFE", BUS_IRQ_GLOBAL_CLEAR, 1, false);
 			if (done < wanted) {
@@ -2401,6 +2735,18 @@ capture_sensor(void)
 /* ---- the look, and the thread ----------------------------------------------------------------------- */
 
 static void
+show_ldos(void)
+{
+	const struct supply *all[3] = { &hw->vana, &hw->vdig, &hw->vio };
+
+	for (int i = 0; i < 3; i++) {
+		if (all[i]->kind == SUPPLY_LDO) {
+			show_ldo(all[i]->ldo);
+		}
+	}
+}
+
+static void
 look(void)
 {
 	uint8_t regs[5], type = 0, subtype = 0, sts = 0, revid[4] = { 0 }, enable = 0;
@@ -2408,10 +2754,13 @@ look(void)
 	show_clocks();
 	show_pin(PIN_PMIC_SDA, "the PM8008i's I2C data");
 	show_pin(PIN_PMIC_SCL, "the PM8008i's I2C clock");
-	show_pin(PIN_MCLK, "MCLK2");
-	show_pin(PIN_CCI_SDA, "CCI 1 master 0 data");
-	show_pin(PIN_CCI_SCL, "CCI 1 master 0 clock");
-	show_pin(PIN_RESET, "the macro sensor's reset");
+	show_pin(hw->mclk_pin, "the sensor's MCLK");
+	show_pin(hw->sda, "the sensor's CCI data");
+	show_pin(hw->scl, "the sensor's CCI clock");
+	show_pin(hw->reset, "the sensor's reset");
+	if (hw->vana.kind == SUPPLY_GPIO) {
+		show_pin(hw->vana.gpio, "the sensor's VANA switch");
+	}
 	if (!pgpio_found || pgpio_read(PGPIO_TYPE, &type) != NULL || pgpio_read(PGPIO_SUBTYPE, &subtype) != NULL ||
 	    pgpio_read(PGPIO_RT_STS, &sts) != NULL || !pgpio_read_all(regs)) {
 		say("camera: the PM8350C's GPIO 3 cannot be read\n");
@@ -2426,14 +2775,14 @@ look(void)
 	}
 	(void)pm8008_get(PM8008_CHIP, MISC_CHIP_ENABLE, &enable, 1);
 	say("camera: the PM8008i: revision %02x %02x %02x %02x, chip enable %#04x\n", revid[0], revid[1], revid[2], revid[3], enable);
-	show_ldo(LDO_VDIG);
-	show_ldo(LDO_VANA);
+	show_ldos();
 }
 
 static void
 camera_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t secs = 20;
+	char which[16] = "";
 
 	(void)PE_parse_boot_argn("cam_after", &secs, sizeof(secs));
 	wait_ms(secs * 1000);           /* (the system up first: nothing else is on these buses then) */
@@ -2443,13 +2792,19 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
-	say("camera: cam=%u: the macro camera (OV02B10)%s\n", level, level == 4 ? ": its frames through CSIPHY 2 and RDI 0 into memory" :
+	if (PE_parse_boot_arg_str("cam_sensor", which, sizeof(which)) && strcmp(which, "wide") == 0) {
+		hw = &sensors[1];
+	}
+	cci_bus.name = hw->bus_name;
+	cci_bus.sda = hw->sda;
+	cci_bus.scl = hw->scl;
+	say("camera: cam=%u: the %s camera%s\n", level, hw->name, level == 4 ? ": its frames through its CSIPHY and RDI 0 into memory" :
 	    level == 3 ? ": the CSID's test pattern through RDI 0 into memory" :
 	    level == 2 ? ": powered up, its chip ID read, powered down" : ": a look, reading only");
 	pgpio_find();
-	found_reset_cfg = rd(GPIO_CFG(PIN_RESET));
-	found_reset_io = rd(GPIO_IO(PIN_RESET));
-	found_mclk_cfg = rd(GPIO_CFG(PIN_MCLK));
+	found_reset_cfg = rd(GPIO_CFG(hw->reset));
+	found_reset_io = rd(GPIO_IO(hw->reset));
+	found_mclk_cfg = rd(GPIO_CFG(hw->mclk_pin));
 	pins_found = true;
 	look();
 	look_around();
@@ -2460,11 +2815,10 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 		capture_sensor();
 		power_down();
 	} else if (level >= 2) {
-		if (power_up() && healthy()) {
+		if (ctab_load() && power_up() && healthy()) {
 			(void)read_chip_id();
 			(void)healthy();
-			show_ldo(LDO_VDIG);
-			show_ldo(LDO_VANA);
+			show_ldos();
 		}
 		power_down();
 		look();

@@ -235,13 +235,16 @@ if [ -f ../fw-haptic/aw8697_haptic.bin ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-haptic/aw8697_haptic.bin root/fw/
 fi
-# ... and the macro camera's register tables (bsd/dev/redwood_camera.c, cam=4), made by tools/camsensor.py out of the
-# sensor's module file of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
-# redwood_aac_ov02b10_macro.bin, in ../fw-camera (the vendor's: neither it nor the tables are in the repository)
-if [ -f ../fw-camera/com.qti.sensormodule.redwood_aac_ov02b10_macro.bin ]; then
+# ... and the cameras' register tables (bsd/dev/redwood_camera.c, cam=2 and up), made by tools/camsensor.py out of
+# the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
+# redwood_<maker>_<sensor>_<camera>.bin, in ../fw-camera (the vendor's: neither they nor the tables are in the
+# repository): camera-<sensor>.tab
+for module in ../fw-camera/com.qti.sensormodule.redwood_*.bin; do
+	[ -f "$module" ] || continue
+	sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.redwood_[a-z]*_\([a-z0-9]*\)_.*/\1/')
 	mkdir -p root/fw
-	../tools/camsensor.py ../fw-camera/com.qti.sensormodule.redwood_aac_ov02b10_macro.bin root/fw/camera-ov02b10.tab >/dev/null
-fi
+	../tools/camsensor.py "$module" "root/fw/camera-$sensor.tab" >/dev/null
+done
 # ... and with ADSP=1 the image of the audio DSP, from the same place into ../fw-audio (bsd/dev/redwood_adsp.c):
 # adsp.mdt and adsp.b02 to adsp.b36, 20 MB. Only when asked for: beside GL=1 the payload would be more than the 64 MB
 # the loader takes.

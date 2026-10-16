@@ -14,7 +14,9 @@ finished photograph; PREFIX-N-raw.png is the frame's raw values as they are (gre
 --bayer N takes the frames for that order instead of the header's. The OV02B10's picture is RGGB
 here (in a picture of a room the second and third sites of each cell track each other, the
 greens; red against blue by plausible colours); its own colour bars (cam_pattern=1) come a line
-off that, GBRG, and the header says so for them.
+off that, GBRG, and the header says so for them. The S5KHM2SD's picture is GBRG (its greens are
+the first and fourth sites; red against blue by the two sensors' raw levels under the same warm
+light), and the header says so too.
 """
 import struct
 import sys
