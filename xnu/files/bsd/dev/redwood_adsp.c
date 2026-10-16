@@ -2500,6 +2500,7 @@ static uint32_t apr_in, apr_out, apr_next_token = 1;
 static bool audio_up;                   /* the core service has said that the audio services are up (step 11) */
 static uint32_t apr_waited_for;         /* the token a question waits for the answer to; 0: none */
 static redwood_apr_events_t apr_events; /* the sound's (redwood_sound.c): what nobody waits for */
+static redwood_apr_events_t apr_events_second;  /* the microphones' (redwood_mic.c) */
 static LCK_MTX_DECLARE(apr_lock, &adsp_lock_group);     /* one question at a time */
 
 /* A packet from the DSP's audio services. From the link's thread. */
@@ -2527,6 +2528,11 @@ apr_input(const uint8_t *data, uint32_t length)
 
 		bzero(words, sizeof(words));
 		memcpy(words, data + header_length, payload < sizeof(words) ? payload : sizeof(words));
+		if (events != NULL && events(header.from_service, header.from_port, header.opcode, header.token, words,
+		    payload < sizeof(words) ? payload : sizeof(words))) {
+			return;
+		}
+		events = apr_events_second;
 		if (events != NULL && events(header.from_service, header.from_port, header.opcode, header.token, words,
 		    payload < sizeof(words) ? payload : sizeof(words))) {
 			return;
@@ -2623,6 +2629,12 @@ void
 redwood_adsp_apr_events(redwood_apr_events_t handler)
 {
 	apr_events = handler;
+}
+
+void
+redwood_adsp_apr_events_second(redwood_apr_events_t handler)
+{
+	apr_events_second = handler;
 }
 
 /* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_answer, if it came. */
@@ -3140,6 +3152,7 @@ redwood_adsp_stop(void)
 {
 	battmgr_stop();
 	redwood_sound_dsp_down();               /* the amplifiers, the stream and the port first, while the DSP still listens */
+	redwood_mic_dsp_down();                 /* and what the microphones' path has asked for */
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started) {
 		unsigned services = 0;
@@ -3208,6 +3221,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		tell("adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
 		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
 		redwood_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, redwood_sound.c) */
+		redwood_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, redwood_mic.c) */
 		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,

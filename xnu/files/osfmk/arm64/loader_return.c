@@ -54,6 +54,7 @@ extern void redwood_adsp_quiesce(void);
 extern void redwood_ddr_quiesce(void);
 extern void redwood_haptic_quiesce(void);
 extern void redwood_torch_quiesce(void);
+extern void redwood_mic_quiesce(void);
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -371,6 +372,7 @@ loader_return(void)
 	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
 	redwood_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	redwood_torch_quiesce();        /* the flashlight off, if it was lit */
+	redwood_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later
 	 * flushed to the console; if the console itself is what failed, that

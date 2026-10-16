@@ -17,7 +17,9 @@
  *                 struct rec_header, then per write: struct rec_block, frames * 4 bytes
  *
  *               With rec_sound_fed=1 as well, the recording has instead what the speakers' guard
- *               let through (redwood_guard.c, on the phone): what reaches the amplifiers.
+ *               let through (redwood_guard.c, on the phone): what reaches the amplifiers. With
+ *               rec_sound_mic=1, what the main microphone hears (redwood_mic.c, mic=3), in both
+ *               channels.
  *
  * When the writer has stopped, a line in the log says how long it wrote, at what rate, how much
  * of it was not silence and how loud: the only way to "hear" a machine one cannot listen to.
@@ -68,6 +70,7 @@ static redwood_audio_sink_t audio_sink;
 
 static uint8_t *rec_base;
 static bool rec_fed;                    /* boot-arg rec_sound_fed=1: what the guard let through is recorded, not what was written */
+static bool rec_mic;                    /* boot-arg rec_sound_mic=1: what the microphone hears (redwood_mic.c) */
 static uint64_t rec_size, rec_used;
 static uint64_t rec_frames, rec_frames_max;
 
@@ -150,6 +153,12 @@ redwood_audio_recording_fed(void)
 	return rec_fed && rec_base != NULL && rec_frames < rec_frames_max;
 }
 
+bool
+redwood_audio_recording_mic(void)
+{
+	return rec_mic && rec_base != NULL && rec_frames < rec_frames_max;
+}
+
 /* From the speakers' feeder: what the guard let through, into the recording (rec_sound_fed=1). */
 void
 redwood_audio_record_fed(const int16_t *frames, uint32_t count)
@@ -173,7 +182,7 @@ audio_play(const int16_t *frames, uint32_t count)
 		}
 	}
 	lck_mtx_lock(&audio_lock);
-	if (!rec_fed) {
+	if (!rec_fed && !rec_mic) {
 		audio_record(frames, count);
 	}
 	if (audio_sink != NULL) {
@@ -318,8 +327,12 @@ audio_recording_init(void)
 	loader_sound[2] = (uint64_t)memory;
 	PE_parse_boot_argn("rec_sound_fed", &fed, sizeof(fed));
 	rec_fed = fed != 0;
+	fed = 0;
+	PE_parse_boot_argn("rec_sound_mic", &fed, sizeof(fed));
+	rec_mic = fed != 0;
 	printf("redwood-audio: recording the first %u s of sound%s, into %llu MB at %#llx\n", seconds,
-	    rec_fed ? " as the speakers' guard lets it through" : "", size >> 20, loader_sound[0]);
+	    rec_fed ? " as the speakers' guard lets it through" : rec_mic ? " the microphone hears (in both channels)" : "", size >> 20,
+	    loader_sound[0]);
 }
 
 void

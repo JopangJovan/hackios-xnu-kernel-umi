@@ -533,13 +533,15 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 #define PERIOD_FRAMES           960             /* 20 ms */
 #define PERIOD_BYTES            (PERIOD_FRAMES * 4)
 #define BUFFER_BYTES            (PERIODS * 4096)        /* a page each */
+#define MIC_BYTES               (16 * 4096)             /* the microphones' (redwood_mic.c), behind the periods */
+#define SHARED_BYTES            (BUFFER_BYTES + MIC_BYTES)
 
 static struct {
 	bool found, on, passed;         /* passed: the boot chain lets the stream through untranslated */
 	uint32_t page, pages, match, context, old_smr, old_s2cr, old_sctlr;
 	vm_offset_t tables;             /* three of 4K: the root, one of the second level, one of the third */
 } space;
-static vm_offset_t buffer;              /* BUFFER_BYTES of ours, the periods */
+static vm_offset_t buffer;              /* BUFFER_BYTES of ours, the periods (and MIC_BYTES behind them: the microphones') */
 static uint64_t buffer_address;         /* as the DSP is to know it */
 
 static bool
@@ -638,7 +640,7 @@ space_on(void)
 	third = (uint64_t *)(space.tables + 8192);
 	root[AUDIO_ADDRESSES >> 30 & 0x1ff] = kvtophys((vm_offset_t)second) | 3;
 	second[AUDIO_ADDRESSES >> 21 & 0x1ff] = kvtophys((vm_offset_t)third) | 3;
-	for (unsigned page = 0; page < BUFFER_BYTES / 4096; page++) {
+	for (unsigned page = 0; page < SHARED_BYTES / 4096; page++) {
 		third[(AUDIO_ADDRESSES >> 12 & 0x1ff) + page] = kvtophys(buffer + 4096 * page) | AUDIO_PTE;
 	}
 	for (vm_offset_t line = space.tables; line < space.tables + 3 * 4096; line += 64) {
@@ -646,9 +648,9 @@ space_on(void)
 	}
 	__asm__ volatile ("dsb sy");
 	table_root = kvtophys(space.tables) | (uint64_t)space.context << 48;
-	say("sound: THE SMMU IS ABOUT TO BE WRITTEN: context %u gets page tables of ours (root %#llx) for the %u KB of the periods "
+	say("sound: THE SMMU IS ABOUT TO BE WRITTEN: context %u gets page tables of ours (root %#llx) for the %u KB of the periods and the microphones' "
 	    "at %#llx, and match register %u sends stream %#x through it\n", space.context, table_root & PTE_ADDRESS,
-	    BUFFER_BYTES / 1024, AUDIO_ADDRESSES, space.match, AUDIO_STREAM);
+	    SHARED_BYTES / 1024, AUDIO_ADDRESSES, space.match, AUDIO_STREAM);
 	if (pause_ms) {
 		sleep_ms(pause_ms);
 	}
@@ -701,6 +703,79 @@ space_off(void)
 	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, space.old_sctlr);
 	get(&apps_smmu, "smr", SMMU_SMR(space.match));
 	space.on = false;
+}
+
+/*
+ * The DSP's view of our memory is one: the sound's periods and the microphones' buffers behind them
+ * (redwood_mic.c), through the same stream and context. Whoever comes first sets it up, whoever
+ * leaves last takes it down. user: 0 the sound, 1 the microphones. With redwood_smmu_lock held.
+ */
+static uint32_t space_users;
+
+static bool
+shared_get(unsigned user)
+{
+	if (space_users == 0) {
+		if (buffer == 0 && kmem_alloc(kernel_map, &buffer, SHARED_BYTES, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			buffer = 0;
+			say("sound: no memory for the DSP's buffers\n");
+			return false;
+		}
+		if (!space.found && !space.passed && !space_find()) {
+			return false;
+		}
+		if (!space.passed && !space.on && !space_on()) {
+			return false;
+		}
+		buffer_address = space.passed ? (kvtophys(buffer) | AUDIO_STREAM_BITS) : (AUDIO_ADDRESSES | AUDIO_STREAM_BITS);
+		if (space.passed) {
+			for (unsigned page = 1; page < SHARED_BYTES / 4096; page++) {
+				if (kvtophys(buffer + 4096 * page) != kvtophys(buffer) + 4096 * page) {
+					say("sound: the DSP's buffers are not one piece of memory, and the stream is not translated\n");
+					return false;
+				}
+			}
+		}
+	}
+	space_users |= 1u << user;
+	return true;
+}
+
+static void
+shared_put(unsigned user)
+{
+	if (!(space_users & 1u << user)) {
+		return;
+	}
+	space_users &= ~(1u << user);
+	if (space_users == 0) {
+		space_off();
+	}
+}
+
+bool
+redwood_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *bytes)
+{
+	bool ok;
+
+	lck_mtx_lock(&redwood_smmu_lock);
+	ok = shared_get(1);
+	lck_mtx_unlock(&redwood_smmu_lock);
+	if (ok) {
+		*memory = buffer + BUFFER_BYTES;
+		*dsp_address = buffer_address + BUFFER_BYTES;
+		*bytes = MIC_BYTES;
+	}
+	return ok;
+}
+
+void
+redwood_audio_dsp_memory_put(void)
+{
+	lck_mtx_lock(&redwood_smmu_lock);
+	shared_put(1);
+	lck_mtx_unlock(&redwood_smmu_lock);
 }
 
 /* ---- ADM and ASM: the path and the stream --------------------------------------------------------------- */
@@ -1273,7 +1348,7 @@ take_down(void)
 		afe_off();
 		pins_off();
 		lck_mtx_lock(&redwood_smmu_lock);
-		space_off();
+		shared_put(0);
 		lck_mtx_unlock(&redwood_smmu_lock);
 		redwood_adsp_apr_events(NULL);
 		say("sound: everything of the sound's is stopped and put back\n");
@@ -1310,27 +1385,13 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 	if (level >= 2) {
-		if (kmem_alloc(kernel_map, &buffer, BUFFER_BYTES, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
-		    KERN_SUCCESS) {
-			say("sound: no memory for the periods\n");
-			goto out;
-		}
 		lck_mtx_lock(&redwood_smmu_lock);
-		ok = space_find() && (space.passed || space_on());
+		ok = shared_get(0);
 		lck_mtx_unlock(&redwood_smmu_lock);
 		if (!ok) {
 			goto out;
 		}
 		ok = false;
-		buffer_address = space.passed ? (kvtophys(buffer) | AUDIO_STREAM_BITS) : (AUDIO_ADDRESSES | AUDIO_STREAM_BITS);
-		if (space.passed) {
-			for (unsigned page = 1; page < BUFFER_BYTES / 4096; page++) {
-				if (kvtophys(buffer + 4096 * page) != kvtophys(buffer) + 4096 * page) {
-					say("sound: the periods are not one piece of memory, and the stream is not translated\n");
-					goto out;
-				}
-			}
-		}
 		redwood_adsp_apr_events(events);
 	}
 	announce("the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");

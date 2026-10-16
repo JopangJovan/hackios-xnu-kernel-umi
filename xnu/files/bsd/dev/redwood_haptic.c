@@ -726,6 +726,30 @@ haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	return error;
 }
 
+/*
+ * A test's stand-in for iOS's waveform (redwood_mic.c, mic_tap=1: the microphone hears the motor): as if
+ * a write of this loudness (of 32767) had just come, or silence for 0. The service plays it with all its
+ * own limits, as it plays iOS's.
+ */
+void
+redwood_haptic_pretend(uint32_t peak)
+{
+	uint64_t now = now_us();
+
+	if (peak <= SILENT_BELOW) {
+		quiet_us = now;
+		return;
+	}
+	if (heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US) {
+		onset_us = now;
+		heard_peak = 0;
+	}
+	heard_us = now;
+	if (peak > heard_peak) {
+		heard_peak = peak;
+	}
+}
+
 static int
 haptic_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
 {

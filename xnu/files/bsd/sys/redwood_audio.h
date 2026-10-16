@@ -54,6 +54,7 @@ void redwood_virtio_sound_init(void);   /* boot-arg virtio_sound=1: QEMU's virti
 void redwood_speaker_init(void);        /* boot-arg speaker_probe=N: a look at the phone's speaker amplifiers */
 void redwood_haptic_init(void);         /* boot-arg haptic=N: the phone's vibration motor (bsd/dev/redwood_haptic.c) */
 void redwood_haptic_quiesce(void);      /* its chip back into reset: at the run's end and on a panic's way out */
+void redwood_haptic_pretend(uint32_t peak); /* a test's stand-in for iOS's waveform: as if a write of this loudness came */
 void redwood_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (bsd/dev/redwood_torch.c) */
 void redwood_torch_quiesce(void);       /* the light off: at the run's end and on a panic's way out */
 
@@ -118,6 +119,15 @@ void redwood_adsp_fw_free(const uint8_t *data, uint64_t size);
 void redwood_sound_dsp_up(void);        /* the DSP's audio services are up (adsp=1): boot-arg sound=N begins */
 void redwood_sound_dsp_down(void);      /* before the DSP is shut down at the run's end: everything of the sound's stopped */
 void redwood_sound_quiesce(void);       /* on a panic's way out: the amplifiers off, without sleeping */
+/* the microphones' part of the memory the DSP sees (redwood_sound.c): false if it cannot be had; given back with _put() */
+bool redwood_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *bytes);
+void redwood_audio_dsp_memory_put(void);
+/* a second handler of the DSP's events (the microphones'), asked when the first does not take one */
+void redwood_adsp_apr_events_second(redwood_apr_events_t handler);
+/* boot-arg rec_sound_mic=1: the recording (rec_sound=N) has what the microphone hears (given with redwood_audio_record_fed()) */
+bool redwood_audio_recording_mic(void);
+void redwood_mic_dsp_up(void);          /* the DSP's audio services are up (adsp=1): boot-arg mic=N begins */
+void redwood_mic_dsp_down(void);        /* before the DSP is shut down at the run's end: what the microphones' path asked for given back */
 #endif
 
 #endif /* _SYS_REDWOOD_AUDIO_H_ */
