@@ -120,7 +120,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
-		$DYN -framework CoreFoundation -framework IOKit -o obj/battery_test src/battery_test.c &&
+		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
 			{ ${LDID:-ldid} -Ssrc/battery_test.entitlements obj/battery_test 2>/dev/null ||
 			  echo "build.sh: no ldid: battery_test is unsigned, and SpringBoard will not open URLs for it"; }
 		# (the keychain answers only a program that has a keychain access group: signed with one, if ldid is there)

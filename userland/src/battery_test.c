@@ -9,10 +9,15 @@
  *   battery_test open URL   have SpringBoard open a URL, such as prefs:root=BATTERY_USAGE (Settings >
  *                           Battery): for screenshots of a page that is hard to reach by touches alone
  *                           (needs the entitlement in battery_test.entitlements, which build.sh signs in)
+ *   battery_test powerlog   what iOS's power log (aggregated, CurrentPowerlog.PLSQL) has collected: every
+ *                           table with rows, how many and over what time; one row of each of the accounting
+ *                           tables Settings > Battery reads (the energy per application comes from them)
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <glob.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -162,11 +167,87 @@ open_url(const char *text)
 	return result ? 0 : 1;
 }
 
+/* the power log's database, read only (aggregated keeps writing it) */
+static int
+powerlog(void)
+{
+	glob_t found;
+	sqlite3 *db;
+	sqlite3_stmt *tables;
+
+	if (glob("/private/var/containers/Shared/SystemGroup/*/Library/BatteryLife/CurrentPowerlog.PLSQL", 0, NULL, &found) != 0 ||
+	    found.gl_pathc == 0) {
+		printf("battery_test: no power log database (is aggregated running?)\n");
+		return 1;
+	}
+	printf("battery_test: the power log: %s\n", found.gl_pathv[0]);
+	if (sqlite3_open_v2(found.gl_pathv[0], &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+		printf("battery_test: cannot open it: %s\n", sqlite3_errmsg(db));
+		return 1;
+	}
+	sqlite3_busy_timeout(db, 2000);
+	if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name", -1, &tables, NULL) != SQLITE_OK) {
+		printf("battery_test: cannot list its tables: %s\n", sqlite3_errmsg(db));
+		return 1;
+	}
+	while (sqlite3_step(tables) == SQLITE_ROW) {
+		const char *name = (const char *)sqlite3_column_text(tables, 0);
+		char query[512];
+		sqlite3_stmt *count;
+		long rows = 0;
+		double first = 0, last = 0;
+
+		snprintf(query, sizeof(query), "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM \"%s\"", name);
+		if (sqlite3_prepare_v2(db, query, -1, &count, NULL) != SQLITE_OK) {
+			snprintf(query, sizeof(query), "SELECT COUNT(*), 0, 0 FROM \"%s\"", name);
+			if (sqlite3_prepare_v2(db, query, -1, &count, NULL) != SQLITE_OK) {
+				continue;
+			}
+		}
+		if (sqlite3_step(count) == SQLITE_ROW) {
+			rows = sqlite3_column_int64(count, 0);
+			first = sqlite3_column_double(count, 1);
+			last = sqlite3_column_double(count, 2);
+		}
+		sqlite3_finalize(count);
+		if (rows == 0) {
+			continue;
+		}
+		printf("battery_test: powerlog %-70s %6ld rows, %.0f s from the first to the last\n", name, rows, last - first);
+		if (strncmp(name, "PLAccountingOperator", 20) == 0 || strncmp(name, "PLBatteryAgent_EventBackward_Battery", 36) == 0) {
+			sqlite3_stmt *row;
+
+			snprintf(query, sizeof(query), "SELECT * FROM \"%s\" ORDER BY ID DESC LIMIT 1", name);
+			if (sqlite3_prepare_v2(db, query, -1, &row, NULL) == SQLITE_OK) {
+				if (sqlite3_step(row) == SQLITE_ROW) {
+					char line[1024] = "";
+
+					for (int c = 0; c < sqlite3_column_count(row) && strlen(line) < sizeof(line) - 80; c++) {
+						const unsigned char *v = sqlite3_column_text(row, c);
+
+						snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s=%.40s", sqlite3_column_name(row, c),
+						    v ? (const char *)v : "-");
+					}
+					printf("battery_test: powerlog   the last row:%s\n", line);
+				}
+				sqlite3_finalize(row);
+			}
+		}
+	}
+	sqlite3_finalize(tables);
+	sqlite3_close(db);
+	globfree(&found);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
 	if (argc > 2 && strcmp(argv[1], "open") == 0) {
 		return open_url(argv[2]);
+	}
+	if (argc > 1 && strcmp(argv[1], "powerlog") == 0) {
+		return powerlog();
 	}
 	int times = argc > 1 ? atoi(argv[1]) : 1;
 	int seconds = argc > 2 ? atoi(argv[2]) : 10;
