@@ -420,11 +420,13 @@ dt_prop_padded(struct dt_writer *w, const char *name, const char *value, uint32_
  * server's renderer here do (eight bits, BGRA), and every page comes out black. Here the screen is
  * what the framebuffer is: sRGB.
  */
+static int gamut_p3;    /* boot-arg gamut=p3 (a test): the iPhone's own "P3" left in place */
+
 static void
 dt_identity(struct dt_writer *w, const struct identity_prop *props, uint32_t count, const unsigned char *data)
 {
 	for (uint32_t i = 0; i < count; i++) {
-		if (str_eq(props[i].name, "artwork-display-gamut")) {
+		if (str_eq(props[i].name, "artwork-display-gamut") && !gamut_p3) {
 			dt_prop(w, props[i].name, "sRGB", 5);
 			continue;
 		}
@@ -1743,6 +1745,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
+		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
 	}
 	if (battery_requested) {
 		charger_start();

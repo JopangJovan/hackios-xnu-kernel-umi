@@ -120,6 +120,8 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_COLOR_ATTACHMENT0            0x8ce0
 #define GL_FRAMEBUFFER_COMPLETE         0x8cd5
 #define GL_FRAMEBUFFER                  0x8d40
+#define GL_SYNC_GPU_COMMANDS_COMPLETE   0x9117
+#define GL_SYNC_FLUSH_COMMANDS_BIT      0x00000001
 
 #define VBLUR_LEVELS    8               /* levels of a blur whose radius varies, the picture itself included */
 #define VBLUR_CHAINS    6               /* ... such blurs kept track of at a time */
@@ -305,6 +307,7 @@ static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
  * here in any case; glwait=0: nowhere, to see what the waiting costs (and frames half drawn).
  */
 static int wait_for_frames = 1;
+static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's end does not push what Mesa holds back (frame_end()) */
 /*
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
  * what CoreAnimation draws a number of things with where the library offers it: the shadows
@@ -810,6 +813,21 @@ frame_end(struct eagl *e, bool finished)
 	}
 	if (in_place != 0 && !finished && wait_for_frames) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
+	} else if (in_place != 0 && !finished && sync_frames) {
+		/*
+		 * The display's driver waits for the last submission that named the surface -- but Mesa's
+		 * freedreno may still hold the frame's last batch back after glFlush, to merge it with the
+		 * next (submit merging, for small submissions), and then the frame goes to the panel with only
+		 * its earlier batches drawn: the wallpaper without the icons, blocks of an older picture,
+		 * for a frame. A fence that is asked to flush and waited for not at all sends everything held
+		 * back to the kernel now; the GPU is not waited for.
+		 */
+		GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+		if (sync != NULL) {
+			(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+			glDeleteSync(sync);
+		}
 	}
 	waited = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
@@ -3021,6 +3039,7 @@ install(void)
 			shown_texture = (GLuint)strtoul(argument + 7, NULL, 10);
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
 		}

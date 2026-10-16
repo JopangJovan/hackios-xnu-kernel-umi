@@ -391,6 +391,7 @@ struct gpu_kept {
 #define GPU_KEPT_BYTES          (160ull << 20)
 #define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
 #define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
+static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
 
 class RedwoodGPUUserClient : public IOUserClient
 {
@@ -657,7 +658,7 @@ RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64
 {
 	struct gpu_kept * place = NULL;
 
-	if (size < GPU_KEEP_FROM || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
+	if (gGPUKeep == 0 || size < GPU_KEEP_FROM || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
 	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
 		return false;
 	}
@@ -733,6 +734,9 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
 			fKeptBytes -= size;
 			gGPUStat.given_again++;
 			IOLockUnlock(gGPULock);
+			if (gGPUKeep == 2) {
+				bzero(b->kernel, (size_t) b->size);
+			}
 			return kIOReturnSuccess;
 		}
 	}
