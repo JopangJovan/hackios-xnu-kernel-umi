@@ -61,11 +61,15 @@
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
+#include <kern/kalloc.h>
 #include <mach/mach_types.h>
+#include <miscfs/devfs/devfs.h>
 #include <pexpert/pexpert.h>
+#include <sys/conf.h>
 #include <sys/redwood_audio.h>
 #include <sys/redwood_input.h>
 #include <sys/systm.h>
+#include <sys/uio.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
@@ -104,6 +108,10 @@ say(const char *format, ...)
 	strlcpy(kept[kept_count++ % KEPT_LINES], line, sizeof(kept[0]));
 	return length;
 }
+
+/* A line that says all went as it should: not said again in iOS's later recordings (mic=4), where it is the same each time. */
+static bool quiet;
+#define note(...)       do { if (!quiet) { say(__VA_ARGS__); } } while (0)
 
 void
 redwood_mic_quiesce(void)
@@ -176,7 +184,7 @@ get(struct block *b, const char *name, uint32_t offset)
 		b->base = ml_io_map(b->phys, b->size);
 	}
 	value = rd(b->base + offset);
-	say("mic: %s %s (%#x) = %#x\n", b->name, name, b->phys + offset, value);
+	note("mic: %s %s (%#x) = %#x\n", b->name, name, b->phys + offset, value);
 	return value;
 }
 
@@ -203,7 +211,7 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value, uint32_t
 		broken = true;
 		return false;
 	}
-	say("mic: %s %s (%#x) <- %#x%s\n", b->name, name, b->phys + offset, value, check ? ", reads back" : "");
+	note("mic: %s %s (%#x) <- %#x%s\n", b->name, name, b->phys + offset, value, check ? ", reads back" : "");
 	return true;
 }
 
@@ -263,8 +271,11 @@ command(const char *what, uint8_t service, uint32_t opcode, const void *payload,
 		return false;
 	}
 	if (answer->opcode == APR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
-		say("mic: %s: %s%s\n", what, answer->words[1] == 0 ? "done" : "REFUSED: ", answer->words[1] == 0 ? "" :
-		    dsp_error(answer->words[1]));
+		if (answer->words[1] == 0) {
+			note("mic: %s: done\n", what);
+		} else {
+			say("mic: %s: REFUSED: %s\n", what, dsp_error(answer->words[1]));
+		}
 		return answer->words[1] == 0 && wanted == 0;
 	}
 	if (wanted != 0 && answer->opcode == wanted) {
@@ -840,7 +851,7 @@ codec_put(uint16_t reg, uint8_t value, uint8_t check)
 	write_id = write_id < 14 ? write_id + 1 : 0;
 	swr_write(codec_device, reg, value, write_id);
 	if (check == 0) {
-		say("mic: the codec's %#06x <- %#04x\n", reg, value);
+		note("mic: the codec's %#06x <- %#04x\n", reg, value);
 		return true;
 	}
 	if (!swr_read(codec_device, reg, &back) || (back & check) != (value & check)) {
@@ -848,7 +859,7 @@ codec_put(uint16_t reg, uint8_t value, uint8_t check)
 		broken = true;
 		return false;
 	}
-	say("mic: the codec's %#06x <- %#04x, reads back\n", reg, value);
+	note("mic: the codec's %#06x <- %#04x, reads back\n", reg, value);
 	return true;
 }
 
@@ -869,7 +880,7 @@ static void
 broadcast(uint16_t reg, uint8_t value)
 {
 	swr_write(0xf, reg, value, 0xf);
-	say("mic: SoundWire, to all: %#06x <- %#04x\n", reg, value);
+	note("mic: SoundWire, to all: %#06x <- %#04x\n", reg, value);
 	sleep_ms(10);           /* ("10 ms for the broadcast to complete", swrm_cmd_fifo_wr_cmd()) */
 }
 
@@ -879,7 +890,7 @@ to_all(uint16_t reg, uint8_t value)
 {
 	write_id = write_id < 14 ? write_id + 1 : 0;
 	swr_write(0xf, reg, value, write_id);
-	say("mic: SoundWire, to all: %#06x <- %#04x\n", reg, value);
+	note("mic: SoundWire, to all: %#06x <- %#04x\n", reg, value);
 }
 
 /* wcd938x_bind(), wcd938x_set_micbias_data(), wcd938x_init_reg() */
@@ -969,7 +980,7 @@ port_config(uint8_t bank, bool first)
 	swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_2_BANK(0, bank), 0, write_id);
 	write_id = write_id < 14 ? write_id + 1 : 0;
 	swr_write(codec_device, SWRS_DP_LANE_CONTROL_BANK(0, bank), 1, write_id);
-	say("mic: the codec's data port 1, bank %u: channel 1 on, sample interval %u, offsets 0 0, lane 1\n", bank, codec_interval);
+	note("mic: the codec's data port 1, bank %u: channel 1 on, sample interval %u, offsets 0 0, lane 1\n", bank, codec_interval);
 	/* the master's port 1 */
 	return put(&tx_swr, "DP_PORT_CTRL (port 1): channel 1, offsets 0 0, interval 7", SWRM_DP_PORT_CTRL_BANK(1, bank),
 	           0x01u << 24 | 0u << 16 | 0u << 8 | master_interval, 0xffffffff) &&
@@ -1029,7 +1040,7 @@ datapath_on(void)
 		(void)swr_read(codec_device, SWRS_DP_LANE_CONTROL_BANK(0, b), &v[3]);
 		(void)swr_read(codec_device, SWRS_SCP_FRAME_CTRL_BANK(b), &v[4]);
 		(void)swr_read(codec_device, SWRS_SCP_HOST_CLK_DIV2_CTL_BANK(b), &v[5]);
-		say("mic: the codec's DP1, bank %u: channels %#x, interval %u, offset %u, lane %u; frame %#x, div2 %#x\n", b, v[0], v[1],
+		note("mic: the codec's DP1, bank %u: channels %#x, interval %u, offset %u, lane %u; frame %#x, div2 %#x\n", b, v[0], v[1],
 		    v[2], v[3], v[4], v[5]);
 	}
 	{
@@ -1039,7 +1050,7 @@ datapath_on(void)
 		(void)swr_read(codec_device, SWRS_SCP_CONTROL, &control);
 		(void)swr_read(codec_device, 0x0100, &dp_int);
 		(void)swr_read(codec_device, 0x0102, &dp_ctl);
-		say("mic: the codec's SCP int status %#x, control/status %#x; DP1 int status %#x, port control %#x; the master's DP1 "
+		note("mic: the codec's SCP int status %#x, control/status %#x; DP1 int status %#x, port control %#x; the master's DP1 "
 		    "interrupt status %#x\n", status, control, dp_int, dp_ctl, swr_rd(0x1100));
 	}
 	return true;
@@ -1436,13 +1447,109 @@ dsp_off(void)
 	}
 }
 
+/* ---- mic=4: the microphone for iOS ------------------------------------------------------------------- */
+
+/*
+ * What the microphone hears goes into a ring, and /dev/redwood-mic gives it to iOS's audio server
+ * (RedwoodAudio.driver's device "Codec", userland/src/audio_plugin.c): 16-bit samples, one channel,
+ * 48 kHz. The path is up only while the device is open (the audio server opens it when its input
+ * starts and closes it when it stops), and a read never waits: it gives what has come, keeping the
+ * reader about 40 ms behind the DSP (it comes in 20 ms periods), and nothing until that much is
+ * there; the audio server makes up the rest with silence.
+ */
+#define RING_FRAMES             16384           /* 341 ms; a power of two */
+#define RING_KEEP               1920            /* 40 ms: how far behind the DSP a reader is kept */
+#define RING_MOST               4800            /* 100 ms: more than this waiting, and the oldest is skipped */
+
+static int16_t *ring;
+static volatile uint64_t ring_written;          /* frames put into the ring since the device was made */
+static uint64_t ring_read;                      /* frames taken from it (one reader: the audio server) */
+static bool ring_primed;                        /* the reader is RING_KEEP behind; false after it ran dry */
+static uint64_t ring_skipped, ring_dry;         /* frames skipped, reads that found too little: said when iOS stops */
+static volatile uint32_t ios_wants;             /* the device is open */
+static volatile bool stopping;                  /* the run ends (redwood_mic_dsp_down()) */
+
+static void
+ring_put(const int16_t *samples, uint32_t count)
+{
+	uint64_t at = ring_written;
+
+	for (uint32_t i = 0; i < count; i++) {
+		ring[(at + i) % RING_FRAMES] = samples[i];
+	}
+	__atomic_store_n(&ring_written, at + count, __ATOMIC_RELEASE);
+}
+
+static int
+mic_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	uint64_t written = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE), avail, want;
+	int error = 0;
+
+	if (ring == NULL || uio_resid(uio) < 2) {
+		return 0;
+	}
+	want = (uint64_t)uio_resid(uio) / 2;
+	avail = written - ring_read;
+	if (avail > RING_MOST) {
+		ring_skipped += avail - RING_KEEP;
+		ring_read = written - RING_KEEP;
+		avail = RING_KEEP;
+	}
+	if (!ring_primed) {
+		if (avail < RING_KEEP) {
+			return 0;
+		}
+		ring_primed = true;
+	}
+	if (avail < want) {
+		ring_dry++;
+		ring_primed = false;
+	}
+	while (want > 0 && avail > 0 && error == 0) {
+		uint64_t at = ring_read % RING_FRAMES, n = want < avail ? want : avail;
+
+		n = n < RING_FRAMES - at ? n : RING_FRAMES - at;
+		error = uiomove((caddr_t)&ring[at], (int)(n * 2), uio);
+		ring_read += n;
+		want -= n;
+		avail -= n;
+	}
+	return error;
+}
+
+static int
+mic_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	ios_wants = 1;
+	return 0;
+}
+
+/* (on the last close) */
+static int
+mic_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	ios_wants = 0;
+	return 0;
+}
+
+static const struct cdevsw mic_cdevsw = {
+	.d_open = mic_dev_open, .d_close = mic_dev_close, .d_read = mic_dev_read, .d_write = eno_rdwrt,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
 /* ---- listening ---------------------------------------------------------------------------------------------- */
 
 static uint32_t mic_secs = 10;
 
-/* the stream run, read for mic_secs: how loud it is, every second; into the recording with rec_sound_mic=1 */
+/*
+ * The stream run, read for mic_secs (for_ios: while iOS has the device open): how loud it is, every
+ * second (for iOS: the first three, then every 30th); into the recording with rec_sound_mic=1; for
+ * iOS into the ring.
+ */
 static void
-listen(void)
+listen(bool for_ios)
 {
 	uint32_t run[3] = { 0, 0, 0 }, frames = 0, seconds = 0, peak = 0, periods = 0, empty = 0;
 	int64_t sum = 0;
@@ -1454,6 +1561,7 @@ listen(void)
 	struct redwood_apr_answer answer;
 
 	read_ready = 0;
+	reads_done = read_errors = 0;
 	if (!redwood_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), APR_WAIT_MS, &answer) ||
 	    answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
 		say("mic: the session, run: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
@@ -1466,7 +1574,11 @@ listen(void)
 			return;
 		}
 	}
-	say("mic: LISTENING: %u reads of 20 ms given to the DSP; for %u s\n", MIC_PERIODS, mic_secs);
+	if (for_ios) {
+		say("mic: LISTENING for iOS: %u reads of 20 ms given to the DSP\n", MIC_PERIODS);
+	} else {
+		say("mic: LISTENING: %u reads of 20 ms given to the DSP; for %u s\n", MIC_PERIODS, mic_secs);
+	}
 	for (;;) {
 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &now);
 		elapsed_ms = now / NSEC_PER_MSEC;
@@ -1482,7 +1594,7 @@ listen(void)
 			redwood_haptic_pretend(0);
 			tap = 2;
 		}
-		if (elapsed_ms >= mic_secs * 1000ull || broken) {
+		if ((for_ios ? (!ios_wants || stopping) : elapsed_ms >= mic_secs * 1000ull) || broken) {
 			break;
 		}
 		if (!(read_ready & (1u << next))) {
@@ -1514,6 +1626,9 @@ listen(void)
 				peak = a > peak ? a : peak;
 			}
 			frames += got;
+			if (for_ios) {
+				ring_put(samples, got);
+			}
 			if (redwood_audio_recording_mic()) {
 				for (uint32_t i = 0; i < got; i += 240) {
 					uint32_t n = got - i < 240 ? got - i : 240;
@@ -1548,9 +1663,12 @@ listen(void)
 				db10 = tenths - (int)((32768 - r) * 60 / 16384);
 			}
 			seconds++;
-			say("mic: second %u: %u frames (%u periods, %u empty), level %d.%d dBFS (rms %u), peak %u, mean %lld; reads %u, "
-			    "errors %u%s%s\n", seconds, frames, periods, empty, db10 / 10, db10 < 0 ? -db10 % 10 : db10 % 10, rms, peak,
-			    sum / (int64_t)frames, reads_done, read_errors, unmuted ? "" : " (muted)", settled ? "" : " (settling)");
+			if (!for_ios || seconds <= 3 || seconds % 30 == 0) {
+				say("mic: second %u: %u frames (%u periods, %u empty), level %d.%d dBFS (rms %u), peak %u, mean %lld; "
+				    "reads %u, errors %u%s%s\n", seconds, frames, periods, empty, db10 / 10, db10 < 0 ? -db10 % 10 : db10 % 10,
+				    rms, peak, sum / (int64_t)frames, reads_done, read_errors, unmuted ? "" : " (muted)",
+				    settled ? "" : " (settling)");
+			}
 			frames = periods = empty = peak = 0;
 			sum = 0;
 			squares = 0;
@@ -1571,38 +1689,123 @@ undo(void)
 	clocks_off();
 }
 
+/* Everything up to the stream's run, in a recording's order; false (and `broken') if any of it fails. */
+static bool
+path_up(void)
+{
+	if (!clocks_on()) {
+		say("mic: the clocks were not all given: the blocks are not touched\n");
+		return false;
+	}
+	if (!reset_release() || !pins_on() || !tx_clocks_on() || !master_on()) {
+		return false;
+	}
+	sleep_ms(5);    /* ("5 ms for SoundWire's auto-enumeration", wcd938x_bind()) */
+	if ((codec_device = codec_wait()) == 0) {
+		return false;
+	}
+	swr_write(0xf, SWRS_SCP_INT_STATUS_MASK_1, 0x04, 0xf);  /* (swrm_runtime_resume(): broadcast) */
+	sleep_ms(10);
+	if (!quiet) {
+		codec_look();
+	}
+	if (level < 3) {
+		return true;
+	}
+	/* the stream and path, the port's format and start, the codec's widgets */
+	return bolero_look() && codec_init() && dsp_path_on() && dsp_port_on() && dec1_on() && (!adc_on || adc1_on()) &&
+	       datapath_on();
+}
+
+/*
+ * mic=4: the path up whenever iOS opens /dev/redwood-mic, down when it closes it; after three
+ * recordings that broke off, no more until the run ends.
+ */
+static void
+for_ios(void)
+{
+	int major = cdevsw_add(-1, &mic_cdevsw);
+	unsigned recordings = 0, failures = 0;
+
+	ring = kalloc_data(RING_FRAMES * sizeof(int16_t), Z_WAITOK | Z_ZERO);
+	if (ring == NULL || major < 0 ||
+	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mic") == NULL) {
+		say("mic: /dev/redwood-mic cannot be made\n");
+		return;
+	}
+	say("mic: THE MICROPHONE IS IOS'S (/dev/redwood-mic) from here on, until the run ends: it listens only while iOS records\n");
+	while (!stopping) {
+		uint64_t began, ns;
+		bool failed;
+
+		if (!ios_wants) {
+			sleep_ms(20);
+			continue;
+		}
+		lck_mtx_lock(&mic_lock);
+		if (stopping) {
+			lck_mtx_unlock(&mic_lock);
+			break;
+		}
+		recordings++;
+		quiet = recordings > 1;
+		ring_primed = false;
+		ring_skipped = ring_dry = 0;
+		ring_read = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE);
+		began = mach_absolute_time();
+		say("mic: iOS records (%u): the path up%s\n", recordings, quiet ? " (the lines that say all went well are not said again)" :
+		    "");
+		if (path_up()) {
+			listen(true);
+		}
+		failed = broken;
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+		say("mic: iOS's recording %u %s after %llu.%llu s; last: %s; %llu frames skipped as too late, %llu reads found too little\n",
+		    recordings, failed ? "BROKE OFF" : "ended", ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / (NSEC_PER_SEC / 10), last_write,
+		    ring_skipped, ring_dry);
+		undo();
+		lck_mtx_unlock(&mic_lock);
+		if (failed) {
+			broken = false;
+			if (++failures >= 3) {
+				say("mic: three recordings broke off: the microphone stays off until the run ends\n");
+				break;
+			}
+			/* (not again until iOS has closed the device and opened it again) */
+			while (ios_wants && !stopping) {
+				sleep_ms(20);
+			}
+		}
+	}
+}
+
 static void
 mic_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	lck_mtx_lock(&mic_lock);
 	say("mic: level %u: %s\n", level, level == 1 ? "a look, after the LPASS's votes and clocks; nothing written to the codec" :
 	    level == 2 ? "the codec brought up to answer on SoundWire, nothing of it set; then all undone" :
-	    "the main microphone, as Android records from it, listened to; then all undone");
-	if (!clocks_on()) {
-		say("mic: the clocks were not all given: the blocks are not touched\n");
-	} else if (level == 1) {
-		sleep_ms(10);
-		look();
-	} else if (reset_release() && pins_on() && tx_clocks_on() && master_on()) {
-		sleep_ms(5);    /* ("5 ms for SoundWire's auto-enumeration", wcd938x_bind()) */
-		if ((codec_device = codec_wait()) != 0) {
-			swr_write(0xf, SWRS_SCP_INT_STATUS_MASK_1, 0x04, 0xf);  /* (swrm_runtime_resume(): broadcast) */
-			sleep_ms(10);
-			codec_look();
-			if (level >= 3) {
-				/* in a recording's order: the stream and path, the port's format and start, the codec's widgets, the run */
-				if (bolero_look() && codec_init() && dsp_path_on() && dsp_port_on() && dec1_on() && (!adc_on || adc1_on()) &&
-				    datapath_on()) {
-					listen();
-				}
-				say("mic: %s; last: %s\n", broken ? "STOPPED" : "listened", last_write);
-			}
-		}
+	    level == 3 ? "the main microphone, as Android records from it, listened to; then all undone" :
+	    "the main microphone for iOS (/dev/redwood-mic), up while iOS records");
+	if (level == 4) {
+		for_ios();
 	} else {
-		say("mic: stopped; last: %s\n", last_write);
+		lck_mtx_lock(&mic_lock);
+		if (level == 1) {
+			if (clocks_on()) {
+				sleep_ms(10);
+				look();
+			} else {
+				say("mic: the clocks were not all given: the blocks are not touched\n");
+			}
+		} else {
+			if (path_up() && level >= 3) {
+				listen(false);
+			}
+			say("mic: %s; last: %s\n", broken ? "STOPPED" : level >= 3 ? "listened" : "done", last_write);
+		}
+		undo();
+		lck_mtx_unlock(&mic_lock);
 	}
-	undo();
-	lck_mtx_unlock(&mic_lock);
 	running = false;
 	say("mic: done\n");
 	thread_terminate(current_thread());
@@ -1616,7 +1819,7 @@ redwood_mic_dsp_up(void)
 	if (!PE_parse_boot_argn("mic", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	level = level > 3 ? 3 : level;
+	level = level > 4 ? 4 : level;
 	PE_parse_boot_argn("mic_secs", &mic_secs, sizeof(mic_secs));
 	PE_parse_boot_argn("mic_input", &smic_input, sizeof(smic_input));
 	PE_parse_boot_argn("mic_adc", &adc_on, sizeof(adc_on));
@@ -1635,6 +1838,7 @@ redwood_mic_dsp_up(void)
 void
 redwood_mic_dsp_down(void)
 {
+	stopping = true;
 	if (running) {
 		lck_mtx_lock(&mic_lock);
 		undo();

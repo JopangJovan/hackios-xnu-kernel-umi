@@ -14,7 +14,7 @@
  * through which everything in iOS is routed. It knows an iPhone's own devices by their names
  * (their UIDs) and makes a port of each: "Speaker" becomes the speaker port, the route an iPhone
  * with nothing plugged in plays through, with a volume, the volume display and the place in
- * Control Center that go with it. So this presents three devices under those names:
+ * Control Center that go with it. So this presents four devices under those names:
  *
  *   "Speaker"   a stereo output whose samples are written to /dev/redwood-audio, where the
  *               kernel takes them to whatever can play them (see sys/redwood_audio.h), and a
@@ -26,6 +26,10 @@
  *   "Actuator"  one output of one channel: the iPhone's Taptic Engine, on which iOS plays its
  *               haptics as waveforms (through the chain 'd22_actuator_general'); its samples go to
  *               the kernel's motor driver, /dev/redwood-haptic (see actuator_write())
+ *   "Codec"     one input of one channel: on an iPhone, the audio codec that the built-in
+ *               microphones are on, of which the virtual audio device makes the built-in microphone
+ *               port; its samples come from the kernel, /dev/redwood-mic (the phone's main
+ *               microphone, boot-arg mic=4), which listens only while this input runs (see codec_read())
  *
  * CoreAudio's own null device ("Null_Device", described in the framework's Info.plist, playing
  * into nowhere) stays as it is: it is the only device the virtual audio device takes while it
@@ -159,6 +163,9 @@ enum {
 	kAudioDevicePropertySafetyOffset = 'saft', kAudioDevicePropertyNominalSampleRate = 'nsrt',
 	kAudioDevicePropertyAvailableNominalSampleRates = 'nsr#', kAudioDevicePropertyIsHidden = 'hidn',
 	kAudioDevicePropertyPreferredChannelsForStereo = 'dch2', kAudioDevicePropertyZeroTimeStampPeriod = 'ring',
+	kAudioSelectorControlClassID = 'slct', kAudioDataSourceControlClassID = 'dsrc',
+	kAudioSelectorControlPropertyCurrentItem = 'scci', kAudioSelectorControlPropertyAvailableItems = 'scai',
+	kAudioSelectorControlPropertyItemName = 'scin', kAudioSelectorControlPropertyItemKind = 'clkk',
 
 	kAudioStreamPropertyIsActive = 'sact', kAudioStreamPropertyDirection = 'sdir', kAudioStreamPropertyTerminalType = 'term',
 	kAudioStreamPropertyStartingChannel = 'schn', kAudioStreamPropertyLatency = 'ltnc',
@@ -187,8 +194,10 @@ enum {
 	OBJECT_SPEAKER, OBJECT_SPEAKER_OUTPUT, OBJECT_SPEAKER_INPUT,
 	OBJECT_HAWKING, OBJECT_HAWKING_INPUT,
 	OBJECT_ACTUATOR, OBJECT_ACTUATOR_OUTPUT,
+	OBJECT_CODEC, OBJECT_CODEC_INPUT,
 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
-	OBJECT_LAST = OBJECT_SPEAKER_VOLUME
+	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
+	OBJECT_LAST = OBJECT_CODEC_SOURCE
 };
 
 #define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
@@ -209,10 +218,19 @@ static struct device devices[] = {
 	  .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 2 },
 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
 	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
+	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
 };
 #define DEVICES                 (sizeof(devices) / sizeof(devices[0]))
 
 #define TRANSPORT_BUILT_IN      'bltn'
+/*
+ * The codec's input has data sources, one for each microphone, and the virtual audio device will not
+ * take a codec without them (VirtualAudio asks for kAudioDevicePropertyDataSources on its input, and
+ * keeps those it knows: 'imic', 'smic', 'fmic', 'lmic', 'tmic', 'umic', 'imi1' to 'imi4'). A plug-in
+ * has them as a data source control on the input, which the HAL answers those properties from. There
+ * is one microphone here, at the bottom: 'imic', the iPhone's internal (bottom) one.
+ */
+#define MIC_SOURCE              'imic'
 #define MANUFACTURER            CFSTR("redwood")
 /* how often a device says where its clock is, in frames: also the largest I/O buffer the HAL will use */
 #define TIMESTAMP_PERIOD        16384
@@ -430,6 +448,40 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 		}
 		return v;
 	}
+	if (object == OBJECT_CODEC_SOURCE) {
+		switch (selector) {
+		case kAudioObjectPropertyBaseClass:
+			WORD(kAudioSelectorControlClassID);
+			break;
+		case kAudioObjectPropertyClass:
+			WORD(kAudioDataSourceControlClassID);
+			break;
+		case kAudioObjectPropertyOwner:
+			WORD(OBJECT_CODEC);
+			break;
+		case kAudioObjectPropertyOwnedObjects:
+			v.empty = true;
+			break;
+		case kAudioControlPropertyScope:
+			WORD(kAudioObjectPropertyScopeInput);
+			break;
+		case kAudioControlPropertyElement:
+			WORD(0);
+			break;
+		case kAudioSelectorControlPropertyCurrentItem:
+		case kAudioSelectorControlPropertyAvailableItems:
+			WORD(MIC_SOURCE);
+			break;
+		case kAudioSelectorControlPropertyItemName:
+			if (qualifier_size == sizeof(UInt32) && qualifier != NULL && *(const UInt32 *)qualifier == MIC_SOURCE) {
+				STRING(CFSTR("Bottom"));
+			} else {
+				STRING(CFSTR(""));
+			}
+			break;
+		}
+		return v;
+	}
 	if (object != OBJECT_PLUGIN && d == NULL) {
 		return v;
 	}
@@ -518,11 +570,17 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_SPEAKER) {
 				LIST(OBJECT_SPEAKER_VOLUME);
 			}
+			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeOutput) {
+				LIST(OBJECT_CODEC_SOURCE);
+			}
 			v.empty = v.size == 0;
 			break;
 		case kAudioObjectPropertyControlList:
 			if (d->object == OBJECT_SPEAKER) {
 				LIST(OBJECT_SPEAKER_VOLUME);
+			}
+			if (d->object == OBJECT_CODEC) {
+				LIST(OBJECT_CODEC_SOURCE);
 			}
 			v.empty = v.size == 0;
 			break;
@@ -580,6 +638,37 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 	return v;
 }
 
+/*
+ * What the HAL (or the virtual audio device through it) asks of an object that it does not have,
+ * the first times for each object, selector and scope: what a device it will not take may lack.
+ */
+#define UNKNOWN_TOLD            64
+static UInt32 unknown_told[UNKNOWN_TOLD][3];
+static unsigned unknown_count;
+
+static void
+unknown(AudioObjectID object, const AudioObjectPropertyAddress *address)
+{
+	UInt32 s = address->mSelector, c = address->mScope;
+
+	for (unsigned i = 0; i < unknown_count; i++) {
+		if (unknown_told[i][0] == object && unknown_told[i][1] == s && unknown_told[i][2] == c) {
+			return;
+		}
+	}
+	if (unknown_count >= UNKNOWN_TOLD) {
+		return;
+	}
+	unknown_told[unknown_count][0] = object;
+	unknown_told[unknown_count][1] = s;
+	unknown_told[unknown_count][2] = c;
+	unknown_count++;
+	say("redwood: audio: asked of object %u (%s) what it does not have: '%c%c%c%c' (%#x), scope '%c%c%c%c', element %u\n",
+	    (unsigned)object, device_of(object) ? CFStringGetCStringPtr(device_of(object)->uid, kCFStringEncodingUTF8) : "-",
+	    (int)(s >> 24 & 0xff), (int)(s >> 16 & 0xff), (int)(s >> 8 & 0xff), (int)(s & 0xff), (unsigned)s,
+	    (int)(c >> 24 & 0xff), (int)(c >> 16 & 0xff), (int)(c >> 8 & 0xff), (int)(c & 0xff), (unsigned)address->mElement);
+}
+
 static Boolean
 has_property(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused pid_t client,
     const AudioObjectPropertyAddress *address)
@@ -590,6 +679,9 @@ has_property(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, _
 		return false;
 	}
 	v = property(object, address, 0, NULL);
+	if (v.size == 0 && !v.empty) {
+		unknown(object, address);
+	}
 	return v.size != 0 || v.empty;
 }
 
@@ -606,6 +698,8 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 	if (object == OBJECT_SPEAKER_VOLUME) {
 		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
 		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
+	} else if (object == OBJECT_CODEC_SOURCE) {
+		*settable = address->mSelector == kAudioSelectorControlPropertyCurrentItem;
 	} else if (object == OBJECT_PLUGIN) {
 		*settable = false;
 	} else if (object == d->object) {
@@ -703,6 +797,11 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		}
 		return 0;
 	}
+	if (object == OBJECT_CODEC_SOURCE) {
+		/* the one microphone there is */
+		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
+		       kAudioHardwareBadPropertySizeError;
+	}
 	if (address->mSelector == kAudioStreamPropertyIsActive) {
 		if (size != sizeof(UInt32)) {
 			return kAudioHardwareBadPropertySizeError;
@@ -727,6 +826,59 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	}
 }
 
+/*
+ * The microphone (the device "Codec"): /dev/redwood-mic is open while the input runs, and the kernel
+ * listens only while it is open. A read gives what has come and never waits; what it does not
+ * give is silence. Said when it starts and stops, with how much came.
+ */
+static int mic = -1;
+static UInt64 mic_frames, mic_heard, mic_short;
+static int mic_peak;
+
+static void
+codec_open(void)
+{
+	mic = open("/dev/redwood-mic", O_RDONLY | O_NONBLOCK);
+	mic_frames = mic_heard = mic_short = 0;
+	mic_peak = 0;
+	say("redwood: audio: the microphone is listened to (/dev/redwood-mic: %s)\n", mic < 0 ? strerror(errno) : "open");
+}
+
+static void
+codec_close(void)
+{
+	say("redwood: audio: the microphone stops: %llu.%02llu s asked for, %llu.%02llu s of it from the kernel (peak %d of 32768), "
+	    "%llu reads short\n", mic_frames / REDWOOD_AUDIO_RATE, mic_frames % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE,
+	    mic_heard / REDWOOD_AUDIO_RATE, mic_heard % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, mic_peak, mic_short);
+	if (mic >= 0) {
+		close(mic);
+	}
+	mic = -1;
+}
+
+static void
+codec_read(int16_t *samples, UInt32 frames)
+{
+	ssize_t got = mic >= 0 ? read(mic, samples, (size_t)frames * 2) : -1;
+	UInt32 have = got > 0 ? (UInt32)got / 2 : 0;
+
+	if (have > 0 && mic_heard == 0) {
+		say("redwood: audio: the microphone's first samples, %llu.%02llu s after the input started\n",
+		    mic_frames / REDWOOD_AUDIO_RATE, mic_frames % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE);
+	}
+	for (UInt32 i = 0; i < have; i++) {
+		int v = samples[i] < 0 ? -samples[i] : samples[i];
+
+		mic_peak = v > mic_peak ? v : mic_peak;
+	}
+	if (have < frames) {
+		memset(samples + have, 0, (size_t)(frames - have) * 2);
+		mic_short += mic_heard > 0;
+	}
+	mic_frames += frames;
+	mic_heard += have;
+}
+
 static OSStatus
 start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client)
 {
@@ -743,6 +895,9 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 			written = refused = 0;
 			say("redwood: audio: playing\n");
 		}
+		if (d->object == OBJECT_CODEC) {
+			codec_open();
+		}
 	}
 	pthread_mutex_unlock(&lock);
 	return 0;
@@ -757,9 +912,13 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 		return kAudioHardwareBadObjectError;
 	}
 	pthread_mutex_lock(&lock);
-	if (d->running != 0 && --d->running == 0 && d->output != 0) {
-		say("redwood: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / REDWOOD_AUDIO_RATE,
-		    written % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, refused, REDWOOD_AUDIO_DEVICE);
+	if (d->running != 0 && --d->running == 0) {
+		if (d->object == OBJECT_CODEC) {
+			codec_close();
+		} else if (d->output != 0) {
+			say("redwood: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / REDWOOD_AUDIO_RATE,
+			    written % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, refused, REDWOOD_AUDIO_DEVICE);
+		}
 	}
 	pthread_mutex_unlock(&lock);
 	return 0;
@@ -849,8 +1008,10 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	if (d == NULL) {
 		return kAudioHardwareBadObjectError;
 	}
-	if (operation == kAudioServerPlugInIOOperationReadInput) {
-		/* nobody is listening on this machine: silence */
+	if (operation == kAudioServerPlugInIOOperationReadInput && stream == OBJECT_CODEC_INPUT) {
+		codec_read(buffer, frames);
+	} else if (operation == kAudioServerPlugInIOOperationReadInput) {
+		/* the speaker's and Hawking's inputs: silence */
 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames);
