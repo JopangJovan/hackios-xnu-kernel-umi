@@ -1,0 +1,7 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The wide camera for iOS, its frames (RC_JOBS=rc.jobs.camera, with cam=5): a program reads 150 of them from the
+# kernel's /dev/redwood-camera (camera_test raw: src/camera_isp.c's exposure and white balance at work on them), says
+# what came and how fast, and leaves the last one as a picture for the host (xl camera). The kernel's "camera:" lines
+# say when the sensor streamed and why it stopped.
+/redwood/bin/sound_test springboard
+/redwood/bin/camera_test raw 150

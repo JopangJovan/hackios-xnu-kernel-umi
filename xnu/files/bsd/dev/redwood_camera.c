@@ -68,7 +68,11 @@
 #include <pexpert/pexpert.h>
 #include <vm/memory_types.h>
 #include <sys/systm.h>
+#include <sys/conf.h>
+#include <sys/uio.h>
+#include <miscfs/devfs/devfs.h>
 #include <sys/redwood_audio.h>
+#include <sys/redwood_camera.h>
 #include <sys/redwood_input.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -2023,6 +2027,11 @@ smmu_down(void)
 #define CSID_TPG_COMMON_GEN_CFG 0x648
 #define TPG_VC                  0xa
 #define RAW10_DT                0x2b
+/*
+ * A line's bytes as the write master lays them out: RAW10 (four pixels in five bytes), the line
+ * rounded up to 16 bytes, the bus's width (a 4000-pixel line takes 5008, not 5000).
+ */
+#define RAW10_STRIDE(width)     (((width) * 10 / 8 + 15) & ~15u)
 
 #define IFE_HW_VERSION          0x0000
 #define IFE_GLOBAL_RESET        0x0018
@@ -2190,7 +2199,7 @@ tpg_start(void)
 
 /* cam_vfe_top_reset(), cam_vfe_bus_init_hw(), cam_vfe_bus_start_wm() and update_wm() for RDI 0 in frame mode. */
 static bool
-ife_config(uint64_t address, uint32_t frame_bytes)
+ife_config(uint64_t address, uint32_t frame_bytes, uint32_t frame_inc)
 {
 	blk_put(ife, "IFE", IFE_IRQ_MASK0, 1u << 31, false);
 	blk_put(ife, "IFE", IFE_GLOBAL_RESET, 0x3f9f, false);
@@ -2210,7 +2219,7 @@ ife_config(uint64_t address, uint32_t frame_bytes)
 	    !blk_put(ife, "IFE", WM0_STRIDE, 0xff01, true) || !blk_put(ife, "IFE", WM0_FRAMEDROP_PERIOD, 0, true) ||
 	    !blk_put(ife, "IFE", WM0_FRAMEDROP_PATTERN, 1, true) || !blk_put(ife, "IFE", WM0_IRQ_SUB_PERIOD, 0, true) ||
 	    !blk_put(ife, "IFE", WM0_IRQ_SUB_PATTERN, 1, true) || !blk_put(ife, "IFE", BUS_IRQ_MASK1, 1, false) ||
-	    !blk_put(ife, "IFE", WM0_IMAGE_ADDR, (uint32_t)address, false) || !blk_put(ife, "IFE", WM0_FRAME_INC, frame_bytes, true) ||
+	    !blk_put(ife, "IFE", WM0_IMAGE_ADDR, (uint32_t)address, false) || !blk_put(ife, "IFE", WM0_FRAME_INC, frame_inc, true) ||
 	    !blk_put(ife, "IFE", WM0_CFG, 3, true)) {
 		return false;
 	}
@@ -2293,7 +2302,7 @@ capture_tpg(void)
 	struct cam_header *h;
 
 	if (!frames_alloc(width, height, stride, 0) || !titan_up() || !smmu_up() || !csid_reset() ||
-	    !csid_config(-1, 4, 0x3210, TPG_VC, width, height, false) || !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height)) {
+	    !csid_config(-1, 4, 0x3210, TPG_VC, width, height, false) || !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height, stride * height)) {
 		titan_down();
 		return;
 	}
@@ -2654,7 +2663,7 @@ capture_sensor(void)
 	snprintf(res, sizeof(res), "res%u", mode_n);
 	width = mode->width;
 	height = mode->height;
-	stride = width * 10 / 8;
+	stride = RAW10_STRIDE(width);
 	rate = (uint64_t)mode->pixel_clock * 10 / (mode->lanes ? mode->lanes : 1);
 	(void)PE_parse_boot_argn("cam_frames", &wanted, sizeof(wanted));
 	wanted = wanted < 1 ? 1 : wanted > 300 ? 300 : wanted;
@@ -2673,7 +2682,7 @@ capture_sensor(void)
 	if (!power_up() || !healthy() || !read_chip_id() || !sensor_table("init") || !sensor_table(res) || !healthy() ||
 	    !titan_up() || !smmu_up() || !csid_reset() ||
 	    !csid_config((int)hw->csiphy, mode->lanes, ctab->lane_assign & ((1u << (4 * mode->lanes)) - 1), 0, width, height,
-	    mode->cphy != 0) || !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height) ||
+	    mode->cphy != 0) || !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height, stride * height) ||
 	    !csiphy_up(mode->lanes, mode->cphy != 0, ctab->lane_assign, settle, rate)) {
 		csiphy_down();
 		titan_down();
@@ -2730,6 +2739,565 @@ capture_sensor(void)
 	for (vm_offset_t line = frames; line < frames + CAM_HEADER_BYTES; line += 64) {
 		__asm__ volatile ("dc cvac, %0" : : "r" (line));
 	}
+}
+
+/* ---- cam=5: the wide camera for iOS (/dev/redwood-camera) ------------------------------------------- */
+
+/*
+ * The sensor's frames for a program (iOS's camera stack in mediaserverd, libredwood-media.dylib), for
+ * as long as it holds /dev/redwood-camera open (sys/redwood_camera.h): the sensor powered up and
+ * streaming at the first read after the open, everything down again at the last close, after
+ * IDLE_MS without a read, and on any fault (and then for the rest of the run). The sequence is
+ * cam=4's. The frames go into three places in turn (kernel memory, mapped page by page through the
+ * SMMU): one the IFE writes, one a read may be copying, one ready.
+ *
+ * Which place the IFE writes: when one is done, the next place's address goes to the write master,
+ * which takes it at the next start of frame (the register update, latched at RDI 0's SOF). Polled
+ * every millisecond: a frame done and the next frame's SOF seen in the same look mean the address
+ * came too late, and the frame just done is being written over (the write master's frame increment
+ * is 0 here: without a new address it writes the next frame where the last went, not past it) --
+ * it is not given out, and the next one done there is. The exposure the program asks for is written between two frames, after
+ * the address, in the sensor's group hold; it counts from the second frame after.
+ *
+ * A picture for the host (REDWOOD_CAMERA_KEEP: what the program made of a frame) goes into one
+ * piece of memory the loader hands over after the run, as cam=3 and cam=4's frames do (xl camera).
+ */
+#define RING                    3
+#define PLACE_SPARE             (256u << 10)    /* room after each frame: some come longer than the mode's lines */
+#define IDLE_MS                 1000
+#define FRAME_TIMEOUT_MS        1500
+#define EXPOSURE_MARGIN         40
+#define GAIN_UNITY              32              /* the S5KHM2SD's 0x0204: 32 is 1x (cam=4) */
+#define GAIN_MAX                0x800
+#define FRAME_LINES_MAX         0xfff0
+#define RDI0_SOF                (1u << 27)      /* IFE_IRQ_STATUS0 (cam_vfe_lite16x.h: sof_irq_mask of RDI 0) */
+#define WM0_DONE                1u              /* BUS_IRQ_STATUS1 */
+
+enum { PLACE_FREE, PLACE_WRITING, PLACE_READY, PLACE_READING };
+
+static LCK_GRP_DECLARE(ios_lck_grp, "redwood-camera");
+static LCK_MTX_DECLARE(ios_lock, &ios_lck_grp);
+static struct {
+	uint8_t         state;
+	uint64_t        sequence, time;
+	uint32_t        exposure_lines, gain, frame_lines;
+} place[RING];
+static vm_offset_t ring;
+static uint64_t ring_bytes, ring_tables_bytes, ring_place_bytes;
+static uint32_t ring_frame_bytes, ios_odd_frames;
+static const struct ctab_mode *ios_mode;
+static uint32_t ios_mode_n, ios_line_ns;
+static volatile bool ios_open, ios_streaming, ios_wanted;  /* open; frames coming; a read wants them */
+static uint64_t ios_last_read, ios_given, ios_frames_done, ios_writes_late;
+static struct { uint32_t lines, gain, frame_lines; bool pending; } ios_ask;
+static struct { uint32_t lines, gain, frame_lines; uint64_t from; } ios_now, ios_next;
+static vm_offset_t keep;
+static uint64_t keep_bytes;
+
+static uint64_t
+ios_ms(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / NSEC_PER_MSEC;
+}
+
+/* exposure_lines, gain, frame_lines within what the sensor takes (frame_lines 0: the shortest that holds the exposure) */
+static void
+exposure_limits(uint32_t *lines, uint32_t *gain, uint32_t *frame_lines)
+{
+	uint32_t shortest = ios_mode->frame_length;
+
+	*gain = *gain < GAIN_UNITY ? GAIN_UNITY : *gain > GAIN_MAX ? GAIN_MAX : *gain;
+	*lines = *lines < 4 ? 4 : *lines > FRAME_LINES_MAX - EXPOSURE_MARGIN ? FRAME_LINES_MAX - EXPOSURE_MARGIN : *lines;
+	if (*frame_lines == 0) {
+		*frame_lines = *lines + EXPOSURE_MARGIN > shortest ? *lines + EXPOSURE_MARGIN : shortest;
+	}
+	*frame_lines = *frame_lines < shortest ? shortest : *frame_lines > FRAME_LINES_MAX ? FRAME_LINES_MAX : *frame_lines;
+	if (*lines > *frame_lines - EXPOSURE_MARGIN) {
+		*lines = *frame_lines - EXPOSURE_MARGIN;
+	}
+}
+
+static bool
+exposure_write(uint32_t lines, uint32_t gain, uint32_t frame_lines)
+{
+	if (!sensor_table("holdon") || !sensor_write(0x0340, (uint16_t)frame_lines, true) || !sensor_write(0x0202, (uint16_t)lines, true) ||
+	    !sensor_write(0x0204, (uint16_t)gain, true) || !sensor_table("holdoff")) {
+		give_up("a sensor write nobody acknowledged");
+		return false;
+	}
+	return true;
+}
+
+static void
+ring_free(void)
+{
+	if (page_tables != 0) {
+		kmem_free(kernel_map, page_tables, ring_tables_bytes);
+		page_tables = 0;
+	}
+	if (ring != 0) {
+		kmem_free(kernel_map, ring, ring_bytes);
+		ring = 0;
+	}
+	frames = 0;
+	frames_bytes = 0;
+}
+
+static bool
+ring_alloc(uint32_t frame_bytes)
+{
+	ring_frame_bytes = frame_bytes;
+	ring_place_bytes = round_page(frame_bytes) + PLACE_SPARE;
+	ring_bytes = RING * ring_place_bytes;
+	if (kmem_alloc(kernel_map, &ring, ring_bytes, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		say("camera: no memory for %u frames (%llu KB)\n", RING, ring_bytes >> 10);
+		ring = 0;
+		return false;
+	}
+	for (vm_offset_t line = ring; line < ring + ring_bytes; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	frames = ring;                  /* (what smmu_up() maps) */
+	frames_bytes = ring_bytes;
+	ring_tables_bytes = (2 + ((ring_bytes + 0x1fffff) >> 21)) * 4096;
+	return true;
+}
+
+/* The session's end, whatever ended it: the sensor's "off", the blocks, the supplies, the memory. */
+static void
+ios_stop(const char *why)
+{
+	lck_mtx_lock(&ios_lock);
+	ios_streaming = false;
+	for (int i = 0; i < RING; i++) {
+		place[i].state = PLACE_FREE;
+	}
+	lck_mtx_unlock(&ios_lock);
+	wakeup(&ios_frames_done);
+	if (!broken) {
+		(void)sensor_table("off");
+	}
+	show_paths("at the end");
+	smmu_faults();
+	csiphy_down();
+	titan_down();
+	power_down();
+	ring_free();
+	say("camera: the frames for iOS stopped (%s): %llu done, %llu given, %llu written over\n", why, ios_frames_done, ios_given,
+	    ios_writes_late);
+}
+
+static const char *ios_res(void);
+
+static bool
+ios_start(void)
+{
+	uint32_t lines, gain, frame_lines;
+
+	ios_frames_done = ios_given = ios_writes_late = 0;
+	ios_odd_frames = 0;
+	if (!ring_alloc(RAW10_STRIDE(ios_mode->width) * ios_mode->height)) {
+		return false;
+	}
+	if (!power_up() || !healthy() || !read_chip_id() || !sensor_table("init") || !sensor_table(ios_res()) || !healthy() ||
+	    !titan_up() || !smmu_up() || !csid_reset() ||
+	    !csid_config((int)hw->csiphy, ios_mode->lanes, ctab->lane_assign & ((1u << (4 * ios_mode->lanes)) - 1), 0, ios_mode->width,
+	    ios_mode->height, ios_mode->cphy != 0) || !ife_config(FRAME_ADDRESSES, ring_frame_bytes, 0) ||
+	    !csiphy_up(ios_mode->lanes, ios_mode->cphy != 0, ctab->lane_assign, ios_mode->settle,
+	    (uint64_t)ios_mode->pixel_clock * 10 / ios_mode->lanes)) {
+		return false;
+	}
+	lck_mtx_lock(&ios_lock);
+	for (int i = 0; i < RING; i++) {
+		place[i].state = PLACE_FREE;
+	}
+	place[0].state = PLACE_WRITING;
+	lines = ios_ask.lines;
+	gain = ios_ask.gain;
+	frame_lines = ios_ask.frame_lines;
+	ios_ask.pending = false;
+	lck_mtx_unlock(&ios_lock);
+	exposure_limits(&lines, &gain, &frame_lines);
+	if (!sensor_table("on") || !exposure_write(lines, gain, frame_lines)) {
+		return false;
+	}
+	ios_now.lines = ios_next.lines = lines;
+	ios_now.gain = ios_next.gain = gain;
+	ios_now.frame_lines = ios_next.frame_lines = frame_lines;
+	ios_next.from = 0;
+	say("camera: the frames for iOS: mode %u, %ux%u, %u lines of %u ns a frame at the shortest; exposure %u lines, gain %#x, "
+	    "frame %u lines\n", ios_mode_n, ios_mode->width, ios_mode->height, ios_mode->frame_length, ios_line_ns, lines, gain, frame_lines);
+	return true;
+}
+
+static void
+ios_session(void)
+{
+	int writing = 0, next = -1;
+	uint64_t last_frame;
+
+	if (!ios_start()) {
+		give_up("the camera did not start");
+		ios_stop("it did not start");
+		return;
+	}
+	last_frame = ios_ms();
+	blk_put(ife, "IFE", IFE_IRQ_CLEAR0, 0xffffffff, false);
+	blk_put(ife, "IFE", IFE_IRQ_GLOBAL_CLEAR, 1, false);
+	lck_mtx_lock(&ios_lock);
+	ios_streaming = true;
+	ios_last_read = ios_ms();
+	lck_mtx_unlock(&ios_lock);
+	while (!broken && ios_open) {
+		uint32_t top, bus;
+		uint64_t now;
+
+		wait_ms(1);
+		now = ios_ms();
+		top = rd(ife + IFE_IRQ_STATUS0);
+		bus = rd(ife + BUS_IRQ_STATUS1);
+		if (!(top & RDI0_SOF) && !(bus & WM0_DONE)) {
+			if (now - last_frame > FRAME_TIMEOUT_MS) {
+				show_paths("no frame");
+				give_up("no frame for 1.5 s");
+				break;
+			}
+			if (now - ios_last_read > IDLE_MS) {
+				break;
+			}
+			continue;
+		}
+		blk_put(ife, "IFE", IFE_IRQ_CLEAR0, top & RDI0_SOF, false);
+		blk_put(ife, "IFE", IFE_IRQ_GLOBAL_CLEAR, 1, false);
+		blk_put(ife, "IFE", BUS_IRQ_CLEAR1, bus & WM0_DONE, false);
+		blk_put(ife, "IFE", BUS_IRQ_GLOBAL_CLEAR, 1, false);
+		lck_mtx_lock(&ios_lock);
+		if (bus & WM0_DONE) {
+			uint32_t ping = rd(csid + CSID_RDI0_BYTES_PING), pong = rd(csid + CSID_RDI0_BYTES_PONG);
+			uint32_t data = ios_mode->width * 10 / 8 * ios_mode->height;
+
+			last_frame = now;
+			ios_frames_done++;
+			if ((ping != data || (pong != data && ios_frames_done > 1)) && ios_odd_frames++ < 8) {
+				say("camera: frame %llu: the CSID counted %u and %u bytes (the mode's frame is %u)\n", ios_frames_done, ping, pong,
+				    data);
+			}
+			if (ios_frames_done >= ios_next.from && ios_next.from != 0) {
+				ios_now = ios_next;
+				ios_next.from = 0;
+			}
+			place[writing].state = PLACE_READY;
+			place[writing].sequence = ios_frames_done;
+			place[writing].time = mach_absolute_time();
+			place[writing].exposure_lines = ios_now.lines;
+			place[writing].gain = ios_now.gain;
+			place[writing].frame_lines = ios_now.frame_lines;
+		}
+		if (top & RDI0_SOF) {
+			if (next >= 0) {
+				writing = next;
+				next = -1;
+			} else if (bus & WM0_DONE) {
+				ios_writes_late++;      /* the address came after this SOF: the frame just done is written over */
+			}
+			place[writing].state = PLACE_WRITING;
+		}
+		if ((bus & WM0_DONE) && next < 0) {
+			for (int i = 0; i < RING; i++) {
+				int c = (writing + 1 + i) % RING;
+
+				if (c != writing && place[c].state != PLACE_READING && (next < 0 || place[c].sequence < place[next].sequence)) {
+					next = c;
+				}
+			}
+			if (next >= 0) {
+				blk_put(ife, "IFE", WM0_IMAGE_ADDR, (uint32_t)(FRAME_ADDRESSES + (uint64_t)next * ring_place_bytes), false);
+				blk_put(ife, "IFE", IFE_REG_UPDATE, 0x2, false);
+			}
+		}
+		bool ask = (bus & WM0_DONE) && ios_ask.pending;
+		uint32_t lines = ios_ask.lines, gain = ios_ask.gain, frame_lines = ios_ask.frame_lines;
+
+		ios_ask.pending = ios_ask.pending && !ask;
+		lck_mtx_unlock(&ios_lock);
+		if (bus & WM0_DONE) {
+			wakeup(&ios_frames_done);
+		}
+		if (ask) {
+			exposure_limits(&lines, &gain, &frame_lines);
+			if (lines != ios_now.lines || gain != ios_now.gain || frame_lines != ios_now.frame_lines) {
+				if (!exposure_write(lines, gain, frame_lines)) {
+					break;
+				}
+				ios_next.lines = lines;
+				ios_next.gain = gain;
+				ios_next.frame_lines = frame_lines;
+				ios_next.from = ios_frames_done + 2;
+			}
+		}
+		if ((bus & WM0_DONE) && ios_frames_done % 30 == 0) {
+			uint32_t fsr = rd(smmu_context + SMMU_CB_FSR);
+
+			if (!healthy()) {
+				break;
+			}
+			if (fsr & SMMU_FSR_ALL) {
+				smmu_faults();
+				give_up("the SMMU refused the IFE");
+				break;
+			}
+			if (ios_frames_done == 30 || ios_frames_done % 900 == 0) {
+				show_paths("streaming");
+			}
+		}
+	}
+	ios_stop(broken ? "a fault" : !ios_open ? "closed" : "nobody reads");
+}
+
+static const char *
+ios_res(void)
+{
+	static char res[8];
+
+	snprintf(res, sizeof(res), "res%u", ios_mode_n);
+	return res;
+}
+
+static int
+camdev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	if (broken) {
+		return EIO;
+	}
+	ios_open = true;
+	return 0;
+}
+
+/* (the last close) */
+static int
+camdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	ios_open = false;
+	ios_wanted = false;
+	wakeup(&ios_open);
+	return 0;
+}
+
+static int
+camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct redwood_camera_frame f;
+	uint64_t since = ios_ms();
+	int b = -1, error = 0;
+
+	lck_mtx_lock(&ios_lock);
+	ios_last_read = ios_ms();
+	if (!ios_streaming && !ios_wanted) {
+		ios_wanted = true;
+		wakeup(&ios_open);
+	}
+	for (;;) {
+		if (broken) {
+			lck_mtx_unlock(&ios_lock);
+			return EIO;
+		}
+		b = -1;
+		for (int i = 0; i < RING; i++) {
+			if (place[i].state == PLACE_READY && place[i].sequence > ios_given && (b < 0 || place[i].sequence > place[b].sequence)) {
+				b = i;
+			}
+		}
+		if (b >= 0) {
+			break;
+		}
+		if (ios_ms() - since > (ios_streaming ? 3000u : 15000u)) {      /* (the sensor's tables take seconds) */
+			lck_mtx_unlock(&ios_lock);
+			return EAGAIN;
+		}
+		struct timespec ts = { 0, 100 * NSEC_PER_MSEC };
+		error = msleep(&ios_frames_done, &ios_lock, PZERO | PCATCH, "redwood-camera", &ts);
+		if (error != 0 && error != EWOULDBLOCK) {
+			lck_mtx_unlock(&ios_lock);
+			return error;
+		}
+		ios_last_read = ios_ms();
+	}
+	place[b].state = PLACE_READING;
+	ios_given = place[b].sequence;
+	bzero(&f, sizeof(f));
+	memcpy(f.magic, REDWOOD_CAMERA_MAGIC, 8);
+	f.header_bytes = sizeof(f);
+	f.width = ios_mode->width;
+	f.height = ios_mode->height;
+	f.stride = RAW10_STRIDE(ios_mode->width);
+	f.format = 1;
+	f.bayer = hw->bayer;
+	f.black = 64;
+	f.sequence = place[b].sequence;
+	f.time = place[b].time;
+	f.exposure_lines = place[b].exposure_lines;
+	f.line_ns = ios_line_ns;
+	f.gain = place[b].gain;
+	f.gain_unity = GAIN_UNITY;
+	f.gain_max = GAIN_MAX;
+	f.frame_lines = place[b].frame_lines;
+	f.frame_lines_min = ios_mode->frame_length;
+	f.frame_lines_max = FRAME_LINES_MAX;
+	f.margin = EXPOSURE_MARGIN;
+	lck_mtx_unlock(&ios_lock);
+
+	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
+	if (error == 0 && uio_resid(uio) > 0) {
+		vm_offset_t at = ring + (uint64_t)b * ring_place_bytes;
+		uint32_t n = (uint32_t)MIN((uint64_t)ring_frame_bytes, (uint64_t)uio_resid(uio));
+
+		uint64_t t0 = mach_absolute_time(), t1, t2;
+
+		/* (what the IFE wrote went past the processor's caches) */
+		for (vm_offset_t line = at & ~63ul; line < at + n; line += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r" (line));
+		}
+		__asm__ volatile ("dsb sy");
+		t1 = mach_absolute_time();
+		error = uiomove((caddr_t)at, (int)n, uio);
+		t2 = mach_absolute_time();
+		if (f.sequence <= 3 || f.sequence % 300 == 0) {
+			uint64_t a, b;
+
+			absolutetime_to_nanoseconds(t1 - t0, &a);
+			absolutetime_to_nanoseconds(t2 - t1, &b);
+			say("camera: frame %llu read: %u bytes, the caches' lines forgotten in %llu us, copied in %llu us\n", f.sequence, n,
+			    a / 1000, b / 1000);
+		}
+	}
+	lck_mtx_lock(&ios_lock);
+	if (place[b].state == PLACE_READING) {
+		place[b].state = PLACE_READY;
+	}
+	ios_last_read = ios_ms();
+	lck_mtx_unlock(&ios_lock);
+	return error;
+}
+
+/* REDWOOD_CAMERA_KEEP: a picture for the host, in one piece of memory the loader hands over. */
+static int
+keep_picture(const struct redwood_camera_command *c, struct uio *uio)
+{
+	struct cam_header *h;
+	uint64_t want = round_page(CAM_HEADER_BYTES + (uint64_t)c->bytes);
+
+	if (c->bytes == 0 || c->d < 1 || c->d > 3 || (uint64_t)c->c * c->b > (uint64_t)c->bytes * 2) {
+		return EINVAL;
+	}
+	if (keep == 0 || keep_bytes < want) {
+		return ENOSPC;                  /* (the piece is made when the device is, while there is memory in one piece) */
+	}
+	h = (struct cam_header *)keep;
+	bzero(h, CAM_HEADER_BYTES);
+	memcpy(h->magic, "RWCAM001", 8);
+	h->width = c->a;
+	h->height = c->b;
+	h->stride = c->c;
+	h->format = c->d;
+	h->bayer = c->d == 1 ? hw->bayer : 0;
+	h->frame_bytes = c->bytes;
+	h->source = 2;
+	strlcpy(h->sensor, "iOS", sizeof(h->sensor));
+	int error = uiomove((caddr_t)(keep + CAM_HEADER_BYTES), (int)MIN((uint64_t)c->bytes, (uint64_t)uio_resid(uio)), uio);
+	h->frames = error == 0 ? 1 : 0;
+	for (vm_offset_t line = keep; line < keep + want; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	loader_recording[0] = kvtophys(keep);
+	loader_recording[1] = want;
+	loader_recording[2] = (uint64_t)keep;
+	say("camera: a picture from iOS for the host: %ux%u, format %u, %u bytes\n", c->a, c->b, c->d, c->bytes);
+	return error;
+}
+
+static int
+camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct redwood_camera_command c;
+	int error;
+
+	if (uio_resid(uio) < (user_ssize_t)sizeof(c) || (error = uiomove((caddr_t)&c, sizeof(c), uio)) != 0) {
+		return EINVAL;
+	}
+	if (c.command == REDWOOD_CAMERA_EXPOSURE) {
+		lck_mtx_lock(&ios_lock);
+		ios_ask.lines = c.a;
+		ios_ask.gain = c.b;
+		ios_ask.frame_lines = c.c;
+		ios_ask.pending = true;
+		lck_mtx_unlock(&ios_lock);
+		return 0;
+	}
+	if (c.command == REDWOOD_CAMERA_KEEP) {
+		return keep_picture(&c, uio);
+	}
+	return EINVAL;
+}
+
+static const struct cdevsw camdev_cdevsw = {
+	.d_open = camdev_open, .d_close = camdev_close, .d_read = camdev_read, .d_write = camdev_write,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/* cam=5: the device, and a session whenever a read wants frames, until a fault. */
+static void
+serve_ios(void)
+{
+	int major;
+	uint32_t mode_n = 1;
+
+	if (!ctab_load()) {
+		return;
+	}
+	(void)PE_parse_boot_argn("cam_mode", &mode_n, sizeof(mode_n));
+	if (mode_n >= ctab->modes) {
+		mode_n = 0;
+	}
+	ios_mode_n = mode_n;
+	ios_mode = &ctab_modes[mode_n];
+	if (ios_mode->lanes < 1 || ios_mode->lanes > (ios_mode->cphy ? 3u : 4u) || ios_mode->data_type != RAW10_DT ||
+	    ios_mode->width % 4 != 0 || ios_mode->fps_milli == 0 || ios_mode->frame_length == 0) {
+		say("camera: mode %u is not what this is written for\n", mode_n);
+		return;
+	}
+	ios_line_ns = (uint32_t)(1000000000000ull / ((uint64_t)ios_mode->fps_milli * ios_mode->frame_length));
+	/* the first exposure, until the program asks for its own: boot-args as cam=4's, else a room's */
+	ios_ask.lines = ios_mode->frame_length - EXPOSURE_MARGIN;
+	ios_ask.gain = 8 * GAIN_UNITY;
+	ios_ask.frame_lines = 0;
+	(void)PE_parse_boot_argn("cam_shutter", &ios_ask.lines, sizeof(ios_ask.lines));
+	(void)PE_parse_boot_argn("cam_gain", &ios_ask.gain, sizeof(ios_ask.gain));
+	major = cdevsw_add(-1, &camdev_cdevsw);
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-camera") == NULL) {
+		say("camera: /dev/redwood-camera cannot be made\n");
+		return;
+	}
+	say("camera: /dev/redwood-camera: the %s camera's frames for iOS (mode %u: %ux%u, %u.%03u frames/s at the most), whenever it "
+	    "is read\n", hw->name, mode_n, ios_mode->width, ios_mode->height, ios_mode->fps_milli / 1000, ios_mode->fps_milli % 1000);
+	while (!broken) {
+		lck_mtx_lock(&ios_lock);
+		while (!broken && !(ios_open && ios_wanted)) {
+			(void)msleep(&ios_open, &ios_lock, PZERO, "redwood-camera-idle", NULL);
+		}
+		ios_wanted = false;
+		lck_mtx_unlock(&ios_lock);
+		if (broken) {
+			break;
+		}
+		ios_session();
+	}
+	say("camera: /dev/redwood-camera: no more frames in this run\n");
 }
 
 /* ---- the look, and the thread ----------------------------------------------------------------------- */
@@ -2792,13 +3360,14 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
-	if (PE_parse_boot_arg_str("cam_sensor", which, sizeof(which)) && strcmp(which, "wide") == 0) {
-		hw = &sensors[1];
+	if ((PE_parse_boot_arg_str("cam_sensor", which, sizeof(which)) && strcmp(which, "wide") == 0) || level == 5) {
+		hw = &sensors[1];       /* (cam=5 is the wide one's: its exposure registers are the SMIA ones) */
 	}
 	cci_bus.name = hw->bus_name;
 	cci_bus.sda = hw->sda;
 	cci_bus.scl = hw->scl;
-	say("camera: cam=%u: the %s camera%s\n", level, hw->name, level == 4 ? ": its frames through its CSIPHY and RDI 0 into memory" :
+	say("camera: cam=%u: the %s camera%s\n", level, hw->name, level == 5 ? ": its frames for iOS" :
+	    level == 4 ? ": its frames through its CSIPHY and RDI 0 into memory" :
 	    level == 3 ? ": the CSID's test pattern through RDI 0 into memory" :
 	    level == 2 ? ": powered up, its chip ID read, powered down" : ": a look, reading only");
 	pgpio_find();
@@ -2810,6 +3379,9 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	look_around();
 	if (level == 3) {
 		capture_tpg();
+		power_down();
+	} else if (level == 5) {
+		serve_ios();
 		power_down();
 	} else if (level == 4) {
 		capture_sensor();
@@ -2835,7 +3407,23 @@ redwood_camera_init(void)
 	if (!PE_parse_boot_argn("cam", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	level = level > 4 ? 4 : level;
+	level = level > 5 ? 5 : level;
+	if (level == 5) {
+		/*
+		 * The memory for a picture for the host (cam_keep_mb, default 24: a 12-megapixel NV12 picture), in
+		 * one piece: taken now, while the system's memory still is in large pieces.
+		 */
+		uint32_t keep_mb = 24;
+
+		(void)PE_parse_boot_argn("cam_keep_mb", &keep_mb, sizeof(keep_mb));
+		keep_bytes = (uint64_t)(keep_mb > 64 ? 64 : keep_mb) << 20;
+		if (keep_bytes != 0 && kmem_alloc_contig(kernel_map, &keep, keep_bytes, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			printf("camera: no memory in one piece for a picture for the host (%u MB)\n", keep_mb);
+			keep = 0;
+			keep_bytes = 0;
+		}
+	}
 	if (kernel_thread_start(camera_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}

@@ -11,6 +11,8 @@ four, their low two bits together in the fifth. Each frame becomes PREFIX-N.png,
 taking each 2x2 cell (bayer 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR) as one pixel -- half the resolution, no
 interpolation -- with a plain grey-world white balance and a gamma of 2.2: a first look, not a
 finished photograph; PREFIX-N-raw.png is the frame's raw values as they are (grey, 8 bits).
+Formats 2 and 3 are a picture iOS made of a frame (cam=5): NV12 (full-range YCbCr 4:2:0, the chroma plane
+after the luma one, both of the stride) or BGRA, which becomes PREFIX.png as it is.
 --bayer N takes the frames for that order instead of the header's. The OV02B10's picture is RGGB
 here (in a picture of a room the second and third sites of each cell track each other, the
 greens; red against blue by plausible colours); its own colour bars (cam_pattern=1) come a line
@@ -60,6 +62,27 @@ def main():
         sys.exit('camraw.py: not frames of the camera driver')
     print(f'camraw.py: {sensor}: {width}x{height}, stride {stride}, format {fmt}, bayer {bayer}, {frames} frame(s) written whole, '
           f'the last in place {last}')
+    if fmt in (2, 3):
+        # a picture iOS made of a frame (cam=5, camera_test or mediaserverd): NV12 (full range) or BGRA
+        base = 4096
+        rows = []
+        for y in range(height):
+            out = bytearray()
+            if fmt == 3:
+                line = data[base + y * stride:base + y * stride + 4 * width]
+                for x in range(width):
+                    out += bytes((line[4 * x + 2], line[4 * x + 1], line[4 * x]))
+            else:
+                luma = data[base + y * stride:base + y * stride + width]
+                chroma = data[base + stride * height + (y // 2) * stride:base + stride * height + (y // 2) * stride + width]
+                for x in range(width):
+                    yy, cb, cr = luma[x], chroma[x & ~1] - 128, chroma[(x & ~1) + 1] - 128
+                    for v in (yy + 1.402 * cr, yy - 0.344136 * cb - 0.714136 * cr, yy + 1.772 * cb):
+                        out.append(max(0, min(255, int(v + 0.5))))
+            rows.append(out)
+        png(f'{sys.argv[2]}.png', width, height, rows, 3)
+        print(f'camraw.py: {sys.argv[2]}.png ({width}x{height}, from {"NV12" if fmt == 2 else "BGRA"})')
+        return
     count = max(frames, 1)
     for n in range(count):
         base = 4096 + n * frame_bytes

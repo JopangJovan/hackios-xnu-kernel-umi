@@ -113,6 +113,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
+		$DYN -O2 -o obj/camera_test src/camera_test.c src/camera_isp.c
 		# (the microphone as an application records: allowed to, by an entitlement, if ldid is there)
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/record_test src/record_test.c &&
 			{ ${LDID:-ldid} -Ssrc/record_test.entitlements obj/record_test 2>/dev/null ||
@@ -172,6 +173,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
 	[ -f obj/sound_test ] && cp obj/sound_test root/bin/
 	[ -f obj/torch_test ] && cp obj/torch_test root/bin/
+	[ -f obj/camera_test ] && cp obj/camera_test root/bin/
 	[ -f obj/record_test ] && cp obj/record_test root/bin/
 	for f in $EXTRA; do cp "$f" root/bin/; done
 	mkdir -p root/lib
