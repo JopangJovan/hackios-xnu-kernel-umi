@@ -33,6 +33,10 @@
  *           the two LDOs)
  *   cam=2   ... and the macro sensor powered up as Android powers it, its chip ID read, and powered
  *           down again (every write read back)
+ *   cam=3   the CSID's test pattern through RDI 0 and IFE-lite 0 into memory, which the loader hands
+ *           to the host after the run (xl camera): the camera subsystem's rails, PLL, clocks, SMMU
+ *           and blocks without the sensor (capture_tpg() below)
+ *   cam=4   the macro sensor's own frames that way, through CSIPHY 2 (capture_sensor() below)
  *
  * Limits, whatever asks: Android's voltages only (1.8 and 2.8 V; nothing else is ever written to
  * the LDOs' set points); only the registers named above are written (a list each, checked at every
@@ -40,13 +44,19 @@
  * in time or reports over-current, a byte nobody acknowledges, and everything is switched off again
  * in the power-down's order and nothing more is done. At the run's end (and on a panic's way out)
  * whatever was switched on is switched off. Everything that was found switched on is left on.
+ * The camera subsystem's own registers (camcc's PLL0 and the clocks named there, CSIPHY 2, CSID-lite
+ * 0, IFE-lite 0, one match register and context of the SMMU) are written the same way, read back
+ * where they keep what they are given, and taken back in the reverse order.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
+#include <vm/vm_kern.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <vm/memory_types.h>
 #include <sys/systm.h>
 #include <sys/redwood_audio.h>
 #include <sys/redwood_input.h>
@@ -932,6 +942,1449 @@ healthy(void)
 	return true;
 }
 
+/* ---- the camera subsystem's surroundings, read only: rails, the SMMU, camcc's PLLs ------------------- */
+
+/*
+ * What the camera's blocks need beyond the sensor (a look first, nothing written): the CX and MX
+ * rails' levels (camcc's clocks at Android's rates want CX at SVS and, for PLL0's 1.2 GHz, MX at
+ * SVS_L1), asked of RPMh by level positions from the boot loader's command database; what the
+ * application processors' RPMh sequencer (DRV 2) holds for them; the two rails' set points in their
+ * regulators (PM8350C S2 and S10); what the SMMU has for the IFEs' streams (dt: 0x800 and 0xc00 with
+ * the mask 0x4e0); camcc's PLL0 and PLL6.
+ */
+#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_SIZE             0x20000UL
+#define RSC_PHYS                0x18220000UL    /* DRV 2's (dt: rsc@18200000, drv-id 2) */
+#define RSC_TCS_BASE            0xd00
+#define RSC_TCS(n)              (RSC_TCS_BASE + 672 * (n))
+#define TCS_CONTROL             0x14
+#define TCS_STATUS              0x18
+#define TCS_ENABLED             0x1c
+#define TCS_COMMAND(c)          (0x30 + 20 * (c))       /* message id, address, value, status */
+#define RSC_TCS_COUNT           8               /* dt qcom,tcs-config: 2 active, 3 sleep, 3 wake */
+
+struct cmd_db_slave {
+	uint16_t id, header_offset, data_offset, count, version, reserved[3];
+};
+struct cmd_db_header {
+	uint32_t version;
+	uint8_t magic[4];
+	struct cmd_db_slave slave[8];
+	uint32_t checksum, reserved;
+	uint8_t data[];
+};
+struct cmd_db_entry {
+	char id[8];
+	uint32_t priority[2];
+	uint32_t address;
+	uint16_t length, offset;
+};
+
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+static const struct cmd_db_header *cmd_db;
+static vm_offset_t rsc;
+
+/* RPMh's address for a resource, and its levels (as many as `max'); 0: not there. */
+static uint32_t
+rpmh_resource(const char *name, uint16_t *levels, unsigned max, unsigned *count)
+{
+	char id[8] = { 0 };
+
+	*count = 0;
+	if (cmd_db == NULL) {
+		cmd_db = (const struct cmd_db_header *)ml_io_map_unmappable(CMD_DB_PHYS, CMD_DB_SIZE, VM_WIMG_WCOMB);
+	}
+	if (!(cmd_db->magic[0] == 0xdb && cmd_db->magic[1] == 0x30 && cmd_db->magic[2] == 0x03 && cmd_db->magic[3] == 0x0c)) {
+		return 0;
+	}
+	strlcpy(id, name, sizeof(id));
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &cmd_db->slave[s];
+		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
+
+		if (slave->id == 0 || slave->count > 512) {
+			continue;
+		}
+		for (unsigned i = 0; i < slave->count; i++) {
+			const uint8_t *data;
+
+			if (memcmp(entry[i].id, id, sizeof(id)) != 0) {
+				continue;
+			}
+			if ((unsigned)slave->data_offset + entry[i].offset + entry[i].length > CMD_DB_SIZE - 0x1000) {
+				return entry[i].address;
+			}
+			data = cmd_db->data + slave->data_offset + entry[i].offset;
+			for (unsigned l = 0; l < entry[i].length / 2u && l < max; l++) {
+				levels[l] = (uint16_t)(data[2 * l] | data[2 * l + 1] << 8);
+				if (l > 0 && levels[l] == 0) {
+					break;
+				}
+				*count = l + 1;
+			}
+			return entry[i].address;
+		}
+	}
+	return 0;
+}
+
+static void
+show_rail(const char *name, uint32_t *address)
+{
+	uint16_t levels[16];
+	unsigned count;
+	char line[200];
+	int at;
+
+	*address = rpmh_resource(name, levels, 16, &count);
+	at = snprintf(line, sizeof(line), "camera: RPMh's %s at %#x, levels:", name, *address);
+	for (unsigned l = 0; l < count && at < (int)sizeof(line) - 8; l++) {
+		at += snprintf(line + at, sizeof(line) - (size_t)at, " %u", levels[l]);
+	}
+	say("%s\n", line);
+	/* what DRV 2's sequencer holds for it, in any of its TCSs */
+	for (unsigned t = 0; *address != 0 && t < RSC_TCS_COUNT; t++) {
+		uint32_t enabled = rd(rsc + RSC_TCS(t) + TCS_ENABLED);
+
+		for (unsigned c = 0; c < 16; c++) {
+			uint32_t where = rd(rsc + RSC_TCS(t) + TCS_COMMAND(c) + 4);
+
+			if (where == *address) {
+				say("camera:   TCS %u command %u: value %u (position), %senabled, message id %#x, status %#x\n", t, c,
+				    rd(rsc + RSC_TCS(t) + TCS_COMMAND(c) + 8), (enabled >> c) & 1 ? "" : "not ",
+				    rd(rsc + RSC_TCS(t) + TCS_COMMAND(c)), rd(rsc + RSC_TCS(t) + TCS_COMMAND(c) + 12));
+			}
+		}
+	}
+}
+
+/* A PMIC peripheral's registers, read through the arbiter's observer (any channel that is that peripheral's). */
+static bool
+pmic_peek(uint16_t id, uint8_t reg, uint8_t *values, unsigned count)
+{
+	for (uint32_t n = 0; n < ARB_MAX_CHANNELS; n++) {
+		uint32_t map = rd(arb_core + ARB_CHANNEL(n));
+
+		if (map == 0 || ((map >> 8) & 0xfff) != id) {
+			continue;
+		}
+		for (unsigned i = 0; i < count; i++) {
+			vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * n;
+
+			lock();
+			wr(channel + CHANNEL_COMMAND, COMMAND_READ | (uint32_t)(reg + i) << 4);
+			const char *problem = wait_done(channel);
+			values[i] = (uint8_t)rd(channel + OBSERVER_DATA0);
+			unlock();
+			if (problem != NULL) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+static void
+show_smps(const char *what, uint16_t id)
+{
+	uint8_t head[2] = { 0, 0 }, set[4] = { 0, 0, 0, 0 }, status[2] = { 0, 0 };
+
+	if (!pmic_peek(id, 0x04, head, 2) || !pmic_peek(id, 0x40, set, 4) || !pmic_peek(id, 0x08, status, 2)) {
+		say("camera: %s (peripheral %#x): cannot be read\n", what, id);
+		return;
+	}
+	say("camera: %s (peripheral %#x): type %#04x subtype %#04x, status %02x %02x, 0x40-0x43: %02x %02x %02x %02x (%u mV?)\n",
+	    what, id, head[0], head[1], status[0], status[1], set[0], set[1], set[2], set[3], set[1] << 8 | set[0]);
+}
+
+#define SMMU_PHYS               0x15000000UL
+#define SMMU_SCR0               0x000
+#define SMMU_IDR0               0x020
+#define SMMU_IDR1               0x024
+#define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
+#define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
+#define IFE_STREAM              0x800                   /* dt: msm_cam_smmu_ife, iommus 0x800.. 0xce0, mask 0x4e0 */
+#define IFE_STREAM_MASK         0x4e0
+
+static vm_offset_t smmu;
+
+static void
+show_smmu(void)
+{
+	uint32_t scr0 = rd(smmu + SMMU_SCR0), idr0 = rd(smmu + SMMU_IDR0), idr1 = rd(smmu + SMMU_IDR1), free_matches = 0;
+	bool used[256] = { false };
+	unsigned contexts = idr1 & 0xff, free_contexts = 0;
+
+	for (uint32_t n = 0; n < (idr0 & 0xff) && SMMU_SMR(n) < 0xc00; n++) {
+		uint32_t smr = rd(smmu + SMMU_SMR(n)), s2cr = rd(smmu + SMMU_S2CR(n));
+		uint32_t stream = smr & 0x7fff, mask = smr >> 16 & 0x7fff;
+
+		if (!(smr >> 31)) {
+			free_matches++;
+			continue;
+		}
+		used[s2cr & 0xff] = true;
+		for (uint32_t ife = 0; ife < 0x10; ife++) {
+			uint32_t sid = (ife < 8 ? 0x800 : 0xc00) + 0x20 * (ife & 7);
+
+			if (((stream ^ sid) & ~mask) == 0) {
+				say("camera: SMMU match register %u (stream %#x mask %#x, s2cr %#x) covers the IFEs' stream %#x\n", n, stream,
+				    mask, s2cr, sid);
+				break;
+			}
+		}
+	}
+	for (unsigned c = 0; c < contexts; c++) {
+		free_contexts += !used[c];
+	}
+	say("camera: the SMMU: scr0 %#x (a stream nobody matches %s), %u match registers free, %u of %u contexts unused by them\n", scr0,
+	    scr0 & (1u << 10) ? "faults" : "passes", free_matches, free_contexts, contexts);
+}
+
+static void
+show_plls(void)
+{
+	for (unsigned p = 0; p <= 6; p += 6) {
+		vm_offset_t pll = camcc + 0x1000UL * p;
+
+		say("camera: camcc PLL%u: mode %#x, l %#x, cal_l %#x, user_ctl %#x %#x, config_ctl %#x %#x %#x, opmode %#x, status %#x, "
+		    "alpha %#x\n", p, rd(pll + 0x00), rd(pll + 0x04), rd(pll + 0x08), rd(pll + 0x0c), rd(pll + 0x10), rd(pll + 0x18),
+		    rd(pll + 0x1c), rd(pll + 0x20), rd(pll + 0x38), rd(pll + 0x30), rd(pll + 0x40));
+	}
+}
+
+static void
+look_around(void)
+{
+	uint32_t cx = 0, mx = 0;
+
+	if (rsc == 0) {
+		rsc = ml_io_map(RSC_PHYS, 0x10000);
+		smmu = ml_io_map(SMMU_PHYS, 0x1000);
+	}
+	show_rail("cx.lvl", &cx);
+	show_rail("mx.lvl", &mx);
+	show_smps("PM8350C S2 (VDD_CX)", 0x217);
+	show_smps("PM8350C S10 (VDD_MX)", 0x22f);
+	show_smmu();
+	show_plls();
+}
+
+/* ---- the camera subsystem (Titan 165): rails, PLL0, clocks ------------------------------------------- */
+
+/*
+ * cam=3: the path a picture takes, tried first with the CSID's own test pattern generator, so that
+ * nothing outside the SoC is involved: CSID-lite 0 (0xacc8000, "csid-lite165": the register layout
+ * of Android's cam_ife_csid_lite17x.h) makes RAW10 frames of a colour bar and sends them down its
+ * RDI 0 path to IFE-lite 0 (0xacc4000, "vfe-lite165": cam_vfe_lite16x.h, the bus of
+ * cam_vfe_bus_ver2.c), whose write master 0 writes each frame as it comes (Android's RDI frame mode)
+ * to memory through the SMMU, as stream 0x800 with the mask 0x4e0 (dt: msm_cam_smmu_ife), into a
+ * context of ours. The memory is one physically contiguous piece that the loader hands to the host
+ * after the run ("xl camera"; tools/camraw.py makes pictures of it).
+ *
+ * What it takes, in Android's order and with Android's numbers (camcc-yupik.c, gcc-yupik.c, the
+ * device tree's clock rates at the "svs" level of csid-lite 0, csiphy 2 and cpas):
+ *   RPMh   CX at SVS (128) for camcc's clocks at 400 MHz, MX at SVS_L1 (192) for PLL0's 1.2 GHz --
+ *          asked through DRV 2's second TCS for requests made at once, as camcc's vdd_cx and vdd_mx
+ *          votes are, and given back (position 0) at the end: DRV 2 holds no other vote on them
+ *          (cam=1 looks: none of its TCSs has a command for either)
+ *   GCC    camera_hf_axi (0x26010), camera_sf_axi (0x2601c)
+ *   camcc  PLL0 (Lucid, 1200 MHz: L 0x3e, alpha 0x8000, its config and user values), then the RCGs
+ *          slow_ahb 80 MHz, camnoc_axi 150, cphy_rx 400, csi2phytimer 300, ife_lite_0_csid 400,
+ *          ife_lite_0 400 (all from PLL0's even (600) or odd (400) output) and the branches
+ *          cpas_ahb, camnoc_axi, csiphy2, csi2phytimer, ife_lite_0_csid, ife_lite_0_cphy_rx,
+ *          ife_lite_0 (the clocks the device tree gives cpas, csiphy 2 and csid-lite 0)
+ * Everything is taken back in the reverse order at the end, and on any fault.
+ */
+#define RSC_IRQ_STATUS          (RSC_TCS_BASE + 0x04)
+#define RSC_IRQ_CLEAR           (RSC_TCS_BASE + 0x08)
+#define TCS_WAIT_FOR_DONE       0x10
+#define TCS_ACTIVE_MODE         (1u << 16)
+#define TCS_TRIGGER             (1u << 24)
+#define MSGID_WRITE_WAITED      (8u | 1u << 8 | 1u << 16)
+#define CAMERA_TCS              1                       /* the second TCS for requests made at once (the audio DSP's driver takes the first) */
+#define CX_LEVEL                128                     /* SVS */
+#define MX_LEVEL                192                     /* SVS_L1 */
+
+static bool rails_voted;
+
+/* The position of the first level at or above `level' in RPMh's list for that rail; -1: not there. */
+static int
+rail_position(const char *name, uint32_t level, uint32_t *address)
+{
+	uint16_t levels[16];
+	unsigned count;
+
+	*address = rpmh_resource(name, levels, 16, &count);
+	for (unsigned l = 0; *address != 0 && l < count; l++) {
+		if (levels[l] >= level) {
+			return (int)l;
+		}
+	}
+	return -1;
+}
+
+/* CX and MX at the camera's levels, or given back (`on' false). True: RPMh has said done. */
+static bool
+rails(bool on)
+{
+	uint32_t addresses[2], values[2], done = 0;
+	int cx = rail_position("cx.lvl", CX_LEVEL, &addresses[0]), mx = rail_position("mx.lvl", MX_LEVEL, &addresses[1]);
+	vm_offset_t tcs = rsc + RSC_TCS(CAMERA_TCS);
+
+	if (cx < 0 || mx < 0) {
+		say("camera: RPMh has no position for CX %u or MX %u\n", CX_LEVEL, MX_LEVEL);
+		return false;
+	}
+	values[0] = on ? (uint32_t)cx : 0;
+	values[1] = on ? (uint32_t)mx : 0;
+	if (rd(tcs + TCS_STATUS) == 0) {
+		say("camera: TCS %u of the sequencer is busy (control %#x)\n", CAMERA_TCS, rd(tcs + TCS_CONTROL));
+		return false;
+	}
+	wr(rsc + RSC_IRQ_CLEAR, 1u << CAMERA_TCS);
+	for (unsigned r = 0; r < 2; r++) {
+		wr(tcs + TCS_COMMAND(r), MSGID_WRITE_WAITED);
+		wr(tcs + TCS_COMMAND(r) + 4, addresses[r]);
+		wr(tcs + TCS_COMMAND(r) + 8, values[r]);
+	}
+	wr(tcs + TCS_WAIT_FOR_DONE, 3);
+	wr(tcs + TCS_ENABLED, 3);
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~TCS_TRIGGER);
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) | TCS_ACTIVE_MODE);
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) | TCS_TRIGGER);
+	rails_voted |= on;
+	/* (each command's status: [8] issued, [16] completed -- the TCS's interrupt may not be enabled for this one) */
+	for (unsigned waited = 0; waited < 100000 && !done; waited += 50) {
+		done = (rd(rsc + RSC_IRQ_STATUS) & (1u << CAMERA_TCS)) ||
+		    ((rd(tcs + TCS_COMMAND(0) + 12) & 1u << 16) && (rd(tcs + TCS_COMMAND(1) + 12) & 1u << 16));
+		if (!done) {
+			spin_us(50);
+		}
+	}
+	say("camera: RPMh's TCS %u: interrupt status %#x (enabled %#x), the commands' status %#x %#x\n", CAMERA_TCS,
+	    rd(rsc + RSC_IRQ_STATUS), rd(rsc + RSC_TCS_BASE), rd(tcs + TCS_COMMAND(0) + 12), rd(tcs + TCS_COMMAND(1) + 12));
+	wr(rsc + RSC_IRQ_CLEAR, 1u << CAMERA_TCS);
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
+	wr(tcs + TCS_ENABLED, 0);
+	say("camera: RPMh %s CX (%#x) position %u and MX (%#x) position %u%s\n", done ? "took" : "DID NOT SAY IT TOOK", addresses[0],
+	    values[0], addresses[1], values[1], on ? "" : " (given back)");
+	return done != 0;
+}
+
+/* camcc's PLL0 (Lucid): the registers of clk-alpha-pll.c's Lucid layout */
+#define PLL_MODE                0x00            /* [0] outputs, [2] out of reset, [23] update bypass, [31] locked */
+#define PLL_L_VAL               0x04
+#define PLL_CAL_L_VAL           0x08
+#define PLL_USER_CTL            0x0c            /* [2:0] the outputs: main, even, odd */
+#define PLL_USER_CTL_U          0x10
+#define PLL_USER_CTL_U1         0x14
+#define PLL_CONFIG_CTL          0x18
+#define PLL_CONFIG_CTL_U        0x1c
+#define PLL_CONFIG_CTL_U1       0x20
+#define PLL_OPMODE              0x38            /* 0 standby, 1 run */
+#define PLL_ALPHA_VAL           0x40
+
+static bool pll_on;
+
+static bool
+camcc_any(uint32_t offset, uint32_t value, uint32_t check)
+{
+	wr(camcc + offset, value);
+	if ((rd(camcc + offset) & check) != (value & check)) {
+		say("camera: camcc %#x <- %#x, but it reads %#x\n", offset, value, rd(camcc + offset));
+		give_up("a camcc register that did not read back");
+		return false;
+	}
+	return true;
+}
+
+static bool
+pll0_up(void)
+{
+	static const struct {
+		uint32_t offset, value;
+	} config[] = {                  /* camcc-yupik.c: cam_cc_pll0_config ("1200MHz Configuration"); CAL_L as clk-alpha-pll.c's default */
+		{ PLL_L_VAL, 0x3e }, { PLL_CAL_L_VAL, 0x44 }, { PLL_ALPHA_VAL, 0x8000 }, { PLL_CONFIG_CTL, 0x20485699 },
+		{ PLL_CONFIG_CTL_U, 0x00002261 }, { PLL_CONFIG_CTL_U1, 0x329a299c }, { PLL_USER_CTL, 0x00003101 },
+		{ PLL_USER_CTL_U, 0x00000805 }, { PLL_USER_CTL_U1, 0x00000000 },
+	};
+
+	if (rd(camcc + PLL_MODE) & 1) {
+		give_up("camcc's PLL0 is running already (somebody else's)");
+		return false;
+	}
+	for (unsigned i = 0; i < sizeof(config) / sizeof(config[0]); i++) {
+		if (!camcc_any(config[i].offset, config[i].value, ~0u)) {
+			return false;
+		}
+	}
+	pll_on = true;
+	/* clk_lucid_pll_configure(): update bypass, outputs off, standby, out of reset */
+	if (!camcc_any(PLL_MODE, rd(camcc + PLL_MODE) | 1u << 23, 1u << 23) || !camcc_any(PLL_MODE, rd(camcc + PLL_MODE) & ~1u, 1) ||
+	    !camcc_any(PLL_OPMODE, 0, 1) || !camcc_any(PLL_MODE, rd(camcc + PLL_MODE) | 1u << 2, 1u << 2)) {
+		return false;
+	}
+	/* alpha_pll_lucid_enable(): run, locked, the outputs on */
+	if (!camcc_any(PLL_OPMODE, 1, 1)) {
+		return false;
+	}
+	if (!wait_bits(PLL_MODE, 1u << 31, 1u << 31, 1000)) {
+		say("camera: camcc's PLL0 does not lock (mode %#x)\n", rd(camcc + PLL_MODE));
+		give_up("a PLL that does not lock");
+		return false;
+	}
+	if (!camcc_any(PLL_USER_CTL, rd(camcc + PLL_USER_CTL) | 7, 7) || !camcc_any(PLL_MODE, rd(camcc + PLL_MODE) | 1, 1)) {
+		return false;
+	}
+	say("camera: camcc's PLL0 locked at 1200 MHz (mode %#x, user_ctl %#x)\n", rd(camcc + PLL_MODE), rd(camcc + PLL_USER_CTL));
+	return true;
+}
+
+static void
+pll0_down(void)
+{
+	if (!pll_on) {
+		return;
+	}
+	/* alpha_pll_lucid_disable(), then back into reset as it was found */
+	wr(camcc + PLL_MODE, rd(camcc + PLL_MODE) & ~1u);
+	wr(camcc + PLL_USER_CTL, rd(camcc + PLL_USER_CTL) & ~7u);
+	wr(camcc + PLL_OPMODE, 0);
+	wr(camcc + PLL_MODE, rd(camcc + PLL_MODE) & ~(1u << 2));
+	pll_on = false;
+	say("camera: camcc's PLL0 off (mode %#x)\n", rd(camcc + PLL_MODE));
+}
+
+/* An RCG set (source, divider field 2n - 1, no M/N) and updated; then branches on. */
+struct rcg {
+	const char *    name;
+	uint32_t        cmd, source, divider;
+	uint32_t        found_cfg;
+	bool            set;
+};
+static struct rcg rcgs[] = {
+	{ "slow_ahb 80 MHz", 0x7058, 2, 14 },           /* PLL0 even (600) / 7.5 */
+	{ "camnoc_axi 150 MHz", 0xc124, 2, 7 },         /* / 4 */
+	{ "cphy_rx 400 MHz", 0xa064, 2, 2 },            /* / 1.5 */
+	{ "csi2phytimer 300 MHz", 0xe0f4, 2, 3 },       /* / 2 */
+	{ "ife_lite_0_csid 400 MHz", 0xc020, 2, 2 },    /* / 1.5 */
+	{ "ife_lite_0 400 MHz", 0xc004, 3, 1 },         /* PLL0 odd (400) / 1 */
+};
+struct branch {
+	const char *    name;
+	bool            gcc;
+	uint32_t        cbcr;
+	bool            set;
+};
+static struct branch branches[] = {
+	{ "gcc camera_hf_axi", true, 0x26010 }, { "gcc camera_sf_axi", true, 0x2601c },
+	{ "cpas_ahb", false, 0xc11c }, { "camnoc_axi", false, 0xc140 }, { "csiphy2", false, 0xe110 },
+	{ "csi2phytimer", false, 0xe10c },
+	{ "ife_lite_0_csid", false, 0xc038 }, { "ife_lite_0_cphy_rx", false, 0xc040 }, { "ife_lite_0", false, 0xc01c },
+};
+
+static bool
+clocks_up(void)
+{
+	for (unsigned i = 0; i < sizeof(rcgs) / sizeof(rcgs[0]); i++) {
+		struct rcg *r = &rcgs[i];
+		uint32_t cfg = r->cmd + 4;
+
+		r->found_cfg = rd(camcc + cfg);
+		if (!camcc_any(cfg, (r->found_cfg & ~0x371fu) | r->source << 8 | r->divider, 0x371f)) {
+			return false;
+		}
+		r->set = true;
+		wr(camcc + r->cmd, rd(camcc + r->cmd) | CMD_UPDATE);
+		if (!wait_bits(r->cmd, CMD_UPDATE, 0, 500)) {
+			say("camera: the RCG %s does not take its configuration (cmd %#x)\n", r->name, rd(camcc + r->cmd));
+			give_up("an RCG that does not update");
+			return false;
+		}
+	}
+	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
+		struct branch *b = &branches[i];
+		vm_offset_t base = b->gcc ? gcc : camcc;
+
+		if (rd(base + b->cbcr) & 1) {
+			continue;               /* (on already: left on at the end too) */
+		}
+		wr(base + b->cbcr, rd(base + b->cbcr) | 1);
+		if (!(rd(base + b->cbcr) & 1)) {
+			say("camera: the branch %s does not take its enable (%#x)\n", b->name, rd(base + b->cbcr));
+			give_up("a clock that does not read back");
+			return false;
+		}
+		b->set = true;
+		for (unsigned waited = 0; rd(base + b->cbcr) & CBCR_OFF; waited += 10) {
+			if (waited > 500) {
+				say("camera: the branch %s does not come on (%#x)\n", b->name, rd(base + b->cbcr));
+				give_up("a clock that does not come on");
+				return false;
+			}
+			spin_us(10);
+		}
+	}
+	say("camera: the camera's clocks on (%u RCGs, %u branches)\n", (unsigned)(sizeof(rcgs) / sizeof(rcgs[0])),
+	    (unsigned)(sizeof(branches) / sizeof(branches[0])));
+	return true;
+}
+
+static void
+clocks_down(void)
+{
+	for (int i = (int)(sizeof(branches) / sizeof(branches[0])) - 1; i >= 0; i--) {
+		struct branch *b = &branches[i];
+		vm_offset_t base = b->gcc ? gcc : camcc;
+
+		if (b->set) {
+			wr(base + b->cbcr, rd(base + b->cbcr) & ~1u);
+			b->set = false;
+		}
+	}
+	for (int i = (int)(sizeof(rcgs) / sizeof(rcgs[0])) - 1; i >= 0; i--) {
+		struct rcg *r = &rcgs[i];
+
+		if (r->set) {
+			wr(camcc + r->cmd + 4, r->found_cfg);
+			wr(camcc + r->cmd, rd(camcc + r->cmd) | CMD_UPDATE);
+			(void)wait_bits(r->cmd, CMD_UPDATE, 0, 500);
+			r->set = false;
+		}
+	}
+	say("camera: the camera's clocks off\n");
+}
+
+/* ---- the frames' memory, and the SMMU ---------------------------------------------------------------- */
+
+#define FRAME_ADDRESSES         0x40000000ull           /* the IFE's addresses for it (in dt's iova pool 0x100000-0xfff00000) */
+#define CAM_HEADER_BYTES        4096
+#define CAM_FRAMES              2
+#define SMMU_CBAR(n)            (4 * (n))
+#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)
+#define SMMU_CBA2R(n)           (0x800 + 4 * (n))
+#define SMMU_CB_SCTLR           0x00
+#define SMMU_CB_TCR2            0x10
+#define SMMU_CB_TTBR0           0x20
+#define SMMU_CB_TTBR1           0x28
+#define SMMU_CB_TCR             0x30
+#define SMMU_CB_MAIR0           0x38
+#define SMMU_CB_MAIR1           0x3c
+#define SMMU_CB_FSR             0x58
+#define SMMU_CB_FAR             0x60
+#define SMMU_CB_FSYNR0          0x68
+#define SMMU_CB_TLBIASID        0x610
+#define SMMU_CB_TLBSYNC         0x7f0
+#define SMMU_CB_TLBSTATUS       0x7f4
+#define SMMU_SGFSR              0x048
+#define SMMU_SGFSYNR1           0x054
+#define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 8 | 1u << 12)
+#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
+#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)
+#define SMMU_MAIR0              0xf404ff44
+#define SMMU_FSR_ALL            0xc00001fe
+#define CAM_PTE                 (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)       /* as redwood_sound.c's */
+
+/* What the loader hands to the host (tools/camraw.py reads it). */
+struct cam_header {
+	char            magic[8];       /* "RWCAM001" */
+	uint32_t        width, height;  /* pixels */
+	uint32_t        stride;         /* bytes from one line to the next */
+	uint32_t        format;         /* 1: MIPI RAW10, packed (four pixels in five bytes) */
+	uint32_t        bayer;          /* 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR */
+	uint32_t        frames;         /* how many were written whole */
+	uint32_t        frame_bytes;    /* each, from CAM_HEADER_BYTES on */
+	uint32_t        source;         /* 0: the CSID's test pattern, 1: the sensor */
+	char            sensor[16];
+	uint32_t        last;           /* which of the frames' places holds the last one written */
+};
+
+extern uint64_t loader_recording[3];
+extern uint64_t kvtophys(vm_offset_t va);
+extern lck_mtx_t redwood_smmu_lock;
+
+static vm_offset_t frames, smmu_second, smmu_context, page_tables;
+static uint64_t frames_bytes;
+static uint32_t smmu_match = ~0u, smmu_context_n, smmu_old_smr, smmu_old_s2cr, smmu_pages_size, smmu_pages;
+static bool smmu_on;
+
+static bool
+frames_alloc(uint32_t width, uint32_t height, uint32_t stride, uint32_t source)
+{
+	struct cam_header *h;
+	uint32_t frame_bytes = stride * height;
+
+	frames_bytes = round_page(CAM_HEADER_BYTES + (uint64_t)CAM_FRAMES * frame_bytes);
+	if (kmem_alloc_contig(kernel_map, &frames, frames_bytes, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		say("camera: no memory for %u frames (%llu KB)\n", CAM_FRAMES, frames_bytes >> 10);
+		return false;
+	}
+	h = (struct cam_header *)frames;
+	memcpy(h->magic, "RWCAM001", 8);
+	h->width = width;
+	h->height = height;
+	h->stride = stride;
+	h->format = 1;
+	h->bayer = source ? 2 : 0;       /* (the OV02B10's own colour bars, cam_pattern=1, read as GBRG; the CSID's test pattern as RGGB) */
+	h->frame_bytes = frame_bytes;
+	h->source = source;
+	strlcpy(h->sensor, source ? "OV02B10" : "CSID TPG", sizeof(h->sensor));
+	/* (what the processor wrote out of its caches; the IFE writes past them) */
+	for (vm_offset_t line = frames; line < frames + frames_bytes; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	loader_recording[0] = kvtophys(frames);
+	loader_recording[1] = frames_bytes;
+	loader_recording[2] = (uint64_t)frames;
+	say("camera: %llu KB of memory for %u frames at %#llx, handed to the loader for the host\n", frames_bytes >> 10, CAM_FRAMES,
+	    loader_recording[0]);
+	return true;
+}
+
+static bool
+smmu_find(void)
+{
+	bool used[256] = { false };
+	uint32_t idr0 = rd(smmu + SMMU_IDR0), idr1 = rd(smmu + SMMU_IDR1);
+
+	smmu_pages_size = idr1 >> 31 ? 0x10000 : 0x1000;
+	smmu_pages = 2u << (idr1 >> 28 & 7);
+	if (2 * smmu_pages * smmu_pages_size != 0x100000) {
+		say("camera: the SMMU's layout is not the one known here\n");
+		return false;
+	}
+	for (uint32_t n = 0; n < (idr0 & 0xff) && SMMU_SMR(n) < 0xc00; n++) {
+		uint32_t smr = rd(smmu + SMMU_SMR(n)), s2cr = rd(smmu + SMMU_S2CR(n));
+
+		if (smr >> 31) {
+			used[s2cr & 0xff] = true;
+			if ((((smr & 0x7fff) ^ IFE_STREAM) & ~((smr >> 16 & 0x7fff) | IFE_STREAM_MASK)) == 0) {
+				say("camera: SMMU match register %u (%#x) is somebody's for the IFEs' streams: left alone\n", n, smr);
+				return false;
+			}
+		} else if (smmu_match == ~0u) {
+			smmu_match = n;
+			smmu_old_smr = smr;
+			smmu_old_s2cr = s2cr;
+		}
+	}
+	for (smmu_context_n = 0; smmu_context_n < (idr1 & 0xff) && used[smmu_context_n]; smmu_context_n++) {
+	}
+	if (smmu_match == ~0u || smmu_context_n >= (idr1 & 0xff)) {
+		say("camera: the SMMU has no match register or context left\n");
+		return false;
+	}
+	smmu_second = ml_io_map(SMMU_PHYS + smmu_pages_size, 0x1000);
+	smmu_context = ml_io_map(SMMU_PHYS + (uint64_t)(smmu_pages + smmu_context_n) * smmu_pages_size, 0x1000);
+	if (rd(smmu_context + SMMU_CB_SCTLR) & 1) {
+		say("camera: SMMU context %u is switched on although no stream uses it: somebody's\n", smmu_context_n);
+		return false;
+	}
+	return true;
+}
+
+static bool
+smmu_put(vm_offset_t base, uint32_t offset, uint32_t value, uint32_t check)
+{
+	wr(base + offset, value);
+	if ((rd(base + offset) & check) != (value & check)) {
+		say("camera: SMMU %#x <- %#x, but it reads %#x\n", offset, value, rd(base + offset));
+		give_up("an SMMU register that did not read back");
+		return false;
+	}
+	return true;
+}
+
+/* The frames' memory behind FRAME_ADDRESSES for the IFEs' streams, through a free context with tables of ours. */
+static bool
+smmu_up(void)
+{
+	uint64_t *root, *second, table_root;
+	uint32_t thirds = (uint32_t)((frames_bytes + 0x1fffff) >> 21), pages = (uint32_t)(frames_bytes >> 12);
+
+	lck_mtx_lock(&redwood_smmu_lock);
+	if (!smmu_find()) {
+		lck_mtx_unlock(&redwood_smmu_lock);
+		give_up("no place in the SMMU");
+		return false;
+	}
+	if (kmem_alloc(kernel_map, &page_tables, (2 + thirds) * 4096, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {
+		lck_mtx_unlock(&redwood_smmu_lock);
+		give_up("no memory for page tables");
+		return false;
+	}
+	root = (uint64_t *)page_tables;
+	second = (uint64_t *)(page_tables + 4096);
+	root[FRAME_ADDRESSES >> 30 & 0x1ff] = kvtophys((vm_offset_t)second) | 3;
+	for (uint32_t t = 0; t < thirds; t++) {
+		uint64_t *third = (uint64_t *)(page_tables + (2 + t) * 4096);
+
+		second[(FRAME_ADDRESSES >> 21 & 0x1ff) + t] = kvtophys((vm_offset_t)third) | 3;
+		for (uint32_t p = 0; p < 512 && t * 512 + p < pages; p++) {
+			third[p] = kvtophys(frames + 4096ull * (t * 512 + p)) | CAM_PTE;
+		}
+	}
+	for (vm_offset_t line = page_tables; line < page_tables + (2 + thirds) * 4096; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	table_root = kvtophys(page_tables) | (uint64_t)smmu_context_n << 48;
+	say("camera: SMMU: context %u gets our tables for %llu KB at %#llx; match register %u sends streams %#x/%#x through it\n",
+	    smmu_context_n, frames_bytes >> 10, FRAME_ADDRESSES, smmu_match, IFE_STREAM, IFE_STREAM_MASK);
+	if (!smmu_put(smmu_context, SMMU_CB_SCTLR, 0, ~0u) || !smmu_put(smmu_second, SMMU_CBA2R(smmu_context_n), 1, 1) ||
+	    !smmu_put(smmu_second, SMMU_CBAR(smmu_context_n), SMMU_CBAR_STAGE_1, 0x30000) ||
+	    !smmu_put(smmu_context, SMMU_CB_TCR2, SMMU_TCR2, 0) || !smmu_put(smmu_context, SMMU_CB_TCR, SMMU_TCR_39_BITS, ~0u) ||
+	    !smmu_put(smmu_context, SMMU_CB_TTBR0, (uint32_t)table_root, ~0u) ||
+	    !smmu_put(smmu_context, SMMU_CB_TTBR0 + 4, (uint32_t)(table_root >> 32), ~0u) ||
+	    !smmu_put(smmu_context, SMMU_CB_TTBR1, 0, ~0u) || !smmu_put(smmu_context, SMMU_CB_TTBR1 + 4, 0, ~0u) ||
+	    !smmu_put(smmu_context, SMMU_CB_MAIR0, SMMU_MAIR0, ~0u) || !smmu_put(smmu_context, SMMU_CB_MAIR1, 0, ~0u)) {
+		lck_mtx_unlock(&redwood_smmu_lock);
+		return false;
+	}
+	wr(smmu_context + SMMU_CB_FSR, SMMU_FSR_ALL);
+	wr(smmu_context + SMMU_CB_TLBIASID, smmu_context_n);
+	wr(smmu_context + SMMU_CB_TLBSYNC, 1);
+	for (unsigned waited = 0; rd(smmu_context + SMMU_CB_TLBSTATUS) & 1; waited++) {
+		if (waited > 1000) {
+			lck_mtx_unlock(&redwood_smmu_lock);
+			give_up("the SMMU does not finish forgetting");
+			return false;
+		}
+		spin_us(10);
+	}
+	if (!smmu_put(smmu_context, SMMU_CB_SCTLR, SMMU_SCTLR_ON, 1)) {
+		lck_mtx_unlock(&redwood_smmu_lock);
+		return false;
+	}
+	smmu_on = true;
+	if (!smmu_put(smmu, SMMU_S2CR(smmu_match), smmu_context_n, 0x300ff) ||
+	    !smmu_put(smmu, SMMU_SMR(smmu_match), 1u << 31 | (uint32_t)IFE_STREAM_MASK << 16 | IFE_STREAM, ~0u)) {
+		lck_mtx_unlock(&redwood_smmu_lock);
+		return false;
+	}
+	lck_mtx_unlock(&redwood_smmu_lock);
+	return true;
+}
+
+static void
+smmu_faults(void)
+{
+	uint32_t status, global;
+
+	if (!smmu_on) {
+		return;
+	}
+	status = rd(smmu_context + SMMU_CB_FSR);
+	global = rd(smmu + SMMU_SGFSR);
+	if ((status & SMMU_FSR_ALL) == 0 && global == 0) {
+		say("camera: the SMMU has refused the IFE nothing (context %u)\n", smmu_context_n);
+		return;
+	}
+	say("camera: THE SMMU HAS REFUSED A REQUEST: context %u status %#x, address %#llx, syndrome %#x; global status %#x, stream %#x\n",
+	    smmu_context_n, status, (uint64_t)rd(smmu_context + SMMU_CB_FAR + 4) << 32 | rd(smmu_context + SMMU_CB_FAR),
+	    rd(smmu_context + SMMU_CB_FSYNR0), global, rd(smmu + SMMU_SGFSYNR1));
+}
+
+static void
+smmu_down(void)
+{
+	if (!smmu_on && smmu_match == ~0u) {
+		return;
+	}
+	smmu_faults();
+	if (!leaving) {
+		lck_mtx_lock(&redwood_smmu_lock);
+	}
+	if (smmu_match != ~0u) {
+		wr(smmu + SMMU_SMR(smmu_match), smmu_old_smr);
+		wr(smmu + SMMU_S2CR(smmu_match), smmu_old_s2cr);
+	}
+	if (smmu_on) {
+		wr(smmu_context + SMMU_CB_SCTLR, 0);
+		wr(smmu_context + SMMU_CB_TLBIASID, smmu_context_n);
+		wr(smmu_context + SMMU_CB_TLBSYNC, 1);
+	}
+	if (!leaving) {
+		lck_mtx_unlock(&redwood_smmu_lock);
+	}
+	smmu_on = false;
+	smmu_match = ~0u;
+	say("camera: the SMMU's match register and context put back as they were found\n");
+}
+
+/* ---- CSID-lite 0 and IFE-lite 0 ----------------------------------------------------------------------- */
+
+#define CSID_PHYS               0x0acc8000UL
+#define IFE_PHYS                0x0acc4000UL
+#define CSIPHY_PHYS             0x0ace4000UL
+
+#define CSID_HW_VERSION         0x000
+#define CSID_RST_STROBES        0x010
+#define CSID_CSI2_RX_IRQ_STATUS 0x020
+#define CSID_CSI2_RX_IRQ_MASK   0x024
+#define CSID_CSI2_RX_IRQ_CLEAR  0x028
+#define CSID_RDI0_IRQ_STATUS    0x030
+#define CSID_RDI0_IRQ_MASK      0x034
+#define CSID_RDI0_IRQ_CLEAR     0x038
+#define CSID_TOP_IRQ_STATUS     0x070
+#define CSID_TOP_IRQ_MASK       0x074
+#define CSID_TOP_IRQ_CLEAR      0x078
+#define CSID_IRQ_CMD            0x080
+#define CSID_CSI2_RX_CFG0       0x100
+#define CSID_CSI2_RX_CFG1       0x104
+#define CSID_CSI2_RX_PKTS       0x160
+#define CSID_CSI2_RX_ECC        0x164
+#define CSID_CSI2_RX_CRC        0x168
+#define CSID_RDI0_CFG0          0x200
+#define CSID_RDI0_CFG1          0x204
+#define CSID_RDI0_CTRL          0x208
+#define CSID_RDI0_FRM_DROP_PATTERN 0x20c
+#define CSID_RDI0_FRM_DROP_PERIOD  0x210
+#define CSID_RDI0_IRQ_SUB_PATTERN  0x214
+#define CSID_RDI0_IRQ_SUB_PERIOD   0x218
+#define CSID_RDI0_PIX_DROP_PATTERN 0x224
+#define CSID_RDI0_PIX_DROP_PERIOD  0x228
+#define CSID_RDI0_LINE_DROP_PATTERN 0x22c
+#define CSID_RDI0_LINE_DROP_PERIOD  0x230
+#define CSID_RDI0_STATUS        0x250
+#define CSID_RDI0_BYTES_PING    0x2e0
+#define CSID_RDI0_BYTES_PONG    0x2e4
+#define CSID_TPG_CTRL           0x600
+#define CSID_TPG_VC_CFG0        0x604
+#define CSID_TPG_VC_CFG1        0x608
+#define CSID_TPG_LFSR_SEED      0x60c
+#define CSID_TPG_DT0_CFG0       0x610
+#define CSID_TPG_DT0_CFG1       0x614
+#define CSID_TPG_DT0_CFG2       0x618
+#define CSID_TPG_COLOR_BARS_CFG 0x640
+#define CSID_TPG_COMMON_GEN_CFG 0x648
+#define TPG_VC                  0xa
+#define RAW10_DT                0x2b
+
+#define IFE_HW_VERSION          0x0000
+#define IFE_GLOBAL_RESET        0x0018
+#define IFE_IRQ_MASK0           0x005c
+#define IFE_IRQ_MASK1           0x0060
+#define IFE_IRQ_CLEAR0          0x0064
+#define IFE_IRQ_CLEAR1          0x0068
+#define IFE_IRQ_STATUS0         0x006c
+#define IFE_IRQ_STATUS1         0x0070
+#define IFE_IRQ_GLOBAL_CLEAR    0x0058
+#define IFE_VIOLATION_STATUS    0x007c
+#define IFE_REG_UPDATE          0x04ac
+#define BUS_HW_VERSION          0x2000
+#define BUS_CGC_OVD             0x200c
+#define BUS_IRQ_MASK1           0x2048
+#define BUS_IRQ_CLEAR0          0x2050
+#define BUS_IRQ_CLEAR1          0x2054
+#define BUS_IRQ_CLEAR2          0x2058
+#define BUS_IRQ_STATUS0         0x205c
+#define BUS_IRQ_STATUS1         0x2060
+#define BUS_IRQ_STATUS2         0x2064
+#define BUS_IRQ_GLOBAL_CLEAR    0x2068
+#define BUS_COMP_ERROR          0x206c
+#define BUS_ADDR_SYNC_FRAME_HDR 0x2080
+#define BUS_ADDR_SYNC_NO_SYNC   0x2084
+#define BUS_TEST_CTRL           0x211c
+#define WM0_STATUS0             0x2200
+#define WM0_STATUS1             0x2204
+#define WM0_CFG                 0x2208
+#define WM0_IMAGE_ADDR          0x2214
+#define WM0_IMAGE_ADDR_OFFSET   0x2218
+#define WM0_WIDTH               0x221c
+#define WM0_HEIGHT              0x2220
+#define WM0_PACKER              0x2224
+#define WM0_STRIDE              0x2228
+#define WM0_IRQ_SUB_PERIOD      0x2248
+#define WM0_IRQ_SUB_PATTERN     0x224c
+#define WM0_FRAMEDROP_PERIOD    0x2250
+#define WM0_FRAMEDROP_PATTERN   0x2254
+#define WM0_FRAME_INC           0x2258
+#define WM0_BURST_LIMIT         0x225c
+
+static vm_offset_t csid, ife, csiphy;
+static bool csid_running, ife_running, tpg_running;
+
+/* A register of the three camera blocks: written, and read back where it is one that keeps what it is given. */
+static bool
+blk_put(vm_offset_t base, const char *what, uint32_t offset, uint32_t value, bool check)
+{
+	wr(base + offset, value);
+	__asm__ volatile ("dsb sy");
+	if (check && rd(base + offset) != value) {
+		say("camera: %s %#x <- %#x, but it reads %#x\n", what, offset, value, rd(base + offset));
+		give_up("a camera register that did not read back");
+		return false;
+	}
+	return true;
+}
+
+static bool
+wait_reg(vm_offset_t base, uint32_t offset, uint32_t mask, uint32_t want, uint32_t us)
+{
+	for (uint32_t waited = 0; waited <= us; waited += 10) {
+		if ((rd(base + offset) & mask) == want) {
+			return true;
+		}
+		spin_us(10);
+	}
+	return false;
+}
+
+/* cam_ife_csid_global_reset() and reset_regs(): interrupts masked and cleared, then the registers, then the hardware. */
+static bool
+csid_reset(void)
+{
+	blk_put(csid, "CSID", CSID_CSI2_RX_IRQ_MASK, 0, false);
+	for (unsigned r = 0; r < 4; r++) {
+		blk_put(csid, "CSID", CSID_RDI0_IRQ_MASK + 0x10 * r, 0, false);
+	}
+	blk_put(csid, "CSID", CSID_TOP_IRQ_CLEAR, 1, false);
+	blk_put(csid, "CSID", CSID_CSI2_RX_IRQ_CLEAR, 0xfffffff, false);
+	for (unsigned r = 0; r < 4; r++) {
+		blk_put(csid, "CSID", CSID_RDI0_IRQ_CLEAR + 0x10 * r, 0x7fff, false);
+	}
+	blk_put(csid, "CSID", CSID_IRQ_CMD, 1, false);
+	blk_put(csid, "CSID", CSID_CSI2_RX_CFG1, 0x80, false);
+	for (unsigned r = 0; r < 4; r++) {
+		blk_put(csid, "CSID", CSID_RDI0_CFG0 + 0x100 * r, 2, false);
+	}
+	for (unsigned hw = 0; hw < 2; hw++) {
+		blk_put(csid, "CSID", CSID_TOP_IRQ_CLEAR, 1, false);
+		blk_put(csid, "CSID", CSID_IRQ_CMD, 1, false);
+		if (hw) {
+			blk_put(csid, "CSID", CSID_TOP_IRQ_MASK, 1, false);
+			blk_put(csid, "CSID", CSID_IRQ_CMD, 1, false);
+		}
+		blk_put(csid, "CSID", CSID_RST_STROBES, hw ? 0x1e : 0x1, false);
+		if (!hw) {
+			blk_put(csid, "CSID", CSID_TOP_IRQ_MASK, 1, false);
+			blk_put(csid, "CSID", CSID_IRQ_CMD, 1, false);
+		}
+		if (!wait_reg(csid, CSID_TOP_IRQ_STATUS, 1, 1, 100000)) {
+			say("camera: the CSID's %s reset does not finish (top irq %#x)\n", hw ? "hardware" : "registers'",
+			    rd(csid + CSID_TOP_IRQ_STATUS));
+			give_up("a CSID that does not reset");
+			return false;
+		}
+		blk_put(csid, "CSID", CSID_TOP_IRQ_CLEAR, 1, false);
+		blk_put(csid, "CSID", CSID_IRQ_CMD, 1, false);
+	}
+	say("camera: CSID-lite 0 reset (version %#x)\n", rd(csid + CSID_HW_VERSION));
+	return true;
+}
+
+/* The RX (from a PHY, or the test pattern generator: `phy' -1) and RDI 0, for RAW10 of vc/dt, written as it comes (packed). */
+static bool
+csid_config(int phy, unsigned lanes, uint32_t lane_cfg, uint32_t vc, uint32_t width, uint32_t height)
+{
+	uint32_t cfg0 = vc << 22 | RAW10_DT << 16 | 0u << 27 | 0xfu << 12 | 0u << 10 | 1u << 2 | 3u;
+
+	if (!blk_put(csid, "CSID", CSID_CSI2_RX_CFG0, (lanes - 1) | lane_cfg << 4 | 0u << 24 | (uint32_t)(phy < 0 ? 0 : phy & 3) << 20,
+	    true) || !blk_put(csid, "CSID", CSID_CSI2_RX_CFG1, 1u << 6 | 1u, true)) {
+		return false;
+	}
+	if (phy < 0) {
+		/* cam_ife_csid_config_tpg(): one data type, frames without end, blanking 0x3ff lines and 0x740 pixels, RAW10, colour bars */
+		if (!blk_put(csid, "CSID", CSID_TPG_VC_CFG0, 0u << 16 | 1u << 10 | vc, true) ||
+		    !blk_put(csid, "CSID", CSID_TPG_VC_CFG1, 0x3ffu << 12 | 0x740, true) ||
+		    !blk_put(csid, "CSID", CSID_TPG_LFSR_SEED, 0x12345678, true) ||
+		    !blk_put(csid, "CSID", CSID_TPG_DT0_CFG0, width << 16 | height, true) ||
+		    !blk_put(csid, "CSID", CSID_TPG_DT0_CFG1, RAW10_DT, true) ||
+		    !blk_put(csid, "CSID", CSID_TPG_DT0_CFG2, (3u - 1) << 16 | 0x8, true) ||
+		    !blk_put(csid, "CSID", CSID_TPG_COLOR_BARS_CFG, 1u << 5, true) ||
+		    !blk_put(csid, "CSID", CSID_TPG_COMMON_GEN_CFG, 0, true)) {
+			return false;
+		}
+	}
+	/* cam_ife_csid_init_config_rdi_path() */
+	if (!blk_put(csid, "CSID", CSID_RDI0_CFG0, cfg0, true) || !blk_put(csid, "CSID", CSID_RDI0_CFG1, 2, true) ||
+	    !blk_put(csid, "CSID", CSID_RDI0_FRM_DROP_PERIOD, 1, true) || !blk_put(csid, "CSID", CSID_RDI0_FRM_DROP_PATTERN, 0, true) ||
+	    !blk_put(csid, "CSID", CSID_RDI0_IRQ_SUB_PERIOD, 1, true) || !blk_put(csid, "CSID", CSID_RDI0_IRQ_SUB_PATTERN, 0, true) ||
+	    !blk_put(csid, "CSID", CSID_RDI0_PIX_DROP_PATTERN, 0, true) || !blk_put(csid, "CSID", CSID_RDI0_PIX_DROP_PERIOD, 1, true) ||
+	    !blk_put(csid, "CSID", CSID_RDI0_LINE_DROP_PATTERN, 0, true) ||
+	    !blk_put(csid, "CSID", CSID_RDI0_LINE_DROP_PERIOD, 1, true) || !blk_put(csid, "CSID", CSID_RDI0_CTRL, 0, true) ||
+	    !blk_put(csid, "CSID", CSID_RDI0_CFG0, cfg0 | 1u << 31, true)) {
+		return false;
+	}
+	csid_running = true;
+	/* cam_ife_csid_enable_rdi_path(): resume at the frame's boundary; the reset, overflow and count errors seen */
+	return blk_put(csid, "CSID", CSID_RDI0_CTRL, 1, true) &&
+	       blk_put(csid, "CSID", CSID_RDI0_IRQ_MASK, 1u << 1 | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 6, true);
+}
+
+static bool
+tpg_start(void)
+{
+	/* cam_ife_csid_tpg_start(): four lanes' worth */
+	if (!blk_put(csid, "CSID", CSID_TPG_CTRL, 4u << 20 | 0x80u << 8 | 3u << 4 | 7u, true)) {
+		return false;
+	}
+	tpg_running = true;
+	return true;
+}
+
+/* cam_vfe_top_reset(), cam_vfe_bus_init_hw(), cam_vfe_bus_start_wm() and update_wm() for RDI 0 in frame mode. */
+static bool
+ife_config(uint64_t address, uint32_t frame_bytes)
+{
+	blk_put(ife, "IFE", IFE_IRQ_MASK0, 1u << 31, false);
+	blk_put(ife, "IFE", IFE_GLOBAL_RESET, 0x3f9f, false);
+	if (!wait_reg(ife, IFE_IRQ_STATUS0, 1u << 31, 1u << 31, 100000)) {
+		say("camera: the IFE does not reset (irq %#x)\n", rd(ife + IFE_IRQ_STATUS0));
+		give_up("an IFE that does not reset");
+		return false;
+	}
+	blk_put(ife, "IFE", IFE_IRQ_CLEAR0, 0xffffffff, false);
+	blk_put(ife, "IFE", IFE_IRQ_CLEAR1, 0xffffffff, false);
+	blk_put(ife, "IFE", IFE_IRQ_GLOBAL_CLEAR, 1, false);
+	say("camera: IFE-lite 0 reset (version %#x, bus %#x)\n", rd(ife + IFE_HW_VERSION), rd(ife + BUS_HW_VERSION));
+	if (!blk_put(ife, "IFE", BUS_ADDR_SYNC_FRAME_HDR, 0, true) || !blk_put(ife, "IFE", BUS_CGC_OVD, 0xfffff, false) ||
+	    !blk_put(ife, "IFE", BUS_TEST_CTRL, 0, false) || !blk_put(ife, "IFE", BUS_ADDR_SYNC_NO_SYNC, 0xffffff, false) ||
+	    !blk_put(ife, "IFE", WM0_BURST_LIMIT, 0xf, true) || !blk_put(ife, "IFE", WM0_WIDTH, 0xff01, true) ||
+	    !blk_put(ife, "IFE", WM0_HEIGHT, 0, true) || !blk_put(ife, "IFE", WM0_PACKER, 0, true) ||
+	    !blk_put(ife, "IFE", WM0_STRIDE, 0xff01, true) || !blk_put(ife, "IFE", WM0_FRAMEDROP_PERIOD, 0, true) ||
+	    !blk_put(ife, "IFE", WM0_FRAMEDROP_PATTERN, 1, true) || !blk_put(ife, "IFE", WM0_IRQ_SUB_PERIOD, 0, true) ||
+	    !blk_put(ife, "IFE", WM0_IRQ_SUB_PATTERN, 1, true) || !blk_put(ife, "IFE", BUS_IRQ_MASK1, 1, false) ||
+	    !blk_put(ife, "IFE", WM0_IMAGE_ADDR, (uint32_t)address, false) || !blk_put(ife, "IFE", WM0_FRAME_INC, frame_bytes, true) ||
+	    !blk_put(ife, "IFE", WM0_CFG, 3, true)) {
+		return false;
+	}
+	ife_running = true;
+	/* the RDI 0 resource's start: its register update */
+	return blk_put(ife, "IFE", IFE_REG_UPDATE, 0x2, false);
+}
+
+static void
+show_paths(const char *when)
+{
+	say("camera: %s: CSID rx irq %#x, packets %u, ecc %#x, crc %u; RDI0 irq %#x status %#x, bytes %u/%u; IFE irq %#x %#x, "
+	    "violation %#x; bus irq %#x %#x %#x, comp error %#x; WM0 status %#x %#x\n", when, rd(csid + CSID_CSI2_RX_IRQ_STATUS),
+	    rd(csid + CSID_CSI2_RX_PKTS), rd(csid + CSID_CSI2_RX_ECC), rd(csid + CSID_CSI2_RX_CRC), rd(csid + CSID_RDI0_IRQ_STATUS),
+	    rd(csid + CSID_RDI0_STATUS), rd(csid + CSID_RDI0_BYTES_PING), rd(csid + CSID_RDI0_BYTES_PONG), rd(ife + IFE_IRQ_STATUS0),
+	    rd(ife + IFE_IRQ_STATUS1), rd(ife + IFE_VIOLATION_STATUS), rd(ife + BUS_IRQ_STATUS0), rd(ife + BUS_IRQ_STATUS1),
+	    rd(ife + BUS_IRQ_STATUS2), rd(ife + BUS_COMP_ERROR), rd(ife + WM0_STATUS0), rd(ife + WM0_STATUS1));
+}
+
+static void
+paths_down(void)
+{
+	if (tpg_running) {
+		wr(csid + CSID_TPG_CTRL, 0);
+		tpg_running = false;
+	}
+	if (csid_running) {
+		/* cam_ife_csid_disable_rdi_path(): halted at once, then the path off */
+		wr(csid + CSID_RDI0_IRQ_MASK, 0);
+		wr(csid + CSID_RDI0_CTRL, (rd(csid + CSID_RDI0_CTRL) & ~3u) | 2);
+		wr(csid + CSID_RDI0_CFG0, rd(csid + CSID_RDI0_CFG0) & ~(1u << 31));
+		wr(csid + CSID_CSI2_RX_CFG0, 0);
+		csid_running = false;
+	}
+	if (ife_running) {
+		wr(ife + WM0_CFG, 0);
+		wr(ife + IFE_REG_UPDATE, 0x2);
+		spin_us(1000);
+		ife_running = false;
+	}
+}
+
+/* The camera's blocks up to their clocks; false (and everything taken back by titan_down()) on any fault. */
+static bool
+titan_up(void)
+{
+	if (csid == 0) {
+		csid = ml_io_map(CSID_PHYS, 0x1000);
+		ife = ml_io_map(IFE_PHYS, 0x4000);
+		csiphy = ml_io_map(CSIPHY_PHYS, 0x2000);
+	}
+	if (!(rd(camcc + TITAN_TOP_GDSCR) & GDSC_ON) && !gdsc_on()) {
+		return false;
+	}
+	if (!rails(true)) {
+		give_up("RPMh did not take the camera's rails");
+		return false;
+	}
+	return pll0_up() && clocks_up();
+}
+
+static void
+titan_down(void)
+{
+	paths_down();
+	smmu_down();
+	clocks_down();
+	pll0_down();
+	if (rails_voted) {
+		rails_voted = false;
+		(void)rails(false);
+	}
+}
+
+/* cam=3: a few frames of the CSID's test pattern through RDI 0 and IFE-lite 0 into memory. */
+static void
+capture_tpg(void)
+{
+	const uint32_t width = 1600, height = 1200, stride = width * 10 / 8;
+	struct cam_header *h;
+
+	if (!frames_alloc(width, height, stride, 0) || !titan_up() || !smmu_up() || !csid_reset() ||
+	    !csid_config(-1, 4, 0x3210, TPG_VC, width, height) || !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height)) {
+		titan_down();
+		return;
+	}
+	show_paths("configured");
+	if (!tpg_start()) {
+		titan_down();
+		return;
+	}
+	h = (struct cam_header *)frames;
+	for (unsigned ms = 0; ms < 2000; ms += 100) {
+		wait_ms(100);
+		if (rd(ife + BUS_IRQ_STATUS1) & 1) {
+			h->frames = 1;
+			say("camera: write master 0 says its frame is done after %u ms\n", ms + 100);
+			break;
+		}
+	}
+	show_paths("after the frames");
+	smmu_faults();
+	titan_down();
+	/* (what the IFE wrote, a look: the first bytes of the frame, past the processor's caches) */
+	for (vm_offset_t line = frames; line < frames + CAM_HEADER_BYTES + 256; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	const uint8_t *p = (const uint8_t *)(frames + CAM_HEADER_BYTES);
+	say("camera: the frame's first bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x ... (frames done: %u)\n", p[0], p[1], p[2],
+	    p[3], p[4], p[5], p[6], p[7], p[8], p[9], h->frames);
+	for (vm_offset_t line = frames; line < frames + CAM_HEADER_BYTES; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+}
+
+/* ---- cam=4: the macro sensor's own frames ------------------------------------------------------------- */
+
+/*
+ * The sensor's tables are Android's, read at run time: tools/camsensor.py makes camera-ov02b10.tab
+ * out of the module file (userland/build.sh puts it into fw/ of the small image). The sequence is
+ * Android's: power up, the chip ID, the initialisation ("init", 108 writes: a soft reset, then its
+ * registers page by page), the resolution's own ("res0": 1600x1200 RAW10 on one lane at 665.6 Mbit/s,
+ * 30 frames a second); CSIPHY 2, CSID-lite 0's RX from PHY 2 and RDI 0, IFE-lite 0's write master as
+ * for cam=3; then "on", the frames, "off" (and its 30 ms), and everything down again. The sensor's
+ * writes are not read back (some of its registers start something and clear themselves, a soft
+ * reset among them); each byte must be acknowledged.
+ *
+ * CSIPHY 2 ("qcom,csiphy-v1.2.1": Android's cam_csiphy_1_2_1_hwreg.h, cam_csiphy_core.c): its reset,
+ * the common registers with the lanes to enable (data lane 0 and the clock lane: the module file's
+ * lane assignment 0, one lane), then the two-phase (D-PHY) settings of every lane position, the
+ * settle count among them, and its interrupts (status only, nothing handled). The settle count is
+ * worked out here from the data rate the way the D-PHY specification places it (the middle of the
+ * window between HS-PREPARE and HS-PREPARE + HS-ZERO, in periods of the 300 MHz timer): Android's
+ * comes from the camera stack and its log does not say it unless the camera has been opened.
+ * Boot-arg cam_settle=N sets it instead.
+ */
+struct ctab_head {
+	char            magic[8];       /* "RWCTAB01" */
+	uint32_t        slave, id_address, id, id_mask, lanes, width, height, data_type, pixel_clock, line_length, frame_length;
+	uint32_t        tables;
+};
+struct ctab_entry {
+	uint16_t        address, data;
+	uint8_t         address_bytes, data_bytes, operation, zero;
+	uint32_t        delay_us;
+};
+
+static const struct ctab_head *ctab;
+static uint64_t ctab_size;
+
+static bool
+ctab_load(void)
+{
+	ctab = (const struct ctab_head *)redwood_wifi_file("camera-ov02b10.tab", &ctab_size);
+	if (ctab == NULL || ctab_size < sizeof(*ctab) || memcmp(ctab->magic, "RWCTAB01", 8) != 0) {
+		say("camera: no camera-ov02b10.tab in fw/ of the small image (made from fw-camera/ when it is built)\n");
+		return false;
+	}
+	say("camera: the macro sensor's tables: %ux%u, data type %#x, %u lane(s), pixel clock %u, line length %u, frame length %u, "
+	    "%u tables\n", ctab->width, ctab->height, ctab->data_type, ctab->lanes, ctab->pixel_clock, ctab->line_length,
+	    ctab->frame_length, ctab->tables);
+	return true;
+}
+
+static const struct ctab_entry *
+ctab_find(const char *name, uint32_t *count)
+{
+	const uint8_t *at = (const uint8_t *)(ctab + 1), *end = (const uint8_t *)ctab + ctab_size;
+
+	for (uint32_t t = 0; t < ctab->tables && at + 12 <= end; t++) {
+		uint32_t n = *(const uint32_t *)(at + 8);
+
+		if (strncmp((const char *)at, name, 8) == 0 && at + 12 + n * sizeof(struct ctab_entry) <= end) {
+			*count = n;
+			return (const struct ctab_entry *)(at + 12);
+		}
+		at += 12 + n * sizeof(struct ctab_entry);
+	}
+	*count = 0;
+	return NULL;
+}
+
+/* One of the sensor's tables written in order, as Android's sensor driver writes it. */
+static bool
+sensor_table(const char *name)
+{
+	uint32_t count;
+	const struct ctab_entry *e = ctab_find(name, &count);
+
+	if (e == NULL) {
+		say("camera: the tables have no \"%s\"\n", name);
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		uint8_t out[4];
+		unsigned n = 0;
+
+		if (e[i].operation != 0 || e[i].address_bytes < 1 || e[i].address_bytes > 2 || e[i].data_bytes < 1 || e[i].data_bytes > 2) {
+			say("camera: \"%s\" %u: an operation not known here (%u, %u/%u bytes)\n", name, i, e[i].operation, e[i].address_bytes,
+			    e[i].data_bytes);
+			give_up("a sensor table not understood");
+			return false;
+		}
+		if (e[i].address_bytes == 2) {
+			out[n++] = (uint8_t)(e[i].address >> 8);
+		}
+		out[n++] = (uint8_t)e[i].address;
+		if (e[i].data_bytes == 2) {
+			out[n++] = (uint8_t)(e[i].data >> 8);
+		}
+		out[n++] = (uint8_t)e[i].data;
+		if (broken || !i2c_transfer(&cci_bus, OV02B10_ADDRESS, out, n, NULL, 0)) {
+			say("camera: \"%s\" %u: %#x <- %#x not acknowledged\n", name, i, e[i].address, e[i].data);
+			give_up("a sensor write nobody acknowledged");
+			return false;
+		}
+		if (e[i].delay_us != 0) {
+			spin_us(e[i].delay_us > 100000 ? 100000 : e[i].delay_us);
+		}
+	}
+	say("camera: the sensor's \"%s\": %u writes\n", name, count);
+	return true;
+}
+
+static bool csiphy_running;
+
+static bool
+csiphy_up(unsigned settle)
+{
+	static const uint32_t lanes[5][2] = {           /* each lane position's two blocks: data lane 0, the clock lane, data lanes 1, 2, 3 */
+		{ 0x000, 0x900 }, { 0x700, 0xc80 }, { 0x200, 0xa00 }, { 0x400, 0xb00 }, { 0x600, 0xc00 },
+	};
+	static const uint8_t irq_masks[11] = { 0xff, 0xff, 0xfb, 0xff, 0x7f, 0xff, 0xff, 0xef, 0xff, 0xff, 0xff };
+
+	/* cam_csiphy_reset(): csiphy_reset_reg_1_2_1 */
+	wr(csiphy + 0x814, 0x00);
+	spin_us(5);
+	wr(csiphy + 0x818, 0x00);
+	wr(csiphy + 0x81c, 0x00);
+	wr(csiphy + 0x800, 0x01);
+	spin_us(1);
+	wr(csiphy + 0x800, 0x00);
+	csiphy_running = true;
+	/* cam_csiphy_config_dev(): the common registers (two-phase), lanes: data lane 0 and the clock lane */
+	if (!blk_put(csiphy, "CSIPHY", 0x814, 0x01 | 0x80, true) || !blk_put(csiphy, "CSIPHY", 0x818, 0x01, true) ||
+	    !blk_put(csiphy, "CSIPHY", 0x81c, 0x02, true)) {
+		return false;
+	}
+	wr(csiphy + 0x800, 0x03);
+	spin_us(1);
+	wr(csiphy + 0x800, 0x02);
+	for (unsigned l = 0; l < 5; l++) {
+		uint32_t b = lanes[l][0], m = lanes[l][1];
+		bool clock = l == 1;
+
+		if (!blk_put(csiphy, "CSIPHY", b + 0x30, 0x00, true) || !blk_put(csiphy, "CSIPHY", m + 0x0, 0x05, true) ||
+		    !blk_put(csiphy, "CSIPHY", m + 0x8, 0x10, true) || !blk_put(csiphy, "CSIPHY", m + 0x4, 0x00, true) ||
+		    !blk_put(csiphy, "CSIPHY", m + 0x4, 0x07, true) || !blk_put(csiphy, "CSIPHY", b + 0x04, 0x0c, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x2c, 0x01, true) || !blk_put(csiphy, "CSIPHY", b + 0x34, 0x07, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x10, 0x02, true) || !blk_put(csiphy, "CSIPHY", b + 0x1c, 0x08, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x3c, 0xb8, true) || !blk_put(csiphy, "CSIPHY", b + 0x08, settle & 0xff, true) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x00, clock ? 0x80 : 0x8d, true) ||
+		    (clock && !blk_put(csiphy, "CSIPHY", b + 0x0c, 0xa5, true)) ||
+		    !blk_put(csiphy, "CSIPHY", b + 0x38, clock ? 0x1f : 0xfe, true) || !blk_put(csiphy, "CSIPHY", b + 0x14, 0x60, true) ||
+		    (clock && !blk_put(csiphy, "CSIPHY", b + 0x28, 0x04, true)) || !blk_put(csiphy, "CSIPHY", 0x800, 0x02, true) ||
+		    !blk_put(csiphy, "CSIPHY", 0x884, 0x01, true)) {
+			return false;
+		}
+	}
+	for (unsigned i = 0; i < 11; i++) {
+		wr(csiphy + 0x82c + 4 * i, irq_masks[i]);
+		wr(csiphy + 0x858 + 4 * i, 0xff);
+	}
+	wr(csiphy + 0x828, 0x1);
+	wr(csiphy + 0x828, 0x0);
+	say("camera: CSIPHY 2 configured: one data lane, settle count %u\n", settle);
+	return true;
+}
+
+static void
+show_csiphy(const char *when)
+{
+	char line[200];
+	int at = snprintf(line, sizeof(line), "camera: CSIPHY 2 %s, interrupt status:", when);
+
+	for (unsigned i = 0; i < 11 && at < (int)sizeof(line) - 6; i++) {
+		at += snprintf(line + at, sizeof(line) - (size_t)at, " %02x", rd(csiphy + 0x8b0 + 4 * i) & 0xff);
+	}
+	say("%s\n", line);
+}
+
+static void
+csiphy_down(void)
+{
+	if (!csiphy_running) {
+		return;
+	}
+	wr(csiphy + 0x814, 0x00);
+	spin_us(5);
+	wr(csiphy + 0x818, 0x00);
+	wr(csiphy + 0x81c, 0x00);
+	wr(csiphy + 0x800, 0x01);
+	spin_us(1);
+	wr(csiphy + 0x800, 0x00);
+	csiphy_running = false;
+}
+
+/* The settle count the D-PHY specification's window gives at this data rate, in periods of the 300 MHz timer. */
+static unsigned
+settle_count(uint64_t bits_per_second)
+{
+	uint64_t ui_ps = 1000000000000ull / bits_per_second;
+	uint64_t prepare_max_ps = 85000 + 6 * ui_ps, prepare_zero_min_ps = 145000 + 10 * ui_ps;
+	uint64_t settle_ps = (prepare_max_ps + prepare_zero_min_ps) / 2;
+
+	return (unsigned)(settle_ps * 300 / 1000000) - 6;
+}
+
+/*
+ * The exposure: the module file's table that sets it (page 1: analog gain 0x22, the frame's extra
+ * lines 0x14/0x15, the exposure in lines 0x0e/0x0f, 0x9b, then 0xfe = 2 to apply it; "holdon" here),
+ * as Android's camera stack writes its first one. Boot-args cam_shutter=LINES and cam_gain=N (the
+ * value of 0x22: 16 is 1x) write those two instead, the same way, for a look in other light.
+ */
+static bool
+exposure(void)
+{
+	uint32_t shutter = 0, gain = 0;
+	uint8_t page1[2] = { 0xfd, 0x01 }, apply[2] = { 0xfe, 0x02 }, page0[2] = { 0xfd, 0x00 };
+
+	(void)PE_parse_boot_argn("cam_shutter", &shutter, sizeof(shutter));
+	(void)PE_parse_boot_argn("cam_gain", &gain, sizeof(gain));
+	if (shutter == 0 && gain == 0) {
+		return true;
+	}
+	if (shutter > 1200) {
+		shutter = 1200;         /* (within the frame's 1237 lines) */
+	}
+	if (gain > 0xf8) {
+		gain = 0xf8;
+	}
+	uint8_t high[2] = { 0x0e, (uint8_t)(shutter >> 8) }, low[2] = { 0x0f, (uint8_t)shutter }, g[2] = { 0x22, (uint8_t)gain };
+
+	if (!i2c_transfer(&cci_bus, OV02B10_ADDRESS, page1, 2, NULL, 0) ||
+	    (shutter != 0 && (!i2c_transfer(&cci_bus, OV02B10_ADDRESS, high, 2, NULL, 0) ||
+	    !i2c_transfer(&cci_bus, OV02B10_ADDRESS, low, 2, NULL, 0))) ||
+	    (gain != 0 && !i2c_transfer(&cci_bus, OV02B10_ADDRESS, g, 2, NULL, 0)) ||
+	    !i2c_transfer(&cci_bus, OV02B10_ADDRESS, apply, 2, NULL, 0) || !i2c_transfer(&cci_bus, OV02B10_ADDRESS, page0, 2, NULL, 0)) {
+		give_up("a sensor write nobody acknowledged");
+		return false;
+	}
+	say("camera: the exposure set to %u lines, gain %#x\n", shutter, gain);
+	return true;
+}
+
+static void
+capture_sensor(void)
+{
+	uint32_t width, height, stride, settle = 0, pattern = 0, wanted = 8;
+	struct cam_header *h;
+	uint64_t rate;
+
+	if (!ctab_load()) {
+		return;
+	}
+	width = ctab->width;
+	height = ctab->height;
+	stride = width * 10 / 8;
+	rate = (uint64_t)ctab->pixel_clock * 10 / (ctab->lanes ? ctab->lanes : 1);
+	(void)PE_parse_boot_argn("cam_frames", &wanted, sizeof(wanted));
+	wanted = wanted < 1 ? 1 : wanted > 300 ? 300 : wanted;
+	if (!PE_parse_boot_argn("cam_settle", &settle, sizeof(settle)) || settle == 0) {
+		settle = settle_count(rate);
+	}
+	if (ctab->lanes != 1 || ctab->data_type != RAW10_DT) {
+		say("camera: %u lanes, data type %#x: not what this is written for\n", ctab->lanes, ctab->data_type);
+		return;
+	}
+	if (!frames_alloc(width, height, stride, 1)) {
+		return;
+	}
+	if (!power_up() || !healthy() || !read_chip_id() || !sensor_table("init") || !sensor_table("res0") || !healthy() ||
+	    !titan_up() || !smmu_up() || !csid_reset() || !csid_config(2, 1, 0x0, 0, width, height) ||
+	    !ife_config(FRAME_ADDRESSES + CAM_HEADER_BYTES, stride * height) || !csiphy_up(settle)) {
+		csiphy_down();
+		titan_down();
+		return;
+	}
+	show_paths("configured");
+	h = (struct cam_header *)frames;
+	if ((!PE_parse_boot_argn("cam_pattern", &pattern, sizeof(pattern)) || pattern == 0 || sensor_table("tpgon")) &&
+	    sensor_table("on") && sensor_table("holdon") && exposure()) {
+		/* frames one after the other into the two places, the last of `wanted' kept (the first ones come before the exposure) */
+		for (unsigned ms = 0, done = 0; ms < 5000 && done < wanted; ms += 10) {
+			wait_ms(10);
+			if (!(rd(ife + BUS_IRQ_STATUS1) & 1)) {
+				continue;
+			}
+			done++;
+			say("camera: frame %u written, %u ms after the sensor was started\n", done, ms + 10);
+			blk_put(ife, "IFE", BUS_IRQ_CLEAR1, 1, false);
+			blk_put(ife, "IFE", BUS_IRQ_GLOBAL_CLEAR, 1, false);
+			if (done < wanted) {
+				blk_put(ife, "IFE", WM0_IMAGE_ADDR, (uint32_t)(FRAME_ADDRESSES + CAM_HEADER_BYTES + (uint64_t)(done & 1) *
+				    stride * height), false);
+				blk_put(ife, "IFE", IFE_REG_UPDATE, 0x2, false);
+			}
+			h->frames = done < CAM_FRAMES ? done : CAM_FRAMES;
+			h->last = (done - 1) & 1;
+			if ((done & 7) == 0 && !healthy()) {
+				break;
+			}
+		}
+		show_paths("after the frames");
+		show_csiphy("after the frames");
+		(void)sensor_table("off");
+	}
+	smmu_faults();
+	csiphy_down();
+	titan_down();
+	for (vm_offset_t line = frames; line < frames + CAM_HEADER_BYTES + 256; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	const uint8_t *p = (const uint8_t *)(frames + CAM_HEADER_BYTES);
+	say("camera: the frame's first bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x ... (frames done: %u)\n", p[0], p[1], p[2],
+	    p[3], p[4], p[5], p[6], p[7], p[8], p[9], h->frames);
+	for (vm_offset_t line = frames; line < frames + CAM_HEADER_BYTES; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+}
+
 /* ---- the look, and the thread ----------------------------------------------------------------------- */
 
 static void
@@ -977,15 +2430,23 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
-	say("camera: cam=%u: the macro camera (OV02B10)%s\n", level, level >= 2 ? ": powered up, its chip ID read, powered down" :
-	    ": a look, reading only");
+	say("camera: cam=%u: the macro camera (OV02B10)%s\n", level, level == 4 ? ": its frames through CSIPHY 2 and RDI 0 into memory" :
+	    level == 3 ? ": the CSID's test pattern through RDI 0 into memory" :
+	    level == 2 ? ": powered up, its chip ID read, powered down" : ": a look, reading only");
 	pgpio_find();
 	found_reset_cfg = rd(GPIO_CFG(PIN_RESET));
 	found_reset_io = rd(GPIO_IO(PIN_RESET));
 	found_mclk_cfg = rd(GPIO_CFG(PIN_MCLK));
 	pins_found = true;
 	look();
-	if (level >= 2) {
+	look_around();
+	if (level == 3) {
+		capture_tpg();
+		power_down();
+	} else if (level == 4) {
+		capture_sensor();
+		power_down();
+	} else if (level >= 2) {
 		if (power_up() && healthy()) {
 			(void)read_chip_id();
 			(void)healthy();
@@ -1007,7 +2468,7 @@ redwood_camera_init(void)
 	if (!PE_parse_boot_argn("cam", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	level = level > 2 ? 2 : level;
+	level = level > 4 ? 4 : level;
 	if (kernel_thread_start(camera_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
@@ -1022,5 +2483,7 @@ redwood_camera_quiesce(void)
 	}
 	leaving = true;
 	broken = false;                 /* (one last time, whatever went before) */
+	csiphy_down();
+	titan_down();
 	power_down();
 }
