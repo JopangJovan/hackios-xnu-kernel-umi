@@ -646,10 +646,34 @@ layer_line(id layer, const char *role, int depth)
 			n += (size_t)snprintf(more + n, sizeof(more) - n, " %.30s", numbers ? numbers : "?");
 			CFRelease((CFTypeRef)text);
 		}
+	} else if (strcmp(class_name, "CAShapeLayer") == 0) {
+		void *stroke = SEND(void *, layer, "strokeColor"), *fill = SEND(void *, layer, "fillColor");
+		id text_stroke = stroke ? (id)CFCopyDescription(stroke) : NULL, text_fill = fill ? (id)CFCopyDescription(fill) : NULL;
+		const char *ns = text_stroke ? strstr(text_of(text_stroke), "( ") : NULL, *nf = text_fill ? strstr(text_of(text_fill), "( ") : NULL;
+
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " SHAPE line %g stroke %.30s fill %.30s ends %g-%g", SEND(double, layer,
+		    "lineWidth"), ns ? ns : "-", nf ? nf : "-", SEND(double, layer, "strokeStart"), SEND(double, layer, "strokeEnd"));
+		if (text_stroke != NULL) {
+			CFRelease((CFTypeRef)text_stroke);
+		}
+		if (text_fill != NULL) {
+			CFRelease((CFTypeRef)text_fill);
+		}
 	} else if (strcmp(class_name, "CALayerHost") == 0) {
 		n += (size_t)snprintf(more + n, sizeof(more) - n, " HOST of context %#x%s%s", SEND(unsigned, layer, "contextId"),
 		    SEND(BOOL, layer, "inheritsSecurity") ? " (inherits security)" : "",
 		    SEND(BOOL, layer, "rendersAsynchronously") ? " (asynchronously)" : "");
+	}
+	{
+		id keys = SEND(id, layer, "animationKeys");
+
+		if (SEND(BOOL, layer, "shouldRasterize")) {
+			n += (size_t)snprintf(more + n, sizeof(more) - n, " RASTERIZED");
+		}
+		for (long i = 0; keys != NULL && i < SEND(long, keys, "count") && n < sizeof(more); i++) {
+			n += (size_t)snprintf(more + n, sizeof(more) - n, "%s%s", i == 0 ? " ANIMATIONS " : ",",
+			    text_of(SEND1(id, keys, "objectAtIndex:", long, i)));
+		}
 	}
 	say("redwood: layers%s: %*s%s%s %p \"%s\" %g,%g %gx%g opacity %g%s\n", layers_of, 2 * depth, "", role, class_name, (void *)layer,
 	    text_of(SEND(id, layer, "name")), frame.x, frame.y, frame.w, frame.h, (double)SEND(float, layer, "opacity"), more);
@@ -737,6 +761,85 @@ layers(void)
 		web_views(SEND1(id, windows, "objectAtIndex:", long, i), 0);
 	}
 	say("redwood: layers%s: end\n", layers_of);
+}
+
+/*
+ * Control Center's glyphs whole from its first frames. Its modules and their parts fade in as it
+ * comes down: opacity animations, mostly springs that take up to a second to settle at 1. While a
+ * layer's opacity is below 1, the window server's OpenGL ES renderer draws the vibrant glyphs in it
+ * from a flattened copy that lacks the strokes composited against what is behind them, and draws them
+ * whole only at full opacity: the strokes of the media controls, orientation lock, screen mirroring
+ * and Focus came in only when the springs had settled, at the end of the presentation. (On an iPhone
+ * they are whole all along.) So in Control Center's window an opacity animation is replaced with an
+ * eased-out fade of CC_FADE_MS between the same values: the modules still fade in and out, and are at
+ * full opacity, glyphs whole, after a few frames. Boot-arg cc_fade=MS sets the fade, cc_fade=0 leaves
+ * iOS's animations alone.
+ */
+#define CC_FADE_MS      100
+static void (*original_add_animation_cc)(id self, SEL selector, id animation, id key);
+static double cc_fade_s = CC_FADE_MS / 1000.0;
+static unsigned cc_fades;
+
+static bool
+in_control_center(id layer)
+{
+	for (int depth = 0; layer != NULL && depth < 64; depth++) {
+		id delegate = SEND(id, layer, "delegate");
+
+		if (delegate != NULL && strcmp(object_getClassName(delegate), "SBControlCenterWindow") == 0) {
+			return true;
+		}
+		layer = SEND(id, layer, "superlayer");
+	}
+	return false;
+}
+
+static void
+add_animation_cc(id self, SEL selector, id animation, id key)
+{
+	Class basic = objc_getClass("CABasicAnimation");
+	id path = animation != NULL && class_respondsToSelector(object_getClass(animation), sel_registerName("keyPath")) ?
+	    SEND(id, animation, "keyPath") : NULL;
+
+	if (path != NULL && strcmp(text_of(path), "opacity") == 0 &&
+	    class_respondsToSelector(object_getClass(animation), sel_registerName("fromValue")) && in_control_center(self)) {
+		id fade = SEND1(id, basic, "animationWithKeyPath:", id, path);
+		id ease = SEND1(id, objc_getClass("CAMediaTimingFunction"), "functionWithName:", id,
+		    SEND1(id, objc_getClass("NSString"), "stringWithUTF8String:", const char *, "easeOut"));
+
+		SEND1(void, fade, "setFromValue:", id, SEND(id, animation, "fromValue"));
+		SEND1(void, fade, "setToValue:", id, SEND(id, animation, "toValue"));
+		SEND1(void, fade, "setByValue:", id, SEND(id, animation, "byValue"));
+		SEND1(void, fade, "setAdditive:", BOOL, SEND(BOOL, animation, "isAdditive"));
+		SEND1(void, fade, "setBeginTime:", double, SEND(double, animation, "beginTime"));
+		SEND1(void, fade, "setFillMode:", id, SEND(id, animation, "fillMode"));
+		SEND1(void, fade, "setRemovedOnCompletion:", BOOL, SEND(BOOL, animation, "isRemovedOnCompletion"));
+		SEND1(void, fade, "setDelegate:", id, SEND(id, animation, "delegate"));
+		SEND1(void, fade, "setDuration:", double, cc_fade_s);
+		SEND1(void, fade, "setTimingFunction:", id, ease);
+		if (cc_fades++ < 3) {
+			say("redwood: Control Center: an opacity animation of %.3f s (%s) made a fade of %.3f s\n",
+			    SEND(double, animation, "duration"), object_getClassName(animation), cc_fade_s);
+		}
+		animation = fade;
+	}
+	original_add_animation_cc(self, selector, animation, key);
+}
+
+static void
+control_center_fades(const char *arguments)
+{
+	const char *setting = strstr(arguments, "cc_fade=");
+	Method add = class_getInstanceMethod(objc_getClass("CALayer"), sel_registerName("addAnimation:forKey:"));
+
+	if (setting != NULL) {
+		cc_fade_s = atof(setting + 8) / 1000.0;
+	}
+	if (cc_fade_s <= 0 || add == NULL) {
+		return;
+	}
+	original_add_animation_cc = (void (*)(id, SEL, id, id))method_getImplementation(add);
+	method_setImplementation(add, (IMP)add_animation_cc);
 }
 
 __attribute__((constructor))
@@ -835,6 +938,14 @@ redwood_springboard_init(void)
 			((void (*)(id, SEL, BOOL))objc_msgSend)(device, monitoring, YES);
 		}
 		watch_main_loop();
+		{
+			char arguments[1024] = "";
+			size_t size = sizeof(arguments) - 1;
+
+			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+				control_center_fades(arguments);
+			}
+		}
 		say("redwood: battery: SOC=%d%% battery=%d charger=%d charging=%d\n",
 		    sysctl_int("kern.redwood.battery_soc"), sysctl_int("kern.redwood.battery_present"),
 		    sysctl_int("kern.redwood.battery_charger_present"), sysctl_int("kern.redwood.battery_charging"));

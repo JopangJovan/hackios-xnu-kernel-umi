@@ -771,6 +771,10 @@ frame_begin(struct eagl *e)
 		trace_left--;
 		eagl_tracing = !trace_placed;
 		trace_placing = trace_placed;
+	} else if (eagl_tracing && trace_placed) {
+		/* (gltrace=FIRST-LAST with gltrace_place: a line a draw for those frames too) */
+		eagl_tracing = 0;
+		trace_placing = 1;
 	}
 	if (eagl_tracing) {
 		eagl_trace("---- frame %u (framebuffer %u)\n", e->frames + 1, e->framebuffer);
