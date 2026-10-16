@@ -35,8 +35,8 @@
  *              stretch of samples after a pause) a short tap (waveform 1), and one that goes on for
  *              longer than a tap the waveform Android loops for vibrations (11), until it ends -- or
  *              for HAPTIC_MAX_MS at most, after which the motor rests for as long before it plays
- *              again. The gain is as loud as iOS's waveform: Android's own (0x80) at full scale,
- *              never above it.
+ *              again. The gain follows how loud iOS's waveform is: Android's own (0x80) from a third
+ *              of full scale up, five eighths of it for the softest, never above it (gain_for()).
  *
  * Limits, whatever asks: Android's own values only (its gain 0x80, its boost and drive levels, its
  * waveforms); no effect longer than HAPTIC_MAX_MS, and the chip is told to stop and put into
@@ -800,6 +800,22 @@ chip_state(void)
 	return get(AW_GLBRD5, &state) ? state & 0x0f : 0xff;
 }
 
+/*
+ * How strong to play what iOS plays. iOS drives its Taptic Engine with waveforms far under full
+ * scale for most feedbacks (a tap's peak anywhere from 1000 to 33000 of 32768, a vibration's
+ * about 17000), and followed in proportion (gain = Android's * peak / full scale) most of them came
+ * out at a tenth of Android's gain or less: not felt at all. Android plays its own clicks and
+ * vibrations at its gain, 0x80. So: Android's gain from a third of full scale up, and below that
+ * down to five eighths of it for the softest -- never above Android's.
+ */
+static uint8_t
+gain_for(uint32_t peak)
+{
+	uint32_t top = android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
+
+	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
+}
+
 static void
 serve(void)
 {
@@ -818,8 +834,7 @@ serve(void)
 		uint64_t now = now_us();
 		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
 		uint32_t peak = heard_peak;
-		/* (the gain as loud as iOS's waveform, Android's 0x80 at full scale and never above) */
-		uint8_t gain = (uint8_t)(peak >= 32767 ? android_regs[AW_PLAYCFG2] : (uint32_t)android_regs[AW_PLAYCFG2] * peak / 32767);
+		uint8_t gain = gain_for(peak);
 
 		switch (state) {
 		case IDLE:
@@ -876,7 +891,7 @@ serve(void)
 			if (active && now - followed >= FOLLOW_US) {
 				followed = now;
 				heard_peak = 0;
-				if (gain != 0 && (gain > playing_gain + 8 || gain + 8 < playing_gain)) {
+				if (peak != 0 && (gain > playing_gain + 8 || gain + 8 < playing_gain)) {
 					if (!put(AW_PLAYCFG2, gain)) {
 						break;
 					}
