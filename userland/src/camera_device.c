@@ -239,7 +239,8 @@ struct prop {
 static const struct prop stream_props[] = {
 	{ "PortType", "String", "ReadOnly" }, { "UniqueID", "String", "ReadOnly" }, { "NonLocalizedName", "String", "ReadOnly" },
 	{ "SupportedFormatsArray", "Collection", "ReadOnly" }, { "FocalLength", "Number", "ReadOnly" },
-	{ "LensFNumber", "Number", "ReadOnly" }, { "MaxZoomFactor", "Number", "ReadOnly" }, { "SupportedColorSpaces", "Collection", "ReadOnly" },
+	{ "LensFNumber", "Number", "ReadOnly" }, { "PixelSize", "Number", "ReadOnly" },
+	{ "MaxZoomFactor", "Number", "ReadOnly" }, { "SupportedColorSpaces", "Collection", "ReadOnly" },
 	{ "HasAutoFocusPositionSensor", "Boolean", "ReadOnly" }, { "Clock", "Clock", "ReadOnly" },
 	{ "FormatIndex", "Number", "ReadWrite" }, { "MinimumFrameRate", "Number", "ReadWrite" }, { "MaximumFrameRate", "Number", "ReadWrite" },
 	{ "MaximumAllowedFrameRate", "Number", "ReadWrite" }, { "VideoOutputConfigurations", "Collection", "ReadWrite" },
@@ -408,12 +409,46 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		value = CFRetain(CMClockGetHostTimeClock());
 	} else if (key_is(key, "TorchLevel") || key_is(key, "ExposureBias")) {
 		value = number_f(0);
+	} else if (key_is(key, "VideoOutputConfigurations") || key_is(key, "VideoOutputsEnabled")) {
+		/*
+		 * ReadWrite, but the capture-graph builder READS these back while it builds the graph
+		 * (BWMultiStreamCameraSourceNode's _updateOutputsStorage does a getProperty: for
+		 * VideoOutputConfigurations, not IfSupported:), and a failed read tears the graph down. Return
+		 * what each output holds now.
+		 */
+		bool configs = key_is(key, "VideoOutputConfigurations");
+		CFMutableDictionaryRef d = (CFMutableDictionaryRef)new_dict();
+
+		pthread_mutex_lock(&s->lock);
+		for (int i = 0; i < OUTPUTS; i++) {
+			CFStringRef name = CFStringCreateWithCString(NULL, output_names[i], kCFStringEncodingUTF8);
+
+			if (configs) {
+				if (s->out[i].config != NULL) {
+					CFDictionarySetValue(d, name, s->out[i].config);
+				}
+			} else {
+				CFDictionarySetValue(d, name, s->out[i].enabled ? kCFBooleanTrue : kCFBooleanFalse);
+			}
+			CFRelease(name);
+		}
+		pthread_mutex_unlock(&s->lock);
+		value = d;
 	} else if (key_is(key, "SupportedPropertiesDictionary")) {
 		value = CFRetain(s->supported);
 	} else if (key_is(key, "FocalLength")) {
 		value = number_f(4.0);          /* (the iPhone X's wide camera's, in millimetres) */
 	} else if (key_is(key, "LensFNumber")) {
 		value = number_f(1.8);
+	} else if (key_is(key, "PixelSize")) {
+		/*
+		 * The capture-graph builder REQUIRES this of the stream: -[BWFigVideoCaptureStream
+		 * initWithCaptureStream:...] does a getProperty: (not IfSupported:) for it, and without it the
+		 * init fails, so FigVideoCaptureSourcesActivateAndCreateDevices errors and the graph is never
+		 * built. The sensor's pixel pitch in micrometres (the iPhone X wide camera's); any value in
+		 * (0, 100) is accepted.
+		 */
+		value = number_f(1.22);
 	} else if (key_is(key, "MaxZoomFactor")) {
 		value = number_f(16);
 	} else if (key_is(key, "ZoomFactor")) {
