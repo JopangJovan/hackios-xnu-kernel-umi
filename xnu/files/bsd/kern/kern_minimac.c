@@ -32,6 +32,7 @@
 #include <sys/ubc_internal.h>
 #include <sys/vnode_internal.h>
 #include <libkern/libkern.h>
+#include <kern/startup.h>
 #include <kern/task.h>
 #include <mach/vm_param.h>
 #include <vm/vm_kern.h>
@@ -242,23 +243,90 @@ minisandbox_policy_syscall(struct proc *p, int call, user_addr_t arg)
 
 /*
  * Privileges for processes that are not root. On a device the sandbox hands them out by
- * entitlement; here the ones the user interface cannot do without are simply granted:
+ * entitlement: a privilege is granted to a process whose code signature has the entitlement
+ * that goes with it. The table is the same pairing: the names are the entitlements iOS's own
+ * programs carry for them (dasd "vm-pressure-level", symptomsd and aggregated
+ * com.apple.private.network.statistics, mediaserverd and mDNSResponder
+ * com.apple.private.network.socket-delegate -- without which NECP said "does not hold the
+ * necessary entitlement to delegate network traffic" -- and so on).
  *
- *   PRIV_WORK_INTERVAL    telling the scheduler about the work of drawing a frame. UIKit does
- *                         it as soon as anything scrolls, and takes a refusal for a programming
- *                         error ("Failed to create work interval"): SpringBoard died of it on
- *                         the first swipe between pages of the home screen.
+ *   PRIV_WORK_INTERVAL    is granted to every process, entitlement or not: telling the scheduler
+ *                         about the work of drawing a frame. UIKit does it as soon as anything
+ *                         scrolls, and takes a refusal for a programming error ("Failed to create
+ *                         work interval"): SpringBoard died of it on the first swipe between
+ *                         pages of the home screen.
  *
- * Whatever else is asked for is refused as before, and said once, to learn what there is.
+ * Whatever is refused is said once, to learn what there is. Boot-arg privs=0: only
+ * PRIV_WORK_INTERVAL, as before.
  */
+extern kern_return_t miniamfi_entitlement_boolean(struct proc *proc, const char *name);
+
+static const struct {
+	int priv;
+	const char *entitlement;
+} minisandbox_privileges[] = {
+	{ PRIV_PROC_UUID_POLICY, "com.apple.private.kernel.uuid-policy" },
+	{ PRIV_GLOBAL_PROC_INFO, "com.apple.private.kernel.global-proc-info" },
+	{ PRIV_SYSTEM_OVERRIDE, "com.apple.private.kernel.system-override" },
+	{ PRIV_HW_DEBUG_DATA, "com.apple.private.kernel.hw-debug-data" },
+	{ PRIV_SELECTIVE_FORCED_IDLE, "com.apple.private.kernel.selective-forced-idle" },
+	{ PRIV_DARKBOOT, "com.apple.private.kernel.darkboot" },
+	{ PRIV_AUDIO_LATENCY, "com.apple.private.kernel.audio_latency" },
+	{ PRIV_KTRACE_BACKGROUND, "com.apple.private.kernel.ktrace-background" },
+	{ PRIV_SETPRIORITY_DARWIN_ROLE, "com.apple.private.kernel.setpriority-darwin-role" },
+	{ PRIV_PACKAGE_EXTENSIONS, "com.apple.private.kernel.set-package-extensions" },
+	{ PRIV_TRIM_ACTIVE_FILE, "com.apple.private.apfs.trim-active-file" },
+	{ PRIV_PROC_CPUMON_OVERRIDE, "com.apple.private.kernel.override-cpumon" },
+	{ PRIV_VM_PRESSURE, "vm-pressure-level" },
+	{ PRIV_VM_JETSAM, "com.apple.private.kernel.jetsam" },
+	{ PRIV_NET_PRIVILEGED_TRAFFIC_CLASS, "com.apple.private.network.privileged-traffic-class" },
+	{ PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, "com.apple.private.network.socket-delegate" },
+	{ PRIV_NET_INTERFACE_CONTROL, "com.apple.private.network.interface-control" },
+	{ PRIV_NET_PRIVILEGED_NETWORK_STATISTICS, "com.apple.private.network.statistics" },
+	{ PRIV_NET_PRIVILEGED_NECP_POLICIES, "com.apple.private.necp.policies" },
+	{ PRIV_NET_RESTRICTED_AWDL, "com.apple.private.network.awdl.restricted" },
+	{ PRIV_NET_QOSMARKING_POLICY_OVERRIDE, "com.apple.private.network.qos-marking-policy-override" },
+	{ PRIV_NET_RESTRICTED_MULTIPATH_EXTENDED, "com.apple.developer.networking.multipath_extended" },
+	{ PRIV_NET_RESTRICTED_ROUTE_NC_READ, "com.apple.developer.networking.route_nc_read" },
+	{ PRIV_NET_VALIDATED_RESOLVER, "com.apple.private.validated-resolver" },
+	{ PRIV_NET_CUSTOM_PROTOCOL, "com.apple.developer.networking.custom-protocol" },
+	{ PRIV_NET_PRIVILEGED_NECP_DROP_ALL_BYPASS, "com.apple.private.necp.drop_all_bypass" },
+	{ PRIV_NET_PRIVILEGED_IPSEC_WAKE_PACKET, "com.apple.private.network.ipsec-wake-packet" },
+	{ PRIV_NETINET_RESERVEDPORT, "com.apple.private.network.reserved-port" },
+	{ PRIV_NETINET_TCP_KA_OFFLOAD, "com.apple.developer.networking.tcp_ka_offload" },
+	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
+	{ PRIV_SKYWALK_REGISTER_KERNEL_PIPE, "com.apple.private.skywalk.register-kernel-pipe" },
+	{ PRIV_SKYWALK_REGISTER_NET_IF, "com.apple.private.skywalk.register-net-if" },
+	{ PRIV_SKYWALK_REGISTER_FLOW_SWITCH, "com.apple.private.skywalk.register-flow-switch" },
+	{ PRIV_SKYWALK_OBSERVE_ALL, "com.apple.private.skywalk.observe-all" },
+	{ PRIV_SKYWALK_OBSERVE_STATS, "com.apple.private.skywalk.observe-stats" },
+	{ PRIV_VFS_OPEN_BY_ID, "com.apple.private.vfs.open-by-id" },
+	{ PRIV_VFS_MOVE_DATA_EXTENTS, "com.apple.private.vfs.move-data-extents" },
+	{ PRIV_VFS_SNAPSHOT, "com.apple.private.vfs.snapshot" },
+	{ PRIV_VFS_DATALESS_RESOLVER, "com.apple.private.vfs.dataless-resolver" },
+	{ PRIV_VFS_SETSIZE, "com.apple.private.vfs.setsize" },
+};
+static TUNABLE(uint32_t, minisandbox_by_entitlement, "privs", 1);
+
 static int
-minisandbox_priv_grant(__unused kauth_cred_t cred, int priv)
+minisandbox_priv_grant(kauth_cred_t cred, int priv)
 {
-	static int seen[16];
+	static int seen[32];
 	static unsigned seen_count;
+	proc_t proc = current_proc();
 
 	if (priv == PRIV_WORK_INTERVAL) {
 		return 0;
+	}
+	/* (the entitlements are the current process's: only for a question about its own credential) */
+	for (unsigned i = 0; minisandbox_by_entitlement && cred == kauth_cred_get() &&
+	    i < sizeof(minisandbox_privileges) / sizeof(minisandbox_privileges[0]); i++) {
+		if (minisandbox_privileges[i].priv == priv) {
+			if (miniamfi_entitlement_boolean(proc, minisandbox_privileges[i].entitlement) == KERN_SUCCESS) {
+				return 0;
+			}
+			break;
+		}
 	}
 	for (unsigned i = 0; i < seen_count; i++) {
 		if (seen[i] == priv) {
@@ -267,8 +335,8 @@ minisandbox_priv_grant(__unused kauth_cred_t cred, int priv)
 	}
 	if (seen_count < sizeof(seen) / sizeof(seen[0])) {
 		seen[seen_count++] = priv;
-		printf("minisandbox: privilege %d refused to %s[%d] (first time)\n", priv, current_proc()->p_comm,
-		    proc_getpid(current_proc()));
+		printf("minisandbox: privilege %d refused to %s[%d] (first time)\n", priv, proc->p_comm,
+		    proc_getpid(proc));
 	}
 	return EPERM;
 }
