@@ -252,6 +252,9 @@ apfs_stats_print(void)
 	printf("apfs: batch   %llu requests  %llu pieces  %u threads at most\n",
 	    (unsigned long long)nx->batch_calls, (unsigned long long)nx->batch_pieces,
 	    nx->parallel != NULL ? nx->parallel_max : 1);
+	printf("apfs: ahead   %llu times  %llu pieces  %llu of them used\n",
+	    (unsigned long long)nx->ra_batches, (unsigned long long)nx->ra_pieces,
+	    (unsigned long long)nx->ra_hits);
 	printf("apfs: blocks  %llu read  %llu cache hits  highest block %llu\n",
 	    (unsigned long long)nx->reads, (unsigned long long)nx->hits,
 	    (unsigned long long)nx->max_addr);

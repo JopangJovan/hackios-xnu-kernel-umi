@@ -1766,6 +1766,9 @@ apfs_cfile_fini(struct apfs_cfile *cf)
 	if (cf->held_data != NULL) {
 		apfs_free(cf->held_data, cf->held_cap);
 	}
+	if (cf->ra_data != NULL) {
+		apfs_free(cf->ra_data, (size_t)APFS_RA_PIECES * APFS_DECMPFS_BLOCK_SIZE);
+	}
 	memset(cf, 0, sizeof(*cf));
 	cf->held = APFS_NO_PIECE;
 }
@@ -2259,6 +2262,8 @@ struct apfs_piece_job {
 	uint32_t plen;                  /* compressed */
 	uint8_t *dst;                   /* the caller's, `want` bytes */
 	size_t   want;
+	bool     ra;                    /* read ahead, not asked for: its failure fails nothing */
+	int      error;
 };
 
 #define APFS_BATCH   32
@@ -2390,7 +2395,8 @@ batch_one(void *arg, uint32_t item, uint32_t worker)
 	if (error == 0 && got != j->want) {
 		error = EIO;
 	}
-	return error;
+	j->error = error;
+	return j->ra ? 0 : error;
 }
 
 /*
@@ -2435,8 +2441,12 @@ batch_run(struct apfs_vol *vol, struct apfs_scratch *sc, uint32_t n)
 	if (workers > 1) {
 		error = nx->parallel(nx->parallel_ctx, n, workers, batch_one, &b);
 	} else {
-		for (i = 0; i < n && error == 0; i++) {
-			error = batch_one(&b, i, 0);
+		for (i = 0; i < n; i++) {
+			int e = batch_one(&b, i, 0);
+
+			if (e != 0 && error == 0) {
+				error = e;
+			}
 		}
 	}
 	nx_relock(nx);
@@ -2470,6 +2480,7 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 	size_t big_cap = 0;
 	uint32_t bs = vol->nx->block_size;
 	uint32_t nbatch = 0;            /* whole pieces gathered in sc->jobs, not yet done */
+	uint32_t ra_at = 0, nra = 0;    /* read-ahead jobs: sc->jobs[ra_at .. ra_at + nra) */
 	uint64_t first, last, i;
 	int error = 0;
 
@@ -2499,6 +2510,20 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 		}
 		from_in_piece = (off > i * APFS_DECMPFS_BLOCK_SIZE)
 		    ? (size_t)(off - i * APFS_DECMPFS_BLOCK_SIZE) : 0;
+		if (cf->held != i && cf->ra_count > 0 && !cf->ra_filling &&
+		    i >= cf->ra_first && i - cf->ra_first < cf->ra_count &&
+		    cf->ra_len[i - cf->ra_first] == want) {
+			/* read ahead by an earlier request of this reader's */
+			n = want - from_in_piece;
+			if (n > len - *out) {
+				n = len - *out;
+			}
+			memcpy(buf + *out, cf->ra_data +
+			    (size_t)(i - cf->ra_first) * APFS_DECMPFS_BLOCK_SIZE + from_in_piece, n);
+			*out += n;
+			vol->nx->ra_hits++;
+			continue;
+		}
 		if (cf->held != i) {
 			uint32_t plen = cf->piece_len[i];
 			uint64_t poff = cf->table_base + cf->piece_off[i];
@@ -2583,12 +2608,66 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 				j->plen = plen;
 				j->dst = buf + *out;
 				j->want = want;
+				j->ra = false;
 				*out += want;
 				if (nbatch == APFS_BATCH) {
 					error = batch_run(vol, sc, nbatch);
 					nbatch = 0;
 					if (error) {
 						goto out;
+					}
+				}
+				/*
+				 * The last piece of this request, the one right after where this
+				 * reader's last request ended, and threads to spare for it (the
+				 * share batch_run would give it is two or more): the pieces after it
+				 * go into this batch as well, into ra_data.
+				 */
+				if (i == last && i >= 1 && i == cf->ra_expect && !cf->ra_filling &&
+				    vol->nx->parallel != NULL && i + 1 < cf->piece_count &&
+				    vol->nx->parallel_max / (vol->nx->requests > 1 ?
+				    vol->nx->requests : 1) >= 2) {
+					uint64_t k;
+
+					if (cf->ra_data == NULL) {
+						cf->ra_data = apfs_alloc((size_t)APFS_RA_PIECES *
+						    APFS_DECMPFS_BLOCK_SIZE);
+					}
+					cf->ra_count = 0;
+					ra_at = nbatch;
+					for (k = i + 1; cf->ra_data != NULL && k < cf->piece_count &&
+					    k - i <= APFS_RA_PIECES && nbatch < APFS_BATCH; k++) {
+						size_t kwant = APFS_DECMPFS_BLOCK_SIZE;
+						uint32_t kplen = cf->piece_len[k];
+						uint64_t kpoff = cf->table_base + cf->piece_off[k];
+						struct apfs_run kruns[APFS_MAX_RUNS];
+						uint32_t knruns = 0;
+						uint64_t kcovered = 0;
+
+						if ((k + 1) * APFS_DECMPFS_BLOCK_SIZE > cf->size) {
+							kwant = (size_t)(cf->size - k * APFS_DECMPFS_BLOCK_SIZE);
+						}
+						if (kplen > APFS_PIECE_CAP || kpoff >= cf->rsrc_size ||
+						    kplen > cf->rsrc_size - kpoff ||
+						    stream_plan(vol, cf->rsrc_id, kpoff, kplen, kruns,
+						    APFS_MAX_RUNS, &knruns, &kcovered) != 0 ||
+						    kcovered != kplen || knruns != 1 || kruns[0].at != 0 ||
+						    kruns[0].len != kplen) {
+							break;  /* not one for a batch: the read-ahead stops here */
+						}
+						j = &sc->jobs[nbatch++];
+						j->addr = kruns[0].addr;
+						j->skew = kruns[0].skew;
+						j->plen = kplen;
+						j->dst = cf->ra_data + (size_t)(k - i - 1) * APFS_DECMPFS_BLOCK_SIZE;
+						j->want = kwant;
+						j->ra = true;
+						cf->ra_len[k - i - 1] = (uint32_t)kwant;
+						nra++;
+					}
+					if (nra > 0) {
+						cf->ra_filling = true;
+						cf->ra_first = i + 1;
 					}
 				}
 				continue;
@@ -2686,7 +2765,31 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 	if (nbatch > 0) {
 		error = batch_run(vol, sc, nbatch);
 	}
+	if (nra > 0) {
+		uint32_t k;
+
+		cf->ra_count = nra;
+		for (k = 0; k < nra; k++) {
+			if (sc->jobs[ra_at + k].error != 0) {
+				cf->ra_count = k;       /* what came before the first that failed */
+				break;
+			}
+		}
+		vol->nx->ra_batches++;
+		vol->nx->ra_pieces += cf->ra_count;
+		cf->ra_filling = false;
+		nra = 0;
+	}
+	if (error == 0) {
+		cf->ra_expect = ((off + len) % APFS_DECMPFS_BLOCK_SIZE == 0)
+		    ? (off + len) / APFS_DECMPFS_BLOCK_SIZE : APFS_NO_PIECE;
+	}
 out:
+	if (nra > 0) {
+		/* given up on before the batch ran: nothing in ra_data is good */
+		cf->ra_count = 0;
+		cf->ra_filling = false;
+	}
 	if (big != NULL) {
 		apfs_free(big, big_cap);
 	}

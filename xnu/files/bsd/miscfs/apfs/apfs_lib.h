@@ -75,6 +75,9 @@ apfs_ticks(void)
 /* Room for a symbolic link's target (Darwin's own limit is 1024 bytes; it is kept in an xattr) */
 #define APFS_LINK_MAX 4096
 
+/* How many pieces a sequential reader's read-ahead decompresses at a time */
+#define APFS_RA_PIECES 7
+
 /*
  * The device.  read() must fill the whole buffer or return an error; offsets and lengths
  * are always whole blocks of the container.
@@ -189,6 +192,7 @@ struct apfs_nx {
 	 */
 	uint32_t          requests;
 	uint64_t          batch_calls, batch_pieces;   /* how many requests used it, for how much */
+	uint64_t          ra_batches, ra_pieces, ra_hits;  /* read-ahead: filled, and used */
 };
 
 /* A volume inside the container. */
@@ -322,6 +326,21 @@ struct apfs_cfile {
 	uint8_t  *held_data;
 	size_t    held_len;
 	size_t    held_cap;             /* 0 when this file is not worth holding */
+
+	/*
+	 * Read-ahead.  A reader with threads to spare (alone on the volume, or one of two)
+	 * that asks for the piece right after the one its last read ended on is taken to be
+	 * reading the file through: the pieces
+	 * after it are decompressed in the same batch, on the other threads, into ra_data,
+	 * and its next reads are copies out of that.  All of it happens inside the request
+	 * that asked; ra_filling keeps everyone else off ra_data while the lock is let go of.
+	 */
+	uint64_t  ra_expect;            /* the piece the last whole-piece read ended before */
+	uint64_t  ra_first;             /* the first piece in ra_data */
+	uint32_t  ra_count;             /* how many are there; 0: none */
+	bool      ra_filling;
+	uint8_t  *ra_data;              /* APFS_RA_PIECES pieces, made when first wanted */
+	uint32_t  ra_len[APFS_RA_PIECES];
 };
 
 /* ---- container and volumes ---- */

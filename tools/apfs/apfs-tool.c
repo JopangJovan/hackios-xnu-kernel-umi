@@ -586,8 +586,9 @@ cmd_census(const char *path, const char *where, bool meta_only)
 	    " bytes out, %" PRIu64 " by zlib\n", nx.inflate_calls, nx.inflate_in, nx.inflate_out,
 	    nx.inflate_fallbacks);
 	fprintf(stderr, "apfs-tool: %" PRIu64 " requests of whole pieces, %" PRIu64 " pieces in "
-	    "them, on %u threads at most\n", nx.batch_calls, nx.batch_pieces,
-	    nx.parallel != NULL ? nx.parallel_max : 1);
+	    "them, on %u threads at most; read ahead %" PRIu64 " times, %" PRIu64 " pieces, %"
+	    PRIu64 " of them used\n", nx.batch_calls, nx.batch_pieces,
+	    nx.parallel != NULL ? nx.parallel_max : 1, nx.ra_batches, nx.ra_pieces, nx.ra_hits);
 	fprintf(stderr, "apfs-tool: highest block touched %" PRIu64 " (%.2f GB in), of which "
 	    "file contents reach %" PRIu64 " (%.2f GB in)\n", nx.max_addr,
 	    nx.max_addr * (double)nx.block_size / 1e9, nx.max_data_addr,
