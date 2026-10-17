@@ -24,6 +24,16 @@
  *                             point is a directory of the root image itself.
  *   apfs_dev=md1              the device to mount for modes 1 to 3 and 6 (default rvblk0)
  *   apfs_mnt=/lib             where to mount it for mode 6 (default /private/var/apfs-check)
+ *   apfs_depth=N              go no deeper than N levels below where the walk starts
+ *                             (1 = only the entries of that directory; 0 = no limit).
+ *                             For splitting a volume too big to hold into parts: one part
+ *                             takes the root's own entries, the others take a subtree
+ *                             each, and the per-line hashes add up to the whole.
+ *   apfs_skip=/a,/b           directories not to go into, as paths inside the volume,
+ *                             comma separated.  Their own line is still counted, only
+ *                             their contents are left out -- which is how a volume too
+ *                             big to hold is cut into parts that between them cover it
+ *                             exactly once.
  *   apfs_subtree=/usr         walk only that part of the volume
  *
  * A line is the same one tools/apfs/apfs-tool's census and `verify.py clines` print:
@@ -121,6 +131,8 @@ struct census {
 	 * through a path that itself crosses into it.
 	 */
 	int       lookup_flags;
+	uint32_t  max_depth;            /* 0: no limit */
+	char     *skip;                 /* comma separated paths not to descend into */
 };
 
 /* The format bits of a mode, which vnode_getattr does not report in va_mode. */
@@ -270,6 +282,32 @@ out:
 
 static void census_dir(struct census *cs);
 
+/* Is this directory one of the ones to stay out of?  Compares the path inside the volume. */
+static bool
+census_skipped(struct census *cs)
+{
+	const char *want = cs->path + cs->rel;
+	size_t want_len = strlen(want);
+	const char *at = cs->skip;
+
+	if (at == NULL) {
+		return false;
+	}
+	while (*at != '\0') {
+		const char *end = strchr(at, ',');
+		size_t n = (end != NULL) ? (size_t)(end - at) : strlen(at);
+
+		if (n == want_len && memcmp(at, want, n) == 0) {
+			return true;
+		}
+		if (end == NULL) {
+			break;
+		}
+		at = end + 1;
+	}
+	return false;
+}
+
 /* Add "/name" to the path, do the entry, and put the path back as it was. */
 static void
 census_child(struct census *cs, const char *name, size_t name_len, uint8_t d_type)
@@ -286,7 +324,9 @@ census_child(struct census *cs, const char *name, size_t name_len, uint8_t d_typ
 	cs->len += name_len;
 	cs->path[cs->len] = '\0';
 
-	if (census_entry(cs, d_type) && d_type == DT_DIR && cs->depth < MAX_DEPTH) {
+	if (census_entry(cs, d_type) && d_type == DT_DIR && cs->depth < MAX_DEPTH &&
+	    (cs->max_depth == 0 || (uint32_t)cs->depth + 1 < cs->max_depth) &&
+	    !census_skipped(cs)) {
 		cs->depth++;
 		census_dir(cs);
 		cs->depth--;
@@ -436,6 +476,15 @@ apfs_walk_one(void *arg, __unused wait_result_t wr)
 
 	bzero(&cs, sizeof(cs));
 	cs.ctx = vfs_context_kernel();
+	PE_parse_boot_argn("apfs_depth", &cs.max_depth, sizeof(cs.max_depth));
+	{
+		static char skip[256];
+
+		if (PE_parse_boot_arg_str("apfs_skip", skip, sizeof(skip)) && skip[0] != '\0') {
+			cs.skip = skip;
+			printf("apfs-check: staying out of %s\n", skip);
+		}
+	}
 	cs.lookup_flags = VNODE_LOOKUP_NOFOLLOW | VNODE_LOOKUP_NOCROSSMOUNT;
 	cs.path = kalloc_data(PATH_CAP, Z_WAITOK | Z_ZERO);
 	cs.buf = kalloc_data(READ_CHUNK, Z_WAITOK);
@@ -539,6 +588,15 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 	 * path leads from the root image into the mount, so crossing has to be allowed; the
 	 * walk is kept on the volume by the check against the mount it started on.
 	 */
+	PE_parse_boot_argn("apfs_depth", &cs.max_depth, sizeof(cs.max_depth));
+	{
+		static char skip[256];
+
+		if (PE_parse_boot_arg_str("apfs_skip", skip, sizeof(skip)) && skip[0] != '\0') {
+			cs.skip = skip;
+			printf("apfs-check: staying out of %s\n", skip);
+		}
+	}
 	cs.lookup_flags = VNODE_LOOKUP_NOFOLLOW |
 	    ((mode == 4 || mode == 5) ? VNODE_LOOKUP_NOCROSSMOUNT : 0);
 	if (PE_parse_boot_arg_str("apfs_dev", subtree, sizeof(subtree)) && subtree[0] != '\0') {

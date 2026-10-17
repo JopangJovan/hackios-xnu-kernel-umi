@@ -21,8 +21,11 @@
 #                       into the data area plus one
 #   data:               the blocks that are present, in the order the table numbers them
 #
-# usage: mksparse.py trace IMAGE [PATH ...]          just say what it would take
-#        mksparse.py build IMAGE OUT [PATH ...]      write the sparse image
+# usage: mksparse.py trace IMAGE [PATH ...] [--depth N]   just say what it would take
+#        mksparse.py build IMAGE OUT [PATH ...] [--depth N] [--skip /a,/b]
+#                                                     write the sparse image
+# --skip leaves out the contents of those directories, the way boot-arg apfs_skip does in
+# the kernel, so that several images between them cover a volume exactly once.
 # With no PATH the whole volume is walked.
 
 import os
@@ -53,7 +56,7 @@ class Tracing(apfs.Blocks):
         return super().raw(addr, count)
 
 
-def walk_and_trace(image, paths):
+def walk_and_trace(image, paths, max_depth=0, skip=()):
     """
     Walk and record.  The recording reader has to be in place before the container is
     opened, not swapped in after: opening it reads block zero, the checkpoint area, the
@@ -83,9 +86,9 @@ def walk_and_trace(image, paths):
 
     n = 0
     for oid, prefix in starts:
-        stack = [(oid, prefix)]
+        stack = [(oid, prefix, 1)]
         while stack:
-            d, px = stack.pop()
+            d, px, depth = stack.pop()
             for name, fid, dt in v.dir_entries(d):
                 p = px + "/" + name
                 ino = v.inode(fid)
@@ -94,8 +97,8 @@ def walk_and_trace(image, paths):
                     continue
                 if ino.is_reg or ino.is_link:
                     ino.contents()          # what makes the data blocks be read
-                if dt == 4:
-                    stack.append((fid, p))
+                if dt == 4 and (max_depth == 0 or depth < max_depth) and p not in skip:
+                    stack.append((fid, p, depth + 1))
                 if n % 20000 == 0:
                     sys.stderr.write("\r  %d entries, %d blocks so far..."
                                      % (n, len(tr.touched)))
@@ -108,6 +111,18 @@ def main(argv):
     if len(argv) < 3:
         print(__doc__ or "", file=sys.stderr)
         return 2
+    args = list(argv[1:])
+    depth = 0
+    skip = ()
+    if "--depth" in args:
+        i = args.index("--depth")
+        depth = int(args[i + 1])
+        del args[i:i + 2]
+    if "--skip" in args:
+        i = args.index("--skip")
+        skip = tuple(args[i + 1].split(","))
+        del args[i:i + 2]
+    argv = [argv[0]] + args
     cmd = argv[1]
     if cmd == "trace":
         image, out, paths = argv[2], None, argv[3:]
@@ -120,7 +135,7 @@ def main(argv):
         print("mksparse.py: unknown command %r" % cmd, file=sys.stderr)
         return 2
 
-    c, tr, entries = walk_and_trace(image, paths)
+    c, tr, entries = walk_and_trace(image, paths, depth, skip)
     if c is None:
         return 1
     present = sorted(tr.touched)

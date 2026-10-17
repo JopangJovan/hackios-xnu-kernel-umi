@@ -24,7 +24,7 @@
 #        verify.py content IMAGE REFDIR [-n COUNT] [--all]
 #        verify.py sample  IMAGE REFDIR            (a few dozen files of every kind)
 #        verify.py clines  IMAGE [PATH]
-#        verify.py sum     IMAGE [PATH]
+#        verify.py sum     IMAGE [PATH] [--depth N]
 
 import os
 import random
@@ -334,11 +334,11 @@ def fnv1a(buf, h=FNV_INIT):
     return h
 
 
-def cmd_sum(image, where):
+def cmd_sum(image, where, max_depth=0):
     """The totals the kernel's apfs_check prints, computed the same way."""
     import io
     out = io.StringIO()
-    rc = _clines(image, where, out)
+    rc = _clines(image, where, out, max_depth)
     if rc:
         return rc
     total = 0
@@ -366,7 +366,7 @@ def cmd_sum(image, where):
     return 0
 
 
-def cmd_clines(image, where):
+def cmd_clines(image, where, max_depth=0):
     """
     One line per directory entry, the same shape apfs-tool's census prints:
         path, d_type, mode, uid, gid, logical size, FNV-1a of the contents
@@ -382,10 +382,10 @@ def cmd_clines(image, where):
             return 1
         start = hit[0]
         prefix = "/" + where.strip("/")
-    return _walk_lines(v, c, start, prefix, sys.stdout)
+    return _walk_lines(v, c, start, prefix, sys.stdout, max_depth)
 
 
-def _clines(image, where, out):
+def _clines(image, where, out, max_depth=0):
     c, v = open_volume(image)
     start = apfs.ROOT_DIR_INO_NUM
     prefix = ""
@@ -396,13 +396,13 @@ def _clines(image, where, out):
             return 1
         start = hit[0]
         prefix = "/" + where.strip("/")
-    return _walk_lines(v, c, start, prefix, out)
+    return _walk_lines(v, c, start, prefix, out, max_depth)
 
 
-def _walk_lines(v, c, start, prefix, out):
-    stack = [(start, prefix)]
+def _walk_lines(v, c, start, prefix, out, max_depth=0):
+    stack = [(start, prefix, 1)]
     while stack:
-        oid, px = stack.pop()
+        oid, px, depth = stack.pop()
         for name, fid, dt in v.dir_entries(oid):
             p = px + "/" + name
             ino = v.inode(fid)
@@ -414,14 +414,15 @@ def _walk_lines(v, c, start, prefix, out):
                 h = fnv1a(ino.contents())
             out.write("%s\t%d\t%06o\t%d\t%d\t%d\t%016x\n"
                       % (p, dt, ino.mode, ino.owner, ino.group, ino.size, h))
-            if dt == 4:
-                stack.append((fid, p))
+            if dt == 4 and (max_depth == 0 or depth < max_depth):
+                stack.append((fid, p, depth + 1))
     c.close()
     return 0
 
 
 def main(argv):
     limit = 200
+    depth = 0
     do_all = False
     args = []
     i = 1
@@ -434,6 +435,10 @@ def main(argv):
         if a == "--all":
             do_all = True
             i += 1
+            continue
+        if a == "--depth" and i + 1 < len(argv):
+            depth = int(argv[i + 1])
+            i += 2
             continue
         args.append(a)
         i += 1
@@ -452,9 +457,9 @@ def main(argv):
     if cmd == "sample":
         return cmd_content(args[1], args[2], limit, False, True)
     if cmd == "clines":
-        return cmd_clines(args[1], args[2] if len(args) > 2 else None)
+        return cmd_clines(args[1], args[2] if len(args) > 2 else None, depth)
     if cmd == "sum":
-        return cmd_sum(args[1], args[2] if len(args) > 2 else None)
+        return cmd_sum(args[1], args[2] if len(args) > 2 else None, depth)
     print("verify.py: unknown command %r" % cmd, file=sys.stderr)
     return 2
 
