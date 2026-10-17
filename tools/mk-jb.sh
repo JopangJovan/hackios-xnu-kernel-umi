@@ -1,0 +1,115 @@
+#!/bin/bash
+# Fetch what Sileo needs into jb/ (never in the repository, like fw-*): the Procursus bootstrap for
+# iOS and the Sileo package, both for arm64 and both "rootless" -- everything under /var/jb.
+#
+# Rootless is what fits this port: / is a packfs image that cannot be written to, and /private/var
+# is the only writable filesystem there is (a memory filesystem, made afresh at every boot), so the
+# whole prefix has to live under /var. The binaries of the rootless distribution are built for
+# iOS 15 and up (dpkg 1.22.6, apt 2.9.4) and Sileo for iOS 11 and up; the "1800" in the path is the
+# name of the distribution, not a demand for iOS 18.
+#
+# What is left behind in jb/:
+#   root/var/jb/...      the bootstrap with Sileo unpacked into it, as the phone will have it
+#   debs/                the packages it was made of, for a look
+# userland/build.sh puts root/var/jb into the system image (as /jb, read only) and init copies it
+# to /private/var/jb at every boot.
+set -e
+SUITE=1800                                              # the rootless distribution of Procursus
+SILEO=org.coolstar.sileo_2.5.1_iphoneos-arm64.deb
+MIRROR=https://apt.procurs.us
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+OUT=$ROOT/jb
+mkdir -p "$OUT/debs"
+
+get() {                                                 # fetch into jb/, once
+	[ -s "$OUT/debs/$2" ] || curl -sL --fail -o "$OUT/debs/$2" "$1"
+}
+get "$MIRROR/bootstraps/$SUITE/bootstrap-iphoneos-arm64.tar.zst" bootstrap.tar.zst
+get "$MIRROR/pool/main/iphoneos-arm64-rootless/$SUITE/sileo/$SILEO" sileo.deb
+
+rm -rf "$OUT/root"
+mkdir -p "$OUT/root"
+zstd -dc "$OUT/debs/bootstrap.tar.zst" | tar -C "$OUT/root" -xf -
+[ -d "$OUT/root/var/jb" ] || { echo "mk-jb.sh: the bootstrap has no var/jb in it" >&2; exit 1; }
+
+# Sileo on top of it: a .deb is an ar archive of control and data, and the data is the tree itself
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+(cd "$TMP" && ar x "$OUT/debs/sileo.deb")
+tar -C "$OUT/root" -xf "$TMP"/data.tar.* 2>/dev/null ||
+	zstd -dc "$TMP/data.tar.zst" | tar -C "$OUT/root" -xf -
+[ -d "$OUT/root/var/jb/Applications/Sileo.app" ] || { echo "mk-jb.sh: no Sileo.app in the package" >&2; exit 1; }
+
+# dpkg is to know that Sileo is installed, or Sileo itself will offer to install it again
+mkdir -p "$TMP/control" && tar -C "$TMP/control" -xf "$TMP"/control.tar.* 2>/dev/null ||
+	zstd -dc "$TMP/control.tar.zst" | tar -C "$TMP/control" -xf -
+{
+	sed '/^$/d' "$TMP/control/control"
+	echo "Status: install ok installed"
+	echo
+} >> "$OUT/root/var/jb/Library/dpkg/status"
+
+# the repositories Sileo starts with: Procursus itself, where everything here came from
+mkdir -p "$OUT/root/var/jb/etc/apt/sources.list.d"
+cat > "$OUT/root/var/jb/etc/apt/sources.list.d/procursus.sources" <<EOF
+Types: deb
+URIs: $MIRROR
+Suites: iphoneos-arm64-rootless/$SUITE
+Components: main
+EOF
+
+# The certificates for apt. gnutls here is built to trust /var/jb/etc/ssl/certs/cacert.pem, which the
+# package ca-certificates of the bootstrap brings along, and yet apt says "No system certificates
+# available" and refuses the handshake with the repository: it asks the system trust store for them,
+# and in this port trustd's own connections go unanswered (it talks to Apple and gets nothing back).
+# So apt is pointed at that file directly, which needs no trust store at all.
+mkdir -p "$OUT/root/var/jb/etc/apt/apt.conf.d"
+cat > "$OUT/root/var/jb/etc/apt/apt.conf.d/10redwood.conf" <<'EOF'
+Acquire::https::CaInfo "/var/jb/etc/ssl/certs/cacert.pem";
+EOF
+
+# Three packages of the bootstrap have no meaning on this port and only break apt: libkrw0 and
+# libdimentio0 read and write the kernel of a jailbroken phone through a plug-in that a jailbreak
+# supplies (libkrw0-plugin), and shshd saves its signing blobs with them. Here the kernel is ours;
+# nothing provides the plug-in, and apt refuses to install anything at all while one dependency in
+# the database is unmet. They go, files and all.
+for package in shshd libkrw0 libdimentio0; do
+	list=$OUT/root/var/jb/Library/dpkg/info/$package.list
+	if [ -f "$list" ]; then
+		while IFS= read -r path; do
+			[ -f "$OUT/root/var/jb/$path" ] && rm -f "$OUT/root/var/jb/$path"
+		done < "$list"
+		rm -f "$OUT"/root/var/jb/Library/dpkg/info/$package.*
+	fi
+	awk -v want="Package: $package" 'BEGIN { RS = ""; FS = "\n" }
+		{
+			drop = 0
+			for (i = 1; i <= NF; i++) {
+				if ($i == want) drop = 1
+			}
+			if (!drop) printf "%s\n\n", $0
+		}' "$OUT/root/var/jb/Library/dpkg/status" > "$OUT/root/var/jb/Library/dpkg/status.new"
+	mv "$OUT/root/var/jb/Library/dpkg/status.new" "$OUT/root/var/jb/Library/dpkg/status"
+done
+
+# What the bootstrap's own prep_bootstrap.sh does, less what this port has no use for: it asks for a
+# terminal password through a window of its own, and sets login shells in an /etc that is made anew
+# at every boot anyway. What is left matters: usr/libexec/firmware puts a package named "firmware"
+# in dpkg's database with the iOS version in it, which is what every other package depends on
+# (Sileo: "firmware (>= 11.0)"), and the few postinst scripts settle the shells and apt's own state.
+cat > "$OUT/root/var/jb/prep.sh" <<'PREP'
+#!/var/jb/bin/sh
+# Run once per boot, after the prefix has been grafted onto /var/jb (rc.jobs.sileo does it).
+/var/jb/usr/libexec/firmware
+/var/jb/usr/sbin/pwd_mkdb -p /var/jb/etc/master.passwd 2>/dev/null
+for package in debianutils apt dash bash zsh vi; do
+	[ -x "/var/jb/Library/dpkg/info/$package.postinst" ] &&
+		"/var/jb/Library/dpkg/info/$package.postinst" configure 99999 >/dev/null 2>&1
+done
+exit 0
+PREP
+chmod 755 "$OUT/root/var/jb/prep.sh"
+rm -f "$OUT/root/var/jb/prep_bootstrap.sh"
+
+echo "mk-jb.sh: $OUT/root/var/jb ($(du -sh "$OUT/root/var/jb" | cut -f1), $(find "$OUT/root/var/jb" | wc -l) entries)"
+echo "          Sileo $(grep -m1 '^Version:' "$TMP/control/control" | cut -d' ' -f2), $(grep -c '^Package:' "$OUT/root/var/jb/Library/dpkg/status") packages in dpkg's database"
