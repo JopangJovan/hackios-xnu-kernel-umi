@@ -60,6 +60,15 @@ struct apfs_dev {
 	void     *ctx;
 	uint64_t  size;                 /* bytes, 0 if not known */
 	int     (*read)(void *ctx, uint64_t off, void *buf, size_t len);
+	/*
+	 * The same, for a file's contents rather than metadata: a whole run of blocks
+	 * straight into the caller's buffer, in as few requests to the device as it can
+	 * manage, and not through any cache.  Metadata is read over and over and is worth
+	 * caching; a file's bytes are usually wanted once, and putting them through the
+	 * cache a block at a time cost one request to the device per 4096 bytes and pushed
+	 * the metadata out of it.  May be NULL, and then read() is used instead.
+	 */
+	int     (*read_bulk)(void *ctx, uint64_t off, void *buf, size_t len);
 };
 
 /* One cached block of metadata. */
@@ -104,6 +113,8 @@ struct apfs_nx {
 	uint32_t          clock;
 	uint64_t          reads;
 	uint64_t          hits;
+	uint64_t          bulk_calls;   /* requests for file data, outside the cache */
+	uint64_t          bulk_bytes;
 };
 
 /* A volume inside the container. */

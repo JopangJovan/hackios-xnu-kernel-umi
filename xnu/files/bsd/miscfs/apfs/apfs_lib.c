@@ -161,6 +161,35 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 	return 0;
 }
 
+/*
+ * A run of whole blocks of file data, straight into the caller's buffer.  Nothing is
+ * cached: see the note on read_bulk in struct apfs_dev.
+ */
+static int
+nx_bulk(struct apfs_nx *nx, uint64_t off, void *buf, size_t len)
+{
+	int error;
+
+	if (len == 0) {
+		return 0;
+	}
+	if ((off % nx->block_size) != 0 || (len % nx->block_size) != 0) {
+		return EIO;
+	}
+	if (off / nx->block_size >= nx->block_count ||
+	    len / nx->block_size > nx->block_count - off / nx->block_size) {
+		return EIO;
+	}
+	error = (nx->dev.read_bulk != NULL)
+	    ? nx->dev.read_bulk(nx->dev.ctx, off, buf, len)
+	    : nx->dev.read(nx->dev.ctx, off, buf, len);
+	if (error == 0) {
+		nx->bulk_calls++;
+		nx->bulk_bytes += len;
+	}
+	return error;
+}
+
 static uint32_t
 obj_type(const uint8_t *blk)
 {
@@ -1463,28 +1492,50 @@ apfs_read_stream(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_size,
 		{
 			uint64_t from = logical > off ? logical : off;
 			uint64_t to = (logical + length) < end ? (logical + length) : end;
-			uint64_t inner = from - logical;
+			uint64_t dev_off = phys * (uint64_t)bs + (from - logical);
 			uint64_t nbytes = to - from;
-			uint64_t addr = phys + inner / bs;
-			uint64_t skew = inner % bs;
+			uint8_t *dp = dst + (from - off);
+			const uint8_t *blk;
 
-			while (nbytes > 0) {
-				const uint8_t *blk;
+			/*
+			 * The whole blocks in the middle go to the device in one request and land
+			 * in the caller's buffer directly.  Only the ends, where the request does
+			 * not line up with a block, go through the block cache -- one block each.
+			 * File data has no object header, so none of it is checksummed.
+			 */
+			if ((dev_off % bs) != 0) {
+				uint64_t skew = dev_off % bs;
 				uint64_t n = bs - skew;
 
 				if (n > nbytes) {
 					n = nbytes;
 				}
-				/* file data has no object header and so no checksum */
-				error = nx_block(vol->nx, addr, &blk, false);
+				error = nx_block(vol->nx, dev_off / bs, &blk, false);
 				if (error) {
 					return error;
 				}
-				memcpy(dst + (from - off), blk + skew, (size_t)n);
-				from += n;
+				memcpy(dp, blk + skew, (size_t)n);
+				dp += n;
+				dev_off += n;
 				nbytes -= n;
-				addr++;
-				skew = 0;
+			}
+			if (nbytes >= bs) {
+				uint64_t n = (nbytes / bs) * bs;
+
+				error = nx_bulk(vol->nx, dev_off, dp, (size_t)n);
+				if (error) {
+					return error;
+				}
+				dp += n;
+				dev_off += n;
+				nbytes -= n;
+			}
+			if (nbytes > 0) {
+				error = nx_block(vol->nx, dev_off / bs, &blk, false);
+				if (error) {
+					return error;
+				}
+				memcpy(dp, blk, (size_t)nbytes);
 			}
 		}
 	}

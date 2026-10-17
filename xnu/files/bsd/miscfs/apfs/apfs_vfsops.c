@@ -70,6 +70,51 @@ apfs_dev_read(void *ctx, uint64_t off, void *buf, size_t len)
 	return 0;
 }
 
+/*
+ * A file's contents, straight into the caller's buffer.  One buffer of our own per
+ * request, outside the buffer cache: these bytes are usually wanted once, and putting a
+ * 64 KB read through the cache a block at a time meant sixteen requests to the device and
+ * sixteen cached blocks nobody would ask for again.
+ */
+#define APFS_BULK_MAX (64 * 1024)
+
+static int
+apfs_dev_read_bulk(void *ctx, uint64_t off, void *buf, size_t len)
+{
+	struct apfs_devctx *dc = ctx;
+	char *out = buf;
+
+	if ((off % dc->dc_devblock) != 0 || (len % dc->dc_devblock) != 0) {
+		return EINVAL;
+	}
+	while (len > 0) {
+		size_t n = len < APFS_BULK_MAX ? len : APFS_BULK_MAX;
+		buf_t bp = buf_alloc(dc->dc_devvp);
+		int error;
+
+		if (bp == NULL) {
+			return ENOMEM;
+		}
+		buf_reset(bp, B_READ);
+		buf_setblkno(bp, (daddr64_t)(off / dc->dc_devblock));
+		buf_setlblkno(bp, (daddr64_t)(off / dc->dc_devblock));
+		buf_setcount(bp, (uint32_t)n);
+		buf_setdataptr(bp, (uintptr_t)out);
+		error = VNOP_STRATEGY(bp);
+		if (error == 0) {
+			error = (int)buf_biowait(bp);
+		}
+		buf_free(bp);
+		if (error) {
+			return error;
+		}
+		out += n;
+		off += n;
+		len -= n;
+	}
+	return 0;
+}
+
 /* ------------------------------------------------------------------ vnodes */
 
 static uint32_t
@@ -245,6 +290,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	dev.ctx = dc;
 	dev.size = devblocks * (uint64_t)devblock;
 	dev.read = apfs_dev_read;
+	dev.read_bulk = apfs_dev_read_bulk;
 
 	error = apfs_nx_open(&am->am_nx, &dev);
 	if (error) {
@@ -394,6 +440,11 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 	if (error) {
 		return error;
 	}
+	printf("apfs: %llu blocks read for metadata (%llu cache hits), %llu requests for "
+	    "file data carrying %llu bytes\n",
+	    (unsigned long long)am->am_nx.reads, (unsigned long long)am->am_nx.hits,
+	    (unsigned long long)am->am_nx.bulk_calls,
+	    (unsigned long long)am->am_nx.bulk_bytes);
 	vfs_setfsprivate(mp, NULL);
 	if (am->am_owns_devvp && am->am_devvp != NULLVP) {
 		(void)VNOP_CLOSE(am->am_devvp, FREAD, ctx);

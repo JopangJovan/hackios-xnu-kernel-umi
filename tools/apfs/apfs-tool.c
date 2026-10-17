@@ -80,6 +80,8 @@ open_image(const char *path, struct apfs_nx *nx, struct apfs_vol *vol)
 	dev.ctx = (void *)(intptr_t)fd;
 	dev.size = (uint64_t)lseek(fd, 0, SEEK_END);
 	dev.read = file_read;
+	/* pread already fetches a whole run in one call */
+	dev.read_bulk = file_read;
 
 	error = apfs_nx_open(nx, &dev);
 	if (error) {
@@ -135,6 +137,8 @@ cmd_info(const char *path)
 		    v.tree.key_count, v.tree.node_count, v.tree.flags);
 	}
 	printf("  blocks read %" PRIu64 ", cache hits %" PRIu64 "\n", nx.reads, nx.hits);
+	printf("  file-data requests %" PRIu64 ", bytes %" PRIu64 "\n", nx.bulk_calls,
+	    nx.bulk_bytes);
 	apfs_nx_close(&nx);
 	return 0;
 }
@@ -480,7 +484,8 @@ cmd_census(const char *path, const char *where)
 		return 1;
 	}
 	fprintf(stderr, "apfs-tool: %ld entries, %" PRIu64 " blocks read, %" PRIu64
-	    " cache hits\n", cs.seen, nx.reads, nx.hits);
+	    " cache hits, %" PRIu64 " file-data requests for %" PRIu64 " bytes\n",
+	    cs.seen, nx.reads, nx.hits, nx.bulk_calls, nx.bulk_bytes);
 	free(cs.path);
 	free(cs.buf);
 	apfs_nx_close(&nx);
