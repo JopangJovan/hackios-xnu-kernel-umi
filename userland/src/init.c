@@ -620,10 +620,18 @@ mount_writable(void)
 		static const char *const mobiles[] = { "/private/var/jb/var/mobile", "/private/var/jb/var/mobile/Library",
 			                               "/private/var/jb/var/mobile/Library/Caches",
 			                               "/private/var/jb/var/mobile/Library/Preferences",
-			                               "/private/var/jb/var/mobile/Documents" };
+			                               "/private/var/jb/var/mobile/Documents",
+			                               /*
+			                                * Sileo keeps the indexes of its repositories apart from
+			                                * apt's own (it runs apt with -oDir::State::lists=
+			                                * sileolists/), and it is mobile who writes them.
+			                                */
+			                               "/private/var/jb/var/lib/apt/sileolists",
+			                               "/private/var/jb/var/lib/apt/sileolists/partial" };
 
 		for (unsigned i = 0; i < sizeof(mobiles) / sizeof(mobiles[0]); i++) {
 			mkdir(mobiles[i], 0755);
+			grafted = chown(mobiles[i], 501, 501) == 0 && grafted;
 		}
 		grafted = own_tree("/private/var/jb/var/mobile", 501) && grafted;
 		printf("  /var/jb: %d directories, %d files and links\n", dirs, entries);
@@ -785,6 +793,7 @@ run_command(char *line)
 	char *envp[] = { "PATH=/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/bin:/sbin:/usr/bin:/usr/sbin",
 		         "HOME=/var/mobile", "TERM=dumb", NULL };
 	int argc = 0, status = 0, background = 0;
+	struct stat st;
 	pid_t pid;
 
 	for (char *p = line; *p && argc < 63;) {
@@ -816,6 +825,21 @@ run_command(char *line)
 
 	/* "exec program args": become that program, keeping process number 1 */
 	if (strcmp(argv[0], "exec") == 0 && argc > 1) {
+		/*
+		 * With etc/quiet in our image (build.sh QUIET=1), what this program says on its
+		 * standard error is dropped. It is meant for launchd, which says a few thousand lines
+		 * about its own business in a couple of minutes and pushes everything else out of the
+		 * kernel's log; the daemons it starts keep their own standard error on the console
+		 * (mkjobs.py sets it), and so does everything the job runner runs.
+		 */
+		if (stat(in_image("/etc/quiet"), &st) == 0) {
+			int null = open("/dev/null", O_WRONLY, 0);
+
+			if (null >= 0) {
+				dup2(null, 2);
+				close(null);
+			}
+		}
 		execve(argv[1], argv + 1, envp);
 		printf("%s: %s\n", argv[1], strerror(errno));
 		return;

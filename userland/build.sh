@@ -214,6 +214,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	done >> root/etc/var.skel
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
+	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
+	# lines about its own business in the first minutes and pushes everything else out of the
+	# kernel's log; the daemons keep their own standard error on the console all the same.
+	rm -f root/etc/quiet
+	[ -n "$QUIET" ] && : > root/etc/quiet
 	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory)
 	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $IOS/rootfs root/LaunchDaemons $IOS_JOBS

@@ -40,6 +40,13 @@ tar -C "$OUT/root" -xf "$TMP"/data.tar.* 2>/dev/null ||
 	zstd -dc "$TMP/data.tar.zst" | tar -C "$OUT/root" -xf -
 [ -d "$OUT/root/var/jb/Applications/Sileo.app" ] || { echo "mk-jb.sh: no Sileo.app in the package" >&2; exit 1; }
 
+# The package ships Sileo's root helper as -rwsr-xr-x root/root: everything Sileo does to the system
+# (apt, dpkg, making its own list directory) it does by spawning giveMeRoot, which is set-user-ID.
+# Unpacking the archive as an ordinary user drops that bit, and without it Sileo can read the
+# repositories and queue packages but install nothing. In the image the file belongs to root, so the
+# bit means what it says there.
+chmod 4755 "$OUT/root/var/jb/Applications/Sileo.app/giveMeRoot"
+
 # dpkg is to know that Sileo is installed, or Sileo itself will offer to install it again
 mkdir -p "$TMP/control" && tar -C "$TMP/control" -xf "$TMP"/control.tar.* 2>/dev/null ||
 	zstd -dc "$TMP/control.tar.zst" | tar -C "$TMP/control" -xf -
@@ -91,6 +98,37 @@ for package in shshd libkrw0 libdimentio0; do
 		}' "$OUT/root/var/jb/Library/dpkg/status" > "$OUT/root/var/jb/Library/dpkg/status.new"
 	mv "$OUT/root/var/jb/Library/dpkg/status.new" "$OUT/root/var/jb/Library/dpkg/status"
 done
+
+# The dependency on "firmware" is taken out of the records of the packages that carry it. That
+# package is not a package: usr/libexec/firmware writes it straight into dpkg's database (the iOS
+# version, "firmware 16.5"), no repository has it and nothing provides it. apt on the command line
+# is content with that -- but Sileo asks apt with an index of its own making (it writes a reduced
+# Packages file into var/lib/apt/sileolists and runs "apt-get -sqf ... -oDir::State::lists=
+# sileolists/"), and against that index apt calls the same firmware "not installable" and reports
+# org.coolstar.sileo and snaputil as broken. Sileo then shows those as errors and refuses to install
+# anything at all. What the dependency says -- "this iOS is new enough" -- is true here by
+# construction: the system is iOS 16.5 and cannot be anything else.
+python3 - "$OUT/root/var/jb/Library/dpkg/status" <<'EOF'
+import re, sys
+
+path = sys.argv[1]
+stanzas = open(path, encoding='utf-8').read().split('\n\n')
+changed = 0
+for i, stanza in enumerate(stanzas):
+    lines = stanza.split('\n')
+    for k, line in enumerate(lines):
+        if not line.startswith('Depends: '):
+            continue
+        groups = [g for g in line[len('Depends: '):].split(', ')
+                  if not re.match(r'^\s*firmware\s*[( ]|^\s*firmware$', g.split(' | ')[0])]
+        if len(groups) != len(line[len('Depends: '):].split(', ')):
+            lines[k] = 'Depends: ' + ', '.join(groups) if groups else None
+            changed += 1
+    lines = [line for line in lines if line is not None]
+    stanzas[i] = '\n'.join(lines)
+open(path, 'w', encoding='utf-8').write('\n\n'.join(stanzas))
+print(f"mk-jb.sh: the dependency on \"firmware\" taken out of {changed} records")
+EOF
 
 # What the bootstrap's own prep_bootstrap.sh does, less what this port has no use for: it asks for a
 # terminal password through a window of its own, and sets login shells in an /etc that is made anew
