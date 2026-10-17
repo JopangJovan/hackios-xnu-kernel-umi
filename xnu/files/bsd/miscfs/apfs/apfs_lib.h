@@ -169,6 +169,26 @@ struct apfs_nx {
 	 */
 	struct apfs_scratch *scratch;
 	uint32_t          scratch_kept;
+	/*
+	 * Several threads for one request: run fn(arg, item, worker) for every item below
+	 * `items`, on up to `workers` threads at once, the caller's among them, each with a
+	 * worker number below `workers`; return the first error any item gave.  Called
+	 * without the lock, and fn takes none.  NULL (the program on the build machine): the
+	 * items are done one after another on the caller's thread.
+	 */
+	int             (*parallel)(void *ctx, uint32_t items, uint32_t workers,
+	    int (*fn)(void *arg, uint32_t item, uint32_t worker), void *arg);
+	void             *parallel_ctx;
+	uint32_t          parallel_max;         /* threads it can bring, the caller's included */
+	/*
+	 * Reads in flight on the container, kept by the caller with the lock held.  The
+	 * threads nx->parallel brings are shared out among them: all of them to a request
+	 * that is alone, none to one among parallel_max or more -- the processors are busy
+	 * already, and on the phone four readers came out 7% slower with helpers than
+	 * without.  0 (the program on the build machine) counts as alone.
+	 */
+	uint32_t          requests;
+	uint64_t          batch_calls, batch_pieces;   /* how many requests used it, for how much */
 };
 
 /* A volume inside the container. */

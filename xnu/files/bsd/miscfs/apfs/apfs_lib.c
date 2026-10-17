@@ -2246,6 +2246,24 @@ out:
 #define APFS_PIECE_CAP    (APFS_DECMPFS_BLOCK_SIZE + 1024)   /* stored: 1 + 64 KB; zlib: a few bytes more */
 #define APFS_SCRATCH_KEEP 16
 
+/*
+ * A whole piece of a request, planned with the lock and lying in one run on the device:
+ * what one thread needs to read it and decompress it into the caller's buffer, with no
+ * lock and nothing shared.  Up to APFS_BATCH of them are done together, on as many
+ * threads as nx->parallel brings -- one reader's request of many pieces no longer waits
+ * on one processor while the others idle.
+ */
+struct apfs_piece_job {
+	uint64_t addr;                  /* the first block the piece lies in */
+	uint32_t skew;                  /* where in that block it starts */
+	uint32_t plen;                  /* compressed */
+	uint8_t *dst;                   /* the caller's, `want` bytes */
+	size_t   want;
+};
+
+#define APFS_BATCH   32
+#define APFS_PAR_MAX 8
+
 struct apfs_scratch {
 	struct apfs_scratch            *next;
 	struct libdeflate_decompressor *dec;
@@ -2257,6 +2275,7 @@ struct apfs_scratch {
 	 */
 	uint8_t                        *raw;
 	size_t                          raw_cap;
+	struct apfs_piece_job          *jobs;   /* APFS_BATCH, made when first wanted */
 };
 
 static void
@@ -2273,6 +2292,9 @@ scratch_free(struct apfs_scratch *sc)
 	}
 	if (sc->raw != NULL) {
 		apfs_free(sc->raw, sc->raw_cap);
+	}
+	if (sc->jobs != NULL) {
+		apfs_free(sc->jobs, APFS_BATCH * sizeof(*sc->jobs));
 	}
 	apfs_free(sc, sizeof(*sc));
 }
@@ -2327,6 +2349,118 @@ scratch_drain(struct apfs_nx *nx)
 	nx->scratch_kept = 0;
 }
 
+/* One batch on its way: the jobs, a scratch for each worker, what each worker counted. */
+struct apfs_batch {
+	struct apfs_nx        *nx;
+	struct apfs_piece_job *jobs;
+	struct apfs_scratch   *sc[APFS_PAR_MAX];
+	struct {
+		uint64_t calls, bytes, data_ticks, inflate_ticks, out, fallbacks;
+	} w[APFS_PAR_MAX];
+};
+
+static int
+batch_one(void *arg, uint32_t item, uint32_t worker)
+{
+	struct apfs_batch *b = arg;
+	struct apfs_piece_job *j = &b->jobs[item];
+	struct apfs_scratch *sc = b->sc[worker];
+	uint32_t bs = b->nx->block_size;
+	size_t span = ((size_t)j->skew + j->plen + bs - 1) / bs * bs;
+	size_t got = 0;
+	bool fell_back = false;
+	uint64_t t0, t1;
+	int error;
+
+	t0 = apfs_ticks();
+	error = dev_read_data(b->nx, j->addr, sc->raw, span, &b->w[worker].calls,
+	    &b->w[worker].bytes);
+	t1 = apfs_ticks();
+	b->w[worker].data_ticks += t1 - t0;
+	if (error) {
+		return error;
+	}
+	error = apfs_inflate_fast(sc->dec, sc->raw + j->skew, j->plen, j->dst, j->want, &got,
+	    &fell_back);
+	b->w[worker].inflate_ticks += apfs_ticks() - t1;
+	b->w[worker].out += got;
+	if (fell_back) {
+		b->w[worker].fallbacks++;
+	}
+	if (error == 0 && got != j->want) {
+		error = EIO;
+	}
+	return error;
+}
+
+/*
+ * Do the `n` jobs gathered in sc->jobs: let go of the lock, spread them over the threads
+ * nx->parallel brings (one scratch each, sc being the caller's), take the lock back and
+ * add up what the workers counted.  Inflate time is then the sum over the workers.
+ */
+static int
+batch_run(struct apfs_vol *vol, struct apfs_scratch *sc, uint32_t n)
+{
+	struct apfs_nx *nx = vol->nx;
+	struct apfs_batch b;
+	uint32_t workers = 1, w, i;
+	uint64_t in = 0;
+	int error = 0;
+
+	memset(&b, 0, sizeof(b));
+	b.nx = nx;
+	b.jobs = sc->jobs;
+	b.sc[0] = sc;
+	if (nx->parallel != NULL && n > 1) {
+		/* the threads shared out among the requests in flight: all of them to one alone */
+		workers = nx->requests > 1 ? nx->parallel_max / nx->requests : nx->parallel_max;
+		if (workers < 1) {
+			workers = 1;
+		}
+		if (workers > n) {
+			workers = n;
+		}
+		if (workers > APFS_PAR_MAX) {
+			workers = APFS_PAR_MAX;
+		}
+		for (w = 1; w < workers; w++) {
+			b.sc[w] = scratch_get(nx);
+			if (b.sc[w] == NULL) {
+				break;
+			}
+		}
+		workers = w;
+	}
+	nx_unlock(nx);
+	if (workers > 1) {
+		error = nx->parallel(nx->parallel_ctx, n, workers, batch_one, &b);
+	} else {
+		for (i = 0; i < n && error == 0; i++) {
+			error = batch_one(&b, i, 0);
+		}
+	}
+	nx_relock(nx);
+	for (i = 0; i < n; i++) {
+		in += sc->jobs[i].plen;
+	}
+	for (w = 0; w < workers; w++) {
+		nx->data_calls += b.w[w].calls;
+		nx->data_bytes += b.w[w].bytes;
+		nx->data_ticks += b.w[w].data_ticks;
+		nx->inflate_ticks += b.w[w].inflate_ticks;
+		nx->inflate_out += b.w[w].out;
+		nx->inflate_fallbacks += b.w[w].fallbacks;
+		if (w > 0) {
+			scratch_put(nx, b.sc[w]);
+		}
+	}
+	nx->inflate_calls += n;
+	nx->inflate_in += in;
+	nx->batch_calls++;
+	nx->batch_pieces += n;
+	return error;
+}
+
 static int
 read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
     struct apfs_cfile *cf, uint64_t off, uint8_t *buf, size_t len, size_t *out)
@@ -2335,6 +2469,7 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 	uint8_t *big = NULL;            /* a piece bigger than APFS_PIECE_CAP, should there be one */
 	size_t big_cap = 0;
 	uint32_t bs = vol->nx->block_size;
+	uint32_t nbatch = 0;            /* whole pieces gathered in sc->jobs, not yet done */
 	uint64_t first, last, i;
 	int error = 0;
 
@@ -2430,6 +2565,34 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 					goto out;
 				}
 			}
+			if (direct && planned && nruns == 1 && runs[0].at == 0 &&
+			    runs[0].len == plen) {
+				/* its place in the caller's buffer is kept; batch_run fills it */
+				struct apfs_piece_job *j;
+
+				if (sc->jobs == NULL) {
+					sc->jobs = apfs_alloc(APFS_BATCH * sizeof(*sc->jobs));
+					if (sc->jobs == NULL) {
+						error = ENOMEM;
+						goto out;
+					}
+				}
+				j = &sc->jobs[nbatch++];
+				j->addr = runs[0].addr;
+				j->skew = runs[0].skew;
+				j->plen = plen;
+				j->dst = buf + *out;
+				j->want = want;
+				*out += want;
+				if (nbatch == APFS_BATCH) {
+					error = batch_run(vol, sc, nbatch);
+					nbatch = 0;
+					if (error) {
+						goto out;
+					}
+				}
+				continue;
+			}
 			if (!raw_type && !direct && sc->mine == NULL) {
 				sc->mine = apfs_alloc(APFS_DECMPFS_BLOCK_SIZE);
 				if (sc->mine == NULL) {
@@ -2519,6 +2682,9 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 		}
 		memcpy(buf + *out, cf->held_data + from_in_piece, n);
 		*out += n;
+	}
+	if (nbatch > 0) {
+		error = batch_run(vol, sc, nbatch);
 	}
 out:
 	if (big != NULL) {

@@ -102,7 +102,28 @@ static const char *volatile watch_phase = "";
 #define FNV_INIT  0xcbf29ce484222325ULL
 #define FNV_PRIME 0x100000001b3ULL
 
-#define READ_CHUNK (64 * 1024)
+/*
+ * How much each read asks for: 64 KB, one compressed piece, unless boot-arg apfs_chunk says
+ * otherwise (up to 4 MB) -- a bigger read is one request whose pieces the driver can
+ * decompress on several processors at once.
+ */
+static uint32_t
+read_chunk(void)
+{
+	static uint32_t chunk;
+
+	if (chunk == 0) {
+		uint32_t want = 64 * 1024;
+
+		PE_parse_boot_argn("apfs_chunk", &want, sizeof(want));
+		if (want < 4096 || want > 4 * 1024 * 1024) {
+			want = 64 * 1024;
+		}
+		chunk = want;
+	}
+	return chunk;
+}
+#define READ_CHUNK read_chunk()
 #define DIR_CHUNK  4096
 #define MAX_DEPTH  48
 #define PATH_CAP   2048

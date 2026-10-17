@@ -19,6 +19,8 @@
 /* pread(2) and clock_gettime(2) come with -D_DEFAULT_SOURCE, set by build-tool.sh */
 #include <fcntl.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +64,81 @@ fnv1a(const uint8_t *p, size_t n, uint64_t h)
 
 #define FNV_INIT 0xcbf29ce484222325ULL
 
+/*
+ * APFS_TOOL_THREADS=N: nx->parallel on threads of this program, so that what the kernel
+ * does on several processors -- whole pieces of one request read and decompressed at once
+ * -- runs here the same way (and can be run under ThreadSanitizer).  A thread per worker
+ * per call: slow, and only for checking.
+ */
+struct host_par {
+	int (*fn)(void *arg, uint32_t item, uint32_t worker);
+	void *arg;
+	uint32_t items;
+	atomic_uint next;
+	atomic_int error;
+};
+
+struct host_par_arg {
+	struct host_par *hp;
+	uint32_t worker;
+};
+
+static void
+host_par_work(struct host_par *hp, uint32_t worker)
+{
+	for (;;) {
+		uint32_t item = atomic_fetch_add(&hp->next, 1);
+		int error, none = 0;
+
+		if (item >= hp->items) {
+			break;
+		}
+		error = hp->fn(hp->arg, item, worker);
+		if (error != 0) {
+			atomic_compare_exchange_strong(&hp->error, &none, error);
+		}
+	}
+}
+
+static void *
+host_par_thread(void *p)
+{
+	struct host_par_arg *a = p;
+
+	host_par_work(a->hp, a->worker);
+	return NULL;
+}
+
+static int
+host_parallel(void *ctx, uint32_t items, uint32_t workers,
+    int (*fn)(void *arg, uint32_t item, uint32_t worker), void *arg)
+{
+	struct host_par hp;
+	struct host_par_arg a[16];
+	pthread_t th[16];
+	uint32_t w, started = 1;
+
+	(void)ctx;
+	hp.fn = fn;
+	hp.arg = arg;
+	hp.items = items;
+	atomic_init(&hp.next, 0);
+	atomic_init(&hp.error, 0);
+	for (w = 1; w < workers && w < 16; w++) {
+		a[w].hp = &hp;
+		a[w].worker = w;
+		if (pthread_create(&th[w], NULL, host_par_thread, &a[w]) != 0) {
+			break;
+		}
+		started++;
+	}
+	host_par_work(&hp, 0);
+	for (w = 1; w < started; w++) {
+		pthread_join(th[w], NULL);
+	}
+	return atomic_load(&hp.error);
+}
+
 static int
 open_image(const char *path, struct apfs_nx *nx, struct apfs_vol *vol)
 {
@@ -83,6 +160,14 @@ open_image(const char *path, struct apfs_nx *nx, struct apfs_vol *vol)
 	if (error) {
 		fprintf(stderr, "apfs-tool: cannot read the container: %s\n", strerror(error));
 		return 1;
+	}
+	if (getenv("APFS_TOOL_THREADS") != NULL) {
+		long t = strtol(getenv("APFS_TOOL_THREADS"), NULL, 0);
+
+		if (t > 1) {
+			nx->parallel = host_parallel;
+			nx->parallel_max = (uint32_t)(t < 16 ? t : 16);
+		}
 	}
 	/* the first volume that has a root directory, like apfs.py picks it */
 	for (i = 0; i < APFS_NX_MAX_FILE_SYSTEMS; i++) {
@@ -500,6 +585,9 @@ cmd_census(const char *path, const char *where, bool meta_only)
 	fprintf(stderr, "apfs-tool: inflate %" PRIu64 " calls, %" PRIu64 " bytes in, %" PRIu64
 	    " bytes out, %" PRIu64 " by zlib\n", nx.inflate_calls, nx.inflate_in, nx.inflate_out,
 	    nx.inflate_fallbacks);
+	fprintf(stderr, "apfs-tool: %" PRIu64 " requests of whole pieces, %" PRIu64 " pieces in "
+	    "them, on %u threads at most\n", nx.batch_calls, nx.batch_pieces,
+	    nx.parallel != NULL ? nx.parallel_max : 1);
 	fprintf(stderr, "apfs-tool: highest block touched %" PRIu64 " (%.2f GB in), of which "
 	    "file contents reach %" PRIu64 " (%.2f GB in)\n", nx.max_addr,
 	    nx.max_addr * (double)nx.block_size / 1e9, nx.max_data_addr,

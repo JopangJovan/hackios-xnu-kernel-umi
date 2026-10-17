@@ -185,15 +185,18 @@ apfs_vnop_read(struct vnop_read_args *ap)
 		buf = am->am_iobuf[--am->am_iobuf_kept];
 	} else {
 		apfs_unlock(am);
-		buf = kalloc_data(APFS_IOBUF, Z_WAITOK);
+		buf = kalloc_data(am->am_iobuf_size, Z_WAITOK);
 		if (buf == NULL) {
 			return ENOMEM;
 		}
 		apfs_lock(am);
 	}
 	/* the lock is held at the top of every round and let go of only for uiomove */
+	am->am_nx.requests++;
 	while (uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < size) {
-		size_t want = (size_t)MIN((user_ssize_t)APFS_IOBUF, uio_resid(uio));
+		size_t round = (am->am_nx.requests <= 1)
+		    ? am->am_iobuf_size : MIN(am->am_iobuf_size, APFS_ROUND_SHARED);
+		size_t want = (size_t)MIN((user_ssize_t)round, uio_resid(uio));
 		size_t got = 0;
 
 		error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf,
@@ -209,6 +212,7 @@ apfs_vnop_read(struct vnop_read_args *ap)
 		}
 		read_bytes += got;
 	}
+	am->am_nx.requests--;
 	if (am->am_iobuf_kept < APFS_IOBUF_KEEP) {
 		am->am_iobuf[am->am_iobuf_kept++] = buf;
 		buf = NULL;
@@ -218,7 +222,7 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	am->am_read_bytes += read_bytes;
 	apfs_unlock(am);
 	if (buf != NULL) {
-		kfree_data(buf, APFS_IOBUF);
+		kfree_data(buf, am->am_iobuf_size);
 	}
 	return error;
 }
@@ -289,8 +293,10 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 		}
 		want = (size_t)MIN(end - at, (off_t)(size - (uint64_t)at));
 		apfs_lock(am);
+		am->am_nx.requests++;
 		error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf, (uint64_t)at,
 		    dst, want, &got);
+		am->am_nx.requests--;
 		apfs_unlock(am);
 		if (error) {
 			break;

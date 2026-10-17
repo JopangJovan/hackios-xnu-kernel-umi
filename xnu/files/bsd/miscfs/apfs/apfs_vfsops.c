@@ -19,6 +19,11 @@
 #include <sys/sysctl.h>
 #include <sys/vnode_internal.h>
 #include <sys/fcntl.h>
+#include <sys/proc.h>
+#include <kern/thread.h>
+#include <libkern/OSAtomic.h>
+#include <machine/machine_routines.h>
+#include <pexpert/pexpert.h>
 
 static LCK_GRP_DECLARE(apfs_lck_grp, "apfs");
 
@@ -243,6 +248,10 @@ apfs_stats_print(void)
 	    (unsigned long long)apfs_ticks_ms(nx->inflate_ticks),
 	    (unsigned long long)nx->inflate_in, (unsigned long long)nx->inflate_out,
 	    (unsigned long long)nx->inflate_fallbacks);
+	/* requests whose whole pieces went out together (nx->parallel), and how many pieces */
+	printf("apfs: batch   %llu requests  %llu pieces  %u threads at most\n",
+	    (unsigned long long)nx->batch_calls, (unsigned long long)nx->batch_pieces,
+	    nx->parallel != NULL ? nx->parallel_max : 1);
 	printf("apfs: blocks  %llu read  %llu cache hits  highest block %llu\n",
 	    (unsigned long long)nx->reads, (unsigned long long)nx->hits,
 	    (unsigned long long)nx->max_addr);
@@ -395,13 +404,168 @@ apfs_lib_relock(void *ctx)
 	apfs_lock((struct apfs_mount *)ctx);
 }
 
+/* ------------------------------------------------------- threads for one request */
+
+/*
+ * apfs_lib's nx->parallel: a few kernel threads that help a request of many compressed
+ * pieces along, each reading and decompressing whole pieces into the caller's buffer while
+ * the caller does the same.  A request posts a job and wakes as many helpers as it can
+ * use; a helper that comes takes a worker number and then items until none are left.  The
+ * caller works through items too, then takes its job off the list -- no helper can join
+ * after that -- and waits for the helpers still inside it.  The job lives on the caller's
+ * stack, which is why nothing may touch it once the caller is back.
+ *
+ * Boot-arg apfs_par=N: at most N threads on one request, the caller's included (default:
+ * four, or the processors if fewer -- see apfs_pool_start(); 1 turns the helpers off).
+ */
+struct apfs_pjob {
+	struct apfs_pjob *pj_next;
+	int             (*pj_fn)(void *arg, uint32_t item, uint32_t worker);
+	void             *pj_arg;
+	uint32_t          pj_items;
+	uint32_t          pj_workers;
+	volatile SInt32   pj_taken;     /* items handed out so far (may run past pj_items) */
+	volatile SInt32   pj_error;
+	uint32_t          pj_joined;    /* worker numbers given out; under apfs_pool_lock */
+	uint32_t          pj_active;    /* helpers inside the job now; under apfs_pool_lock */
+};
+
+static LCK_MTX_DECLARE(apfs_pool_lock, &apfs_lck_grp);
+static struct apfs_pjob *apfs_pool_jobs;        /* oldest first */
+static uint32_t apfs_pool_threads;
+static uint32_t apfs_par_max;                   /* threads on one request, the caller's included */
+
+static void
+apfs_pjob_work(struct apfs_pjob *pj, uint32_t worker)
+{
+	for (;;) {
+		SInt32 item = OSIncrementAtomic(&pj->pj_taken);
+		int error;
+
+		if (item < 0 || (uint32_t)item >= pj->pj_items) {
+			break;
+		}
+		error = pj->pj_fn(pj->pj_arg, (uint32_t)item, worker);
+		if (error != 0) {
+			OSCompareAndSwap(0, (UInt32)error, (volatile UInt32 *)&pj->pj_error);
+		}
+	}
+}
+
+static void
+apfs_pool_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	lck_mtx_lock(&apfs_pool_lock);
+	for (;;) {
+		struct apfs_pjob *pj;
+		uint32_t worker;
+
+		for (pj = apfs_pool_jobs; pj != NULL; pj = pj->pj_next) {
+			if (pj->pj_joined < pj->pj_workers &&
+			    (uint32_t)pj->pj_taken < pj->pj_items) {
+				break;
+			}
+		}
+		if (pj == NULL) {
+			(void)msleep(&apfs_pool_jobs, &apfs_pool_lock, PRIBIO, "apfs_pool", NULL);
+			continue;
+		}
+		worker = pj->pj_joined++;
+		pj->pj_active++;
+		lck_mtx_unlock(&apfs_pool_lock);
+		apfs_pjob_work(pj, worker);
+		lck_mtx_lock(&apfs_pool_lock);
+		if (--pj->pj_active == 0) {
+			wakeup(&pj->pj_active);
+		}
+	}
+}
+
+static int
+apfs_parallel(__unused void *ctx, uint32_t items, uint32_t workers,
+    int (*fn)(void *arg, uint32_t item, uint32_t worker), void *arg)
+{
+	struct apfs_pjob pj, **pp;
+	uint32_t i;
+
+	bzero(&pj, sizeof(pj));
+	pj.pj_fn = fn;
+	pj.pj_arg = arg;
+	pj.pj_items = items;
+	pj.pj_workers = workers;
+	pj.pj_joined = 1;               /* the caller is worker 0 */
+
+	lck_mtx_lock(&apfs_pool_lock);
+	for (pp = &apfs_pool_jobs; *pp != NULL; pp = &(*pp)->pj_next) {
+	}
+	*pp = &pj;
+	for (i = 1; i < workers; i++) {
+		wakeup_one((caddr_t)&apfs_pool_jobs);
+	}
+	lck_mtx_unlock(&apfs_pool_lock);
+
+	apfs_pjob_work(&pj, 0);
+
+	lck_mtx_lock(&apfs_pool_lock);
+	for (pp = &apfs_pool_jobs; *pp != &pj; pp = &(*pp)->pj_next) {
+	}
+	*pp = pj.pj_next;
+	while (pj.pj_active > 0) {
+		(void)msleep(&pj.pj_active, &apfs_pool_lock, PRIBIO, "apfs_pjob", NULL);
+	}
+	lck_mtx_unlock(&apfs_pool_lock);
+	return pj.pj_error;
+}
+
+/*
+ * The helpers, once, at the first mount.  Four threads on one request at most unless
+ * apfs_par says otherwise: on this phone one reader with 1 MB reads took 765 ms over the
+ * restore ramdisk with two, 612 with four or five, 714 with all eight -- the four small
+ * cores take two and a half times as long over a piece, and a request waits for its
+ * slowest one.
+ */
+static void
+apfs_pool_start(void)
+{
+	uint32_t want = ml_get_topology_info()->num_cpus, i;
+
+	if (want > 4) {
+		want = 4;
+	}
+	if (want < 1) {
+		want = 1;
+	}
+	PE_parse_boot_argn("apfs_par", &want, sizeof(want));
+	if (want < 1) {
+		want = 1;
+	}
+	lck_mtx_lock(&apfs_pool_lock);
+	if (apfs_par_max != 0) {
+		lck_mtx_unlock(&apfs_pool_lock);
+		return;
+	}
+	apfs_par_max = want;
+	lck_mtx_unlock(&apfs_pool_lock);
+	for (i = 0; i + 1 < want; i++) {
+		thread_t th;
+
+		if (kernel_thread_start(apfs_pool_thread, NULL, &th) != KERN_SUCCESS) {
+			break;
+		}
+		thread_deallocate(th);
+		OSIncrementAtomic((volatile SInt32 *)&apfs_pool_threads);
+	}
+	printf("apfs: %u threads on a request of many pieces (%u helpers)\n", want,
+	    apfs_pool_threads);
+}
+
 /* ------------------------------------------------------------------ mount */
 
 static void
 apfs_free_mount(struct apfs_mount *am)
 {
 	while (am->am_iobuf_kept > 0) {
-		kfree_data(am->am_iobuf[--am->am_iobuf_kept], APFS_IOBUF);
+		kfree_data(am->am_iobuf[--am->am_iobuf_kept], am->am_iobuf_size);
 	}
 	apfs_nx_close(&am->am_nx);
 	lck_mtx_destroy(&am->am_lock, &apfs_lck_grp);
@@ -467,6 +631,20 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	am->am_nx.unlock = apfs_lib_unlock;
 	am->am_nx.relock = apfs_lib_relock;
 	am->am_nx.lock_ctx = am;
+	am->am_iobuf_size = APFS_IOBUF_DEFAULT;
+	{
+		uint32_t round = 0;
+
+		if (PE_parse_boot_argn("apfs_round", &round, sizeof(round)) &&
+		    round >= 64 * 1024 && round <= APFS_IOBUF_MAX && (round % (64 * 1024)) == 0) {
+			am->am_iobuf_size = round;
+		}
+	}
+	apfs_pool_start();
+	if (apfs_pool_threads > 0) {
+		am->am_nx.parallel = apfs_parallel;
+		am->am_nx.parallel_max = apfs_pool_threads + 1;
+	}
 
 	/* the first volume that has a root directory */
 	{

@@ -18,11 +18,13 @@ done
 [ -n "$SRC" ] || { echo "build-tool.sh: apfs_lib.c is in neither the kernel tree nor xnu/files" >&2; exit 1; }
 
 mkdir -p "$(dirname "$OUT")"
+# TOOL_CFLAGS: more for the compiler, e.g. "-fsanitize=thread -g" with APFS_TOOL_THREADS
+TOOL_CFLAGS=${TOOL_CFLAGS:-}
 OBJ=$(mktemp -d)
 trap 'rm -rf "$OBJ"' EXIT
 # (libdeflate as released compares signed with unsigned in a few places; -Wextra says so)
-cc -std=c11 -O2 -Wall -Wextra -Wno-sign-compare -Wno-unused-parameter -I"$HERE/host-shim" -c -o "$OBJ/apfs_deflate.o" \
+cc -std=c11 -O2 -Wall -Wextra -Wno-sign-compare -Wno-unused-parameter $TOOL_CFLAGS -I"$HERE/host-shim" -c -o "$OBJ/apfs_deflate.o" \
 	"$SRC/apfs_deflate.c"
 cc -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wno-unused-parameter -I"$SRC" -I"$HERE" \
-	-o "$OUT" "$HERE/apfs-tool.c" "$SRC/apfs_lib.c" "$OBJ/apfs_deflate.o" -lz
+	$TOOL_CFLAGS -o "$OUT" "$HERE/apfs-tool.c" "$SRC/apfs_lib.c" "$OBJ/apfs_deflate.o" -lz -pthread
 echo "build-tool.sh: $OUT (from $SRC)"

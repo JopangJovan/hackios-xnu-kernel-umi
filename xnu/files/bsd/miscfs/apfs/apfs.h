@@ -28,8 +28,20 @@
 
 struct apfs_node;
 
-#define APFS_IOBUF      65536   /* what one round of vnop_read reads */
-#define APFS_IOBUF_KEEP 8
+/*
+ * What one round of vnop_read reads.  Alone on the volume, am_iobuf_size (boot-arg
+ * apfs_round): a read(2) of that much is one request to apfs_lib, whose whole compressed
+ * pieces are decompressed on several processors -- the bigger the round, the more there is
+ * to share out.  With other reads in flight, APFS_ROUND_SHARED: the processors are busy
+ * anyway, and a round that stays in the cache until uiomove copies it out is worth more.
+ * One reader with 1 MB reads over the restore ramdisk, rounds of 128 KB / 256 KB / 512 KB /
+ * 1 MB: 867 / 663 / 612 / 561 ms; four readers: 1429 / 1534 / 1747 / 2009 ms, and 1327
+ * with rounds of 64 or 128 KB and no helpers.
+ */
+#define APFS_IOBUF_DEFAULT (1024 * 1024)
+#define APFS_IOBUF_MAX     (2 * 1024 * 1024)
+#define APFS_ROUND_SHARED  (128 * 1024)
+#define APFS_IOBUF_KEEP    8
 
 struct apfs_mount {
 	mount_t            am_mp;
@@ -57,11 +69,12 @@ struct apfs_mount {
 	uint64_t           am_lock_held_ticks;
 	uint64_t           am_lock_t0;      /* when the holder took it; only the holder writes */
 	/*
-	 * vnop_read's 64 KB buffers, kept for the next read rather than allocated and freed
-	 * for every one (at that size the kernel goes to the VM).  Under am_lock.
+	 * vnop_read's buffers, kept for the next read rather than allocated and freed for
+	 * every one (at that size the kernel goes to the VM).  Under am_lock.
 	 */
 	void              *am_iobuf[APFS_IOBUF_KEEP];
 	uint32_t           am_iobuf_kept;
+	uint32_t           am_iobuf_size;
 };
 
 /* The private part of a vnode: which object it is. */
