@@ -13,7 +13,7 @@
  *        apfs-tool ls     IMAGE [PATH]
  *        apfs-tool stat   IMAGE PATH
  *        apfs-tool cat    IMAGE PATH
- *        apfs-tool census IMAGE [PATH]
+ *        apfs-tool census IMAGE [PATH] [--meta]   (--meta: do not read contents)
  */
 
 /* pread(2) and clock_gettime(2) come with -D_DEFAULT_SOURCE, set by build-tool.sh */
@@ -336,6 +336,7 @@ struct census {
 	uint8_t         *buf;
 	long             max;
 	long             seen;
+	bool             meta_only;
 	int              error;
 };
 
@@ -408,8 +409,8 @@ census_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_
 	if (apfs_inode_size(cs->vol, &ino, &size) != 0) {
 		size = ino.size;
 	}
-	if ((ino.mode & APFS_S_IFMT) == APFS_S_IFREG ||
-	    (ino.mode & APFS_S_IFMT) == APFS_S_IFLNK) {
+	if (!cs->meta_only && ((ino.mode & APFS_S_IFMT) == APFS_S_IFREG ||
+	    (ino.mode & APFS_S_IFMT) == APFS_S_IFLNK)) {
 		h = file_hash(cs, &ino, size);
 	}
 	printf("%s\t%u\t%06o\t%u\t%u\t%" PRIu64 "\t%016" PRIx64 "\n", cs->path, d_type,
@@ -436,7 +437,7 @@ census_dir(struct census *cs, uint64_t dir_id)
 }
 
 static int
-cmd_census(const char *path, const char *where)
+cmd_census(const char *path, const char *where, bool meta_only)
 {
 	struct apfs_nx nx;
 	struct apfs_vol vol;
@@ -458,6 +459,7 @@ cmd_census(const char *path, const char *where)
 	cs.path = malloc(cs.path_cap);
 	cs.buf = malloc(65536);
 	cs.max = 0;
+	cs.meta_only = meta_only;
 	if (cs.path == NULL || cs.buf == NULL) {
 		return 1;
 	}
@@ -479,6 +481,10 @@ cmd_census(const char *path, const char *where)
 	}
 	fprintf(stderr, "apfs-tool: %ld entries, %" PRIu64 " blocks read, %" PRIu64
 	    " cache hits\n", cs.seen, nx.reads, nx.hits);
+	fprintf(stderr, "apfs-tool: highest block touched %" PRIu64 " (%.2f GB in), of which "
+	    "file contents reach %" PRIu64 " (%.2f GB in)\n", nx.max_addr,
+	    nx.max_addr * (double)nx.block_size / 1e9, nx.max_data_addr,
+	    nx.max_data_addr * (double)nx.block_size / 1e9);
 	free(cs.path);
 	free(cs.buf);
 	apfs_nx_close(&nx);
@@ -494,7 +500,7 @@ main(int argc, char **argv)
 		    "       apfs-tool ls     IMAGE [PATH]\n"
 		    "       apfs-tool stat   IMAGE PATH\n"
 		    "       apfs-tool cat    IMAGE PATH\n"
-		    "       apfs-tool census IMAGE [PATH]\n");
+		    "       apfs-tool census IMAGE [PATH] [--meta]\n");
 		return 2;
 	}
 	if (strcmp(argv[1], "info") == 0) {
@@ -510,7 +516,8 @@ main(int argc, char **argv)
 		return cmd_cat(argv[2], argv[3]);
 	}
 	if (strcmp(argv[1], "census") == 0) {
-		return cmd_census(argv[2], argc > 3 ? argv[3] : NULL);
+		return cmd_census(argv[2], (argc > 3 && argv[3][0] == '/') ? argv[3] : NULL,
+		    (argc > 3 && strcmp(argv[argc - 1], "--meta") == 0));
 	}
 	fprintf(stderr, "apfs-tool: unknown command %s\n", argv[1]);
 	return 2;

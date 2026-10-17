@@ -147,6 +147,42 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 	return 0;
 }
 
+/*
+ * The same breakdown, straight to the log.  Needed where there is no user space to read
+ * the sysctl: when the volume is the root, nothing else is running.
+ */
+void
+apfs_stats_print(void)
+{
+	struct apfs_mount *am = apfs_the_mount;
+	struct apfs_nx *nx;
+
+	if (am == NULL) {
+		printf("apfs: nothing mounted\n");
+		return;
+	}
+	nx = &am->am_nx;
+	printf("apfs: pagein  %llu calls  %llu ms  %llu bytes\n",
+	    (unsigned long long)am->am_pagein_calls,
+	    (unsigned long long)apfs_ticks_ms(am->am_pagein_ticks),
+	    (unsigned long long)am->am_pagein_bytes);
+	printf("apfs: read    %llu calls  %llu ms  %llu bytes\n",
+	    (unsigned long long)am->am_read_calls,
+	    (unsigned long long)apfs_ticks_ms(am->am_read_ticks),
+	    (unsigned long long)am->am_read_bytes);
+	printf("apfs: device  %llu calls  %llu ms  %llu bytes\n",
+	    (unsigned long long)nx->dev_calls,
+	    (unsigned long long)apfs_ticks_ms(nx->dev_ticks),
+	    (unsigned long long)nx->dev_bytes);
+	printf("apfs: inflate %llu calls  %llu ms  %llu bytes in  %llu bytes out\n",
+	    (unsigned long long)nx->inflate_calls,
+	    (unsigned long long)apfs_ticks_ms(nx->inflate_ticks),
+	    (unsigned long long)nx->inflate_in, (unsigned long long)nx->inflate_out);
+	printf("apfs: blocks  %llu read  %llu cache hits  highest block %llu\n",
+	    (unsigned long long)nx->reads, (unsigned long long)nx->hits,
+	    (unsigned long long)nx->max_addr);
+}
+
 SYSCTL_PROC(_kern, OID_AUTO, apfs_stats, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_apfs_stats, "A", "APFS: where the time goes; write to zero it");
 

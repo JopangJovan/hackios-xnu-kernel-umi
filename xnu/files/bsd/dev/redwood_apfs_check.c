@@ -8,6 +8,13 @@
  *   apfs_check=3              mount it and stop, leaving it for user space to read
  *                             (userland/src/apfs_mmap_test.c, which is the only way the
  *                             driver's vnop_pagein ever runs)
+ *   apfs_check=4              mount nothing: walk the root filesystem, which is what the
+ *                             root already is when the volume was handed to the kernel as
+ *                             its root device.  This is how the phone is reached: it has
+ *                             no driver for its own storage and no virtio, so the only
+ *                             block device there is a RAM disk, and a RAM disk given to
+ *                             the kernel as the root is mounted by vfs_mountroot.
+ *   apfs_dev=md1              the device to mount for modes 1 to 3 (default rvblk0)
  *   apfs_subtree=/usr         walk only that part of the volume
  *
  * A line is the same one tools/apfs/apfs-tool's census and `verify.py clines` print:
@@ -50,6 +57,9 @@
 #include <pexpert/pexpert.h>
 #include <sys/redwood_apfs_check.h>
 
+extern void loader_return(void);        /* osfmk/arm64/loader_return.c */
+extern void apfs_stats_print(void);     /* bsd/miscfs/apfs/apfs_vfsops.c */
+
 #define CHECK_MNT    "/private/var/apfs-check"
 #define CHECK_PARENT "/private/var"
 #define CHECK_LEAF   "apfs-check"
@@ -86,6 +96,20 @@ struct census {
 	uint32_t  errors;
 	bool      print_lines;
 	int       depth;
+	/*
+	 * The volume being walked.  Walking the root means walking over the mount points of
+	 * other filesystems -- devfs on /dev above all -- and their contents are not this
+	 * volume's, so anything that turns out to live on another mount is passed over.
+	 */
+	mount_t   mp;
+	/*
+	 * NOCROSSMOUNT when the volume being walked is the root: a lookup then gives the
+	 * directory this volume has under a mount point rather than the root of whatever is
+	 * mounted on it, so /dev is counted as the (empty) directory it is here instead of
+	 * being either skipped or walked as devfs.  Not set when the volume is reached
+	 * through a path that itself crosses into it.
+	 */
+	int       lookup_flags;
 };
 
 /* The format bits of a mode, which vnode_getattr does not report in va_mode. */
@@ -155,7 +179,7 @@ hash_link(struct census *cs, vnode_t vp, uint64_t *out)
 	return 0;
 }
 
-static void
+static bool
 census_entry(struct census *cs, uint8_t d_type)
 {
 	struct vnode_attr va;
@@ -173,11 +197,15 @@ census_entry(struct census *cs, uint8_t d_type)
 	 * would look like a lookup failure.  Crossing mount points has to stay allowed: the
 	 * path leads from the ramfs that holds the mount point into the volume itself.
 	 */
-	error = vnode_lookup(cs->path, VNODE_LOOKUP_NOFOLLOW, &vp, cs->ctx);
+	error = vnode_lookup(cs->path, cs->lookup_flags, &vp, cs->ctx);
 	if (error) {
 		printf("apfs-check: %s: lookup failed: %d\n", cs->path + cs->rel, error);
 		cs->errors++;
-		return;
+		return false;
+	}
+	if (cs->mp != NULL && vnode_mount(vp) != cs->mp) {
+		vnode_put(vp);          /* another filesystem is mounted here */
+		return false;
 	}
 	VATTR_INIT(&va);
 	VATTR_WANTED(&va, va_mode);
@@ -226,6 +254,7 @@ census_entry(struct census *cs, uint8_t d_type)
 	}
 out:
 	vnode_put(vp);
+	return error == 0;
 }
 
 static void census_dir(struct census *cs);
@@ -246,8 +275,7 @@ census_child(struct census *cs, const char *name, size_t name_len, uint8_t d_typ
 	cs->len += name_len;
 	cs->path[cs->len] = '\0';
 
-	census_entry(cs, d_type);
-	if (d_type == DT_DIR && cs->depth < MAX_DEPTH) {
+	if (census_entry(cs, d_type) && d_type == DT_DIR && cs->depth < MAX_DEPTH) {
 		cs->depth++;
 		census_dir(cs);
 		cs->depth--;
@@ -265,9 +293,14 @@ census_dir(struct census *cs)
 	off_t offset = 0;
 	int error;
 
-	error = vnode_lookup(cs->path, VNODE_LOOKUP_NOFOLLOW, &dvp, cs->ctx);
+	error = vnode_lookup(cs->len != 0 ? cs->path : "/", cs->lookup_flags, &dvp,
+	    cs->ctx);
+	if (error == 0 && cs->mp == NULL) {
+		cs->mp = vnode_mount(dvp);
+	}
 	if (error) {
-		printf("apfs-check: %s: lookup failed: %d\n", cs->path + cs->rel, error);
+		printf("apfs-check: %s: lookup failed: %d\n",
+		    cs->len != 0 ? cs->path + cs->rel : "/", error);
 		cs->errors++;
 		return;
 	}
@@ -373,14 +406,39 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 	uint32_t mode = (uint32_t)(uintptr_t)arg;
 	vfs_context_t ctx = vfs_context_kernel();
 	struct census cs;
-	char devname[] = CHECK_DEV;
+	char devname[64] = CHECK_DEV;
 	char subtree[256] = "";
 	uint64_t start, end;
 	int error, tries;
 
 	bzero(&cs, sizeof(cs));
 	cs.ctx = ctx;
-	cs.print_lines = (mode >= 2);
+	cs.print_lines = (mode == 2);
+	cs.lookup_flags = VNODE_LOOKUP_NOFOLLOW |
+	    ((mode >= 4) ? VNODE_LOOKUP_NOCROSSMOUNT : 0);
+	if (PE_parse_boot_arg_str("apfs_dev", subtree, sizeof(subtree)) && subtree[0] != '\0') {
+		snprintf(devname, sizeof(devname), "/dev/%s", subtree);
+	}
+	subtree[0] = '\0';
+
+	cs.path = kalloc_data(PATH_CAP, Z_WAITOK | Z_ZERO);
+	cs.buf = kalloc_data(READ_CHUNK, Z_WAITOK);
+	if (cs.path == NULL || cs.buf == NULL) {
+		printf("apfs-check: out of memory\n");
+		return;
+	}
+
+	if (mode >= 4) {
+		/*
+		 * The volume is already the root: nothing to mount, and no mount point to
+		 * make, so none of what follows about /private/var applies.
+		 */
+		cs.rel = 0;
+		cs.len = 0;
+		cs.path[0] = '\0';
+		printf("apfs-check: walking the root filesystem\n");
+		goto walk;
+	}
 
 	/*
 	 * /private/var is a ramfs that userland's init mounts, so the mount point cannot be
@@ -407,23 +465,17 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 	error = kernel_mount("apfs", NULLVP, NULLVP, CHECK_MNT, devname, 0,
 	    MNT_RDONLY | MNT_DONTBROWSE, KERNEL_MOUNT_NOAUTH, ctx);
 	if (error) {
-		printf("apfs-check: mounting %s on %s failed: %d\n", CHECK_DEV, CHECK_MNT,
+		printf("apfs-check: mounting %s on %s failed: %d\n", devname, CHECK_MNT,
 		    error);
 		return;
 	}
-	printf("apfs-check: %s mounted on %s\n", CHECK_DEV, CHECK_MNT);
+	printf("apfs-check: %s mounted on %s\n", devname, CHECK_MNT);
 	if (mode >= 3) {
 		/* someone in user space is going to read it; leave it alone */
 		printf("apfs-check: left mounted, not walking it here\n");
 		return;
 	}
 
-	cs.path = kalloc_data(PATH_CAP, Z_WAITOK | Z_ZERO);
-	cs.buf = kalloc_data(READ_CHUNK, Z_WAITOK);
-	if (cs.path == NULL || cs.buf == NULL) {
-		printf("apfs-check: out of memory\n");
-		return;
-	}
 	cs.rel = sizeof(CHECK_MNT) - 1;
 	strlcpy(cs.path, CHECK_MNT, PATH_CAP);
 	cs.len = cs.rel;
@@ -439,6 +491,7 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 		printf("apfs-check: walking the whole volume\n");
 	}
 
+walk:
 	start = mach_absolute_time();
 	census_dir(&cs);
 	end = mach_absolute_time();
@@ -454,6 +507,7 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 	printf("apfs-check: content bytes %llu\n", cs.bytes);
 	printf("apfs-check: line-hash sum %016llx\n", (unsigned long long)cs.sum);
 	printf("apfs-check: errors %u\n", cs.errors);
+	apfs_stats_print();
 	printf("apfs-check: compare with tools/apfs/verify.py sum\n");
 
 	kfree_data(cs.path, PATH_CAP);
@@ -467,6 +521,19 @@ redwood_apfs_check_init(void)
 	thread_t th;
 
 	if (!PE_parse_boot_argn("apfs_check", &mode, sizeof(mode)) || mode == 0) {
+		return;
+	}
+	if (mode >= 4) {
+		/*
+		 * The volume is the root, so everything the walk needs is already up -- and
+		 * bsd_init is about to exec /sbin/launchd off it, which on anything but our
+		 * own packfs image ends in a panic before a thread of our own would finish.
+		 * So walk it here, on this thread, and go back to the loader with the answer
+		 * rather than letting that happen.
+		 */
+		apfs_check_thread((void *)(uintptr_t)mode, 0);
+		printf("apfs-check: going back to the loader\n");
+		loader_return();
 		return;
 	}
 	if (kernel_thread_start(apfs_check_thread, (void *)(uintptr_t)mode, &th) !=

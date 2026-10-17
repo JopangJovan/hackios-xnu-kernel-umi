@@ -83,6 +83,9 @@ int apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
     struct componentname *cnp, vnode_t *vpp);
 void apfs_node_detach(struct apfs_node *an);
 
+/* the breakdown of where the time went, straight to the log (apfs_vfsops.c) */
+void apfs_stats_print(void);
+
 void apfs_lock(struct apfs_mount *am);
 void apfs_unlock(struct apfs_mount *am);
 

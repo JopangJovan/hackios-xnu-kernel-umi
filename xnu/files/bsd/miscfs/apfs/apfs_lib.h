@@ -129,6 +129,13 @@ struct apfs_nx {
 	 * Ticks, not nanoseconds -- see apfs_ticks().
 	 */
 	uint64_t          dev_calls, dev_ticks, dev_bytes;
+	/*
+	 * The highest block either kind of read has reached.  What it is for: the phone has
+	 * no driver for its own storage, so a volume there has to live in a RAM disk, and
+	 * that says how much of the front of the image would be enough.
+	 */
+	uint64_t          max_addr;             /* any block */
+	uint64_t          max_data_addr;        /* blocks of file contents only */
 	uint64_t          inflate_calls, inflate_ticks, inflate_in, inflate_out;
 };
 

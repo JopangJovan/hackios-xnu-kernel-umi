@@ -118,6 +118,9 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 	if (addr == 0 || addr >= nx->block_count) {
 		return EIO;
 	}
+	if (addr > nx->max_addr) {
+		nx->max_addr = addr;
+	}
 	for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
 		if (nx->cache[i].addr == addr && nx->cache[i].data != NULL) {
 			nx->cache[i].age = ++nx->clock;
@@ -1465,6 +1468,9 @@ apfs_read_stream(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_size,
 		if (phys >= vol->nx->block_count ||
 		    length / bs > vol->nx->block_count - phys) {
 			return EIO;
+		}
+		if (phys + length / bs - 1 > vol->nx->max_data_addr) {
+			vol->nx->max_data_addr = phys + length / bs - 1;
 		}
 		/* the overlap of [logical, logical+length) with [off, end) */
 		{
