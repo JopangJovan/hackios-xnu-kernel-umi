@@ -22,10 +22,9 @@
  * Everything asked of the device and the stream that is not answered here is said in mediaserverd's
  * log ("redwood: camera: ..."), once per property.
  *
- * NOT FINISHED: no frames reach applications yet. AVFoundation lists the back camera with the
- * plist's formats, and Camera.app opens, but its session takes the stream and gives it back at once
- * (the capture graph is not built: captureSession_buildGraphWithConfiguration takes the device
- * back), over and over; the stream is never started.
+ * The graph builds, the session runs, and the pictures of the PrimaryScaler output reach Camera.app's
+ * preview. NOT FINISHED: a photograph is not taken yet ("StillImageCaptureNow" is not answered), and
+ * the session is rebuilt every few seconds, so the preview comes in bursts rather than steadily.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
@@ -188,29 +187,6 @@ put(CFMutableDictionaryRef d, const char *key, CFTypeRef value)
 	CFRelease(value);
 }
 
-static void
-put_k(CFMutableDictionaryRef d, CFStringRef key, CFTypeRef value)
-{
-	CFDictionarySetValue(d, key, value);
-	CFRelease(value);
-}
-
-static int64_t
-get_i(CFDictionaryRef d, const char *key, int64_t otherwise)
-{
-	CFStringRef k = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
-	CFTypeRef v = d ? CFDictionaryGetValue(d, k) : NULL;
-	int64_t out = otherwise;
-
-	CFRelease(k);
-	if (v != NULL && CFGetTypeID(v) == CFNumberGetTypeID()) {
-		CFNumberGetValue(v, kCFNumberSInt64Type, &out);
-	} else if (v != NULL && CFGetTypeID(v) == CFBooleanGetTypeID()) {
-		out = CFBooleanGetValue(v);
-	}
-	return out;
-}
-
 static CFDictionaryRef
 new_dict(void)
 {
@@ -357,10 +333,8 @@ struct output {
 	CFDictionaryRef config;                 /* from VideoOutputConfigurations */
 	bool            enabled;
 	void *          handler;                /* a block: ^(CVPixelBufferRef, CMTime) */
-	CVPixelBufferPoolRef pool;
-	int             pool_width, pool_height;
-	uint32_t        pool_format;
-	uint64_t        delivered;
+	bool            said_shape;
+	uint64_t        delivered, refused;
 };
 
 #define OUTPUTS 3
@@ -369,12 +343,14 @@ static const char *const output_names[OUTPUTS] = { "PrimaryScaler", "SecondarySc
 struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
+	CFDictionaryRef colour_info;    /* from VideoOutputsColorInfo */
 	int             format_index;
 	double          min_fps, max_fps;
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
 	pthread_t       worker;
 	volatile bool   running;
+	volatile bool   graph_running;  /* the capture graph has started this stream: frames may be given out */
 	bool            worker_started;
 	int             torch;
 	uint64_t        frames;
@@ -449,6 +425,19 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		}
 		pthread_mutex_unlock(&s->lock);
 		value = d;
+	} else if (key_is(key, "VideoOutputsColorInfo")) {
+		/*
+		 * ReadWrite, and the capture graph READS it before it starts the session:
+		 * -[BWMultiStreamCameraSourceNode _verifyColorSpacePropertiesForAllOutputs] does a
+		 * getProperty:error: for it, and an error there fails the session's transition to running
+		 * and tears the whole graph down again. What it holds matters only for an output whose
+		 * colour space is not sRGB (_verifyColorSpacePropertiesForOutputID: returns at once when
+		 * the output's colour space is 0), and sRGB is the only one this stream offers, so what
+		 * the graph set is given back as it is.
+		 */
+		pthread_mutex_lock(&s->lock);
+		value = s->colour_info != NULL ? CFRetain(s->colour_info) : new_dict();
+		pthread_mutex_unlock(&s->lock);
 	} else if (key_is(key, "SupportedPropertiesDictionary")) {
 		value = CFRetain(s->supported);
 	} else if (key_is(key, "FocalLength")) {
@@ -566,6 +555,15 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		pthread_mutex_unlock(&s->lock);
 		return 0;
 	}
+	if (key_is(key, "VideoOutputsColorInfo")) {
+		pthread_mutex_lock(&s->lock);
+		if (s->colour_info != NULL) {
+			CFRelease(s->colour_info);
+		}
+		s->colour_info = value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID() ? CFRetain(value) : NULL;
+		pthread_mutex_unlock(&s->lock);
+		return 0;
+	}
 	if (key_is(key, "TorchLevel")) {
 		torch_set(s, value);
 		return 0;
@@ -625,32 +623,39 @@ render_piece(void *context, size_t i)
 }
 
 static CVPixelBufferRef
-output_buffer(struct output *out, int width, int height, uint32_t pf)
+output_buffer(struct output *out)
 {
+	CVPixelBufferPoolRef pool = NULL;
 	CVPixelBufferRef pb = NULL;
+	CFTypeRef value = out->config != NULL ? CFDictionaryGetValue(out->config, CFSTR("BufferPool")) : NULL;
 
-	if (out->pool == NULL || out->pool_width != width || out->pool_height != height || out->pool_format != pf) {
-		CFMutableDictionaryRef a = (CFMutableDictionaryRef)new_dict();
-
-		if (out->pool != NULL) {
-			CVPixelBufferPoolRelease(out->pool);
-			out->pool = NULL;
-		}
-		put_k(a, kCVPixelBufferWidthKey, number_i(width));
-		put_k(a, kCVPixelBufferHeightKey, number_i(height));
-		put_k(a, kCVPixelBufferPixelFormatTypeKey, number_i(pf));
-		put_k(a, kCVPixelBufferIOSurfacePropertiesKey, new_dict());
-		if (CVPixelBufferPoolCreate(NULL, NULL, a, &out->pool) != kCVReturnSuccess) {
-			out->pool = NULL;
-		}
-		CFRelease(a);
-		out->pool_width = width;
-		out->pool_height = height;
-		out->pool_format = pf;
-		say("%s: %dx%d %c%c%c%c buffers%s", out->name, width, height, pf >> 24, pf >> 16 & 255, pf >> 8 & 255, pf & 255,
-		    out->pool ? "" : " CANNOT BE MADE");
+	/*
+	 * The graph makes the pool itself and hands it over in the output's configuration
+	 * (kFigCaptureStreamVideoOutputConfigurationKey_BufferPool), sized and laid out as the node
+	 * behind the output wants it (an IOSurface each, extra rows at the bottom where a scaler wants
+	 * them, as few buffers as the node holds at once) -- there is nothing for this side to choose,
+	 * and a buffer of our own making is not one the graph would take. The configuration carries no
+	 * width or height: the pool's buffers have them.
+	 */
+	if (value != NULL && CFGetTypeID(value) == CVPixelBufferPoolGetTypeID()) {
+		pool = (CVPixelBufferPoolRef)value;
 	}
-	if (out->pool == NULL || CVPixelBufferPoolCreatePixelBuffer(NULL, out->pool, &pb) != kCVReturnSuccess) {
+	if (pool == NULL) {
+		if (!out->said_shape) {
+			out->said_shape = true;
+			say("%s: no pool of the graph's in the configuration: no pictures", out->name);
+		}
+		return NULL;
+	}
+	if (CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb) != kCVReturnSuccess) {
+		/*
+		 * The preview pool holds one buffer (MinimumBufferCount 1): while the graph still has it,
+		 * there is none to be had, and this frame is not given out. Said at most every 300th frame.
+		 */
+		if (out->refused++ % 300 == 0) {
+			say("%s: the graph's pool has no buffer to spare (%llu frames so)", out->name,
+			    (unsigned long long)out->refused);
+		}
 		return NULL;
 	}
 	return pb;
@@ -661,21 +666,28 @@ typedef void (^pixel_buffer_handler)(CVPixelBufferRef, CMTime);
 static void
 deliver(struct stream *s, struct output *out, const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw)
 {
-	int width = (int)get_i(out->config, "Width", 0), height = (int)get_i(out->config, "Height", 0);
-	uint32_t pf = (uint32_t)get_i(out->config, "PixelFormat", PF_420F);
-	CVPixelBufferRef pb;
+	CVPixelBufferRef pb = output_buffer(out);
+	uint32_t pf, width, height;
 
 	(void)s;
-	if (width <= 0 || height <= 0 || width > 8192 || height > 8192) {
+	if (pb == NULL) {
 		return;
 	}
-	pf = pf == PF_420V || pf == PF_BGRA ? pf : PF_420F;
-	if ((pb = output_buffer(out, width, height, pf)) == NULL) {
+	pf = CVPixelBufferGetPixelFormatType(pb);
+	width = (uint32_t)CVPixelBufferGetWidth(pb);
+	height = (uint32_t)CVPixelBufferGetHeight(pb);
+	if (width == 0 || height == 0 || (pf != PF_420F && pf != PF_420V && pf != PF_BGRA)) {
+		if (out->delivered == 0 && out->said_shape == false) {
+			out->said_shape = true;
+			say("%s: %ux%u %c%c%c%c buffers are not for this ISP", out->name, width, height, pf >> 24, pf >> 16 & 255,
+			    pf >> 8 & 255, pf & 255);
+		}
+		CVPixelBufferRelease(pb);
 		return;
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, (uint32_t)width, (uint32_t)height, 8 };
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8 };
 
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
 	CVPixelBufferUnlockBaseAddress(pb, 0);
@@ -689,7 +701,8 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	((pixel_buffer_handler)out->handler)(pb, pts);
 	CVPixelBufferRelease(pb);
 	if (out->delivered++ == 0) {
-		say("%s: the first picture given (%dx%d)", out->name, width, height);
+		say("%s: the first picture given (%ux%u %c%c%c%c)", out->name, width, height, pf >> 24, pf >> 16 & 255,
+		    pf >> 8 & 255, pf & 255);
 	}
 }
 
@@ -750,11 +763,25 @@ worker(void *context)
 			(void)write(device, &c, sizeof(c));
 		}
 		s->frames++;
+		/*
+		 * Only once the graph has started the stream. Its PixelBufferHandler blocks hand the buffer
+		 * to multiStreamCameraSourceNode_sendBufferToBufferServicingThread, which reaches into the
+		 * source node's innards: called before the graph is started (or after it has been torn down)
+		 * it walks a pointer that is not there yet and mediaserverd dies of SIGSEGV. The frames
+		 * before that are read and thrown away, which is also what settles the exposure.
+		 */
 		pthread_mutex_lock(&s->lock);
-		for (int i = 0; i < OUTPUTS; i++) {
+		for (int i = 0; s->graph_running && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 
-			if (out->handler != NULL && out->config != NULL && (out->enabled || i == 0)) {
+			/*
+			 * The scalers' outputs are the moving picture and are given every frame; the still image
+			 * output is a photograph, which the graph asks for one at a time ("StillImageCaptureNow")
+			 * and which is the whole sensor, 4032x3024 -- not something to make thirty times a second.
+			 * (NOT FINISHED: nothing answers StillImageCaptureNow yet, so no photograph is taken.)
+			 */
+			if (out->handler != NULL && out->config != NULL && (out->enabled || i == 0) &&
+			    strcmp(out->name, "StillImage") != 0) {
 				deliver(s, out, &isp, f, raw);
 			}
 		}
@@ -770,17 +797,29 @@ worker(void *context)
 	return NULL;
 }
 
+/*
+ * Reading frames from the kernel and giving them to the graph are two things: the first begins when
+ * the capture graph reserves the stream (`graph` false, from the device's RequestStreams: the sensor
+ * takes a moment to settle and the exposure longer), the second only when the graph starts the
+ * stream itself (`graph` true, the FigCaptureStream start method).
+ */
 static OSStatus
-stream_start(CMBaseObjectRef o)
+stream_begin(CMBaseObjectRef o, bool graph)
 {
 	struct stream *s = stream_of(o);
 
+	if (graph) {
+		pthread_mutex_lock(&s->lock);
+		s->graph_running = true;
+		pthread_mutex_unlock(&s->lock);
+		say("stream: the graph starts the stream (format %d)", s->format_index);
+	}
 	if (s->running) {
 		return 0;
 	}
 	s->running = true;
 	s->frames = 0;
-	say("stream: start (format %d)", s->format_index);
+	say("stream: frames begin (format %d)", s->format_index);
 	if (pthread_create(&s->worker, NULL, worker, o) != 0) {
 		s->running = false;
 		return ERR_UNSUPPORTED;
@@ -790,11 +829,20 @@ stream_start(CMBaseObjectRef o)
 }
 
 static OSStatus
+stream_start(CMBaseObjectRef o)
+{
+	return stream_begin(o, true);
+}
+
+static OSStatus
 stream_stop(CMBaseObjectRef o)
 {
 	struct stream *s = stream_of(o);
 
 	say("stream: stop");
+	pthread_mutex_lock(&s->lock);
+	s->graph_running = false;
+	pthread_mutex_unlock(&s->lock);
 	s->running = false;
 	if (s->worker_started) {
 		pthread_join(s->worker, NULL);
@@ -837,15 +885,15 @@ stream_finalize(CMBaseObjectRef o)
 		if (s->out[i].handler) {
 			CFRelease(s->out[i].handler);
 		}
-		if (s->out[i].pool) {
-			CVPixelBufferPoolRelease(s->out[i].pool);
-		}
 	}
 	if (s->formats) {
 		CFRelease(s->formats);
 	}
 	if (s->supported) {
 		CFRelease(s->supported);
+	}
+	if (s->colour_info) {
+		CFRelease(s->colour_info);
 	}
 	if (s->torch >= 0) {
 		close(s->torch);
@@ -960,7 +1008,7 @@ device_request_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef op
 			CMBaseObjectRef st = (CMBaseObjectRef)CFArrayGetValueAtIndex(streams, i);
 
 			if (st != NULL) {
-				(void)stream_start(st);
+				(void)stream_begin(st, false);
 			}
 		}
 	}

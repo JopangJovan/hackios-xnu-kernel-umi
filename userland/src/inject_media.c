@@ -24,9 +24,12 @@
  *
  * The camera (only where the kernel has one: cam=5, /dev/redwood-camera): the vendor is made for
  * everybody, with the create function of our capture device (camera_device.c) in place of the
- * one H10ISP.mediacapture would give for the iPhone's ISP. NOT FINISHED: no frames reach
- * applications yet (see camera_device.c). Its stream takes the torch level too, so FigFlashlight
- * would need nothing of its own then (not tried yet).
+ * one H10ISP.mediacapture would give for the iPhone's ISP; the capture graph is built around it and
+ * its frames reach Camera.app's preview (see camera_device.c). Its stream takes the torch level too,
+ * so FigFlashlight would need nothing of its own then (not tried yet).
+ *
+ * What the capture stack asks of hardware this phone has none of is refused here: there is no ISP
+ * processing session, so there can be no video stabilization (see video_stabilization_method below).
  *
  * CMCapture is not loaded yet when this library is: the methods are replaced when its image
  * arrives.
@@ -204,6 +207,41 @@ flashlight_stream_set(__unused id self, __unused SEL selector, id key, id value)
 	return 0;
 }
 
+/*
+ * Video stabilization, of which this hardware has none: the capture graph's VIS node
+ * (-[FigCaptureVISPipeline _newVISNodeWithUpstreamOutput:...]) is made with the ISP's processing
+ * session, and this device has no such session, so the node comes back nil, the VIS pipeline with
+ * it, the movie file sink's tail pipeline with that, and captureSession_buildGraphWithConfiguration
+ * tears the whole graph down -- the preview too, for all that the preview has nothing to do with
+ * stabilizing a recording. The connection's stabilization method is where the whole stack reads the
+ * wish from (+[FigVideoCaptureConnectionConfiguration videoStabilizationMethods:includeIris:] ->
+ * cspc_getVideoStabilizationType -> the connections' FigCaptureVideoStabilizationType), and 0 there
+ * means none: the graph is then built without a VIS pipeline anywhere
+ * (+[FigCaptureVISPipeline visPipelineIsRequiredForFigCaptureVideoStabilizationType:] says no to
+ * every type but 2 and 3), and recordings are as steady as the hand that holds the phone.
+ */
+static int
+video_stabilization_method(id self, SEL selector)
+{
+	(void)self;
+	(void)selector;
+	return 0;
+}
+
+/*
+ * The type the stack acts on. The connection configuration arrives from the application's
+ * AVFoundation with the type in it, which is read straight out of the object and not computed from
+ * the method above (-[FigCaptureSessionParsedConfiguration _computeVideoStabilizationTypes] only
+ * fills in what the client left out), so the wish has to be refused here as well.
+ */
+static int
+video_stabilization_type(id self, SEL selector)
+{
+	(void)self;
+	(void)selector;
+	return 0;                       /* kFigCaptureVideoStabilizationType_None */
+}
+
 struct method_spec {
 	const char *selector, *types;
 	IMP imp;
@@ -251,12 +289,17 @@ static struct replacement {
 	const char *class_name, *selector;
 	uintptr_t expected;
 	IMP replacement, *original;
+	bool instance;                  /* an instance method, not a class method */
 	bool done;
 } replacements[] = {
 	{ "BWCoreImageFilterRenderer", "prewarmPortraitFilterVersion:semanticStyleFilters:", 0x1a2115c0cUL,
-	  (IMP)prewarm_portrait_filter, NULL, false },
+	  (IMP)prewarm_portrait_filter, NULL, false, false },
 	{ "BWFigCaptureDeviceVendor", "sharedCaptureDeviceVendor", 0x1a1ef0d04UL,
-	  (IMP)shared_vendor, &original_shared_vendor, false },
+	  (IMP)shared_vendor, &original_shared_vendor, false, false },
+	{ "FigVideoCaptureConnectionConfiguration", "videoStabilizationMethod", 0x1a1e99ef8UL,
+	  (IMP)video_stabilization_method, NULL, true, false },
+	{ "FigVideoCaptureConnectionConfiguration", "videoStabilizationType", 0x1a20d8f48UL,
+	  (IMP)video_stabilization_type, NULL, true, false },
 };
 
 static void
@@ -272,10 +315,12 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 			continue;
 		}
 		r->done = true;
-		method = class_getClassMethod(cls, sel_registerName(r->selector));
+		method = r->instance ? class_getInstanceMethod(cls, sel_registerName(r->selector)) :
+		    class_getClassMethod(cls, sel_registerName(r->selector));
 		original = method ? method_getImplementation(method) : NULL;
 		if (original == NULL || (uintptr_t)original != r->expected + slide) {
-			say("redwood: +[%s %s]: found %#lx, expected %#lx; left alone\n", r->class_name, r->selector,
+			say("redwood: %c[%s %s]: found %#lx, expected %#lx; left alone\n", r->instance ? '-' : '+', r->class_name,
+			    r->selector,
 			    original ? (uintptr_t)original - slide : 0, r->expected);
 			continue;
 		}
@@ -283,7 +328,7 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 			*r->original = original;
 		}
 		method_setImplementation(method, r->replacement);
-		say("redwood: mediaserverd: +[%s %s] replaced\n", r->class_name, r->selector);
+		say("redwood: mediaserverd: %c[%s %s] replaced\n", r->instance ? '-' : '+', r->class_name, r->selector);
 	}
 }
 
