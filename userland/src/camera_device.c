@@ -23,9 +23,17 @@
  * log ("redwood: camera: ..."), once per property.
  *
  * The graph builds, the session runs, and the pictures of the PrimaryScaler output are Camera.app's
- * preview, steadily. NOT FINISHED: a photograph is not taken yet -- "StillImageCaptureNow" is not
- * answered and the StillImage output is passed over, it being the whole sensor (4032x3024), which is
- * not something to make thirty times a second.
+ * preview, steadily.
+ *
+ * NOT FINISHED: no photograph is taken. The shutter reaches mediaserverd (-[BWStillImageCoordinatorNode
+ * initiateStillImageCaptureNowWithSettings:] and then -[BWFigVideoCaptureDevice
+ * _captureStillImageNowWithSettings:]), and there it quietly comes to nothing: the device's
+ * _convertStillImageCaptureSettings:toStillImageCaptureNowOptions:captureStreamPropertyValues: gives
+ * back no stream settings for this port, so _captureStillImageNowOnStreamWithOptions: writes nothing
+ * on the stream, reports success, and no "StillImageCaptureNow" ever arrives here. What this side
+ * would do with it is written below and waits for that: one frame of the sensor, the whole of it, to
+ * the StillImage output. (Those methods of CMCapture are objc_direct: they cannot be replaced to be
+ * looked into, which is as far as this went.)
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
@@ -233,6 +241,7 @@ static const struct prop stream_props[] = {
 	{ "MultipleOutputSupportEnabled", "Boolean", "ReadWrite" }, { "VideoOutputsColorInfo", "Collection", "ReadWrite" },
 	{ "RegionOfInterestForCameraControls", "Collection", "ReadWrite" }, { "AEMeteringMode", "Number", "ReadWrite" },
 	{ "MaxFrameCoalescingDuration", "Number", "ReadWrite" }, { "LimitAERange", "Boolean", "ReadWrite" },
+	{ "TimeMachineSuspendNow", "Boolean", "WriteOnly" }, { "TimeMachineResumeNow", "Boolean", "WriteOnly" },
 }, device_props[] = {
 	{ "StreamArray", "Collection", "ReadOnly" }, { "Clock", "Clock", "ReadOnly" }, { "ClientIsActive", "Boolean", "ReadWrite" },
 	{ "SupportedSynchronizedStreamsGroups", "Collection", "ReadOnly" }, { "MemoryPoolID", "Number", "ReadWrite" },
@@ -345,6 +354,7 @@ struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
 	CFDictionaryRef colour_info;    /* from VideoOutputsColorInfo */
+	unsigned        stills_wanted;  /* photographs asked for by StillImageCaptureNow, not yet given */
 	int             format_index;
 	double          min_fps, max_fps;
 	struct output   out[OUTPUTS];
@@ -354,7 +364,7 @@ struct stream {
 	volatile bool   graph_running;  /* the capture graph has started this stream: frames may be given out */
 	bool            worker_started;
 	int             torch;
-	uint64_t        frames;
+	uint64_t        frames, stills_given;
 };
 
 static struct stream *
@@ -554,6 +564,19 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		free(keys);
 		free(values);
 		pthread_mutex_unlock(&s->lock);
+		return 0;
+	}
+	if (key_is(key, "StillImageCaptureNow")) {
+		/*
+		 * The shutter: the capture graph's still image coordinator asks for a photograph by writing
+		 * this, with what it wants of it (how many pictures, the flash, the settings' number by which
+		 * it will know the frames again). One frame of the sensor goes to the StillImage output for
+		 * each ask.
+		 */
+		pthread_mutex_lock(&s->lock);
+		s->stills_wanted++;
+		pthread_mutex_unlock(&s->lock);
+		say_once("stream: a photograph asked for", key, value);
 		return 0;
 	}
 	if (key_is(key, "VideoOutputsColorInfo")) {
@@ -776,14 +799,22 @@ worker(void *context)
 			struct output *out = &s->out[i];
 
 			/*
-			 * The scalers' outputs are the moving picture and are given every frame; the still image
-			 * output is a photograph, which the graph asks for one at a time ("StillImageCaptureNow")
-			 * and which is the whole sensor, 4032x3024 -- not something to make thirty times a second.
-			 * (NOT FINISHED: nothing answers StillImageCaptureNow yet, so no photograph is taken.)
+			 * The scalers' outputs are the moving picture and are given every frame. The still image
+			 * output is the whole sensor (4032x3024) and is the photograph: a frame goes to it only
+			 * when the graph has asked for one, which is not something to make thirty times a second.
 			 */
-			if (out->handler != NULL && out->config != NULL && (out->enabled || i == 0) &&
-			    strcmp(out->name, "StillImage") != 0) {
-				deliver(s, out, &isp, f, raw);
+			bool still = strcmp(out->name, "StillImage") == 0;
+
+			if (out->handler == NULL || out->config == NULL || !(out->enabled || i == 0)) {
+				continue;
+			}
+			if (still && s->stills_wanted == 0) {
+				continue;
+			}
+			deliver(s, out, &isp, f, raw);
+			if (still) {
+				s->stills_wanted--;
+				say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
 			}
 		}
 		pthread_mutex_unlock(&s->lock);
