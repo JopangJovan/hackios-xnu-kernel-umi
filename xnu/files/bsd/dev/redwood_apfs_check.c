@@ -149,6 +149,15 @@ struct census {
 	uint64_t  max_entries;          /* 0: no limit */
 	bool      stop;
 	uint64_t  t0;                   /* when the walk started, for the progress line */
+	/*
+	 * FNV-1a goes a byte at a time, each step waiting on the one before: about three
+	 * cycles a byte, more than a second over the restore ramdisk -- the checker's own
+	 * time, not the filesystem's.  Boot-arg apfs_hash=0 reads every byte all the same and
+	 * does not hash it (the sums are then not the ones to compare); hash_ticks is how
+	 * long the hashing took otherwise.
+	 */
+	bool      no_hash;
+	uint64_t  hash_ticks;
 };
 
 /* The format bits of a mode, which vnode_getattr does not report in va_mode. */
@@ -186,7 +195,12 @@ hash_file(struct census *cs, vnode_t vp, uint64_t size, uint64_t *out)
 		if (resid == want) {
 			break;                  /* nothing more to be had */
 		}
-		h = fnv1a(cs->buf, (size_t)(want - resid), h);
+		if (!cs->no_hash) {
+			uint64_t t0 = mach_absolute_time();
+
+			h = fnv1a(cs->buf, (size_t)(want - resid), h);
+			cs->hash_ticks += mach_absolute_time() - t0;
+		}
 		cs->bytes += (uint64_t)(want - resid);
 		off += (uint64_t)(want - resid);
 	}
@@ -574,10 +588,13 @@ apfs_walk_one(void *arg, __unused wait_result_t wr)
 {
 	struct walk_job *job = arg;
 	struct census cs;
-	uint64_t start, end, ns = 0;
+	uint64_t start, end, ns = 0, hash_ns = 0;
+	uint32_t hash = 1;
 
 	bzero(&cs, sizeof(cs));
 	cs.ctx = vfs_context_kernel();
+	PE_parse_boot_argn("apfs_hash", &hash, sizeof(hash));
+	cs.no_hash = (hash == 0);
 	PE_parse_boot_argn("apfs_depth", &cs.max_depth, sizeof(cs.max_depth));
 	PE_parse_boot_argn("apfs_max", &cs.max_entries, sizeof(cs.max_entries));
 	{
@@ -600,6 +617,7 @@ apfs_walk_one(void *arg, __unused wait_result_t wr)
 	census_dir(&cs);
 	end = mach_absolute_time();
 	absolutetime_to_nanoseconds(end - start, &ns);
+	absolutetime_to_nanoseconds(cs.hash_ticks, &hash_ns);
 
 	job->ms = ns / 1000000;
 	job->entries = cs.entries;
@@ -607,8 +625,9 @@ apfs_walk_one(void *arg, __unused wait_result_t wr)
 	job->sum = cs.sum;
 	job->errors = cs.errors;
 	printf("apfs-check: reader %d: %llu entries  %llu bytes  sum %016llx  errors %u  "
-	    "%llu ms\n", job->index, cs.entries, cs.bytes,
-	    (unsigned long long)cs.sum, cs.errors, job->ms);
+	    "%llu ms  hash %s%llu ms\n", job->index, cs.entries, cs.bytes,
+	    (unsigned long long)cs.sum, cs.errors, job->ms, cs.no_hash ? "off " : "",
+	    hash_ns / 1000000);
 
 	kfree_data(cs.path, PATH_CAP);
 	kfree_data(cs.buf, READ_CHUNK);
