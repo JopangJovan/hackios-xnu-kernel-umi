@@ -593,9 +593,28 @@ apfs_vnop_mnomap(__unused struct vnop_mnomap_args *ap)
 	return 0;
 }
 
+/*
+ * The last reference to this file has gone.  Give back what was worked out about how its
+ * contents are stored -- the table of compressed pieces and, above all, the 64 KB of the
+ * piece last decompressed.
+ *
+ * It used to be kept until the vnode was reclaimed, which is later: VFS holds on to
+ * vnodes it may want again, up to desiredvnodes of them (1024 here), so up to 64 MB of
+ * pieces nobody was reading.  Here each file gives it back as soon as it is closed, and
+ * the cache still covers what it is for: the reads of one file, one after another.
+ * (This was first suspected of resetting the phone on long walks; it was not -- memory
+ * stayed flat throughout -- see redwood_apfs_check.c for what was.)
+ */
 static int
-apfs_vnop_inactive(__unused struct vnop_inactive_args *ap)
+apfs_vnop_inactive(struct vnop_inactive_args *ap)
 {
+	struct apfs_node *an = APFS_VP(ap->a_vp);
+
+	if (an != NULL) {
+		apfs_lock(an->an_mount);
+		apfs_cfile_fini(&an->an_cf);
+		apfs_unlock(an->an_mount);
+	}
 	return 0;
 }
 

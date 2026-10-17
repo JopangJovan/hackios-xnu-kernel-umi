@@ -29,6 +29,8 @@
  *                             For splitting a volume too big to hold into parts: one part
  *                             takes the root's own entries, the others take a subtree
  *                             each, and the per-line hashes add up to the whole.
+ *   apfs_max=N                stop after N entries (and say how memory stood on the way):
+ *                             for finding out what a walk that never comes back runs into
  *   apfs_skip=/a,/b           directories not to go into, as paths inside the volume,
  *                             comma separated.  Their own line is still counted, only
  *                             their contents are left out -- which is how a volume too
@@ -55,6 +57,7 @@
  */
 
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <libkern/libkern.h>
@@ -80,6 +83,16 @@
 extern void loader_return(void);        /* osfmk/arm64/loader_return.c */
 extern void apfs_stats_print(void);     /* bsd/miscfs/apfs/apfs_vfsops.c */
 extern void redwood_sparse_report(void);
+
+/* how memory stands, for the progress line (osfmk/vm, bsd/vfs) */
+extern unsigned int vm_page_free_count, vm_page_wire_count, memorystatus_available_pages;
+extern long numvnodes;
+extern int desiredvnodes;
+#define CHECK_MB(pages) ((unsigned int)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
+
+/* which operation the walk is in, for the stuck detector further down */
+static const char *volatile watch_phase = "";
+#define PHASE(name) (watch_phase = (name))
 
 #define CHECK_MNT    "/private/var/apfs-check"
 #define CHECK_PARENT "/private/var"
@@ -133,6 +146,9 @@ struct census {
 	int       lookup_flags;
 	uint32_t  max_depth;            /* 0: no limit */
 	char     *skip;                 /* comma separated paths not to descend into */
+	uint64_t  max_entries;          /* 0: no limit */
+	bool      stop;
+	uint64_t  t0;                   /* when the walk started, for the progress line */
 };
 
 /* The format bits of a mode, which vnode_getattr does not report in va_mode. */
@@ -220,6 +236,7 @@ census_entry(struct census *cs, uint8_t d_type)
 	 * would look like a lookup failure.  Crossing mount points has to stay allowed: the
 	 * path leads from the ramfs that holds the mount point into the volume itself.
 	 */
+	PHASE("lookup");
 	error = vnode_lookup(cs->path, cs->lookup_flags, &vp, cs->ctx);
 	if (error) {
 		printf("apfs-check: %s: lookup failed: %d\n", cs->path + cs->rel, error);
@@ -235,6 +252,7 @@ census_entry(struct census *cs, uint8_t d_type)
 	VATTR_WANTED(&va, va_uid);
 	VATTR_WANTED(&va, va_gid);
 	VATTR_WANTED(&va, va_data_size);
+	PHASE("getattr");
 	error = vnode_getattr(vp, &va, cs->ctx);
 	if (error) {
 		printf("apfs-check: %s: getattr failed: %d\n", cs->path + cs->rel, error);
@@ -247,9 +265,11 @@ census_entry(struct census *cs, uint8_t d_type)
 
 	if (vnode_vtype(vp) == VREG) {
 		cs->files++;
+		PHASE("read");
 		error = hash_file(cs, vp, size, &h);
 	} else if (vnode_vtype(vp) == VLNK) {
 		cs->links++;
+		PHASE("readlink");
 		error = hash_link(cs, vp, &h);
 	} else if (vnode_vtype(vp) == VDIR) {
 		cs->dirs++;
@@ -272,15 +292,90 @@ census_entry(struct census *cs, uint8_t d_type)
 	if (cs->print_lines) {
 		printf("apfs-line: %s", line);
 	}
-	if ((cs->entries % 20000) == 0) {
-		printf("apfs-check: %llu entries so far\n", cs->entries);
+	if ((cs->entries % 10000) == 0) {
+		uint64_t ns = 0;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - cs->t0, &ns);
+		printf("apfs-check: %llu entries so far at %llu ms  free %u MB  wired %u MB  "
+		    "available %u MB  vnodes %ld of %d\n", cs->entries, ns / 1000000,
+		    CHECK_MB(vm_page_free_count),
+		    CHECK_MB(vm_page_wire_count), CHECK_MB(memorystatus_available_pages),
+		    numvnodes, desiredvnodes);
+	}
+	if (cs->max_entries != 0 && cs->entries >= cs->max_entries) {
+		cs->stop = true;
 	}
 out:
+	PHASE("vnode_put");
 	vnode_put(vp);
+	PHASE("");
 	return error == 0;
 }
 
 static void census_dir(struct census *cs);
+
+/*
+ * A walk that stops making progress, rather than one that fails.  On the phone a walk of
+ * the real volume can stop dead past some tens of thousands of entries, and then nothing
+ * is left to say why: the watchdog resets the phone and the log goes with it.  So a timer
+ * looks every few seconds; if the count of entries has not moved, it says which entry and
+ * which operation the walk is in, and goes back to the loader -- with the log -- before
+ * the watchdog does.
+ */
+#define WATCH_SECONDS 6
+
+static struct census *volatile watch_cs;
+static uint64_t watch_last = ~0ULL;
+static thread_call_t watch_call;
+
+static void
+watch_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	struct census *cs = watch_cs;
+	uint64_t deadline;
+
+	if (cs == NULL) {
+		return;                 /* the walk is over */
+	}
+	/* entries and bytes both count as progress: one big file can take a while */
+	if (cs->entries + cs->bytes == watch_last) {
+		printf("apfs-check: STUCK: no progress for %d s after entry %llu, at %s, in %s\n",
+		    WATCH_SECONDS, cs->entries, cs->path + cs->rel, watch_phase);
+		apfs_stats_print();
+		redwood_sparse_report();
+		printf("apfs-check: going back to the loader with that\n");
+		loader_return();
+		return;
+	}
+	/* a sign the timer got to run at all: a walk can starve every thread call */
+	printf("apfs-check: tick, %llu entries\n", cs->entries);
+	watch_last = cs->entries + cs->bytes;
+	clock_interval_to_deadline(WATCH_SECONDS, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(watch_call, deadline);
+}
+
+static void
+watch_start(struct census *cs)
+{
+	uint64_t deadline;
+
+	if (watch_call == NULL) {
+		watch_call = thread_call_allocate(watch_tick, NULL);
+	}
+	watch_last = ~0ULL;
+	watch_cs = cs;
+	clock_interval_to_deadline(WATCH_SECONDS, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(watch_call, deadline);
+}
+
+static void
+watch_stop(void)
+{
+	watch_cs = NULL;
+	if (watch_call != NULL) {
+		thread_call_cancel(watch_call);
+	}
+}
 
 /* Is this directory one of the ones to stay out of?  Compares the path inside the volume. */
 static bool
@@ -314,6 +409,9 @@ census_child(struct census *cs, const char *name, size_t name_len, uint8_t d_typ
 {
 	size_t saved = cs->len;
 
+	if (cs->stop) {
+		return;
+	}
 	if (cs->len + name_len + 2 > PATH_CAP) {
 		printf("apfs-check: path below %s is too long\n", cs->path + cs->rel);
 		cs->errors++;
@@ -375,6 +473,7 @@ census_dir(struct census *cs)
 			break;
 		}
 		uio_addiov(uio, CAST_USER_ADDR_T(dbuf), DIR_CHUNK);
+		PHASE("readdir");
 		error = VNOP_READDIR(dvp, uio, 0, &eof, &items, cs->ctx);
 		if (error) {
 			printf("apfs-check: %s: readdir failed: %d\n", cs->path + cs->rel, error);
@@ -403,8 +502,11 @@ census_dir(struct census *cs)
 				continue;
 			}
 			census_child(cs, de->d_name, de->d_namlen, de->d_type);
+			if (cs->stop) {
+				break;
+			}
 		}
-		if (eof) {
+		if (eof || cs->stop) {
 			break;
 		}
 	}
@@ -477,6 +579,7 @@ apfs_walk_one(void *arg, __unused wait_result_t wr)
 	bzero(&cs, sizeof(cs));
 	cs.ctx = vfs_context_kernel();
 	PE_parse_boot_argn("apfs_depth", &cs.max_depth, sizeof(cs.max_depth));
+	PE_parse_boot_argn("apfs_max", &cs.max_entries, sizeof(cs.max_entries));
 	{
 		static char skip[256];
 
@@ -589,6 +692,7 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 	 * walk is kept on the volume by the check against the mount it started on.
 	 */
 	PE_parse_boot_argn("apfs_depth", &cs.max_depth, sizeof(cs.max_depth));
+	PE_parse_boot_argn("apfs_max", &cs.max_entries, sizeof(cs.max_entries));
 	{
 		static char skip[256];
 
@@ -737,7 +841,10 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 
 walk:
 	start = mach_absolute_time();
+	cs.t0 = start;
+	watch_start(&cs);
 	census_dir(&cs);
+	watch_stop();
 	end = mach_absolute_time();
 
 	{
@@ -759,6 +866,15 @@ walk:
 	kfree_data(cs.buf, READ_CHUNK);
 }
 
+static volatile int apfs_check_finished;
+
+static void
+apfs_check_runner(void *arg, wait_result_t wr)
+{
+	apfs_check_thread(arg, wr);
+	apfs_check_finished = 1;
+}
+
 void
 redwood_apfs_check_init(void)
 {
@@ -770,14 +886,31 @@ redwood_apfs_check_init(void)
 	}
 	if (mode >= 4) {
 		/*
-		 * The volume is the root (or mode 6, which mounts it here), so everything the
-		 * walk needs is already up -- and
-		 * bsd_init is about to exec /sbin/launchd off it, which on anything but our
-		 * own packfs image ends in a panic before a thread of our own would finish.
-		 * So walk it here, on this thread, and go back to the loader with the answer
-		 * rather than letting that happen.
+		 * The volume is the root (or mode 6, which mounts it here), and bsd_init is
+		 * about to exec /sbin/launchd off it, which on anything but our own packfs
+		 * image ends in a panic.  So the walk has to be over before this returns.
+		 *
+		 * It does not run on this thread, though.  This is the boot thread: it runs
+		 * above the threads that service thread calls, and a walk off a RAM disk never
+		 * blocks, so for as long as it lasts no thread call runs at all -- not even
+		 * the one that feeds the phone's watchdog every ten seconds.  On the phone a
+		 * walk past half a minute was reset with no log to say why; in QEMU, which
+		 * has no such watchdog, the same walk let not one 6-second timer fire in 72 s.
+		 * So the walk gets a thread of ordinary priority, and this one sleeps until
+		 * it is done.
 		 */
-		apfs_check_thread((void *)(uintptr_t)mode, 0);
+		thread_t th;
+
+		apfs_check_finished = 0;
+		if (kernel_thread_start(apfs_check_runner, (void *)(uintptr_t)mode, &th) !=
+		    KERN_SUCCESS) {
+			printf("apfs-check: cannot start the thread\n");
+			return;
+		}
+		thread_deallocate(th);
+		while (!apfs_check_finished) {
+			delay_for_interval(100, NSEC_PER_MSEC);     /* sleeps */
+		}
 		printf("apfs-check: going back to the loader\n");
 		loader_return();
 		return;
