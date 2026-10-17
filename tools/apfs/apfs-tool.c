@@ -280,6 +280,7 @@ cmd_cat(const char *path, const char *where)
 	struct apfs_nx nx;
 	struct apfs_vol vol;
 	struct apfs_inode ino;
+	struct apfs_cfile cf;
 	uint64_t id, off = 0;
 	uint8_t dt;
 	uint8_t *buf;
@@ -300,10 +301,12 @@ cmd_cat(const char *path, const char *where)
 	if (buf == NULL) {
 		return 1;
 	}
+	memset(&cf, 0, sizeof(cf));
+	cf.held = APFS_NO_PIECE;
 	while (off < ino.size) {
 		size_t got = 0;
 
-		error = apfs_read_file(&vol, &ino, off, buf, 65536, &got);
+		error = apfs_read_file(&vol, &ino, &cf, off, buf, 65536, &got);
 		if (error) {
 			fprintf(stderr, "apfs-tool: read at %" PRIu64 ": %s\n", off,
 			    strerror(error));
@@ -319,6 +322,7 @@ cmd_cat(const char *path, const char *where)
 		}
 		off += got;
 	}
+	apfs_cfile_fini(&cf);
 	free(buf);
 	apfs_nx_close(&nx);
 	return 0;
@@ -343,15 +347,19 @@ static uint64_t
 file_hash(struct census *cs, const struct apfs_inode *ino, uint64_t size)
 {
 	uint64_t h = FNV_INIT, off = 0;
+	struct apfs_cfile cf;
 
+	memset(&cf, 0, sizeof(cf));
+	cf.held = APFS_NO_PIECE;
 	for (;;) {
 		size_t got = 0;
-		int error = apfs_read_file(cs->vol, ino, off, cs->buf, 65536, &got);
+		int error = apfs_read_file(cs->vol, ino, &cf, off, cs->buf, 65536, &got);
 
 		if (error) {
 			fprintf(stderr, "apfs-tool: %s: read at %" PRIu64 ": %s\n", cs->path,
 			    off, strerror(error));
 			cs->error = error;
+			apfs_cfile_fini(&cf);
 			return 0;
 		}
 		if (got == 0) {
@@ -363,6 +371,7 @@ file_hash(struct census *cs, const struct apfs_inode *ino, uint64_t size)
 			break;
 		}
 	}
+	apfs_cfile_fini(&cf);
 	return h;
 }
 

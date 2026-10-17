@@ -5,6 +5,9 @@
  *
  *   apfs_check=1              walk the whole volume and print only the totals
  *   apfs_check=2              also print a line per entry
+ *   apfs_check=3              mount it and stop, leaving it for user space to read
+ *                             (userland/src/apfs_mmap_test.c, which is the only way the
+ *                             driver's vnop_pagein ever runs)
  *   apfs_subtree=/usr         walk only that part of the volume
  *
  * A line is the same one tools/apfs/apfs-tool's census and `verify.py clines` print:
@@ -409,6 +412,11 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 		return;
 	}
 	printf("apfs-check: %s mounted on %s\n", CHECK_DEV, CHECK_MNT);
+	if (mode >= 3) {
+		/* someone in user space is going to read it; leave it alone */
+		printf("apfs-check: left mounted, not walking it here\n");
+		return;
+	}
 
 	cs.path = kalloc_data(PATH_CAP, Z_WAITOK | Z_ZERO);
 	cs.buf = kalloc_data(READ_CHUNK, Z_WAITOK);

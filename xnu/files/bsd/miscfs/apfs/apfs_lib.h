@@ -197,12 +197,46 @@ struct apfs_xattr {
 	uint64_t       stream_size;
 };
 
-/* How a file's contents are stored, once the decmpfs attribute has been read. */
+/* No piece is being held. */
+#define APFS_NO_PIECE ((uint64_t)~0ULL)
+
+/*
+ * How a file's contents are stored, and what has been worked out about it so far.
+ *
+ * A compressed file's bytes are cut into 64 KB pieces, each its own zlib stream, with a
+ * table in the resource fork saying where each piece is.  Reaching that table costs
+ * several walks of the file-system tree -- the attribute record, the fork's header, the
+ * table entry -- and a piece has to be decompressed whole however few of its bytes are
+ * wanted.  A reader that comes back for the next page would pay all of that again, which
+ * is what made paging a mapped file slow.
+ *
+ * So this holds what has been found: the fork's stream, the whole table, and the last
+ * piece decompressed.  One of these belongs to whoever is reading the file -- the driver
+ * keeps one per vnode -- and it is handed to apfs_read_file() on every call.
+ * apfs_cfile_fini() gives back what it holds.  Passing NULL instead works and is correct,
+ * and is the slow way.
+ */
 struct apfs_cfile {
-	bool     compressed;
-	uint32_t type;                  /* decmpfs compression type */
-	uint64_t size;                  /* uncompressed size */
-	bool     in_rsrc;               /* the bytes are in com.apple.ResourceFork */
+	bool      ready;                /* set up, for the inode in obj_id */
+	uint64_t  obj_id;
+	bool      compressed;
+	uint32_t  type;                 /* decmpfs compression type */
+	uint64_t  size;                 /* uncompressed size */
+	bool      in_rsrc;              /* the bytes are in com.apple.ResourceFork */
+
+	/* the resource fork and its table of pieces, read once */
+	uint64_t  rsrc_id;
+	uint64_t  rsrc_size;
+	uint64_t  table_base;
+	uint32_t  piece_count;
+	uint32_t *piece_off;            /* piece_count entries, from table_base */
+	uint32_t *piece_len;
+
+	/* the piece last decompressed */
+	uint64_t  held;                 /* its index, or APFS_NO_PIECE */
+	uint8_t  *held_data;
+	size_t    held_len;
+	size_t    held_cap;             /* 0 when this file is not worth holding */
 };
 
 /* ---- container and volumes ---- */
@@ -287,16 +321,22 @@ int apfs_readlink(struct apfs_vol *vol, uint64_t obj_id, char *buf, size_t len,
 int apfs_read_stream(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_size,
     uint64_t off, void *buf, size_t len, size_t *out);
 
-/* Whether a file is compressed, and how. */
+/*
+ * Work out how a file's contents are stored and read in whatever is worth reading once.
+ * Calling it again for the same inode does nothing; for a different one it starts over.
+ */
 int apfs_cfile_init(struct apfs_vol *vol, const struct apfs_inode *ino,
     struct apfs_cfile *cf);
+
+/* Give back everything a context holds.  Safe on a zeroed or already finished one. */
+void apfs_cfile_fini(struct apfs_cfile *cf);
 
 /*
  * The contents of a file as a reader of the file would see them: the data stream for a
  * plain file, the decompressed bytes for a compressed one.
  */
-int apfs_read_file(struct apfs_vol *vol, const struct apfs_inode *ino, uint64_t off,
-    void *buf, size_t len, size_t *out);
+int apfs_read_file(struct apfs_vol *vol, const struct apfs_inode *ino,
+    struct apfs_cfile *cf, uint64_t off, void *buf, size_t len, size_t *out);
 
 /* ---- odds and ends worth testing on their own ---- */
 

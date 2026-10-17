@@ -200,8 +200,8 @@ apfs_vnop_read(struct vnop_read_args *ap)
 		size_t got = 0;
 
 		apfs_lock(am);
-		error = apfs_read_file(&am->am_vol, &ino, (uint64_t)uio_offset(uio), buf, want,
-		    &got);
+		error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf,
+		    (uint64_t)uio_offset(uio), buf, want, &got);
 		apfs_unlock(am);
 		if (error) {
 			break;
@@ -273,7 +273,8 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 		}
 		want = (size_t)MIN(end - at, (off_t)(size - (uint64_t)at));
 		apfs_lock(am);
-		error = apfs_read_file(&am->am_vol, &ino, (uint64_t)at, dst, want, &got);
+		error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf, (uint64_t)at,
+		    dst, want, &got);
 		apfs_unlock(am);
 		if (error) {
 			break;
@@ -593,6 +594,9 @@ apfs_vnop_reclaim(struct vnop_reclaim_args *ap)
 	struct apfs_node *an = APFS_VP(vp);
 
 	if (an != NULL) {
+		apfs_lock(an->an_mount);
+		apfs_cfile_fini(&an->an_cf);
+		apfs_unlock(an->an_mount);
 		apfs_node_detach(an);
 		vnode_clearfsnode(vp);
 		kfree_type(struct apfs_node, an);

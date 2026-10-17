@@ -50,6 +50,13 @@ struct apfs_node {
 	uint16_t           an_mode;
 	uint64_t           an_size;     /* the logical size, as a reader of the file sees it */
 	bool               an_attached; /* an_vp is set and the node is in the hash */
+	/*
+	 * What has been worked out about how this file's contents are stored, kept for as
+	 * long as the vnode lives: the table of compressed pieces and the piece last
+	 * decompressed.  Without it every read and every page fault would find them again.
+	 * Guarded by am_lock, like everything else that reaches apfs_lib.
+	 */
+	struct apfs_cfile  an_cf;
 };
 
 #define APFS_MP(mp)       ((struct apfs_mount *)vfs_fsprivate(mp))

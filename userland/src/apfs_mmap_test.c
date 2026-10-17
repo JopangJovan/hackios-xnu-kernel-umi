@@ -1,0 +1,237 @@
+/*
+ * Read files off the APFS mount and hash them, two ways, so that what the driver hands
+ * back can be compared with what tools/apfs/apfs.py reads from the same image on the
+ * build machine.
+ *
+ *   mmap   map the file and read it through the mapping.  This is the only way to make
+ *          the driver's vnop_pagein run: the walk inside the kernel (boot-arg apfs_check)
+ *          goes through vnop_read, and nothing on this volume is executed, so without
+ *          this the paging path is never touched at all.
+ *   read   read(2) the file in pieces of a given size.  With a small size this is the
+ *          case the compressed-file path is worst at -- every read decompresses the whole
+ *          64 KB piece it falls in.
+ *
+ * The hash is FNV-1a over the whole file, which is what verify.py and the in-kernel walk
+ * use, so a line here can be compared with a line from either.
+ *
+ * usage: apfs_mmap_test mmap [PATH]
+ *        apfs_mmap_test read [PATH] [CHUNK]
+ * PATH defaults to /private/var/apfs-check/usr, CHUNK to 4096.
+ */
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#define FNV_INIT  0xcbf29ce484222325ULL
+#define FNV_PRIME 0x100000001b3ULL
+
+#define MOUNT "/private/var/apfs-check"
+
+static const char *tag;         /* what to print each line under */
+static int chunk_size = 4096;
+static int use_mmap;
+
+static unsigned long long total_sum;
+static unsigned long long total_bytes;
+static long total_files, total_errors;
+
+static unsigned long long
+fnv1a(const unsigned char *p, size_t n, unsigned long long h)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		h ^= p[i];
+		h *= FNV_PRIME;
+	}
+	return h;
+}
+
+static double
+now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
+/* The bytes of one file, through a mapping. */
+static int
+hash_mapped(const char *path, off_t size, unsigned long long *out)
+{
+	int fd = open(path, O_RDONLY);
+	void *map;
+
+	if (fd < 0) {
+		return -1;
+	}
+	if (size == 0) {
+		close(fd);
+		*out = FNV_INIT;        /* nothing to map, and nothing to hash */
+		return 0;
+	}
+	map = mmap(NULL, (size_t)size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED) {
+		return -1;
+	}
+	/* touching every page is what makes the kernel page the file in */
+	*out = fnv1a((const unsigned char *)map, (size_t)size, FNV_INIT);
+	munmap(map, (size_t)size);
+	return 0;
+}
+
+/* The bytes of one file, read in pieces. */
+static int
+hash_read(const char *path, off_t size, unsigned long long *out)
+{
+	int fd = open(path, O_RDONLY);
+	unsigned long long h = FNV_INIT;
+	unsigned char *buf;
+	ssize_t n;
+
+	(void)size;
+	if (fd < 0) {
+		return -1;
+	}
+	buf = malloc((size_t)chunk_size);
+	if (buf == NULL) {
+		close(fd);
+		return -1;
+	}
+	while ((n = read(fd, buf, (size_t)chunk_size)) > 0) {
+		h = fnv1a(buf, (size_t)n, h);
+	}
+	free(buf);
+	close(fd);
+	if (n < 0) {
+		return -1;
+	}
+	*out = h;
+	return 0;
+}
+
+static void
+do_file(const char *path, off_t size)
+{
+	unsigned long long h = 0;
+	char line[2048];
+	int rc = use_mmap ? hash_mapped(path, size, &h) : hash_read(path, size, &h);
+
+	if (rc != 0) {
+		printf("%s %s: cannot read it: %s\n", tag, path + sizeof(MOUNT) - 1,
+		    strerror(errno));
+		total_errors++;
+		return;
+	}
+	snprintf(line, sizeof(line), "%s\t%lld\t%016llx\n", path + sizeof(MOUNT) - 1,
+	    (long long)size, h);
+	printf("%s %s", tag, line);
+	total_sum += fnv1a((const unsigned char *)line, strlen(line), FNV_INIT);
+	total_files++;
+	total_bytes += (unsigned long long)size;
+}
+
+static void
+walk(char *path, size_t len)
+{
+	DIR *d = opendir(path);
+	struct dirent *de;
+
+	if (d == NULL) {
+		printf("%s %s: cannot open the directory: %s\n", tag,
+		    path + sizeof(MOUNT) - 1, strerror(errno));
+		total_errors++;
+		return;
+	}
+	while ((de = readdir(d)) != NULL) {
+		struct stat st;
+		size_t n = strlen(de->d_name);
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+			continue;
+		}
+		if (len + n + 2 > PATH_MAX) {
+			total_errors++;
+			continue;
+		}
+		path[len] = '/';
+		memcpy(path + len + 1, de->d_name, n + 1);
+		/* lstat, not stat: a symbolic link is not followed and not read */
+		if (lstat(path, &st) != 0) {
+			printf("%s %s: lstat failed: %s\n", tag, path + sizeof(MOUNT) - 1,
+			    strerror(errno));
+			total_errors++;
+		} else if (S_ISDIR(st.st_mode)) {
+			walk(path, len + 1 + n);
+		} else if (S_ISREG(st.st_mode)) {
+			do_file(path, st.st_size);
+		}
+		path[len] = '\0';
+	}
+	closedir(d);
+}
+
+int
+main(int argc, char **argv)
+{
+	static char path[PATH_MAX];
+	const char *where = MOUNT "/usr";
+	const char *mode = argc > 1 ? argv[1] : "mmap";
+	double t0, t1;
+	int tries;
+
+	use_mmap = (strcmp(mode, "read") != 0);
+	tag = use_mmap ? "apfs-mmap:" : "apfs-read:";
+	if (argc > 2) {
+		where = argv[2];
+	}
+	if (argc > 3) {
+		chunk_size = atoi(argv[3]);
+		if (chunk_size <= 0) {
+			chunk_size = 4096;
+		}
+	}
+	if (strncmp(where, MOUNT, sizeof(MOUNT) - 1) != 0) {
+		printf("%s a path under %s, please\n", tag, MOUNT);
+		return 2;
+	}
+
+	/* the kernel mounts the volume as soon as /private/var is there; wait for it */
+	for (tries = 0; tries < 120; tries++) {
+		struct stat st;
+
+		if (stat(where, &st) == 0) {
+			break;
+		}
+		sleep(1);
+	}
+
+	printf("%s %s, %s%s\n", tag, where, use_mmap ? "through a mapping" : "with read(2)",
+	    use_mmap ? "" : " in pieces");
+	if (!use_mmap) {
+		printf("%s pieces of %d bytes\n", tag, chunk_size);
+	}
+	snprintf(path, sizeof(path), "%s", where);
+	t0 = now_ms();
+	walk(path, strlen(path));
+	t1 = now_ms();
+
+	printf("%s files %ld  bytes %llu  errors %ld\n", tag, total_files, total_bytes,
+	    total_errors);
+	printf("%s line-hash sum %016llx\n", tag, total_sum);
+	printf("%s done in %.0f ms (%.1f MB/s)\n", tag, t1 - t0,
+	    (t1 > t0) ? (double)total_bytes / 1048576.0 / ((t1 - t0) / 1000.0) : 0.0);
+	return total_errors ? 1 : 0;
+}

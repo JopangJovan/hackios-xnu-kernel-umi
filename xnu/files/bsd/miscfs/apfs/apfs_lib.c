@@ -306,6 +306,9 @@ node_child(struct apfs_btree *tree, const struct node *n, uint32_t i, uint64_t *
 	return 0;
 }
 
+static int cfile_header(struct apfs_vol *vol, const struct apfs_inode *ino,
+    bool *compressed, uint32_t *type, uint64_t *size, bool *in_rsrc);
+
 /* Where a node identifier actually is: a block address, directly or through a map. */
 static int
 tree_node_addr(struct apfs_btree *tree, uint64_t oid, uint64_t *addr);
@@ -1011,7 +1014,9 @@ apfs_inode_get(struct apfs_vol *vol, uint64_t obj_id, struct apfs_inode *ino)
 int
 apfs_inode_size(struct apfs_vol *vol, const struct apfs_inode *ino, uint64_t *size)
 {
-	struct apfs_cfile cf;
+	bool compressed = false, in_rsrc = false;
+	uint32_t type = 0;
+	uint64_t csize = 0;
 	int error;
 
 	if ((ino->mode & APFS_S_IFMT) == APFS_S_IFLNK) {
@@ -1025,11 +1030,12 @@ apfs_inode_size(struct apfs_vol *vol, const struct apfs_inode *ino, uint64_t *si
 		*size = n;
 		return 0;
 	}
-	error = apfs_cfile_init(vol, ino, &cf);
+	/* only the decmpfs header is needed here, not the table of pieces */
+	error = cfile_header(vol, ino, &compressed, &type, &csize, &in_rsrc);
 	if (error) {
 		return error;
 	}
-	*size = cf.compressed ? cf.size : ino->size;
+	*size = compressed ? csize : ino->size;
 	return 0;
 }
 
@@ -1503,15 +1509,19 @@ apfs_readlink(struct apfs_vol *vol, uint64_t obj_id, char *buf, size_t len, size
 	return 0;
 }
 
-int
-apfs_cfile_init(struct apfs_vol *vol, const struct apfs_inode *ino,
-    struct apfs_cfile *cf)
+/* Just the decmpfs header: what a caller needs to report a size, and nothing more. */
+static int
+cfile_header(struct apfs_vol *vol, const struct apfs_inode *ino, bool *compressed,
+    uint32_t *type, uint64_t *size, bool *in_rsrc)
 {
 	uint8_t hdr[16];
 	size_t n = 0;
 	int error;
 
-	memset(cf, 0, sizeof(*cf));
+	*compressed = false;
+	*type = 0;
+	*size = 0;
+	*in_rsrc = false;
 	error = apfs_xattr_read(vol, ino->obj_id, APFS_DECMPFS_XATTR_NAME, hdr, sizeof(hdr),
 	    &n);
 	if (error == ENOENT) {
@@ -1523,23 +1533,187 @@ apfs_cfile_init(struct apfs_vol *vol, const struct apfs_inode *ino,
 	if (n < sizeof(hdr) || le32(hdr) != APFS_DECMPFS_MAGIC) {
 		return 0;
 	}
-	cf->compressed = true;
-	cf->type = le32(hdr + 4);
-	cf->size = le64(hdr + 8);
-	switch (cf->type) {
+	*compressed = true;
+	*type = le32(hdr + 4);
+	*size = le64(hdr + 8);
+	switch (*type) {
 	case APFS_DECMPFS_TYPE_ZLIB_ATTR:
 	case APFS_DECMPFS_TYPE_RAW_ATTR:
-		cf->in_rsrc = false;
+		*in_rsrc = false;
 		return 0;
 	case APFS_DECMPFS_TYPE_ZLIB_RSRC:
 	case APFS_DECMPFS_TYPE_RAW_RSRC:
-		cf->in_rsrc = true;
+		*in_rsrc = true;
 		return 0;
 	default:
 		apfs_log("inode %llu: decmpfs type %u is not supported\n",
-		    (unsigned long long)ino->obj_id, cf->type);
+		    (unsigned long long)ino->obj_id, *type);
 		return ENOTSUP;
 	}
+}
+
+void
+apfs_cfile_fini(struct apfs_cfile *cf)
+{
+	if (cf == NULL) {
+		return;
+	}
+	if (cf->piece_off != NULL) {
+		apfs_free(cf->piece_off, (size_t)cf->piece_count * sizeof(uint32_t));
+	}
+	if (cf->piece_len != NULL) {
+		apfs_free(cf->piece_len, (size_t)cf->piece_count * sizeof(uint32_t));
+	}
+	if (cf->held_data != NULL) {
+		apfs_free(cf->held_data, cf->held_cap);
+	}
+	memset(cf, 0, sizeof(*cf));
+	cf->held = APFS_NO_PIECE;
+}
+
+/*
+ * Read the resource fork's table of pieces, once.  The fork is an HFS-Plus resource fork:
+ * sixteen big-endian bytes giving the offset and length of the resource data and of the
+ * resource map.  At that data offset sits a four-byte big-endian length, and the table
+ * starts right after it -- a little-endian count, then an (offset, length) pair per piece,
+ * the offsets measured from the start of the table.  The table is not at a fixed place:
+ * the data offset is 256 in every file here, so the table lands at 260, but it has to be
+ * read rather than assumed.
+ */
+static int
+cfile_read_table(struct apfs_vol *vol, const struct apfs_inode *ino,
+    struct apfs_cfile *cf)
+{
+	struct apfs_xattr xa;
+	uint8_t head[16];
+	uint8_t *tbl = NULL;
+	size_t got = 0, tbl_len;
+	uint32_t i;
+	int error;
+
+	error = apfs_xattr_lookup(vol, ino->obj_id, APFS_RSRC_FORK_XATTR_NAME, &xa);
+	if (error) {
+		return error;
+	}
+	if ((xa.flags & APFS_XATTR_DATA_STREAM) == 0) {
+		return ENOTSUP;         /* a resource fork small enough to be embedded */
+	}
+	cf->rsrc_id = xa.stream_id;
+	cf->rsrc_size = xa.stream_size;
+
+	error = apfs_read_stream(vol, cf->rsrc_id, cf->rsrc_size, 0, head, sizeof(head),
+	    &got);
+	if (error) {
+		return error;
+	}
+	if (got < sizeof(head)) {
+		return EIO;
+	}
+	cf->table_base = (uint64_t)be32(head) + 4;
+	if (cf->table_base + 4 > cf->rsrc_size) {
+		return EIO;
+	}
+	error = apfs_read_stream(vol, cf->rsrc_id, cf->rsrc_size, cf->table_base, head, 4,
+	    &got);
+	if (error) {
+		return error;
+	}
+	if (got < 4) {
+		return EIO;
+	}
+	cf->piece_count = le32(head);
+	if (cf->piece_count == 0 ||
+	    cf->piece_count != (uint32_t)((cf->size + APFS_DECMPFS_BLOCK_SIZE - 1) /
+	    APFS_DECMPFS_BLOCK_SIZE)) {
+		apfs_log("inode %llu: resource fork says %u pieces, %llu bytes needs %llu\n",
+		    (unsigned long long)ino->obj_id, cf->piece_count,
+		    (unsigned long long)cf->size,
+		    (unsigned long long)((cf->size + APFS_DECMPFS_BLOCK_SIZE - 1) /
+		    APFS_DECMPFS_BLOCK_SIZE));
+		return EIO;
+	}
+	tbl_len = (size_t)cf->piece_count * 8;
+	if (cf->table_base + 4 + tbl_len > cf->rsrc_size) {
+		return EIO;
+	}
+	cf->piece_off = apfs_alloc((size_t)cf->piece_count * sizeof(uint32_t));
+	cf->piece_len = apfs_alloc((size_t)cf->piece_count * sizeof(uint32_t));
+	tbl = apfs_alloc(tbl_len);
+	if (cf->piece_off == NULL || cf->piece_len == NULL || tbl == NULL) {
+		error = ENOMEM;
+		goto out;
+	}
+	error = apfs_read_stream(vol, cf->rsrc_id, cf->rsrc_size, cf->table_base + 4, tbl,
+	    tbl_len, &got);
+	if (error) {
+		goto out;
+	}
+	if (got < tbl_len) {
+		error = EIO;
+		goto out;
+	}
+	for (i = 0; i < cf->piece_count; i++) {
+		uint64_t off = le32(tbl + 8 * i);
+		uint64_t len = le32(tbl + 8 * i + 4);
+
+		if (len == 0 || cf->table_base + off + len > cf->rsrc_size) {
+			error = EIO;
+			goto out;
+		}
+		cf->piece_off[i] = (uint32_t)off;
+		cf->piece_len[i] = (uint32_t)len;
+	}
+out:
+	if (tbl != NULL) {
+		apfs_free(tbl, tbl_len);
+	}
+	return error;
+}
+
+int
+apfs_cfile_init(struct apfs_vol *vol, const struct apfs_inode *ino,
+    struct apfs_cfile *cf)
+{
+	int error;
+
+	if (cf->ready && cf->obj_id == ino->obj_id) {
+		return 0;               /* already worked out, with its table and piece */
+	}
+	apfs_cfile_fini(cf);
+	cf->obj_id = ino->obj_id;
+	cf->held = APFS_NO_PIECE;
+
+	error = cfile_header(vol, ino, &cf->compressed, &cf->type, &cf->size, &cf->in_rsrc);
+	if (error) {
+		return error;
+	}
+	if (!cf->compressed) {
+		cf->ready = true;
+		return 0;
+	}
+	if (cf->in_rsrc) {
+		error = cfile_read_table(vol, ino, cf);
+		if (error) {
+			apfs_cfile_fini(cf);
+			return error;
+		}
+		cf->held_cap = APFS_DECMPFS_BLOCK_SIZE;
+	} else if (cf->size <= APFS_DECMPFS_BLOCK_SIZE) {
+		/* the whole thing is in the attribute and fits: hold it as one piece */
+		cf->held_cap = (size_t)cf->size;
+		cf->piece_count = 1;
+	} else {
+		cf->held_cap = 0;       /* too big to hold; it is read afresh each time */
+	}
+	if (cf->held_cap != 0) {
+		cf->held_data = apfs_alloc(cf->held_cap);
+		if (cf->held_data == NULL) {
+			apfs_cfile_fini(cf);
+			return ENOMEM;
+		}
+	}
+	cf->ready = true;
+	return 0;
 }
 
 /*
@@ -1628,25 +1802,73 @@ apfs_inflate(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len,
 }
 
 /*
+ * The contents of a file whose bytes are in the com.apple.decmpfs attribute, from the
+ * bytes after the header.
+ *
+ * Type 9 means they were stored as they are, with one marker byte in front.  All 23947
+ * type-9 files in the iOS 16.5 root file system have 0xcc there and exactly `want` bytes
+ * after it, which is how the marker's length was settled; a payload that is already
+ * exactly the right length is taken whole.
+ */
+static int
+decmpfs_attr(uint32_t type, const uint8_t *src, size_t src_len, size_t want,
+    uint8_t *dst, size_t *out)
+{
+	switch (type) {
+	case APFS_DECMPFS_TYPE_RAW_ATTR: {
+		const uint8_t *p = src;
+		size_t n = src_len;
+
+		if (n != want) {
+			if (n == 0) {
+				return EIO;
+			}
+			p++;
+			n--;
+		}
+		if (n > want) {
+			n = want;
+		}
+		memcpy(dst, p, n);
+		*out = n;
+		return 0;
+	}
+	case APFS_DECMPFS_TYPE_ZLIB_ATTR:
+		return apfs_inflate(src, src_len, dst, want, out);
+	default:
+		return ENOTSUP;
+	}
+}
+
+/*
  * A compressed file whose bytes are in the attribute: the whole thing is there, after the
- * header, with one marker byte in front when it was stored rather than compressed.
+ * header, with one marker byte in front when it was stored rather than compressed.  When
+ * the context can hold it, it is produced once and kept.
  */
 static int
 read_cfile_attr(struct apfs_vol *vol, const struct apfs_inode *ino,
-    const struct apfs_cfile *cf, uint64_t off, uint8_t *buf, size_t len, size_t *out)
+    struct apfs_cfile *cf, uint64_t off, uint8_t *buf, size_t len, size_t *out)
 {
 	struct apfs_xattr xa;
 	uint8_t *attr = NULL;
 	uint8_t *plain = NULL;
-	size_t attr_len = 0, plain_len = 0;
-	size_t alloc = APFS_XATTR_MAX_EMBEDDED_SIZE + 16;
-	int error;
+	size_t attr_len = 0, plain_len = 0, alloc = 0;
+	bool held = false;
+	int error = 0;
 
 	*out = 0;
+	if (cf->held_cap != 0 && cf->held == 0) {
+		plain = cf->held_data;          /* produced on an earlier call */
+		plain_len = cf->held_len;
+		held = true;
+		goto copy;
+	}
+
 	error = apfs_xattr_lookup(vol, ino->obj_id, APFS_DECMPFS_XATTR_NAME, &xa);
 	if (error) {
 		return error;
 	}
+	alloc = APFS_XATTR_MAX_EMBEDDED_SIZE + 16;
 	if (xa.flags & APFS_XATTR_DATA_STREAM) {
 		if (xa.stream_size > 64u * 1024u * 1024u) {
 			return EIO;
@@ -1670,40 +1892,26 @@ read_cfile_attr(struct apfs_vol *vol, const struct apfs_inode *ino,
 		error = EIO;
 		goto out;
 	}
-	plain = apfs_alloc((size_t)cf->size ? (size_t)cf->size : 1);
-	if (plain == NULL) {
-		error = ENOMEM;
-		goto out;
-	}
-	if (cf->type == APFS_DECMPFS_TYPE_RAW_ATTR) {
-		const uint8_t *p = attr + 16;
-		size_t n = attr_len - 16;
-
-		/*
-		 * Stored as it is.  Every type-9 file in the iOS 16.5 root file system has one
-		 * marker byte in front of the contents; a payload that is already exactly the
-		 * right length is taken whole.
-		 */
-		if (n != cf->size) {
-			if (n == 0) {
-				error = EIO;
-				goto out;
-			}
-			p++;
-			n--;
-		}
-		if (n > cf->size) {
-			n = (size_t)cf->size;
-		}
-		memcpy(plain, p, n);
-		plain_len = n;
+	if (cf->held_cap != 0 && cf->held_cap >= (size_t)cf->size) {
+		plain = cf->held_data;
+		held = true;
 	} else {
-		error = apfs_inflate(attr + 16, attr_len - 16, plain, (size_t)cf->size,
-		    &plain_len);
-		if (error) {
+		plain = apfs_alloc((size_t)cf->size ? (size_t)cf->size : 1);
+		if (plain == NULL) {
+			error = ENOMEM;
 			goto out;
 		}
 	}
+	error = decmpfs_attr(cf->type, attr + 16, attr_len - 16, (size_t)cf->size,
+	    plain, &plain_len);
+	if (error) {
+		goto out;
+	}
+	if (held) {
+		cf->held = 0;
+		cf->held_len = plain_len;
+	}
+copy:
 	if (off < plain_len) {
 		size_t n = plain_len - (size_t)off;
 
@@ -1717,7 +1925,7 @@ out:
 	if (attr != NULL) {
 		apfs_free(attr, alloc);
 	}
-	if (plain != NULL) {
+	if (plain != NULL && !held) {
 		apfs_free(plain, (size_t)cf->size ? (size_t)cf->size : 1);
 	}
 	return error;
@@ -1725,50 +1933,23 @@ out:
 
 /*
  * A compressed file whose bytes are in com.apple.ResourceFork: the contents cut into
- * 64 KB pieces, each its own zlib stream.  The fork is an HFS-Plus resource fork; the
- * piece table starts four bytes past the data offset in its big-endian header.
+ * 64 KB pieces, each its own zlib stream.  The table saying where the pieces are was read
+ * once by apfs_cfile_init(); the piece last decompressed is kept, so a reader working
+ * through the file -- or a page fault asking for 16 KB of it -- does not decompress the
+ * same 64 KB again.
  */
 static int
 read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
-    const struct apfs_cfile *cf, uint64_t off, uint8_t *buf, size_t len, size_t *out)
+    struct apfs_cfile *cf, uint64_t off, uint8_t *buf, size_t len, size_t *out)
 {
-	struct apfs_xattr xa;
-	uint8_t head[16];
-	uint8_t entry[8];
-	uint8_t *piece = NULL, *plain = NULL;
-	size_t piece_cap = 0, got = 0;
-	uint64_t base, nblocks, first, last, i;
-	int error;
+	uint8_t *piece = NULL;
+	size_t piece_cap = 0;
+	uint64_t first, last, i;
+	int error = 0;
 
 	*out = 0;
-	error = apfs_xattr_lookup(vol, ino->obj_id, APFS_RSRC_FORK_XATTR_NAME, &xa);
-	if (error) {
-		return error;
-	}
-	if ((xa.flags & APFS_XATTR_DATA_STREAM) == 0) {
-		return ENOTSUP;         /* a resource fork small enough to be embedded */
-	}
-	error = apfs_read_stream(vol, xa.stream_id, xa.stream_size, 0, head, sizeof(head),
-	    &got);
-	if (error) {
-		return error;
-	}
-	if (got < sizeof(head)) {
-		return EIO;
-	}
-	base = (uint64_t)be32(head) + 4;        /* data offset, then the big-endian length */
-	if (base + 4 > xa.stream_size) {
-		return EIO;
-	}
-	error = apfs_read_stream(vol, xa.stream_id, xa.stream_size, base, entry, 4, &got);
-	if (error) {
-		return error;
-	}
-	if (got < 4) {
-		return EIO;
-	}
-	nblocks = le32(entry);
-	if (nblocks == 0 || nblocks > (cf->size / APFS_RSRC_PIECE) + 1) {
+	(void)ino;
+	if (cf->piece_count == 0 || cf->piece_off == NULL) {
 		return EIO;
 	}
 	if (off >= cf->size) {
@@ -1777,102 +1958,83 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 	if (len > cf->size - off) {
 		len = (size_t)(cf->size - off);
 	}
-	first = off / APFS_RSRC_PIECE;
-	last = (off + len - 1) / APFS_RSRC_PIECE;
-	if (last >= nblocks) {
+	first = off / APFS_DECMPFS_BLOCK_SIZE;
+	last = (off + len - 1) / APFS_DECMPFS_BLOCK_SIZE;
+	if (last >= cf->piece_count) {
 		return EIO;
 	}
-	plain = apfs_alloc(APFS_RSRC_PIECE);
-	if (plain == NULL) {
-		return ENOMEM;
-	}
+
 	for (i = first; i <= last; i++) {
-		uint64_t ent_off = base + 4 + 8 * i;
-		uint64_t poff, plen;
-		size_t want, copied, from_in_piece, n;
+		size_t want = APFS_DECMPFS_BLOCK_SIZE;
+		size_t from_in_piece, n, got = 0;
 
-		if (ent_off + 8 > xa.stream_size) {
-			error = EIO;
-			goto out;
+		if ((i + 1) * APFS_DECMPFS_BLOCK_SIZE > cf->size) {
+			want = (size_t)(cf->size - i * APFS_DECMPFS_BLOCK_SIZE);
 		}
-		error = apfs_read_stream(vol, xa.stream_id, xa.stream_size, ent_off, entry, 8,
-		    &got);
-		if (error) {
-			goto out;
-		}
-		if (got < 8) {
-			error = EIO;
-			goto out;
-		}
-		poff = le32(entry);
-		plen = le32(entry + 4);
-		if (plen == 0 || base + poff + plen > xa.stream_size) {
-			error = EIO;
-			goto out;
-		}
-		if (plen > piece_cap) {
-			if (piece != NULL) {
-				apfs_free(piece, piece_cap);
-			}
-			piece_cap = (size_t)plen;
-			piece = apfs_alloc(piece_cap);
-			if (piece == NULL) {
-				error = ENOMEM;
-				goto out;
-			}
-		}
-		error = apfs_read_stream(vol, xa.stream_id, xa.stream_size, base + poff, piece,
-		    (size_t)plen, &got);
-		if (error) {
-			goto out;
-		}
-		if (got < plen) {
-			error = EIO;
-			goto out;
-		}
-		/* how much of the file this piece stands for */
-		want = APFS_RSRC_PIECE;
-		if ((i + 1) * APFS_RSRC_PIECE > cf->size) {
-			want = (size_t)(cf->size - i * APFS_RSRC_PIECE);
-		}
-		if (cf->type == APFS_DECMPFS_TYPE_RAW_RSRC) {
-			size_t m = plen < want ? (size_t)plen : want;
+		if (cf->held != i) {
+			uint32_t plen = cf->piece_len[i];
 
-			memcpy(plain, piece, m);
-			copied = m;
-		} else {
-			error = apfs_inflate(piece, (size_t)plen, plain, want, &copied);
+			if (plen > piece_cap) {
+				if (piece != NULL) {
+					apfs_free(piece, piece_cap);
+				}
+				piece_cap = plen;
+				piece = apfs_alloc(piece_cap);
+				if (piece == NULL) {
+					error = ENOMEM;
+					goto out;
+				}
+			}
+			error = apfs_read_stream(vol, cf->rsrc_id, cf->rsrc_size,
+			    cf->table_base + cf->piece_off[i], piece, plen, &got);
 			if (error) {
 				goto out;
 			}
+			if (got < plen) {
+				error = EIO;
+				goto out;
+			}
+			cf->held = APFS_NO_PIECE;       /* what is in there now is unknown */
+			if (cf->type == APFS_DECMPFS_TYPE_RAW_RSRC) {
+				size_t m = plen < want ? (size_t)plen : want;
+
+				memcpy(cf->held_data, piece, m);
+				cf->held_len = m;
+			} else {
+				error = apfs_inflate(piece, plen, cf->held_data, want,
+				    &cf->held_len);
+				if (error) {
+					goto out;
+				}
+			}
+			if (cf->held_len != want) {
+				error = EIO;
+				goto out;
+			}
+			cf->held = i;
 		}
-		if (copied != want) {
-			error = EIO;
-			goto out;
-		}
-		/* the overlap of this piece with what was asked for */
-		from_in_piece = (off > i * APFS_RSRC_PIECE)
-		    ? (size_t)(off - i * APFS_RSRC_PIECE) : 0;
-		n = copied - from_in_piece;
+		from_in_piece = (off > i * APFS_DECMPFS_BLOCK_SIZE)
+		    ? (size_t)(off - i * APFS_DECMPFS_BLOCK_SIZE) : 0;
+		n = cf->held_len - from_in_piece;
 		if (n > len - *out) {
 			n = len - *out;
 		}
-		memcpy(buf + *out, plain + from_in_piece, n);
+		memcpy(buf + *out, cf->held_data + from_in_piece, n);
 		*out += n;
 	}
 out:
 	if (piece != NULL) {
 		apfs_free(piece, piece_cap);
 	}
-	apfs_free(plain, APFS_RSRC_PIECE);
 	return error;
 }
 
 int
-apfs_read_file(struct apfs_vol *vol, const struct apfs_inode *ino, uint64_t off,
-    void *buf, size_t len, size_t *out)
+apfs_read_file(struct apfs_vol *vol, const struct apfs_inode *ino,
+    struct apfs_cfile *cf, uint64_t off, void *buf, size_t len, size_t *out)
 {
-	struct apfs_cfile cf;
+	struct apfs_cfile own;
+	bool borrowed = false;
 	int error;
 
 	*out = 0;
@@ -1889,18 +2051,31 @@ apfs_read_file(struct apfs_vol *vol, const struct apfs_inode *ino, uint64_t off,
 		}
 		return 0;
 	}
-	error = apfs_cfile_init(vol, ino, &cf);
-	if (error) {
-		return error;
+	/*
+	 * Without a context from the caller, one is made for this call alone -- correct, and
+	 * the slow way: the table and the piece are then found again on the next call.
+	 */
+	if (cf == NULL) {
+		memset(&own, 0, sizeof(own));
+		own.held = APFS_NO_PIECE;
+		cf = &own;
+		borrowed = true;
 	}
-	if (!cf.compressed) {
-		if (!ino->has_dstream) {
-			return 0;
+	error = apfs_cfile_init(vol, ino, cf);
+	if (error == 0) {
+		if (!cf->compressed) {
+			error = ino->has_dstream
+			    ? apfs_read_stream(vol, ino->private_id, ino->size, off, buf, len,
+			    out)
+			    : 0;
+		} else if (cf->in_rsrc) {
+			error = read_cfile_rsrc(vol, ino, cf, off, buf, len, out);
+		} else {
+			error = read_cfile_attr(vol, ino, cf, off, buf, len, out);
 		}
-		return apfs_read_stream(vol, ino->private_id, ino->size, off, buf, len, out);
 	}
-	if (cf.in_rsrc) {
-		return read_cfile_rsrc(vol, ino, &cf, off, buf, len, out);
+	if (borrowed) {
+		apfs_cfile_fini(cf);
 	}
-	return read_cfile_attr(vol, ino, &cf, off, buf, len, out);
+	return error;
 }
