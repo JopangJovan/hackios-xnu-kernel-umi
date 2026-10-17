@@ -153,7 +153,8 @@ struct apfs_rec {
 struct apfs_cursor {
 	struct apfs_btree *tree;
 	int                depth;
-	uint64_t           node[APFS_MAX_LEVELS];  /* block address at each level */
+	uint64_t           node[APFS_MAX_LEVELS];  /* the block address at each level,
+	                                            * never an object identifier */
 	uint32_t           index[APFS_MAX_LEVELS];
 	bool               done;
 };

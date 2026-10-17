@@ -310,16 +310,20 @@ node_child(struct apfs_btree *tree, const struct node *n, uint32_t i, uint64_t *
 static int
 tree_node_addr(struct apfs_btree *tree, uint64_t oid, uint64_t *addr);
 
+/*
+ * Read a node that is already known by block address.
+ *
+ * Everything that walks a tree keeps block addresses, never object identifiers: the root
+ * is only ever an address, so a cursor that mixed the two would resolve the root's
+ * address through the object map as though it were an identifier.  That lookup fails with
+ * ENOENT, which a caller scanning for records reads as "there are no more" -- the records
+ * of the object quietly go missing instead of the read failing.
+ */
 static int
-tree_node(struct apfs_btree *tree, uint64_t oid, const uint8_t **blk, struct node *n)
+node_at(struct apfs_btree *tree, uint64_t addr, const uint8_t **blk, struct node *n)
 {
-	uint64_t addr;
-	int error = tree_node_addr(tree, oid, &addr);
+	int error = nx_block(tree->nx, addr, blk, true);
 
-	if (error) {
-		return error;
-	}
-	error = nx_block(tree->nx, addr, blk, true);
 	if (error) {
 		return error;
 	}
@@ -328,6 +332,19 @@ tree_node(struct apfs_btree *tree, uint64_t oid, const uint8_t **blk, struct nod
 		return EIO;
 	}
 	return node_parse(tree, *blk, n);
+}
+
+/* The block address of child i of a non-leaf node. */
+static int
+node_child_addr(struct apfs_btree *tree, const struct node *n, uint32_t i, uint64_t *addr)
+{
+	uint64_t oid;
+	int error = node_child(tree, n, i, &oid);
+
+	if (error) {
+		return error;
+	}
+	return tree_node_addr(tree, oid, addr);
 }
 
 /* ------------------------------------------------------------------ object maps */
@@ -725,16 +742,12 @@ apfs_seek(struct apfs_btree *tree, uint64_t obj_id, uint8_t type,
 {
 	const uint8_t *blk;
 	struct node n;
-	uint64_t node_oid = tree->root;
+	uint64_t addr = tree->root;
 	int error;
 
 	memset(cur, 0, sizeof(*cur));
 	cur->tree = tree;
-	error = nx_block(tree->nx, node_oid, &blk, true);
-	if (error) {
-		return error;
-	}
-	error = node_parse(tree, blk, &n);
+	error = node_at(tree, addr, &blk, &n);
 	if (error) {
 		return error;
 	}
@@ -745,7 +758,7 @@ apfs_seek(struct apfs_btree *tree, uint64_t obj_id, uint8_t type,
 		if (cur->depth >= APFS_MAX_LEVELS) {
 			return EIO;
 		}
-		cur->node[cur->depth] = node_oid;
+		cur->node[cur->depth] = addr;
 		if (n.nkeys == 0) {
 			cur->done = true;
 			return 0;
@@ -795,12 +808,12 @@ apfs_seek(struct apfs_btree *tree, uint64_t obj_id, uint8_t type,
 			}
 		}
 		cur->index[cur->depth] = pick;
-		error = node_child(tree, &n, pick, &node_oid);
+		error = node_child_addr(tree, &n, pick, &addr);
 		if (error) {
 			return error;
 		}
 		cur->depth++;
-		error = tree_node(tree, node_oid, &blk, &n);
+		error = node_at(tree, addr, &blk, &n);
 		if (error) {
 			return error;
 		}
@@ -823,7 +836,7 @@ apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec)
 		return ENOENT;
 	}
 	for (;;) {
-		error = tree_node(tree, cur->node[cur->depth], &blk, &n);
+		error = node_at(tree, cur->node[cur->depth], &blk, &n);
 		if (error) {
 			return error;
 		}
@@ -857,7 +870,7 @@ apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec)
 				return ENOENT;
 			}
 			cur->depth--;
-			error = tree_node(tree, cur->node[cur->depth], &blk, &n);
+			error = node_at(tree, cur->node[cur->depth], &blk, &n);
 			if (error) {
 				return error;
 			}
@@ -873,7 +886,7 @@ apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec)
 		for (;;) {
 			uint64_t child;
 
-			error = node_child(tree, &n, cur->index[cur->depth], &child);
+			error = node_child_addr(tree, &n, cur->index[cur->depth], &child);
 			if (error) {
 				return error;
 			}
@@ -883,7 +896,7 @@ apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec)
 			cur->depth++;
 			cur->node[cur->depth] = child;
 			cur->index[cur->depth] = 0;
-			error = tree_node(tree, child, &blk, &n);
+			error = node_at(tree, child, &blk, &n);
 			if (error) {
 				return error;
 			}

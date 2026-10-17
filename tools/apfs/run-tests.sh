@@ -5,9 +5,13 @@
 #   2. the UDIF reader against the image's own trailer and partition table
 #   3. the APFS reader against 7-Zip's, over every entry in the volume (needs ios165/)
 #   4. file contents against the files 7-Zip extracted, byte for byte (needs ios165/)
+#   5. the C the kernel is built from against apfs.py, over the whole volume
 #
-# Steps 3 and 4 need the APFS partition unpacked out of ios165/rootfs.dmg; pass it as
+# Steps 3, 4 and 5 need the APFS partition unpacked out of ios165/rootfs.dmg; pass it as
 # $1, or set APFS_IMAGE.  Without it only the first two steps run.
+#
+# APFS_SUBTREE=/some/path keeps step 5 to one subtree, which is the quick way to run it;
+# unset, it walks the whole volume and reads every file through both readers.
 #
 # usage: tools/apfs/run-tests.sh [APFS-PARTITION-OR-DMG]
 
@@ -15,6 +19,7 @@ set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 IMAGE=${1:-${APFS_IMAGE:-}}
+APFS_SUBTREE=${APFS_SUBTREE:-}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 fail=0
@@ -67,6 +72,29 @@ if [ -d "$ROOT/ios165/rootfs" ]; then
 	echo "   (that is a sample of every kind; --all compares all of them)"
 else
 	echo "   skipped: ios165/rootfs is not here"
+fi
+echo
+
+# The C in bsd/miscfs/apfs is what goes into the kernel, so it is run against the reader
+# that has already been checked against 7-Zip.  SUBTREE keeps it to part of the volume;
+# with no SUBTREE it walks all 318098 entries and reads every file, which takes a while
+# on the Python side.
+echo "== 5. the kernel's C against apfs.py${APFS_SUBTREE:+ over $APFS_SUBTREE}"
+if "$HERE/build-tool.sh" "$TMP/apfs-tool" > /dev/null; then
+	"$TMP/apfs-tool" census "$IMAGE" ${APFS_SUBTREE:+"$APFS_SUBTREE"} 2>/dev/null |
+		sort > "$TMP/c.txt"
+	python3 "$HERE/verify.py" clines "$IMAGE" ${APFS_SUBTREE:+"$APFS_SUBTREE"} |
+		sort > "$TMP/py.txt"
+	if diff "$TMP/c.txt" "$TMP/py.txt" > "$TMP/d.txt"; then
+		echo "   $(wc -l < "$TMP/c.txt") entries, identical in both readers"
+	else
+		echo "   $(grep -c '^[<>]' "$TMP/d.txt") differing lines of $(wc -l < "$TMP/py.txt"):"
+		head -10 "$TMP/d.txt"
+		fail=1
+	fi
+else
+	echo "   skipped: the tool would not build"
+	fail=1
 fi
 
 exit $fail
