@@ -25,13 +25,13 @@
 /* How much is read out of a file at a time when copying into a uio. */
 #define APFS_IOBUF 65536
 
-static void
+void
 apfs_lock(struct apfs_mount *am)
 {
 	lck_mtx_lock(&am->am_lock);
 }
 
-static void
+void
 apfs_unlock(struct apfs_mount *am)
 {
 	lck_mtx_unlock(&am->am_lock);
@@ -159,6 +159,7 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	struct apfs_inode ino;
 	uint8_t *buf;
 	uint64_t size = 0;
+	uint64_t t0, read_bytes = 0;
 	int error = 0;
 
 	if (vnode_isdir(vp)) {
@@ -176,6 +177,7 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	if (buf == NULL) {
 		return ENOMEM;
 	}
+	t0 = apfs_ticks();
 	while (uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < size) {
 		size_t want = (size_t)MIN((user_ssize_t)APFS_IOBUF, uio_resid(uio));
 		size_t got = 0;
@@ -194,8 +196,14 @@ apfs_vnop_read(struct vnop_read_args *ap)
 		if (error) {
 			break;
 		}
+		read_bytes += got;
 	}
 	kfree_data(buf, APFS_IOBUF);
+	apfs_lock(am);
+	am->am_read_ticks += apfs_ticks() - t0;
+	am->am_read_calls++;
+	am->am_read_bytes += read_bytes;
+	apfs_unlock(am);
 	return error;
 }
 
@@ -215,6 +223,7 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	struct apfs_inode ino;
 	vm_offset_t address = 0;
 	uint64_t size = 0;
+	uint64_t t0 = apfs_ticks();
 	off_t at, end;
 	int error = 0;
 
@@ -284,6 +293,11 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	}
 
 	ubc_upl_unmap(upl);
+	apfs_lock(am);
+	am->am_pagein_ticks += apfs_ticks() - t0;
+	am->am_pagein_calls++;
+	am->am_pagein_bytes += ap->a_size;
+	apfs_unlock(am);
 	if (!(ap->a_flags & UPL_NOCOMMIT)) {
 		if (error) {
 			ubc_upl_abort_range(upl, upl_offset, (upl_size_t)ap->a_size,

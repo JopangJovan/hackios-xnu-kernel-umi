@@ -16,9 +16,7 @@
  *        apfs-tool census IMAGE [PATH]
  */
 
-/* pread(2) */
-#define _DEFAULT_SOURCE
-
+/* pread(2) and clock_gettime(2) come with -D_DEFAULT_SOURCE, set by build-tool.sh */
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>

@@ -29,6 +29,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -55,6 +56,44 @@ fnv1a(const unsigned char *p, size_t n, unsigned long long h)
 		h *= FNV_PRIME;
 	}
 	return h;
+}
+
+/*
+ * The driver's own breakdown of where the time went (kern.apfs_stats): waiting for the
+ * device, decompressing, and the rest.  Zeroed before a road is walked and printed after,
+ * so the numbers belong to that road alone.
+ */
+static void
+stats_reset(void)
+{
+	char zero = 0;
+
+	if (sysctlbyname("kern.apfs_stats", NULL, NULL, &zero, 1) != 0) {
+		printf("%s cannot zero kern.apfs_stats: %s\n", tag, strerror(errno));
+	}
+}
+
+static void
+stats_print(void)
+{
+	char buf[1024];
+	size_t n = sizeof(buf);
+	char *line, *next;
+
+	if (sysctlbyname("kern.apfs_stats", buf, &n, NULL, 0) != 0) {
+		printf("%s cannot read kern.apfs_stats: %s\n", tag, strerror(errno));
+		return;
+	}
+	buf[sizeof(buf) - 1] = '\0';
+	for (line = buf; line != NULL && *line != '\0'; line = next) {
+		next = strchr(line, '\n');
+		if (next != NULL) {
+			*next++ = '\0';
+		}
+		if (*line != '\0') {
+			printf("%s kernel: %s\n", tag, line);
+		}
+	}
 }
 
 static double
@@ -224,6 +263,7 @@ main(int argc, char **argv)
 		printf("%s pieces of %d bytes\n", tag, chunk_size);
 	}
 	snprintf(path, sizeof(path), "%s", where);
+	stats_reset();
 	t0 = now_ms();
 	walk(path, strlen(path));
 	t1 = now_ms();
@@ -233,5 +273,6 @@ main(int argc, char **argv)
 	printf("%s line-hash sum %016llx\n", tag, total_sum);
 	printf("%s done in %.0f ms (%.1f MB/s)\n", tag, t1 - t0,
 	    (t1 > t0) ? (double)total_bytes / 1048576.0 / ((t1 - t0) / 1000.0) : 0.0);
+	stats_print();
 	return total_errors ? 1 : 0;
 }

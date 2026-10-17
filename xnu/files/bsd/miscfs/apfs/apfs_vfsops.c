@@ -16,6 +16,7 @@
 #include <sys/systm.h>
 #include <sys/time.h>
 #include <uuid/uuid.h>
+#include <sys/sysctl.h>
 #include <sys/vnode_internal.h>
 #include <sys/fcntl.h>
 
@@ -69,6 +70,85 @@ apfs_dev_read(void *ctx, uint64_t off, void *buf, size_t len)
 	}
 	return 0;
 }
+
+/* ------------------------------------------------------------- where the time goes */
+
+/*
+ * One mounted volume, for the sysctl below to look at.  This port mounts one APFS volume
+ * and the counters are a bring-up aid, so a single pointer is enough; it is set when the
+ * volume is mounted and cleared when it goes away.
+ */
+static struct apfs_mount *apfs_the_mount;
+
+static uint64_t
+apfs_ticks_ms(uint64_t ticks)
+{
+	uint64_t ns = 0;
+
+	absolutetime_to_nanoseconds(ticks, &ns);
+	return ns / 1000000;
+}
+
+/*
+ * kern.apfs_stats: reading it says where the time went, writing anything zeroes the
+ * counters.  The point is to tell apart, on one road through the driver, the time spent
+ * waiting for the device, the time spent decompressing, and the rest -- which is the
+ * driver's own work and the paging machinery above it.
+ */
+static int
+sysctl_apfs_stats SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	struct apfs_mount *am = apfs_the_mount;
+	char text[640];
+	int error;
+
+	if (am == NULL) {
+		strlcpy(text, "apfs: nothing mounted\n", sizeof(text));
+	} else {
+		struct apfs_nx *nx = &am->am_nx;
+
+		snprintf(text, sizeof(text),
+		    "pagein   %llu calls  %llu ms  %llu bytes\n"
+		    "read     %llu calls  %llu ms  %llu bytes\n"
+		    "device   %llu calls  %llu ms  %llu bytes\n"
+		    "inflate  %llu calls  %llu ms  %llu bytes in  %llu bytes out\n"
+		    "blocks   %llu read  %llu cache hits\n",
+		    (unsigned long long)am->am_pagein_calls,
+		    (unsigned long long)apfs_ticks_ms(am->am_pagein_ticks),
+		    (unsigned long long)am->am_pagein_bytes,
+		    (unsigned long long)am->am_read_calls,
+		    (unsigned long long)apfs_ticks_ms(am->am_read_ticks),
+		    (unsigned long long)am->am_read_bytes,
+		    (unsigned long long)nx->dev_calls,
+		    (unsigned long long)apfs_ticks_ms(nx->dev_ticks),
+		    (unsigned long long)nx->dev_bytes,
+		    (unsigned long long)nx->inflate_calls,
+		    (unsigned long long)apfs_ticks_ms(nx->inflate_ticks),
+		    (unsigned long long)nx->inflate_in,
+		    (unsigned long long)nx->inflate_out,
+		    (unsigned long long)nx->reads,
+		    (unsigned long long)nx->hits);
+	}
+	error = SYSCTL_OUT(req, text, strlen(text) + 1);
+	if (error || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (am != NULL) {
+		apfs_lock(am);
+		am->am_pagein_calls = am->am_pagein_ticks = am->am_pagein_bytes = 0;
+		am->am_read_calls = am->am_read_ticks = am->am_read_bytes = 0;
+		am->am_nx.dev_calls = am->am_nx.dev_ticks = am->am_nx.dev_bytes = 0;
+		am->am_nx.inflate_calls = am->am_nx.inflate_ticks = 0;
+		am->am_nx.inflate_in = am->am_nx.inflate_out = 0;
+		am->am_nx.reads = am->am_nx.hits = 0;
+		apfs_unlock(am);
+	}
+	return 0;
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, apfs_stats, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_apfs_stats, "A", "APFS: where the time goes; write to zero it");
 
 /* ------------------------------------------------------------------ vnodes */
 
@@ -305,6 +385,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	sp->f_fsid.val[1] = vfs_typenum(mp);
 	strlcpy(sp->f_fstypename, "apfs", sizeof(sp->f_fstypename));
 
+	apfs_the_mount = am;
 	printf("apfs: volume \"%s\": %llu files, %llu directories, %llu blocks of %u used\n",
 	    am->am_vol.name, (unsigned long long)am->am_vol.num_files,
 	    (unsigned long long)am->am_vol.num_dirs,
@@ -393,6 +474,9 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 
 	if (error) {
 		return error;
+	}
+	if (apfs_the_mount == am) {
+		apfs_the_mount = NULL;
 	}
 	vfs_setfsprivate(mp, NULL);
 	if (am->am_owns_devvp && am->am_devvp != NULLVP) {

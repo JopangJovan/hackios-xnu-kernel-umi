@@ -38,6 +38,12 @@ struct apfs_mount {
 	bool               am_owns_devvp;  /* we opened it, so we close it */
 	struct apfs_node  *am_hash[APFS_HASH_BUCKETS];
 	uint64_t           am_root_id;
+	/*
+	 * Where the time goes at the vnode operations, to set beside the container's own
+	 * counters (waiting for the device, decompressing).  Ticks; see apfs_ticks().
+	 */
+	uint64_t           am_pagein_calls, am_pagein_ticks, am_pagein_bytes;
+	uint64_t           am_read_calls, am_read_ticks, am_read_bytes;
 };
 
 /* The private part of a vnode: which object it is. */
@@ -76,6 +82,9 @@ int apfs_mountroot(mount_t mp, vnode_t devvp, vfs_context_t ctx);
 int apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
     struct componentname *cnp, vnode_t *vpp);
 void apfs_node_detach(struct apfs_node *an);
+
+void apfs_lock(struct apfs_mount *am);
+void apfs_unlock(struct apfs_mount *am);
 
 /* apfs_vnops.c */
 extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;

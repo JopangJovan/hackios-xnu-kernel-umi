@@ -17,6 +17,6 @@ done
 [ -n "$SRC" ] || { echo "build-tool.sh: apfs_lib.c is in neither the kernel tree nor xnu/files" >&2; exit 1; }
 
 mkdir -p "$(dirname "$OUT")"
-cc -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -I"$SRC" -I"$HERE" \
+cc -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wno-unused-parameter -I"$SRC" -I"$HERE" \
 	-o "$OUT" "$HERE/apfs-tool.c" "$SRC/apfs_lib.c" -lz
 echo "build-tool.sh: $OUT (from $SRC)"

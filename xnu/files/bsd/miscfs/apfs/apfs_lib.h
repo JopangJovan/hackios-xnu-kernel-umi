@@ -28,6 +28,26 @@
 
 #include "apfs_format.h"
 
+/*
+ * A clock for the breakdown counters below.  Raw ticks: the kernel's are mach absolute
+ * time and are turned into nanoseconds where they are printed, the host's already are
+ * nanoseconds.
+ */
+#ifdef KERNEL
+#include <kern/clock.h>
+#define apfs_ticks()    mach_absolute_time()
+#else
+#include <time.h>
+static inline uint64_t
+apfs_ticks(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
+
 #ifdef KERNEL
 #include <sys/param.h>
 #include <sys/errno.h>
@@ -104,6 +124,12 @@ struct apfs_nx {
 	uint32_t          clock;
 	uint64_t          reads;
 	uint64_t          hits;
+	/*
+	 * Where the time goes, to tell apart waiting for the device from decompressing.
+	 * Ticks, not nanoseconds -- see apfs_ticks().
+	 */
+	uint64_t          dev_calls, dev_ticks, dev_bytes;
+	uint64_t          inflate_calls, inflate_ticks, inflate_in, inflate_out;
 };
 
 /* A volume inside the container. */

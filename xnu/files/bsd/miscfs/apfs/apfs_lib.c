@@ -145,8 +145,15 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 		return ENOMEM;
 	}
 	victim->addr = APFS_BUF_EMPTY;
-	error = nx->dev.read(nx->dev.ctx, addr * (uint64_t)nx->block_size, victim->data,
-	    nx->block_size);
+	{
+		uint64_t t0 = apfs_ticks();
+
+		error = nx->dev.read(nx->dev.ctx, addr * (uint64_t)nx->block_size,
+		    victim->data, nx->block_size);
+		nx->dev_ticks += apfs_ticks() - t0;
+		nx->dev_calls++;
+		nx->dev_bytes += nx->block_size;
+	}
 	if (error) {
 		return error;
 	}
@@ -1762,11 +1769,12 @@ apfs_zfree(voidpf opaque, voidpf address)
 
 /* One zlib stream.  A leading 0xff means the piece was stored rather than compressed. */
 static int
-apfs_inflate(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len,
-    size_t *out)
+apfs_inflate_counted(struct apfs_nx *nx, const uint8_t *src, size_t src_len, uint8_t *dst,
+    size_t dst_len, size_t *out)
 {
 	z_stream zs;
 	int zerr;
+	uint64_t t0;
 
 	if (src_len == 0) {
 		return EIO;
@@ -1781,6 +1789,7 @@ apfs_inflate(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len,
 		*out = n;
 		return 0;
 	}
+	t0 = apfs_ticks();
 	memset(&zs, 0, sizeof(zs));
 	zs.zalloc = apfs_zalloc;
 	zs.zfree = apfs_zfree;
@@ -1795,6 +1804,12 @@ apfs_inflate(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len,
 	zerr = inflate(&zs, Z_FINISH);
 	*out = (size_t)zs.total_out;
 	inflateEnd(&zs);
+	if (nx != NULL) {
+		nx->inflate_ticks += apfs_ticks() - t0;
+		nx->inflate_calls++;
+		nx->inflate_in += src_len;
+		nx->inflate_out += *out;
+	}
 	if (zerr != Z_STREAM_END && zerr != Z_OK && zerr != Z_BUF_ERROR) {
 		return EIO;
 	}
@@ -1811,8 +1826,8 @@ apfs_inflate(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len,
  * exactly the right length is taken whole.
  */
 static int
-decmpfs_attr(uint32_t type, const uint8_t *src, size_t src_len, size_t want,
-    uint8_t *dst, size_t *out)
+decmpfs_attr(struct apfs_nx *nx, uint32_t type, const uint8_t *src, size_t src_len,
+    size_t want, uint8_t *dst, size_t *out)
 {
 	switch (type) {
 	case APFS_DECMPFS_TYPE_RAW_ATTR: {
@@ -1834,7 +1849,7 @@ decmpfs_attr(uint32_t type, const uint8_t *src, size_t src_len, size_t want,
 		return 0;
 	}
 	case APFS_DECMPFS_TYPE_ZLIB_ATTR:
-		return apfs_inflate(src, src_len, dst, want, out);
+		return apfs_inflate_counted(nx, src, src_len, dst, want, out);
 	default:
 		return ENOTSUP;
 	}
@@ -1902,7 +1917,7 @@ read_cfile_attr(struct apfs_vol *vol, const struct apfs_inode *ino,
 			goto out;
 		}
 	}
-	error = decmpfs_attr(cf->type, attr + 16, attr_len - 16, (size_t)cf->size,
+	error = decmpfs_attr(vol->nx, cf->type, attr + 16, attr_len - 16, (size_t)cf->size,
 	    plain, &plain_len);
 	if (error) {
 		goto out;
@@ -2001,8 +2016,8 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 				memcpy(cf->held_data, piece, m);
 				cf->held_len = m;
 			} else {
-				error = apfs_inflate(piece, plen, cf->held_data, want,
-				    &cf->held_len);
+				error = apfs_inflate_counted(vol->nx, piece, plen,
+				    cf->held_data, want, &cf->held_len);
 				if (error) {
 					goto out;
 				}
