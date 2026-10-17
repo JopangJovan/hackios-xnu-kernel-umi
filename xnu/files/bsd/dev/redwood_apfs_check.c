@@ -18,7 +18,12 @@
  *                             the whole of it, to see what the one lock round apfs_lib
  *                             costs when there is more than one reader
  *   apfs_threads=N            how many, for mode 5 (default 4)
- *   apfs_dev=md1              the device to mount for modes 1 to 3 (default rvblk0)
+ *   apfs_check=6              mount apfs_dev on apfs_mnt, walk it on this thread and go
+ *                             back to the loader.  For a volume that is not the root and
+ *                             where there is no user space to make a mount point: the
+ *                             point is a directory of the root image itself.
+ *   apfs_dev=md1              the device to mount for modes 1 to 3 and 6 (default rvblk0)
+ *   apfs_mnt=/lib             where to mount it for mode 6 (default /private/var/apfs-check)
  *   apfs_subtree=/usr         walk only that part of the volume
  *
  * A line is the same one tools/apfs/apfs-tool's census and `verify.py clines` print:
@@ -64,6 +69,7 @@
 
 extern void loader_return(void);        /* osfmk/arm64/loader_return.c */
 extern void apfs_stats_print(void);     /* bsd/miscfs/apfs/apfs_vfsops.c */
+extern void redwood_sparse_report(void);
 
 #define CHECK_MNT    "/private/var/apfs-check"
 #define CHECK_PARENT "/private/var"
@@ -528,8 +534,13 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 	bzero(&cs, sizeof(cs));
 	cs.ctx = ctx;
 	cs.print_lines = (mode == 2);
+	/*
+	 * NOCROSSMOUNT only where the volume is the root (modes 4 and 5).  In mode 6 the
+	 * path leads from the root image into the mount, so crossing has to be allowed; the
+	 * walk is kept on the volume by the check against the mount it started on.
+	 */
 	cs.lookup_flags = VNODE_LOOKUP_NOFOLLOW |
-	    ((mode >= 4) ? VNODE_LOOKUP_NOCROSSMOUNT : 0);
+	    ((mode == 4 || mode == 5) ? VNODE_LOOKUP_NOCROSSMOUNT : 0);
 	if (PE_parse_boot_arg_str("apfs_dev", subtree, sizeof(subtree)) && subtree[0] != '\0') {
 		snprintf(devname, sizeof(devname), "/dev/%s", subtree);
 	}
@@ -542,13 +553,68 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 		return;
 	}
 
+	if (mode == 6) {
+		char mnt[128] = CHECK_MNT;
+
+		if (PE_parse_boot_arg_str("apfs_mnt", subtree, sizeof(subtree)) &&
+		    subtree[0] == '/') {
+			strlcpy(mnt, subtree, sizeof(mnt));
+		}
+		subtree[0] = '\0';
+		/*
+		 * A node just made with devfs_make_node() is not in /dev the instant it is
+		 * made -- this runs straight after the device registered itself, and the first
+		 * lookup comes back ENOENT -- so wait for it rather than guess how long devfs
+		 * takes to show it.
+		 */
+		{
+			vnode_t t = NULLVP;
+			int tries;
+
+			for (tries = 0; tries < 100; tries++) {
+				if (vnode_lookup(devname, 0, &t, ctx) == 0) {
+					vnode_put(t);
+					break;
+				}
+				delay_for_interval(20, NSEC_PER_MSEC);
+			}
+			if (tries >= 100) {
+				printf("apfs-check: %s never showed up in /dev\n", devname);
+			} else if (tries > 0) {
+				printf("apfs-check: %s showed up in /dev after %d ms\n", devname,
+				    tries * 20);
+			}
+		}
+		error = kernel_mount("apfs", NULLVP, NULLVP, mnt, devname, 0,
+		    MNT_RDONLY | MNT_DONTBROWSE, KERNEL_MOUNT_NOAUTH, ctx);
+		if (error) {
+			printf("apfs-check: mounting %s on %s failed: %d\n", devname, mnt,
+			    error);
+			kfree_data(cs.path, PATH_CAP);
+			kfree_data(cs.buf, READ_CHUNK);
+			return;
+		}
+		printf("apfs-check: %s mounted on %s\n", devname, mnt);
+		cs.rel = strlen(mnt);
+		strlcpy(cs.path, mnt, PATH_CAP);
+		cs.len = cs.rel;
+		if (PE_parse_boot_arg_str("apfs_subtree", subtree, sizeof(subtree)) &&
+		    subtree[0] == '/') {
+			strlcat(cs.path, subtree, PATH_CAP);
+			cs.len = strlen(cs.path);
+			printf("apfs-check: walking %s\n", cs.path + cs.rel);
+		} else {
+			printf("apfs-check: walking the whole volume\n");
+		}
+		goto walk;
+	}
 	if (mode >= 5) {
 		kfree_data(cs.path, PATH_CAP);
 		kfree_data(cs.buf, READ_CHUNK);
 		apfs_check_concurrent();
 		return;
 	}
-	if (mode >= 4) {
+	if (mode >= 4 && mode != 6) {
 		/*
 		 * The volume is already the root: nothing to mount, and no mount point to
 		 * make, so none of what follows about /private/var applies.
@@ -628,6 +694,7 @@ walk:
 	printf("apfs-check: line-hash sum %016llx\n", (unsigned long long)cs.sum);
 	printf("apfs-check: errors %u\n", cs.errors);
 	apfs_stats_print();
+	redwood_sparse_report();
 	printf("apfs-check: compare with tools/apfs/verify.py sum\n");
 
 	kfree_data(cs.path, PATH_CAP);
@@ -645,7 +712,8 @@ redwood_apfs_check_init(void)
 	}
 	if (mode >= 4) {
 		/*
-		 * The volume is the root, so everything the walk needs is already up -- and
+		 * The volume is the root (or mode 6, which mounts it here), so everything the
+		 * walk needs is already up -- and
 		 * bsd_init is about to exec /sbin/launchd off it, which on anything but our
 		 * own packfs image ends in a panic before a thread of our own would finish.
 		 * So walk it here, on this thread, and go back to the loader with the answer

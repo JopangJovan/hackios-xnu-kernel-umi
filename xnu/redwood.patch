@@ -46,10 +46,10 @@ index 222158a93918..68bb0f3e56bf 100755
  ######################################################################
  # HISTORY
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..9902234f568c 100644
+index 44274016a4cf..489ab8da091f 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,33 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,34 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -74,6 +74,7 @@ index 44274016a4cf..9902234f568c 100644
 +bsd/dev/redwood_wifi.c		standard
 +bsd/dev/redwood_adsp.c		standard
 +bsd/dev/redwood_virtio_blk.c	standard
++bsd/dev/redwood_sparse.c	standard
 +bsd/dev/redwood_apfs_check.c	optional apfs
 +bsd/dev/redwood_sound.c		standard
 +bsd/dev/redwood_qmi.c		standard
@@ -83,7 +84,7 @@ index 44274016a4cf..9902234f568c 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +182,13 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +183,13 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -97,7 +98,7 @@ index 44274016a4cf..9902234f568c 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +395,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +396,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -105,7 +106,7 @@ index 44274016a4cf..9902234f568c 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +418,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +419,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -298,23 +299,24 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..0c71e8a534bb 100644
+index 4df41ba1f61b..16cf4fd8d8f1 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,12 @@
+@@ -147,6 +147,13 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
 +#include <sys/redwood_input.h>
 +#include <sys/redwood_audio.h>
 +#include <sys/redwood_virtio_blk.h>
++#include <sys/redwood_sparse.h>
 +#if APFS
 +#include <sys/redwood_apfs_check.h>
 +#endif
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +496,7 @@ bsd_init(void)
+@@ -490,7 +497,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -323,13 +325,14 @@ index 4df41ba1f61b..0c71e8a534bb 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +982,13 @@ bsd_init(void)
+@@ -976,6 +983,14 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
 +		redwood_input_init();           /* /dev/redwood-touch */
 +		redwood_audio_init();           /* /dev/redwood-audio */
 +		redwood_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
++		redwood_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
 +#if APFS
 +		/* mounts and walks /dev/rvblk0 once userland has /private/var up */
 +		redwood_apfs_check_init();

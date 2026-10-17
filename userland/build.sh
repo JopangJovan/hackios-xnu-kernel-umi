@@ -181,6 +181,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/camera_avtest ] && cp obj/camera_avtest root/bin/
 	[ -f obj/record_test ] && cp obj/record_test root/bin/
 	for f in $EXTRA; do cp "$f" root/bin/; done
+	# /dev and /private/var exist so that this image can also be the root on its own:
+	# devfs is mounted on /dev, and init puts a ramfs on /private/var
+	mkdir -p root/dev root/private/var
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
