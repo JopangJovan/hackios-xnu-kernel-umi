@@ -1542,6 +1542,50 @@ apfs_cfile_init(struct apfs_vol *vol, const struct apfs_inode *ino,
 	}
 }
 
+/*
+ * zlib asks for its own working memory through these.  The kernel's copy of zlib has no
+ * allocator of its own -- a zeroed z_stream leaves zalloc NULL and inflateInit_ then calls
+ * through it -- so they have to be set, and they are set on both sides so that the kernel
+ * and the program on the build machine run the same code.  zfree is told only an address,
+ * so each block carries its own length in front of it.
+ */
+static voidpf
+apfs_zalloc(voidpf opaque, unsigned items, unsigned size)
+{
+	size_t n;
+	uint8_t *p;
+
+	(void)opaque;
+	if (items == 0 || size == 0) {
+		return Z_NULL;
+	}
+	if ((size_t)items > (~(size_t)0 - sizeof(size_t)) / size) {
+		return Z_NULL;
+	}
+	n = (size_t)items * size + sizeof(size_t);
+	p = apfs_alloc(n);
+	if (p == NULL) {
+		return Z_NULL;
+	}
+	memcpy(p, &n, sizeof(n));
+	return p + sizeof(size_t);
+}
+
+static void
+apfs_zfree(voidpf opaque, voidpf address)
+{
+	uint8_t *p;
+	size_t n;
+
+	(void)opaque;
+	if (address == NULL) {
+		return;
+	}
+	p = (uint8_t *)address - sizeof(size_t);
+	memcpy(&n, p, sizeof(n));
+	apfs_free(p, n);
+}
+
 /* One zlib stream.  A leading 0xff means the piece was stored rather than compressed. */
 static int
 apfs_inflate(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len,
@@ -1564,6 +1608,9 @@ apfs_inflate(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len,
 		return 0;
 	}
 	memset(&zs, 0, sizeof(zs));
+	zs.zalloc = apfs_zalloc;
+	zs.zfree = apfs_zfree;
+	zs.opaque = Z_NULL;
 	zs.next_in = (Bytef *)(uintptr_t)src;
 	zs.avail_in = (uInt)src_len;
 	zs.next_out = (Bytef *)dst;

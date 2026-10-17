@@ -17,6 +17,7 @@
 #include <sys/time.h>
 #include <uuid/uuid.h>
 #include <sys/vnode_internal.h>
+#include <sys/fcntl.h>
 
 static LCK_GRP_DECLARE(apfs_lck_grp, "apfs");
 
@@ -317,21 +318,74 @@ apfs_mountroot(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	return apfs_mount_common(mp, devvp, ctx);
 }
 
+/*
+ * mount(2), and kernel_mount().  The mount data is the path of the block device holding
+ * the container, as a string.  VFS does not resolve it for us the way it does for a
+ * filesystem marked VFC_VFSLOCALARGS -- see the note in vfs_conf.c for why this one is
+ * not -- so it is looked up and opened here, and closed again in apfs_unmount().
+ */
 static int
-apfs_mount(mount_t mp, vnode_t devvp, __unused user_addr_t data, vfs_context_t ctx)
+apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 {
+	char *path;
+	vnode_t vp = NULLVP;
+	size_t len = 0;
+	int error;
+
 	if (vfs_isupdate(mp)) {
 		/* nothing about a mounted volume can change, least of all to read-write */
 		return vfs_iswriteupgrade(mp) ? EROFS : 0;
 	}
-	if (devvp == NULLVP) {
+	if (devvp != NULLVP) {
+		/* mounted as the root: VFS found the device and owns the vnode */
+		return apfs_mount_common(mp, devvp, ctx);
+	}
+	if (data == USER_ADDR_NULL) {
 		return EINVAL;
 	}
-	return apfs_mount_common(mp, devvp, ctx);
+	path = kalloc_data(MAXPATHLEN, Z_WAITOK);
+	if (path == NULL) {
+		return ENOMEM;
+	}
+	if (vfs_iskernelmount(mp)) {
+		/* kernel_mount() hands the pointer through untouched */
+		error = (strlcpy(path, CAST_DOWN(char *, data), MAXPATHLEN) < MAXPATHLEN)
+		    ? 0 : ENAMETOOLONG;
+	} else {
+		error = copyinstr(data, path, MAXPATHLEN, &len);
+	}
+	if (error == 0) {
+		error = vnode_lookup(path, 0, &vp, ctx);
+	}
+	if (error == 0 && !vnode_isblk(vp)) {
+		error = ENOTBLK;
+	}
+	if (error == 0) {
+		error = VNOP_OPEN(vp, FREAD, ctx);
+		if (error == 0) {
+			/*
+			 * The iocount from the lookup is kept for as long as the volume is
+			 * mounted; apfs_unmount() closes and drops it.
+			 */
+			error = apfs_mount_common(mp, vp, ctx);
+			if (error == 0) {
+				APFS_MP(mp)->am_owns_devvp = true;
+			} else {
+				(void)VNOP_CLOSE(vp, FREAD, ctx);
+			}
+		}
+		if (error != 0) {
+			vnode_put(vp);
+		}
+	} else if (vp != NULLVP) {
+		vnode_put(vp);
+	}
+	kfree_data(path, MAXPATHLEN);
+	return error;
 }
 
 static int
-apfs_unmount(mount_t mp, int mntflags, __unused vfs_context_t ctx)
+apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 {
 	struct apfs_mount *am = APFS_MP(mp);
 	int error = vflush(mp, NULLVP, (mntflags & MNT_FORCE) ? FORCECLOSE : 0);
@@ -340,6 +394,10 @@ apfs_unmount(mount_t mp, int mntflags, __unused vfs_context_t ctx)
 		return error;
 	}
 	vfs_setfsprivate(mp, NULL);
+	if (am->am_owns_devvp && am->am_devvp != NULLVP) {
+		(void)VNOP_CLOSE(am->am_devvp, FREAD, ctx);
+		vnode_put(am->am_devvp);
+	}
 	apfs_free_mount(am);
 	return 0;
 }

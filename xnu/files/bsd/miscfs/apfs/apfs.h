@@ -35,6 +35,7 @@ struct apfs_mount {
 	struct apfs_nx     am_nx;
 	struct apfs_vol    am_vol;
 	uint32_t           am_devblock;
+	bool               am_owns_devvp;  /* we opened it, so we close it */
 	struct apfs_node  *am_hash[APFS_HASH_BUCKETS];
 	uint64_t           am_root_id;
 };

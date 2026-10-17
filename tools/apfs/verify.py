@@ -13,10 +13,18 @@
 #   clines   the same lines tools/apfs/apfs-tool prints, so the C code that goes into the
 #            kernel can be diffed against this reader over a whole tree.
 #
+#   sum      those same lines folded the way the kernel folds them (boot-arg apfs_check):
+#            each line hashed on its own and the hashes added together.  Printing 318098
+#            lines out of a guest over a serial line is 47 MB, so the driver running in
+#            QEMU reports this sum instead and it is compared with this one.  Addition
+#            does not care about the order the entries came in, which the two walks need
+#            not share.
+#
 # usage: verify.py listing IMAGE SLT
 #        verify.py content IMAGE REFDIR [-n COUNT] [--all]
 #        verify.py sample  IMAGE REFDIR            (a few dozen files of every kind)
 #        verify.py clines  IMAGE [PATH]
+#        verify.py sum     IMAGE [PATH]
 
 import os
 import random
@@ -326,6 +334,38 @@ def fnv1a(buf, h=FNV_INIT):
     return h
 
 
+def cmd_sum(image, where):
+    """The totals the kernel's apfs_check prints, computed the same way."""
+    import io
+    out = io.StringIO()
+    rc = _clines(image, where, out)
+    if rc:
+        return rc
+    total = 0
+    entries = dirs = files = links = others = 0
+    content = 0
+    for line in out.getvalue().splitlines():
+        total = (total + fnv1a((line + "\n").encode())) & MASK64
+        entries += 1
+        f = line.split("\t")
+        mode = int(f[2], 8)
+        if (mode & 0o170000) == 0o040000:
+            dirs += 1
+        elif (mode & 0o170000) == 0o120000:
+            links += 1
+            content += int(f[5])
+        elif (mode & 0o170000) == 0o100000:
+            files += 1
+            content += int(f[5])
+        else:
+            others += 1
+    print("entries %d  dirs %d  files %d  symlinks %d  other %d"
+          % (entries, dirs, files, links, others))
+    print("content bytes %d" % content)
+    print("line-hash sum %016x" % total)
+    return 0
+
+
 def cmd_clines(image, where):
     """
     One line per directory entry, the same shape apfs-tool's census prints:
@@ -342,7 +382,24 @@ def cmd_clines(image, where):
             return 1
         start = hit[0]
         prefix = "/" + where.strip("/")
-    out = sys.stdout
+    return _walk_lines(v, c, start, prefix, sys.stdout)
+
+
+def _clines(image, where, out):
+    c, v = open_volume(image)
+    start = apfs.ROOT_DIR_INO_NUM
+    prefix = ""
+    if where:
+        hit = v.lookup(where)
+        if hit is None:
+            print("verify.py: %s: not found" % where, file=sys.stderr)
+            return 1
+        start = hit[0]
+        prefix = "/" + where.strip("/")
+    return _walk_lines(v, c, start, prefix, out)
+
+
+def _walk_lines(v, c, start, prefix, out):
     stack = [(start, prefix)]
     while stack:
         oid, px = stack.pop()
@@ -380,11 +437,12 @@ def main(argv):
             continue
         args.append(a)
         i += 1
-    if len(args) < 2 or (args[0] != "clines" and len(args) < 3):
+    if len(args) < 2 or (args[0] not in ("clines", "sum") and len(args) < 3):
         print("usage: verify.py listing IMAGE SLT\n"
               "       verify.py content IMAGE REFDIR [-n COUNT] [--all]\n"
               "       verify.py sample  IMAGE REFDIR\n"
-              "       verify.py clines  IMAGE [PATH]", file=sys.stderr)
+              "       verify.py clines  IMAGE [PATH]\n"
+              "       verify.py sum     IMAGE [PATH]", file=sys.stderr)
         return 2
     cmd = args[0]
     if cmd == "listing":
@@ -395,6 +453,8 @@ def main(argv):
         return cmd_content(args[1], args[2], limit, False, True)
     if cmd == "clines":
         return cmd_clines(args[1], args[2] if len(args) > 2 else None)
+    if cmd == "sum":
+        return cmd_sum(args[1], args[2] if len(args) > 2 else None)
     print("verify.py: unknown command %r" % cmd, file=sys.stderr)
     return 2
 

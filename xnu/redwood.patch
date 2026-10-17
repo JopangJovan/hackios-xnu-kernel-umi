@@ -46,10 +46,10 @@ index 222158a93918..68bb0f3e56bf 100755
  ######################################################################
  # HISTORY
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..cbbb936699fc 100644
+index 44274016a4cf..9902234f568c 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,31 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,33 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -73,6 +73,8 @@ index 44274016a4cf..cbbb936699fc 100644
 +bsd/dev/redwood_mic.c		standard
 +bsd/dev/redwood_wifi.c		standard
 +bsd/dev/redwood_adsp.c		standard
++bsd/dev/redwood_virtio_blk.c	standard
++bsd/dev/redwood_apfs_check.c	optional apfs
 +bsd/dev/redwood_sound.c		standard
 +bsd/dev/redwood_qmi.c		standard
 +bsd/dev/redwood_wlfw.c		standard
@@ -81,7 +83,7 @@ index 44274016a4cf..cbbb936699fc 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +180,13 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +182,13 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -95,7 +97,7 @@ index 44274016a4cf..cbbb936699fc 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +393,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +395,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -103,7 +105,7 @@ index 44274016a4cf..cbbb936699fc 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +416,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +418,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -296,19 +298,23 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..d532c567ba6b 100644
+index 4df41ba1f61b..0c71e8a534bb 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,8 @@
+@@ -147,6 +147,12 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
 +#include <sys/redwood_input.h>
 +#include <sys/redwood_audio.h>
++#include <sys/redwood_virtio_blk.h>
++#if APFS
++#include <sys/redwood_apfs_check.h>
++#endif
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +492,7 @@ bsd_init(void)
+@@ -490,7 +496,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -317,12 +323,17 @@ index 4df41ba1f61b..d532c567ba6b 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +978,8 @@ bsd_init(void)
+@@ -976,6 +982,13 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
 +		redwood_input_init();           /* /dev/redwood-touch */
 +		redwood_audio_init();           /* /dev/redwood-audio */
++		redwood_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
++#if APFS
++		/* mounts and walks /dev/rvblk0 once userland has /private/var up */
++		redwood_apfs_check_init();
++#endif
  	}
  #endif /* DEVFS */
  
@@ -924,7 +935,7 @@ index cbaa0b221894..78315a2d54cf 100644
  	int eofflag;
  	uint64_t options;
 diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
-index bae70cda3a96..444f414532f5 100644
+index bae70cda3a96..d7bf8c05b527 100644
 --- a/bsd/vfs/vfs_conf.c
 +++ b/bsd/vfs/vfs_conf.c
 @@ -103,6 +103,20 @@ extern  struct vfsops mockfs_vfsops;
@@ -960,7 +971,7 @@ index bae70cda3a96..444f414532f5 100644
  };
  
  int fstypenumstart = FT_BINDFS + 1;
-@@ -194,6 +211,67 @@ static struct vfstable vfstbllist[] = {
+@@ -194,6 +211,73 @@ static struct vfstable vfstbllist[] = {
  	},
  #endif /* BINDFS */
  
@@ -999,7 +1010,13 @@ index bae70cda3a96..444f414532f5 100644
 +		.vfc_next = NULL,
 +		.vfc_reserved1 = 0,
 +		.vfc_reserved2 = 0,
-+		.vfc_vfsflags = VFC_VFSLOCALARGS | VFC_VFS64BITREADY | VFC_VFSNATIVEXATTR,
++		/*
++		 * Generic args, not local: a kernel mount of a filesystem marked
++		 * VFC_VFSLOCALARGS is refused outright (mount_common), and this one has to be
++		 * mountable from the kernel.  So apfs_mount() takes the device's path as its
++		 * mount data and opens it itself.
++		 */
++		.vfc_vfsflags = VFC_VFSGENERICARGS | VFC_VFS64BITREADY | VFC_VFSNATIVEXATTR,
 +		.vfc_descptr = NULL,
 +		.vfc_descsize = 0,
 +		.vfc_sysctl = NULL
@@ -1028,7 +1045,7 @@ index bae70cda3a96..444f414532f5 100644
  #if MOCKFS
  	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
  	{
-@@ -298,6 +376,18 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
+@@ -298,6 +382,18 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
  extern const struct vnodeopv_desc mockfs_vnodeop_opv_desc;
  #endif /* MOCKFS */
  
@@ -1047,7 +1064,7 @@ index bae70cda3a96..444f414532f5 100644
  extern const struct vnodeopv_desc nullfs_vnodeop_opv_desc;
  extern const struct vnodeopv_desc bindfs_vnodeop_opv_desc;
  
-@@ -327,5 +417,14 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
+@@ -327,5 +423,14 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
  #if MOCKFS
  	&mockfs_vnodeop_opv_desc,
  #endif /* MOCKFS */
