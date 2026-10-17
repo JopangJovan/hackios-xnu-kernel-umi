@@ -242,6 +242,47 @@ video_stabilization_type(id self, SEL selector)
 	return 0;                       /* kFigCaptureVideoStabilizationType_None */
 }
 
+/*
+ * The microphone, which the capture stack has none of here. A capture session's sound comes through
+ * CoreMedia's own capture audio session -- BWAudioSourceNode's start sets its properties and reads
+ * its pull format, all of it through a brokered plug-in of the audio HAL -- and that plug-in is not
+ * on this phone: the node's start comes back with 'nope', the HAL's word for "no such thing".
+ *
+ * Camera.app's session has an audio input in it, because it is a session for photographs and for
+ * video both. The graph starts its source nodes late (startDeferredSourceNodesIfNeeded) and takes
+ * the first error it gets for the whole graph's, so the session reported AVCaptureSessionRuntimeError
+ * to the application, which took the session down and built it again, two seconds later, for ever:
+ * the camera's preview came in bursts of five frames with the sensor powering down in between.
+ *
+ * The node is told that it started. It then produces no sound -- which is all a phone with no
+ * capture audio has to offer -- and the rest of the graph, the preview and the photograph, runs.
+ * Only that one error is swallowed: a microphone that is there and fails for another reason still
+ * takes the session down, as it should. (The kernel's own microphone, adsp=1 mic=4, is a different
+ * path: AVAudioRecorder and Voice Memos record through it, and nothing here touches it.)
+ */
+#define ERROR_NO_SUCH_THING     1852797029      /* 'nope' */
+
+static IMP original_audio_source_start;
+
+static BOOL
+audio_source_start(id self, SEL selector, id *error)
+{
+	BOOL started = ((BOOL (*)(id, SEL, id *))original_audio_source_start)(self, selector, error);
+	id made = error != NULL ? *error : NULL;
+	static bool said;
+
+	if (started || made == NULL || ((long (*)(id, SEL))objc_msgSend)(made, sel_registerName("code")) != ERROR_NO_SUCH_THING) {
+		return started;
+	}
+	*error = NULL;                  /* (autoreleased by the capture stack: not ours to give back) */
+	if (!said) {
+		said = true;
+		say("redwood: mediaserverd: there is no capture audio on this phone: the session's audio source gives nothing, "
+		    "and the camera runs without it\n");
+	}
+	return true;
+}
+
 struct method_spec {
 	const char *selector, *types;
 	IMP imp;
@@ -296,6 +337,7 @@ static struct replacement {
 	  (IMP)prewarm_portrait_filter, NULL, false, false },
 	{ "BWFigCaptureDeviceVendor", "sharedCaptureDeviceVendor", 0x1a1ef0d04UL,
 	  (IMP)shared_vendor, &original_shared_vendor, false, false },
+	{ "BWAudioSourceNode", "start:", 0x1a1eefa18UL, (IMP)audio_source_start, &original_audio_source_start, true, false },
 	{ "FigVideoCaptureConnectionConfiguration", "videoStabilizationMethod", 0x1a1e99ef8UL,
 	  (IMP)video_stabilization_method, NULL, true, false },
 	{ "FigVideoCaptureConnectionConfiguration", "videoStabilizationType", 0x1a20d8f48UL,

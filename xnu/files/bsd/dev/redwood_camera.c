@@ -620,12 +620,31 @@ sensor_ldo(unsigned n, unsigned mv)
 	return false;
 }
 
+/*
+ * The PM8008i's I2C is bit-banged, on a bus whose lines the phone's own firmware holds as well, and
+ * a transfer now and then goes unanswered -- more often the longer the run, and most often right
+ * after the camera has been switched off and on again. Taken for a fault the first time, the camera
+ * was gone for the rest of the run (give_up: nothing more is written); asked again, the chip
+ * answers. The number of goes that were needed is said at the end of the run.
+ */
+#define PM8008_GOES             4
+
+static uint64_t pm8008_retries;
+
 static bool
 pm8008_get(uint8_t address, uint16_t reg, uint8_t *values, unsigned count)
 {
 	uint8_t where[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
 
-	return i2c_transfer(&pmic_bus, address, where, 2, values, count);
+	for (unsigned go = 0; go < PM8008_GOES; go++) {
+		if (i2c_transfer(&pmic_bus, address, where, 2, values, count)) {
+			pm8008_retries += go;
+			return true;
+		}
+		wait_ms(1);
+	}
+	pm8008_retries += PM8008_GOES;
+	return false;
 }
 
 /* The registers the PM8008i may be written in: the chip enable, and the set point, mode and enable of the sensor's LDOs. */
@@ -642,13 +661,17 @@ pm8008_put(uint8_t address, uint16_t reg, uint8_t value, bool force)
 		give_up(allowed ? "a write to the PM8008i after a fault" : "a PM8008i register that is not to be written");
 		return false;
 	}
-	if (!i2c_transfer(&pmic_bus, address, out, 3, NULL, 0) || !pm8008_get(address, reg, &back, 1) || back != value) {
-		say("camera: PM8008i %#04x:%#06x <- %#04x: %s (reads %#04x)\n", address, reg, value, back == 0xff ? "no answer" :
-		    "does not read back", back);
-		give_up("a write to the PM8008i that failed");
-		return false;
+	for (unsigned go = 0; go < PM8008_GOES; go++) {
+		if (i2c_transfer(&pmic_bus, address, out, 3, NULL, 0) && pm8008_get(address, reg, &back, 1) && back == value) {
+			pm8008_retries += go;
+			return true;
+		}
+		wait_ms(1);
 	}
-	return true;
+	say("camera: PM8008i %#04x:%#06x <- %#04x: %s (reads %#04x), %u goes\n", address, reg, value, back == 0xff ? "no answer" :
+	    "does not read back", back, PM8008_GOES);
+	give_up("a write to the PM8008i that failed");
+	return false;
 }
 
 static void
@@ -1221,7 +1244,15 @@ power_down(void)
 	supply_off(&hw->vana);
 	supply_off(&hw->vdig);
 	gdsc_off();
-	if (chip_enable_switched) {
+	/*
+	 * The PM8008i itself stays as it is between one use of the camera and the next: out of reset and
+	 * enabled, with its LDOs off (they are switched above). Put back into reset it does come out
+	 * again -- it answers for its revision at 0x08 -- but its regulators are deaf from then on (a
+	 * write to 0x09 reads back 0xff), and the camera is gone for the rest of the run. It is put back
+	 * as it was found when the kernel leaves (redwood_camera_quiesce), which is where Android gets
+	 * the phone back.
+	 */
+	if (leaving && chip_enable_switched) {
 		uint8_t enable = 0;
 
 		if (pm8008_get(PM8008_CHIP, MISC_CHIP_ENABLE, &enable, 1) &&
@@ -1232,7 +1263,7 @@ power_down(void)
 		}
 		chip_enable_switched = false;
 	}
-	if (pgpio_changed) {
+	if (leaving && pgpio_changed) {
 		uint8_t now[5];
 		bool all = pgpio_read_all(now);
 
@@ -1250,7 +1281,11 @@ power_down(void)
 		reset_driven = false;
 	}
 	powered = false;
-	say("camera: powered down\n");
+	if (pm8008_retries != 0) {
+		say("camera: powered down (the PM8008i needed %llu more goes on its I2C)\n", pm8008_retries);
+	} else {
+		say("camera: powered down\n");
+	}
 }
 
 /* The PM8008i out of reset (its reset pin as Android drives it) and enabled. */
@@ -1263,7 +1298,9 @@ pm8008_up(void)
 		give_up("the PM8350C's GPIO 3 cannot be read");
 		return false;
 	}
-	memcpy(pgpio_found_regs, regs, sizeof(regs));
+	if (!pgpio_changed) {           /* (as Android left it, which is what the run's end puts back) */
+		memcpy(pgpio_found_regs, regs, sizeof(regs));
+	}
 	if (!pgpio_active(regs)) {
 		uint8_t want[5] = { (uint8_t)(regs[0] & ~7), (uint8_t)((regs[1] & ~7) | 5), (uint8_t)((regs[2] & ~3) | 1), 0x80,
 			            (uint8_t)(regs[4] | 0x80) };
@@ -1329,9 +1366,27 @@ read_chip_id(void)
 	unsigned out = ctab->address_bytes == 2 ? 2 : 1, in = ctab->data_bytes >= 1 && ctab->data_bytes <= 4 ? ctab->data_bytes : 2;
 	uint32_t chip = 0;
 
-	if (!i2c_transfer(&cci_bus, sensor_address(), out == 2 ? where : where + 1, out, id, in)) {
+	/*
+	 * The first word asked of the sensor after its supplies have come up. Powered up again within a
+	 * run -- the capture graph stops and starts the stream as the application reconfigures its
+	 * session -- it is not always ready by the time the power sequence's own waits are over, and one
+	 * unanswered transfer used to end the camera for the rest of the run. It is asked again, for as
+	 * long as the sensor's own data sheet would have it waiting.
+	 */
+	unsigned go;
+
+	for (go = 0; go < 20; go++) {
+		if (i2c_transfer(&cci_bus, sensor_address(), out == 2 ? where : where + 1, out, id, in)) {
+			break;
+		}
+		wait_ms(2);
+	}
+	if (go == 20) {
 		say("camera: the %s sensor does not answer at %#04x\n", hw->name, sensor_address());
 		return false;
+	}
+	if (go != 0) {
+		say("camera: the %s sensor answered at %#04x after %u more goes (%u ms)\n", hw->name, sensor_address(), go, go * 2);
 	}
 	for (unsigned i = 0; i < in; i++) {
 		chip = chip << 8 | id[i];

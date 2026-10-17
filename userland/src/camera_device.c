@@ -22,9 +22,10 @@
  * Everything asked of the device and the stream that is not answered here is said in mediaserverd's
  * log ("redwood: camera: ..."), once per property.
  *
- * The graph builds, the session runs, and the pictures of the PrimaryScaler output reach Camera.app's
- * preview. NOT FINISHED: a photograph is not taken yet ("StillImageCaptureNow" is not answered), and
- * the session is rebuilt every few seconds, so the preview comes in bursts rather than steadily.
+ * The graph builds, the session runs, and the pictures of the PrimaryScaler output are Camera.app's
+ * preview, steadily. NOT FINISHED: a photograph is not taken yet -- "StillImageCaptureNow" is not
+ * answered and the StillImage output is passed over, it being the whole sensor (4032x3024), which is
+ * not something to make thirty times a second.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
@@ -839,7 +840,8 @@ stream_stop(CMBaseObjectRef o)
 {
 	struct stream *s = stream_of(o);
 
-	say("stream: stop");
+	say("stream: stop (%llu frames, %llu pictures given)", (unsigned long long)s->frames,
+	    (unsigned long long)s->out[0].delivered);
 	pthread_mutex_lock(&s->lock);
 	s->graph_running = false;
 	pthread_mutex_unlock(&s->lock);
