@@ -24,7 +24,6 @@
 #include <vfs/vfs_support.h>
 
 /* How much is read out of a file at a time when copying into a uio. */
-#define APFS_IOBUF 65536
 
 void
 apfs_lock(struct apfs_mount *am)
@@ -180,37 +179,47 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	}
 	ino = APFS_VP(vp)->an_ino;
 	size = APFS_VP(vp)->an_size;
-	buf = kalloc_data(APFS_IOBUF, Z_WAITOK);
-	if (buf == NULL) {
-		return ENOMEM;
-	}
 	t0 = apfs_ticks();
+	apfs_lock(am);
+	if (am->am_iobuf_kept > 0) {
+		buf = am->am_iobuf[--am->am_iobuf_kept];
+	} else {
+		apfs_unlock(am);
+		buf = kalloc_data(APFS_IOBUF, Z_WAITOK);
+		if (buf == NULL) {
+			return ENOMEM;
+		}
+		apfs_lock(am);
+	}
+	/* the lock is held at the top of every round and let go of only for uiomove */
 	while (uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < size) {
 		size_t want = (size_t)MIN((user_ssize_t)APFS_IOBUF, uio_resid(uio));
 		size_t got = 0;
 
-		apfs_lock(am);
 		error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf,
 		    (uint64_t)uio_offset(uio), buf, want, &got);
+		if (error || got == 0) {
+			break;
+		}
 		apfs_unlock(am);
-		if (error) {
-			break;
-		}
-		if (got == 0) {
-			break;
-		}
 		error = uiomove((caddr_t)buf, (int)got, uio);
+		apfs_lock(am);
 		if (error) {
 			break;
 		}
 		read_bytes += got;
 	}
-	kfree_data(buf, APFS_IOBUF);
-	apfs_lock(am);
+	if (am->am_iobuf_kept < APFS_IOBUF_KEEP) {
+		am->am_iobuf[am->am_iobuf_kept++] = buf;
+		buf = NULL;
+	}
 	am->am_read_ticks += apfs_ticks() - t0;
 	am->am_read_calls++;
 	am->am_read_bytes += read_bytes;
 	apfs_unlock(am);
+	if (buf != NULL) {
+		kfree_data(buf, APFS_IOBUF);
+	}
 	return error;
 }
 

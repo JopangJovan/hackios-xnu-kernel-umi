@@ -71,6 +71,57 @@ apfs_dev_read(void *ctx, uint64_t off, void *buf, size_t len)
 	return 0;
 }
 
+/*
+ * A file's contents, straight into the caller's memory: one buffer header of our own and
+ * one VNOP_STRATEGY a request, past the buffer cache.  apfs_lib calls this without the
+ * volume's lock, from several threads at once; nothing here is shared but the device.
+ * (Tried once before, in QEMU, in place of the block cache for the middle of a request and
+ * with the lock held, it was slower there; here it is the device reads coming out from
+ * under the lock, on a device where one costs a memory copy -- see apfs_lib.c.)
+ */
+#define APFS_DATA_MAX (128 * 1024)
+
+static int
+apfs_dev_read_data(void *ctx, uint64_t off, void *buf, size_t len)
+{
+	struct apfs_devctx *dc = ctx;
+	char *out = buf;
+
+	if ((off % dc->dc_devblock) != 0 || (len % dc->dc_devblock) != 0) {
+		return EINVAL;
+	}
+	while (len > 0) {
+		size_t n = len < APFS_DATA_MAX ? len : APFS_DATA_MAX;
+		buf_t bp = buf_alloc(dc->dc_devvp);
+		int error;
+
+		if (bp == NULL) {
+			return ENOMEM;
+		}
+		buf_reset(bp, B_READ);
+		buf_setblkno(bp, (daddr64_t)(off / dc->dc_devblock));
+		buf_setlblkno(bp, (daddr64_t)(off / dc->dc_devblock));
+		buf_setcount(bp, (uint32_t)n);
+		buf_setdataptr(bp, (uintptr_t)out);
+		error = VNOP_STRATEGY(bp);
+		if (error == 0) {
+			error = (int)buf_biowait(bp);
+		}
+		/* read() must fill the whole buffer, and so must this (md cuts the count short) */
+		if (error == 0 && (buf_resid(bp) != 0 || buf_count(bp) != n)) {
+			error = EIO;
+		}
+		buf_free(bp);
+		if (error) {
+			return error;
+		}
+		out += n;
+		off += n;
+		len -= n;
+	}
+	return 0;
+}
+
 /* ------------------------------------------------------------- where the time goes */
 
 /*
@@ -112,7 +163,8 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    "pagein   %llu calls  %llu ms  %llu bytes\n"
 		    "read     %llu calls  %llu ms  %llu bytes\n"
 		    "device   %llu calls  %llu ms  %llu bytes\n"
-		    "inflate  %llu calls  %llu ms  %llu bytes in  %llu bytes out\n"
+		    "data     %llu calls  %llu ms  %llu bytes\n"
+		    "inflate  %llu calls  %llu ms  %llu bytes in  %llu bytes out  %llu by zlib\n"
 		    "blocks   %llu read  %llu cache hits\n",
 		    (unsigned long long)am->am_pagein_calls,
 		    (unsigned long long)apfs_ticks_ms(am->am_pagein_ticks),
@@ -123,10 +175,14 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    (unsigned long long)nx->dev_calls,
 		    (unsigned long long)apfs_ticks_ms(nx->dev_ticks),
 		    (unsigned long long)nx->dev_bytes,
+		    (unsigned long long)nx->data_calls,
+		    (unsigned long long)apfs_ticks_ms(nx->data_ticks),
+		    (unsigned long long)nx->data_bytes,
 		    (unsigned long long)nx->inflate_calls,
 		    (unsigned long long)apfs_ticks_ms(nx->inflate_ticks),
 		    (unsigned long long)nx->inflate_in,
 		    (unsigned long long)nx->inflate_out,
+		    (unsigned long long)nx->inflate_fallbacks,
 		    (unsigned long long)nx->reads,
 		    (unsigned long long)nx->hits);
 	}
@@ -139,8 +195,9 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		am->am_pagein_calls = am->am_pagein_ticks = am->am_pagein_bytes = 0;
 		am->am_read_calls = am->am_read_ticks = am->am_read_bytes = 0;
 		am->am_nx.dev_calls = am->am_nx.dev_ticks = am->am_nx.dev_bytes = 0;
+		am->am_nx.data_calls = am->am_nx.data_ticks = am->am_nx.data_bytes = 0;
 		am->am_nx.inflate_calls = am->am_nx.inflate_ticks = 0;
-		am->am_nx.inflate_in = am->am_nx.inflate_out = 0;
+		am->am_nx.inflate_in = am->am_nx.inflate_out = am->am_nx.inflate_fallbacks = 0;
 		am->am_nx.reads = am->am_nx.hits = 0;
 		am->am_lock_waits = am->am_lock_wait_ticks = am->am_lock_held_ticks = 0;
 		apfs_unlock(am);
@@ -175,10 +232,17 @@ apfs_stats_print(void)
 	    (unsigned long long)nx->dev_calls,
 	    (unsigned long long)apfs_ticks_ms(nx->dev_ticks),
 	    (unsigned long long)nx->dev_bytes);
-	printf("apfs: inflate %llu calls  %llu ms  %llu bytes in  %llu bytes out\n",
+	/* file contents, read without the lock (the line above is metadata, with it) */
+	printf("apfs: data    %llu calls  %llu ms  %llu bytes\n",
+	    (unsigned long long)nx->data_calls,
+	    (unsigned long long)apfs_ticks_ms(nx->data_ticks),
+	    (unsigned long long)nx->data_bytes);
+	/* "by zlib": streams libdeflate refused (bad, or more out than the piece holds), zlib's then */
+	printf("apfs: inflate %llu calls  %llu ms  %llu bytes in  %llu bytes out  %llu by zlib\n",
 	    (unsigned long long)nx->inflate_calls,
 	    (unsigned long long)apfs_ticks_ms(nx->inflate_ticks),
-	    (unsigned long long)nx->inflate_in, (unsigned long long)nx->inflate_out);
+	    (unsigned long long)nx->inflate_in, (unsigned long long)nx->inflate_out,
+	    (unsigned long long)nx->inflate_fallbacks);
 	printf("apfs: blocks  %llu read  %llu cache hits  highest block %llu\n",
 	    (unsigned long long)nx->reads, (unsigned long long)nx->hits,
 	    (unsigned long long)nx->max_addr);
@@ -336,6 +400,9 @@ apfs_lib_relock(void *ctx)
 static void
 apfs_free_mount(struct apfs_mount *am)
 {
+	while (am->am_iobuf_kept > 0) {
+		kfree_data(am->am_iobuf[--am->am_iobuf_kept], APFS_IOBUF);
+	}
 	apfs_nx_close(&am->am_nx);
 	lck_mtx_destroy(&am->am_lock, &apfs_lck_grp);
 	kfree_type(struct apfs_mount, am);
@@ -379,6 +446,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	dev.ctx = dc;
 	dev.size = devblocks * (uint64_t)devblock;
 	dev.read = apfs_dev_read;
+	dev.read_data = apfs_dev_read_data;
 
 	error = apfs_nx_open(&am->am_nx, &dev);
 	if (error) {

@@ -72,14 +72,24 @@ apfs_ticks(void)
 /* How many blocks of metadata to keep; a B-tree descent touches one per level. */
 #define APFS_CACHE_BLOCKS 64
 
+/* Room for a symbolic link's target (Darwin's own limit is 1024 bytes; it is kept in an xattr) */
+#define APFS_LINK_MAX 4096
+
 /*
  * The device.  read() must fill the whole buffer or return an error; offsets and lengths
  * are always whole blocks of the container.
+ *
+ * read_data() is the same for the contents of files, which are read once and not kept:
+ * straight into the caller's memory, past any cache, and called without the caller's lock
+ * -- so it must be safe on several threads at once and touch nothing apfs_lib keeps.
+ * NULL: read() is used for those too (still without the lock, so read() must then be safe
+ * that way as well).
  */
 struct apfs_dev {
 	void     *ctx;
 	uint64_t  size;                 /* bytes, 0 if not known */
 	int     (*read)(void *ctx, uint64_t off, void *buf, size_t len);
+	int     (*read_data)(void *ctx, uint64_t off, void *buf, size_t len);
 };
 
 /* One cached block of metadata. */
@@ -109,6 +119,8 @@ struct apfs_omap {
 	bool              ready;
 };
 
+struct apfs_scratch;            /* apfs_lib.c's own */
+
 /* A mounted container. */
 struct apfs_nx {
 	struct apfs_dev   dev;
@@ -122,9 +134,10 @@ struct apfs_nx {
 	struct apfs_omap  omap;         /* resolves volume superblocks */
 	/*
 	 * The caller's lock round this container, which apfs_lib may let go of while it
-	 * does work that touches nothing shared -- decompressing a piece into a buffer of
-	 * its own -- and take back afterwards.  Everything else here (the block cache, the
-	 * cursors, a file's held piece) is only touched with it held.  NULL for a caller
+	 * does work that touches nothing shared -- reading a file's contents off the device
+	 * (dev.read_data), decompressing a piece into a buffer no one else sees -- and take
+	 * back afterwards.  Everything else here (the block cache, the cursors, a file's held
+	 * piece, the scratch list) is only touched with it held.  NULL for a caller
 	 * with no lock, such as the single-threaded program on the build machine.
 	 */
 	void            (*unlock)(void *ctx);
@@ -139,6 +152,8 @@ struct apfs_nx {
 	 * Ticks, not nanoseconds -- see apfs_ticks().
 	 */
 	uint64_t          dev_calls, dev_ticks, dev_bytes;
+	/* the same for file contents, read without the lock (read_data) */
+	uint64_t          data_calls, data_ticks, data_bytes;
 	/*
 	 * The highest block either kind of read has reached.  What it is for: the phone has
 	 * no driver for its own storage, so a volume there has to live in a RAM disk, and
@@ -147,6 +162,13 @@ struct apfs_nx {
 	uint64_t          max_addr;             /* any block */
 	uint64_t          max_data_addr;        /* blocks of file contents only */
 	uint64_t          inflate_calls, inflate_ticks, inflate_in, inflate_out;
+	uint64_t          inflate_fallbacks;   /* streams libdeflate refused and zlib took */
+	/*
+	 * Decompressors and buffers for reading compressed pieces, kept from one read to the
+	 * next instead of allocated for each; touched only with the lock held.
+	 */
+	struct apfs_scratch *scratch;
+	uint32_t          scratch_kept;
 };
 
 /* A volume inside the container. */

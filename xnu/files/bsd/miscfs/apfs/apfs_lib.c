@@ -18,6 +18,7 @@
 #else
 #include <zlib.h>
 #endif
+#include "libdeflate/libdeflate.h"
 
 /* The pieces a resource-fork-compressed file is cut into. */
 #define APFS_RSRC_PIECE APFS_DECMPFS_BLOCK_SIZE
@@ -689,10 +690,14 @@ out:
 	return error;
 }
 
+static void scratch_drain(struct apfs_nx *nx);
+
 void
 apfs_nx_close(struct apfs_nx *nx)
 {
 	uint32_t i;
+
+	scratch_drain(nx);
 
 	for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
 		if (nx->cache[i].data != NULL) {
@@ -1521,6 +1526,171 @@ apfs_read_stream(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_size,
 	return 0;
 }
 
+/*
+ * File contents without the lock.  apfs_read_stream above fetches a file's data a block
+ * at a time through the block cache, with the caller's lock held all the while: one
+ * request to the device per 4096 bytes, each block copied in and copied out again, and
+ * the cache filled with data that pushes the B-tree nodes out of it.  Reading a stream is
+ * split in two here instead.  stream_plan(), with the lock, turns the extent records into
+ * runs of blocks on the device; stream_fetch(), without it, reads those runs with
+ * dev.read_data -- one request a run, whole blocks straight into the destination.
+ */
+struct apfs_run {
+	uint64_t at;                    /* bytes into the request */
+	uint64_t addr;                  /* the run's first block on the device */
+	uint32_t skew;                  /* bytes into that block where the run starts */
+	uint64_t len;                   /* bytes */
+};
+
+#define APFS_MAX_RUNS 8
+
+/*
+ * Where [off, off + len) of a stream lies, as at most `max` runs in order (len already cut
+ * to the stream's size).  What the runs leave out of [0, *covered) is holes, read as
+ * zeros.  *covered is less than len when there were more than `max` runs: the caller plans
+ * again from there.  With the lock held.
+ */
+static int
+stream_plan(struct apfs_vol *vol, uint64_t stream_id, uint64_t off, uint64_t len,
+    struct apfs_run *runs, uint32_t max, uint32_t *nruns, uint64_t *covered)
+{
+	struct apfs_cursor cur;
+	struct apfs_rec rec;
+	uint32_t bs = vol->nx->block_size;
+	uint64_t end = off + len;
+	int error;
+
+	*nruns = 0;
+	*covered = len;
+	error = apfs_seek(&vol->tree, stream_id, APFS_TYPE_FILE_EXTENT, &cur);
+	if (error) {
+		return error;
+	}
+	for (;;) {
+		uint64_t logical, length, phys, from, to, inner;
+
+		error = apfs_cursor_next(&cur, &rec);
+		if (error == ENOENT) {
+			break;
+		}
+		if (error) {
+			return error;
+		}
+		if (rec.obj_id != stream_id || rec.type != APFS_TYPE_FILE_EXTENT) {
+			break;
+		}
+		if (rec.key_len < 16 || rec.val == NULL || rec.val_len < 24) {
+			return EIO;
+		}
+		logical = le64(rec.key + 8);
+		length = le64(rec.val) & APFS_J_FILE_EXTENT_LEN_MASK;
+		phys = le64(rec.val + 8);
+		if (length == 0 || (length % bs) != 0) {
+			return EIO;
+		}
+		if (logical >= end) {
+			break;                  /* extents are in order: past what we need */
+		}
+		if (logical + length <= off || phys == 0) {
+			continue;               /* before what we need, or a hole */
+		}
+		if (phys >= vol->nx->block_count ||
+		    length / bs > vol->nx->block_count - phys) {
+			return EIO;
+		}
+		if (phys + length / bs - 1 > vol->nx->max_data_addr) {
+			vol->nx->max_data_addr = phys + length / bs - 1;
+		}
+		/* the overlap of [logical, logical+length) with [off, end) */
+		from = logical > off ? logical : off;
+		to = (logical + length) < end ? (logical + length) : end;
+		inner = from - logical;
+		if (*nruns == max) {
+			*covered = from - off;
+			break;
+		}
+		runs[*nruns].at = from - off;
+		runs[*nruns].addr = phys + inner / bs;
+		runs[*nruns].skew = (uint32_t)(inner % bs);
+		runs[*nruns].len = to - from;
+		(*nruns)++;
+	}
+	return 0;
+}
+
+/* One read of file contents; without the lock. */
+static int
+dev_read_data(struct apfs_nx *nx, uint64_t addr, void *buf, size_t len, uint64_t *calls,
+    uint64_t *bytes)
+{
+	int error = (nx->dev.read_data != NULL)
+	    ? nx->dev.read_data(nx->dev.ctx, addr * (uint64_t)nx->block_size, buf, len)
+	    : nx->dev.read(nx->dev.ctx, addr * (uint64_t)nx->block_size, buf, len);
+
+	(*calls)++;
+	*bytes += len;
+	return error;
+}
+
+/*
+ * Read what stream_plan found into dst, without the lock: whole blocks straight in, the
+ * ends of a run that do not fill a block through `bounce` (one block), zeros for holes.
+ */
+static int
+stream_fetch(struct apfs_nx *nx, const struct apfs_run *runs, uint32_t nruns,
+    uint64_t covered, uint8_t *dst, uint8_t *bounce, uint64_t *calls, uint64_t *bytes)
+{
+	uint32_t bs = nx->block_size;
+	uint64_t done = 0;
+	uint32_t r;
+	int error;
+
+	for (r = 0; r < nruns; r++) {
+		uint64_t at = runs[r].at, addr = runs[r].addr, left = runs[r].len;
+		uint32_t skew = runs[r].skew;
+
+		if (at > done) {
+			memset(dst + done, 0, (size_t)(at - done));
+		}
+		if (skew != 0 || left < bs) {   /* starts inside a block, or is less than one */
+			uint64_t n = bs - skew < left ? bs - skew : left;
+
+			error = dev_read_data(nx, addr, bounce, bs, calls, bytes);
+			if (error) {
+				return error;
+			}
+			memcpy(dst + at, bounce + skew, (size_t)n);
+			at += n;
+			left -= n;
+			addr++;
+		}
+		if (left >= bs) {
+			uint64_t n = left - left % bs;
+
+			error = dev_read_data(nx, addr, dst + at, (size_t)n, calls, bytes);
+			if (error) {
+				return error;
+			}
+			at += n;
+			left -= n;
+			addr += n / bs;
+		}
+		if (left > 0) {                 /* the start of one more block */
+			error = dev_read_data(nx, addr, bounce, bs, calls, bytes);
+			if (error) {
+				return error;
+			}
+			memcpy(dst + at, bounce, (size_t)left);
+			at += left;
+		}
+		done = at;
+	}
+	if (covered > done) {
+		memset(dst + done, 0, (size_t)(covered - done));
+	}
+	return 0;
+}
+
 int
 apfs_readlink(struct apfs_vol *vol, uint64_t obj_id, char *buf, size_t len, size_t *out)
 {
@@ -1746,6 +1916,41 @@ apfs_cfile_init(struct apfs_vol *vol, const struct apfs_inode *ino,
 }
 
 /*
+ * libdeflate allocates its decompressor through these (apfs_deflate.c).  It frees by pointer
+ * alone, so each block carries its own length in front of it, as for zlib below.
+ */
+void *
+apfs_deflate_malloc(size_t size)
+{
+	size_t n = size + sizeof(size_t);
+	uint8_t *p;
+
+	if (size > (~(size_t)0) - sizeof(size_t)) {
+		return NULL;
+	}
+	p = apfs_alloc(n);
+	if (p == NULL) {
+		return NULL;
+	}
+	memcpy(p, &n, sizeof(n));
+	return p + sizeof(size_t);
+}
+
+void
+apfs_deflate_free(void *ptr)
+{
+	uint8_t *p;
+	size_t n;
+
+	if (ptr == NULL) {
+		return;
+	}
+	p = (uint8_t *)ptr - sizeof(size_t);
+	memcpy(&n, p, sizeof(n));
+	apfs_free(p, n);
+}
+
+/*
  * zlib asks for its own working memory through these.  The kernel's copy of zlib has no
  * allocator of its own -- a zeroed z_stream leaves zalloc NULL and inflateInit_ then calls
  * through it -- so they have to be set, and they are set on both sides so that the kernel
@@ -1789,7 +1994,56 @@ apfs_zfree(voidpf opaque, voidpf address)
 	apfs_free(p, n);
 }
 
-/* One zlib stream.  A leading 0xff means the piece was stored rather than compressed. */
+/*
+ * One zlib stream through libdeflate; a leading 0xff means the piece was stored, not
+ * compressed.  libdeflate takes the whole stream at once and decodes with large tables:
+ * over all 19149 pieces of the restore ramdisk, 740 MB/s on the build machine against
+ * zlib's 344, and on the phone 1248 ms against 3834 for one reader (856 once its Adler-32
+ * is the NEON one).  It checks the stream's Adler-32 just as zlib does.  A stream it will
+ * not take is handed to zlib instead and counted, so that such a thing cannot go by
+ * unnoticed -- none of the pieces in either iOS volume is one.  `d` is the caller's
+ * decompressor, NULL for one made here for this call alone.
+ */
+static int apfs_inflate_counted(struct apfs_nx *nx, const uint8_t *src, size_t src_len,
+    uint8_t *dst, size_t dst_len, size_t *out);
+
+static int
+apfs_inflate_fast(struct libdeflate_decompressor *d, const uint8_t *src, size_t src_len,
+    uint8_t *dst, size_t dst_len, size_t *out, bool *fell_back)
+{
+	struct libdeflate_decompressor *own = NULL;
+	enum libdeflate_result r;
+	size_t got = 0;
+
+	if (src_len == 0) {
+		return EIO;
+	}
+	if (src[0] == 0xFF) {           /* stored, not compressed */
+		size_t n = src_len - 1 < dst_len ? src_len - 1 : dst_len;
+
+		memcpy(dst, src + 1, n);
+		*out = n;
+		return 0;
+	}
+	if (d == NULL) {
+		own = libdeflate_alloc_decompressor();
+		if (own == NULL) {
+			return ENOMEM;
+		}
+		d = own;
+	}
+	r = libdeflate_zlib_decompress(d, src, src_len, dst, dst_len, &got);
+	if (own != NULL) {
+		libdeflate_free_decompressor(own);
+	}
+	if (r == LIBDEFLATE_SUCCESS) {
+		*out = got;
+		return 0;
+	}
+	*fell_back = true;              /* counted by the caller, which may not hold the lock now */
+	return apfs_inflate_counted(NULL, src, src_len, dst, dst_len, out);
+}
+
 static int
 apfs_inflate_counted(struct apfs_nx *nx, const uint8_t *src, size_t src_len, uint8_t *dst,
     size_t dst_len, size_t *out)
@@ -1870,8 +2124,15 @@ decmpfs_attr(struct apfs_nx *nx, uint32_t type, const uint8_t *src, size_t src_l
 		*out = n;
 		return 0;
 	}
-	case APFS_DECMPFS_TYPE_ZLIB_ATTR:
-		return apfs_inflate_counted(nx, src, src_len, dst, want, out);
+	case APFS_DECMPFS_TYPE_ZLIB_ATTR: {
+		bool fb = false;
+		int error = apfs_inflate_fast(NULL, src, src_len, dst, want, out, &fb);
+
+		if (fb && nx != NULL) {
+			nx->inflate_fallbacks++;
+		}
+		return error;
+	}
 	default:
 		return ENOTSUP;
 	}
@@ -1975,13 +2236,105 @@ out:
  * through the file -- or a page fault asking for 16 KB of it -- does not decompress the
  * same 64 KB again.
  */
+/*
+ * What reading a compressed piece needs besides the file's own state: a decompressor, room
+ * for the compressed bytes, and room for a piece when it goes to the file's cache.  Made
+ * and thrown away on every read before, which was three allocations a read -- with the
+ * lock held, and the 64 KB one big enough that the kernel goes to the VM for it.  They are
+ * kept on the container now, taken and given back with the lock held, a few at most.
+ */
+#define APFS_PIECE_CAP    (APFS_DECMPFS_BLOCK_SIZE + 1024)   /* stored: 1 + 64 KB; zlib: a few bytes more */
+#define APFS_SCRATCH_KEEP 16
+
+struct apfs_scratch {
+	struct apfs_scratch            *next;
+	struct libdeflate_decompressor *dec;
+	uint8_t                        *piece;  /* APFS_PIECE_CAP */
+	uint8_t                        *mine;   /* APFS_DECMPFS_BLOCK_SIZE, made when first wanted */
+	/*
+	 * The blocks a piece lies in, read in one request (APFS_PIECE_CAP and a block either
+	 * side); also the bounce block for the ends of runs.
+	 */
+	uint8_t                        *raw;
+	size_t                          raw_cap;
+};
+
+static void
+scratch_free(struct apfs_scratch *sc)
+{
+	if (sc->dec != NULL) {
+		libdeflate_free_decompressor(sc->dec);
+	}
+	if (sc->piece != NULL) {
+		apfs_free(sc->piece, APFS_PIECE_CAP);
+	}
+	if (sc->mine != NULL) {
+		apfs_free(sc->mine, APFS_DECMPFS_BLOCK_SIZE);
+	}
+	if (sc->raw != NULL) {
+		apfs_free(sc->raw, sc->raw_cap);
+	}
+	apfs_free(sc, sizeof(*sc));
+}
+
+static struct apfs_scratch *
+scratch_get(struct apfs_nx *nx)
+{
+	struct apfs_scratch *sc = nx->scratch;
+
+	if (sc != NULL) {
+		nx->scratch = sc->next;
+		nx->scratch_kept--;
+		sc->next = NULL;
+		return sc;
+	}
+	sc = apfs_alloc(sizeof(*sc));
+	if (sc == NULL) {
+		return NULL;
+	}
+	sc->dec = libdeflate_alloc_decompressor();
+	sc->piece = apfs_alloc(APFS_PIECE_CAP);
+	sc->raw_cap = APFS_PIECE_CAP + 2 * (size_t)nx->block_size;
+	sc->raw = apfs_alloc(sc->raw_cap);
+	if (sc->dec == NULL || sc->piece == NULL || sc->raw == NULL) {
+		scratch_free(sc);
+		return NULL;
+	}
+	return sc;
+}
+
+static void
+scratch_put(struct apfs_nx *nx, struct apfs_scratch *sc)
+{
+	if (nx->scratch_kept >= APFS_SCRATCH_KEEP) {
+		scratch_free(sc);
+		return;
+	}
+	sc->next = nx->scratch;
+	nx->scratch = sc;
+	nx->scratch_kept++;
+}
+
+static void
+scratch_drain(struct apfs_nx *nx)
+{
+	while (nx->scratch != NULL) {
+		struct apfs_scratch *sc = nx->scratch;
+
+		nx->scratch = sc->next;
+		scratch_free(sc);
+	}
+	nx->scratch_kept = 0;
+}
+
 static int
 read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
     struct apfs_cfile *cf, uint64_t off, uint8_t *buf, size_t len, size_t *out)
 {
-	uint8_t *piece = NULL;
-	uint8_t *mine = NULL;           /* a piece's worth, decompressed into without the lock */
-	size_t piece_cap = 0;
+	struct apfs_scratch *sc = NULL;
+	uint8_t *big = NULL;            /* a piece bigger than APFS_PIECE_CAP, should there be one */
+	size_t big_cap = 0;
+	uint32_t bs = vol->nx->block_size;
 	uint64_t first, last, i;
 	int error = 0;
 
@@ -2009,78 +2362,148 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 		if ((i + 1) * APFS_DECMPFS_BLOCK_SIZE > cf->size) {
 			want = (size_t)(cf->size - i * APFS_DECMPFS_BLOCK_SIZE);
 		}
+		from_in_piece = (off > i * APFS_DECMPFS_BLOCK_SIZE)
+		    ? (size_t)(off - i * APFS_DECMPFS_BLOCK_SIZE) : 0;
 		if (cf->held != i) {
 			uint32_t plen = cf->piece_len[i];
+			uint64_t poff = cf->table_base + cf->piece_off[i];
+			bool raw_type = (cf->type == APFS_DECMPFS_TYPE_RAW_RSRC);
+			struct apfs_run runs[APFS_MAX_RUNS];
+			uint32_t nruns = 0;
+			uint64_t covered = 0, calls = 0, bytes = 0, t0, t1, t2;
+			bool planned = false, fell_back = false;
+			/*
+			 * The whole piece wanted, from its start (a 64 KB read at a 64 KB
+			 * offset, which is what read(2) in big chunks and pagein ask for):
+			 * straight into the caller's buffer, and the file's cache is left as
+			 * it was.  Otherwise into a buffer of our own, which goes into the
+			 * file's cache once the lock is back, by swapping buffers.
+			 */
+			bool direct = !raw_type && from_in_piece == 0 && len - *out >= want;
+			const uint8_t *src;
+			uint8_t *piece, *dst = NULL;
+			size_t got_len = 0;
 
-			if (plen > piece_cap) {
-				if (piece != NULL) {
-					apfs_free(piece, piece_cap);
-				}
-				piece_cap = plen;
-				piece = apfs_alloc(piece_cap);
-				if (piece == NULL) {
+			if (sc == NULL) {
+				sc = scratch_get(vol->nx);
+				if (sc == NULL) {
 					error = ENOMEM;
 					goto out;
 				}
 			}
-			error = apfs_read_stream(vol, cf->rsrc_id, cf->rsrc_size,
-			    cf->table_base + cf->piece_off[i], piece, plen, &got);
-			if (error) {
-				goto out;
-			}
-			if (got < plen) {
-				error = EIO;
-				goto out;
-			}
-			if (cf->type == APFS_DECMPFS_TYPE_RAW_RSRC) {
-				size_t m = plen < want ? (size_t)plen : want;
-
-				cf->held = APFS_NO_PIECE;
-				memcpy(cf->held_data, piece, m);
-				cf->held_len = m;
-			} else {
-				/*
-				 * Decompress without the caller's lock, into a buffer of our
-				 * own: zlib touches nothing anyone else can see, and it is most
-				 * of the time spent here -- with the lock held through it, four
-				 * readers on eight processors kept the lock busy 94% of the
-				 * time.  The piece only goes into the file's cache once the
-				 * lock is back, by swapping buffers.  Two readers of the same
-				 * file may decompress the same piece once each; that is the
-				 * price, and the cache stays right either way.
-				 */
-				size_t got_len = 0;
-				uint64_t t0;
-
-				if (mine == NULL) {
-					mine = apfs_alloc(APFS_DECMPFS_BLOCK_SIZE);
-					if (mine == NULL) {
-						error = ENOMEM;
-						goto out;
-					}
-				}
-				t0 = apfs_ticks();
-				nx_unlock(vol->nx);
-				error = apfs_inflate_counted(NULL, piece, plen, mine, want,
-				    &got_len);
-				nx_relock(vol->nx);
-				vol->nx->inflate_ticks += apfs_ticks() - t0;
-				vol->nx->inflate_calls++;
-				vol->nx->inflate_in += plen;
-				vol->nx->inflate_out += got_len;
+			piece = sc->piece;
+			if (plen <= APFS_PIECE_CAP && poff < cf->rsrc_size &&
+			    plen <= cf->rsrc_size - poff) {
+				error = stream_plan(vol, cf->rsrc_id, poff, plen, runs, APFS_MAX_RUNS,
+				    &nruns, &covered);
 				if (error) {
 					goto out;
 				}
+				planned = (covered == plen);
+			}
+			if (!planned) {
+				/*
+				 * Bigger than a piece should be, running past the fork's end, or
+				 * in more runs than a plan holds: the old way, with the lock.
+				 */
+				if (plen > APFS_PIECE_CAP) {
+					if (plen > big_cap) {
+						if (big != NULL) {
+							apfs_free(big, big_cap);
+						}
+						big_cap = plen;
+						big = apfs_alloc(big_cap);
+						if (big == NULL) {
+							error = ENOMEM;
+							goto out;
+						}
+					}
+					piece = big;
+				}
+				error = apfs_read_stream(vol, cf->rsrc_id, cf->rsrc_size, poff, piece,
+				    plen, &got);
+				if (error) {
+					goto out;
+				}
+				if (got < plen) {
+					error = EIO;
+					goto out;
+				}
+			}
+			if (!raw_type && !direct && sc->mine == NULL) {
+				sc->mine = apfs_alloc(APFS_DECMPFS_BLOCK_SIZE);
+				if (sc->mine == NULL) {
+					error = ENOMEM;
+					goto out;
+				}
+			}
+			dst = direct ? buf + *out : sc->mine;
+
+			/*
+			 * Without the lock from here: reading the piece off the device and
+			 * decompressing it touch nothing anyone else can see.  Decompressing
+			 * is most of the time spent here -- with the lock held through it,
+			 * four readers on eight processors kept the lock busy 94% of the
+			 * time.  Two readers of the same file may decompress the same piece
+			 * once each; that is the price, and the cache stays right either way.
+			 */
+			t0 = apfs_ticks();
+			nx_unlock(vol->nx);
+			src = piece;
+			if (planned && nruns == 1 && runs[0].at == 0 && runs[0].len == plen) {
+				/* the usual case: the blocks the piece lies in, in one request */
+				size_t span = ((size_t)runs[0].skew + plen + bs - 1) / bs * bs;
+
+				error = dev_read_data(vol->nx, runs[0].addr, sc->raw, span, &calls,
+				    &bytes);
+				src = sc->raw + runs[0].skew;
+			} else if (planned) {
+				error = stream_fetch(vol->nx, runs, nruns, covered, piece, sc->raw,
+				    &calls, &bytes);
+			}
+			t1 = apfs_ticks();
+			if (error == 0 && !raw_type) {
+				error = apfs_inflate_fast(sc->dec, src, plen, dst, want, &got_len,
+				    &fell_back);
+			}
+			nx_relock(vol->nx);
+			t2 = apfs_ticks();
+			vol->nx->data_calls += calls;
+			vol->nx->data_bytes += bytes;
+			vol->nx->data_ticks += t1 - t0;
+			if (!raw_type) {
+				if (fell_back) {
+					vol->nx->inflate_fallbacks++;
+				}
+				vol->nx->inflate_ticks += t2 - t1;
+				vol->nx->inflate_calls++;
+				vol->nx->inflate_in += plen;
+				vol->nx->inflate_out += got_len;
+			}
+			if (error) {
+				goto out;
+			}
+			if (raw_type) {
+				size_t m = plen < want ? (size_t)plen : want;
+
+				cf->held = APFS_NO_PIECE;
+				memcpy(cf->held_data, src, m);
+				cf->held_len = m;
+			} else {
 				if (got_len != want) {
 					error = EIO;
 					goto out;
+				}
+				if (direct) {
+					*out += want;
+					continue;
 				}
 				/* in it goes: the old piece's buffer becomes ours */
 				{
 					uint8_t *t = cf->held_data;
 
-					cf->held_data = mine;
-					mine = t;
+					cf->held_data = sc->mine;
+					sc->mine = t;
 				}
 				cf->held_len = got_len;
 			}
@@ -2090,8 +2513,6 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 			}
 			cf->held = i;
 		}
-		from_in_piece = (off > i * APFS_DECMPFS_BLOCK_SIZE)
-		    ? (size_t)(off - i * APFS_DECMPFS_BLOCK_SIZE) : 0;
 		n = cf->held_len - from_in_piece;
 		if (n > len - *out) {
 			n = len - *out;
@@ -2100,11 +2521,68 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 		*out += n;
 	}
 out:
-	if (piece != NULL) {
-		apfs_free(piece, piece_cap);
+	if (big != NULL) {
+		apfs_free(big, big_cap);
 	}
-	if (mine != NULL) {
-		apfs_free(mine, APFS_DECMPFS_BLOCK_SIZE);
+	if (sc != NULL) {
+		scratch_put(vol->nx, sc);
+	}
+	return error;
+}
+
+/*
+ * An uncompressed file's contents: planned with the lock, read without it, whole blocks
+ * straight into the caller's buffer.
+ */
+static int
+read_plain(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_size, uint64_t off,
+    uint8_t *buf, size_t len, size_t *out)
+{
+	struct apfs_run runs[APFS_MAX_RUNS];
+	struct apfs_scratch *sc;
+	size_t done = 0;
+	int error = 0;
+
+	*out = 0;
+	if (off >= stream_size) {
+		return 0;
+	}
+	if (len > stream_size - off) {
+		len = (size_t)(stream_size - off);
+	}
+	sc = scratch_get(vol->nx);
+	if (sc == NULL) {
+		return ENOMEM;
+	}
+	while (done < len) {
+		uint32_t nruns = 0;
+		uint64_t covered = 0, calls = 0, bytes = 0, t0;
+
+		error = stream_plan(vol, stream_id, off + done, len - done, runs, APFS_MAX_RUNS,
+		    &nruns, &covered);
+		if (error) {
+			break;
+		}
+		if (covered == 0) {
+			error = EIO;            /* cannot happen: a plan covers at least its first run */
+			break;
+		}
+		t0 = apfs_ticks();
+		nx_unlock(vol->nx);
+		error = stream_fetch(vol->nx, runs, nruns, covered, buf + done, sc->raw, &calls,
+		    &bytes);
+		nx_relock(vol->nx);
+		vol->nx->data_calls += calls;
+		vol->nx->data_bytes += bytes;
+		vol->nx->data_ticks += apfs_ticks() - t0;
+		if (error) {
+			break;
+		}
+		done += (size_t)covered;
+	}
+	scratch_put(vol->nx, sc);
+	if (error == 0) {
+		*out = done;
 	}
 	return error;
 }
@@ -2119,17 +2597,24 @@ apfs_read_file(struct apfs_vol *vol, const struct apfs_inode *ino,
 
 	*out = 0;
 	if ((ino->mode & APFS_S_IFMT) == APFS_S_IFLNK) {
+		/*
+		 * The whole target, then the part asked for.  Reading only `len` bytes of it and
+		 * then counting from `off` gave the wrong bytes to anyone reading a link in
+		 * pieces smaller than its target (the host tool, reading a byte at a time).
+		 */
 		size_t n = 0;
+		char *target = apfs_alloc(APFS_LINK_MAX);
 
-		error = apfs_readlink(vol, ino->obj_id, buf, len, &n);
-		if (error) {
-			return error;
+		if (target == NULL) {
+			return ENOMEM;
 		}
-		*out = (off < n) ? n - (size_t)off : 0;
-		if (off > 0 && *out > 0) {
-			memmove(buf, (uint8_t *)buf + off, *out);
+		error = apfs_readlink(vol, ino->obj_id, target, APFS_LINK_MAX, &n);
+		if (error == 0 && off < n) {
+			*out = n - (size_t)off < len ? n - (size_t)off : len;
+			memcpy(buf, target + off, *out);
 		}
-		return 0;
+		apfs_free(target, APFS_LINK_MAX);
+		return error;
 	}
 	/*
 	 * Without a context from the caller, one is made for this call alone -- correct, and
@@ -2145,8 +2630,7 @@ apfs_read_file(struct apfs_vol *vol, const struct apfs_inode *ino,
 	if (error == 0) {
 		if (!cf->compressed) {
 			error = ino->has_dstream
-			    ? apfs_read_stream(vol, ino->private_id, ino->size, off, buf, len,
-			    out)
+			    ? read_plain(vol, ino->private_id, ino->size, off, buf, len, out)
 			    : 0;
 		} else if (cf->in_rsrc) {
 			error = read_cfile_rsrc(vol, ino, cf, off, buf, len, out);

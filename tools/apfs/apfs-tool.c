@@ -336,6 +336,7 @@ struct census {
 	uint8_t         *buf;
 	long             max;
 	long             seen;
+	size_t           chunk;         /* how much each read asks for */
 	bool             meta_only;
 	int              error;
 };
@@ -352,7 +353,7 @@ file_hash(struct census *cs, const struct apfs_inode *ino, uint64_t size)
 	cf.held = APFS_NO_PIECE;
 	for (;;) {
 		size_t got = 0;
-		int error = apfs_read_file(cs->vol, ino, &cf, off, cs->buf, 65536, &got);
+		int error = apfs_read_file(cs->vol, ino, &cf, off, cs->buf, cs->chunk, &got);
 
 		if (error) {
 			fprintf(stderr, "apfs-tool: %s: read at %" PRIu64 ": %s\n", cs->path,
@@ -457,7 +458,22 @@ cmd_census(const char *path, const char *where, bool meta_only)
 	cs.vol = &vol;
 	cs.path_cap = 4096;
 	cs.path = malloc(cs.path_cap);
-	cs.buf = malloc(65536);
+	/*
+	 * APFS_TOOL_CHUNK: reads of another size than 64 KB (say 4096, or 12345 and 200000,
+	 * which never line up with a compressed file's 64 KB pieces), so that the roads through
+	 * apfs_read_file the census does not otherwise take are checked over a whole volume too.
+	 */
+	cs.chunk = 65536;
+	if (getenv("APFS_TOOL_CHUNK") != NULL) {
+		long c = strtol(getenv("APFS_TOOL_CHUNK"), NULL, 0);
+
+		if (c < 1 || c > 16 * 1024 * 1024) {
+			fprintf(stderr, "apfs-tool: APFS_TOOL_CHUNK %ld is not 1..16M\n", c);
+			return 2;
+		}
+		cs.chunk = (size_t)c;
+	}
+	cs.buf = malloc(cs.chunk);
 	cs.max = 0;
 	cs.meta_only = meta_only;
 	if (cs.path == NULL || cs.buf == NULL) {
@@ -481,6 +497,9 @@ cmd_census(const char *path, const char *where, bool meta_only)
 	}
 	fprintf(stderr, "apfs-tool: %ld entries, %" PRIu64 " blocks read, %" PRIu64
 	    " cache hits\n", cs.seen, nx.reads, nx.hits);
+	fprintf(stderr, "apfs-tool: inflate %" PRIu64 " calls, %" PRIu64 " bytes in, %" PRIu64
+	    " bytes out, %" PRIu64 " by zlib\n", nx.inflate_calls, nx.inflate_in, nx.inflate_out,
+	    nx.inflate_fallbacks);
 	fprintf(stderr, "apfs-tool: highest block touched %" PRIu64 " (%.2f GB in), of which "
 	    "file contents reach %" PRIu64 " (%.2f GB in)\n", nx.max_addr,
 	    nx.max_addr * (double)nx.block_size / 1e9, nx.max_data_addr,

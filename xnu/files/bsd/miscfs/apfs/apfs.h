@@ -28,6 +28,9 @@
 
 struct apfs_node;
 
+#define APFS_IOBUF      65536   /* what one round of vnop_read reads */
+#define APFS_IOBUF_KEEP 8
+
 struct apfs_mount {
 	mount_t            am_mp;
 	vnode_t            am_devvp;
@@ -53,6 +56,12 @@ struct apfs_mount {
 	uint64_t           am_lock_wait_ticks;
 	uint64_t           am_lock_held_ticks;
 	uint64_t           am_lock_t0;      /* when the holder took it; only the holder writes */
+	/*
+	 * vnop_read's 64 KB buffers, kept for the next read rather than allocated and freed
+	 * for every one (at that size the kernel goes to the VM).  Under am_lock.
+	 */
+	void              *am_iobuf[APFS_IOBUF_KEEP];
+	uint32_t           am_iobuf_kept;
 };
 
 /* The private part of a vnode: which object it is. */
