@@ -10,9 +10,13 @@
 #   content  ios165/rootfs/ -- the files 7-Zip actually extracted, compared byte for
 #            byte.  This is the one that proves we decompress correctly.
 #
+#   clines   the same lines tools/apfs/apfs-tool prints, so the C code that goes into the
+#            kernel can be diffed against this reader over a whole tree.
+#
 # usage: verify.py listing IMAGE SLT
 #        verify.py content IMAGE REFDIR [-n COUNT] [--all]
 #        verify.py sample  IMAGE REFDIR            (a few dozen files of every kind)
+#        verify.py clines  IMAGE [PATH]
 
 import os
 import random
@@ -311,6 +315,54 @@ def cmd_content(image, refdir, limit, do_all, stratified):
     return 0 if not fails else 1
 
 
+FNV_INIT = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
+MASK64 = (1 << 64) - 1
+
+
+def fnv1a(buf, h=FNV_INIT):
+    for b in buf:
+        h = ((h ^ b) * FNV_PRIME) & MASK64
+    return h
+
+
+def cmd_clines(image, where):
+    """
+    One line per directory entry, the same shape apfs-tool's census prints:
+        path, d_type, mode, uid, gid, logical size, FNV-1a of the contents
+    Only regular files and symbolic links get a hash; everything else gets zero.
+    """
+    c, v = open_volume(image)
+    start = apfs.ROOT_DIR_INO_NUM
+    prefix = ""
+    if where:
+        hit = v.lookup(where)
+        if hit is None:
+            print("verify.py: %s: not found" % where, file=sys.stderr)
+            return 1
+        start = hit[0]
+        prefix = "/" + where.strip("/")
+    out = sys.stdout
+    stack = [(start, prefix)]
+    while stack:
+        oid, px = stack.pop()
+        for name, fid, dt in v.dir_entries(oid):
+            p = px + "/" + name
+            ino = v.inode(fid)
+            if ino is None:
+                out.write("%s\t?\tno-inode\n" % p)
+                continue
+            h = 0
+            if ino.is_reg or ino.is_link:
+                h = fnv1a(ino.contents())
+            out.write("%s\t%d\t%06o\t%d\t%d\t%d\t%016x\n"
+                      % (p, dt, ino.mode, ino.owner, ino.group, ino.size, h))
+            if dt == 4:
+                stack.append((fid, p))
+    c.close()
+    return 0
+
+
 def main(argv):
     limit = 200
     do_all = False
@@ -328,10 +380,11 @@ def main(argv):
             continue
         args.append(a)
         i += 1
-    if len(args) < 3:
+    if len(args) < 2 or (args[0] != "clines" and len(args) < 3):
         print("usage: verify.py listing IMAGE SLT\n"
               "       verify.py content IMAGE REFDIR [-n COUNT] [--all]\n"
-              "       verify.py sample  IMAGE REFDIR", file=sys.stderr)
+              "       verify.py sample  IMAGE REFDIR\n"
+              "       verify.py clines  IMAGE [PATH]", file=sys.stderr)
         return 2
     cmd = args[0]
     if cmd == "listing":
@@ -340,6 +393,8 @@ def main(argv):
         return cmd_content(args[1], args[2], limit, do_all, False)
     if cmd == "sample":
         return cmd_content(args[1], args[2], limit, False, True)
+    if cmd == "clines":
+        return cmd_clines(args[1], args[2] if len(args) > 2 else None)
     print("verify.py: unknown command %r" % cmd, file=sys.stderr)
     return 2
 
