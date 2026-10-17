@@ -1239,9 +1239,9 @@ ufs_check_gpt(efi_block_io *bio, uint64_t unit)
 	    got_entries == entries_crc ? "right" : "WRONG", (uint64_t)got_entries);
 }
 
-/* one line per 32 bytes: "ufs: super WHAT +OFFSET: hex" */
+/* one line per 32 bytes: "ufs: PART WHAT +OFFSET: hex" */
 static void
-ufs_dump(const char *what, const uint8_t *p, uint64_t n)
+ufs_dump_of(const char *part, const char *what, const uint8_t *p, uint64_t n)
 {
 	for (uint64_t at = 0; at < n; at += 32) {
 		char line[72];
@@ -1252,8 +1252,33 @@ ufs_dump(const char *what, const uint8_t *p, uint64_t n)
 			line[k++] = "0123456789abcdef"[p[i] & 15];
 		}
 		line[k] = 0;
-		print("ufs: super %s +%x: %s\n", what, at, line);
+		print("ufs: %s %s +%x: %s\n", part, what, at, line);
 	}
+}
+
+static void
+ufs_dump(const char *what, const uint8_t *p, uint64_t n)
+{
+	ufs_dump_of("super", what, p, n);
+}
+
+/*
+ * The start of userdata: where an f2fs (or ext4) of Android's would have its superblock, at 1024
+ * and, for f2fs, its copy at 4096 + 1024. Plain text there says the filesystem itself lies on the
+ * flash as it is; anything else says it lies under an encryption of the whole partition
+ * (Android's metadata encryption, dm-default-key), and only Android can see into it.
+ */
+static void
+ufs_dump_userdata(efi_block_io *bio)
+{
+	uint64_t bs = bio->media->block_size, want = 8192;
+
+	if (bs == 0 || want % bs || EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, want, ufs_buffer))) {
+		print("ufs: userdata: its start could not be read\n");
+		return;
+	}
+	ufs_dump_of("userdata", "sb", ufs_buffer + 1024, 1024);
+	ufs_dump_of("userdata", "sb2", ufs_buffer + 4096 + 1024, 64);
 }
 
 /*
@@ -1353,6 +1378,10 @@ ufs_survey(void)
 		}
 		if (name[0] == 's' && name[1] == 'u' && name[2] == 'p' && name[3] == 'e' && name[4] == 'r' && name[5] == 0) {
 			ufs_dump_super(bio);
+		}
+		if (name[0] == 'u' && name[1] == 's' && name[2] == 'e' && name[3] == 'r' && name[4] == 'd' &&
+		    name[5] == 'a' && name[6] == 't' && name[7] == 'a' && name[8] == 0) {
+			ufs_dump_userdata(bio);
 		}
 	}
 	print("ufs: %d raw units, %d partitions\n", units, partitions);
