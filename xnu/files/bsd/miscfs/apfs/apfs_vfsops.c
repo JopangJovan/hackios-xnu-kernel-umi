@@ -142,6 +142,7 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		am->am_nx.inflate_calls = am->am_nx.inflate_ticks = 0;
 		am->am_nx.inflate_in = am->am_nx.inflate_out = 0;
 		am->am_nx.reads = am->am_nx.hits = 0;
+		am->am_lock_waits = am->am_lock_wait_ticks = am->am_lock_held_ticks = 0;
 		apfs_unlock(am);
 	}
 	return 0;
@@ -181,6 +182,10 @@ apfs_stats_print(void)
 	printf("apfs: blocks  %llu read  %llu cache hits  highest block %llu\n",
 	    (unsigned long long)nx->reads, (unsigned long long)nx->hits,
 	    (unsigned long long)nx->max_addr);
+	printf("apfs: lock    %llu takes  %llu ms waiting  %llu ms held\n",
+	    (unsigned long long)am->am_lock_waits,
+	    (unsigned long long)apfs_ticks_ms(am->am_lock_wait_ticks),
+	    (unsigned long long)apfs_ticks_ms(am->am_lock_held_ticks));
 }
 
 SYSCTL_PROC(_kern, OID_AUTO, apfs_stats, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,

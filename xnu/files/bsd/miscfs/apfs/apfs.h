@@ -44,6 +44,15 @@ struct apfs_mount {
 	 */
 	uint64_t           am_pagein_calls, am_pagein_ticks, am_pagein_bytes;
 	uint64_t           am_read_calls, am_read_ticks, am_read_bytes;
+	/*
+	 * What the one lock round apfs_lib costs: how long callers stood waiting for it, and
+	 * how long it was held.  Held time is the part of the work that cannot happen on two
+	 * processors at once, so with several readers it is the ceiling.
+	 */
+	uint64_t           am_lock_waits;
+	uint64_t           am_lock_wait_ticks;
+	uint64_t           am_lock_held_ticks;
+	uint64_t           am_lock_t0;      /* when the holder took it; only the holder writes */
 };
 
 /* The private part of a vnode: which object it is. */

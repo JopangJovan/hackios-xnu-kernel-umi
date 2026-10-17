@@ -6,6 +6,7 @@
  */
 
 #include <kern/kalloc.h>
+#include <libkern/OSAtomic.h>
 #include <libkern/libkern.h>
 #include <miscfs/apfs/apfs.h>
 #include <sys/attr.h>
@@ -28,12 +29,18 @@
 void
 apfs_lock(struct apfs_mount *am)
 {
+	uint64_t t0 = apfs_ticks();
+
 	lck_mtx_lock(&am->am_lock);
+	OSAddAtomic64((int64_t)(apfs_ticks() - t0), (volatile int64_t *)&am->am_lock_wait_ticks);
+	OSAddAtomic64(1, (volatile int64_t *)&am->am_lock_waits);
+	am->am_lock_t0 = apfs_ticks();
 }
 
 void
 apfs_unlock(struct apfs_mount *am)
 {
+	am->am_lock_held_ticks += apfs_ticks() - am->am_lock_t0;
 	lck_mtx_unlock(&am->am_lock);
 }
 

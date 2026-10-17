@@ -14,6 +14,10 @@
  *                             no driver for its own storage and no virtio, so the only
  *                             block device there is a RAM disk, and a RAM disk given to
  *                             the kernel as the root is mounted by vfs_mountroot.
+ *   apfs_check=5              several threads walk the root filesystem at once, each over
+ *                             the whole of it, to see what the one lock round apfs_lib
+ *                             costs when there is more than one reader
+ *   apfs_threads=N            how many, for mode 5 (default 4)
  *   apfs_dev=md1              the device to mount for modes 1 to 3 (default rvblk0)
  *   apfs_subtree=/usr         walk only that part of the volume
  *
@@ -55,6 +59,7 @@
 #include <sys/vnode_if.h>
 #include <sys/vnode_internal.h>
 #include <pexpert/pexpert.h>
+#include <libkern/OSAtomic.h>
 #include <sys/redwood_apfs_check.h>
 
 extern void loader_return(void);        /* osfmk/arm64/loader_return.c */
@@ -400,6 +405,115 @@ make_mount_point(vfs_context_t ctx)
 	return error;
 }
 
+#define MAX_THREADS 8
+
+static volatile int apfs_check_running;
+
+struct walk_job {
+	int      index;
+	uint64_t ms;
+	uint64_t entries;
+	uint64_t bytes;
+	uint64_t sum;
+	uint32_t errors;
+};
+
+static struct walk_job apfs_jobs[MAX_THREADS];
+
+/* One reader: the whole root filesystem, with everything of its own. */
+static void
+apfs_walk_one(void *arg, __unused wait_result_t wr)
+{
+	struct walk_job *job = arg;
+	struct census cs;
+	uint64_t start, end, ns = 0;
+
+	bzero(&cs, sizeof(cs));
+	cs.ctx = vfs_context_kernel();
+	cs.lookup_flags = VNODE_LOOKUP_NOFOLLOW | VNODE_LOOKUP_NOCROSSMOUNT;
+	cs.path = kalloc_data(PATH_CAP, Z_WAITOK | Z_ZERO);
+	cs.buf = kalloc_data(READ_CHUNK, Z_WAITOK);
+	if (cs.path == NULL || cs.buf == NULL) {
+		printf("apfs-check: reader %d: out of memory\n", job->index);
+		OSDecrementAtomic(&apfs_check_running);
+		return;
+	}
+	start = mach_absolute_time();
+	census_dir(&cs);
+	end = mach_absolute_time();
+	absolutetime_to_nanoseconds(end - start, &ns);
+
+	job->ms = ns / 1000000;
+	job->entries = cs.entries;
+	job->bytes = cs.bytes;
+	job->sum = cs.sum;
+	job->errors = cs.errors;
+	printf("apfs-check: reader %d: %llu entries  %llu bytes  sum %016llx  errors %u  "
+	    "%llu ms\n", job->index, cs.entries, cs.bytes,
+	    (unsigned long long)cs.sum, cs.errors, job->ms);
+
+	kfree_data(cs.path, PATH_CAP);
+	kfree_data(cs.buf, READ_CHUNK);
+	OSDecrementAtomic(&apfs_check_running);
+}
+
+/*
+ * Several readers at once over the same volume.  What is wanted is not only that nothing
+ * breaks but what the lock costs: all of apfs_lib runs under one mutex, so the part of the
+ * work that is held time cannot go faster however many processors there are.
+ */
+static void
+apfs_check_concurrent(void)
+{
+	uint32_t want = 4;
+	uint64_t start, end, ns = 0;
+	uint64_t total_bytes = 0, total_entries = 0;
+	int i, n, bad = 0;
+
+	if (PE_parse_boot_argn("apfs_threads", &want, sizeof(want)) == 0 || want == 0) {
+		want = 4;
+	}
+	if (want > MAX_THREADS) {
+		want = MAX_THREADS;
+	}
+	n = (int)want;
+	printf("apfs-check: %d readers over the root filesystem at once\n", n);
+
+	bzero(apfs_jobs, sizeof(apfs_jobs));
+	apfs_check_running = n;
+	start = mach_absolute_time();
+	for (i = 0; i < n; i++) {
+		thread_t th;
+
+		apfs_jobs[i].index = i;
+		if (kernel_thread_start(apfs_walk_one, &apfs_jobs[i], &th) != KERN_SUCCESS) {
+			printf("apfs-check: cannot start reader %d\n", i);
+			OSDecrementAtomic(&apfs_check_running);
+			continue;
+		}
+		thread_deallocate(th);
+	}
+	while (apfs_check_running > 0) {
+		delay_for_interval(50, NSEC_PER_MSEC);
+	}
+	end = mach_absolute_time();
+	absolutetime_to_nanoseconds(end - start, &ns);
+
+	for (i = 0; i < n; i++) {
+		total_bytes += apfs_jobs[i].bytes;
+		total_entries += apfs_jobs[i].entries;
+		if (apfs_jobs[i].sum != apfs_jobs[0].sum ||
+		    apfs_jobs[i].entries != apfs_jobs[0].entries || apfs_jobs[i].errors != 0) {
+			bad++;
+		}
+	}
+	printf("apfs-check: %d readers done in %llu ms\n", n, ns / 1000000);
+	printf("apfs-check: together %llu entries  %llu bytes  %llu KB/s\n", total_entries,
+	    total_bytes, ns ? (total_bytes * 1000000ull) / ns : 0);
+	printf("apfs-check: readers that disagreed or failed: %d\n", bad);
+	apfs_stats_print();
+}
+
 static void
 apfs_check_thread(void *arg, __unused wait_result_t wr)
 {
@@ -428,6 +542,12 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 		return;
 	}
 
+	if (mode >= 5) {
+		kfree_data(cs.path, PATH_CAP);
+		kfree_data(cs.buf, READ_CHUNK);
+		apfs_check_concurrent();
+		return;
+	}
 	if (mode >= 4) {
 		/*
 		 * The volume is already the root: nothing to mount, and no mount point to
