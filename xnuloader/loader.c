@@ -1239,6 +1239,73 @@ ufs_check_gpt(efi_block_io *bio, uint64_t unit)
 	    got_entries == entries_crc ? "right" : "WRONG", (uint64_t)got_entries);
 }
 
+/* one line per 32 bytes: "ufs: super WHAT +OFFSET: hex" */
+static void
+ufs_dump(const char *what, const uint8_t *p, uint64_t n)
+{
+	for (uint64_t at = 0; at < n; at += 32) {
+		char line[72];
+		unsigned k = 0;
+
+		for (uint64_t i = at; i < n && i < at + 32; i++) {
+			line[k++] = "0123456789abcdef"[p[i] >> 4];
+			line[k++] = "0123456789abcdef"[p[i] & 15];
+		}
+		line[k] = 0;
+		print("ufs: super %s +%x: %s\n", what, at, line);
+	}
+}
+
+/*
+ * Android's own system (system, vendor, product, ...) is not in GPT partitions but in logical ones
+ * inside "super", which liblp's metadata at its start describes: a geometry at 4096 (and its copy
+ * at 8192), then its metadata slots from 12288 on -- each a header and its tables of partitions,
+ * extents, groups and block devices. Printed raw for tools/ufs-super.py, which checks their SHA-256 sums and
+ * says where in super nothing lies: a place a volume of this port's own could have without
+ * anything of Android's being moved.
+ */
+static void
+ufs_dump_super(efi_block_io *bio)
+{
+	uint64_t bs = bio->media->block_size, want = 256 * 1024;
+	const uint8_t *geometry = ufs_buffer + 4096;
+	uint32_t max_size, slots;
+
+	if (bs == 0 || want % bs || (bio->media->last_block + 1) * bs < want ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, want, ufs_buffer))) {
+		print("ufs: super: its start could not be read\n");
+		return;
+	}
+	if (*(const uint32_t *)geometry != 0x616c4467) {
+		print("ufs: super: no liblp geometry (magic %x)\n", (uint64_t)*(const uint32_t *)geometry);
+		return;
+	}
+	ufs_dump("geometry", geometry, 52);
+	max_size = *(const uint32_t *)(geometry + 40);
+	slots = *(const uint32_t *)(geometry + 44);
+	/* a slot per A/B slot: the first describes super as slot _a sees it, the second as _b does */
+	for (uint32_t slot = 0; slot < slots && slot < 2; slot++) {
+		const uint8_t *header = ufs_buffer + 3 * 4096 + (uint64_t)slot * max_size;
+		uint32_t header_size, tables_size;
+		char what[8] = "header0", tables[8] = "tables0";
+
+		if (3 * 4096 + (uint64_t)(slot + 1) * max_size > want || *(const uint32_t *)header != 0x414c5030) {
+			print("ufs: super: slot %d: no metadata header within the first %d KB\n", (uint64_t)slot, want >> 10);
+			continue;
+		}
+		header_size = *(const uint32_t *)(header + 8);
+		tables_size = *(const uint32_t *)(header + 44);
+		if (header_size < 128 || header_size > 256 || tables_size > max_size - header_size || tables_size > 16384) {
+			print("ufs: super: slot %d: header of %d bytes, tables of %d: not dumped\n", (uint64_t)slot,
+			    (uint64_t)header_size, (uint64_t)tables_size);
+			continue;
+		}
+		what[6] = tables[6] = (char)('0' + slot);
+		ufs_dump(what, header, header_size);
+		ufs_dump(tables, header + header_size, tables_size);
+	}
+}
+
 static void
 ufs_survey(void)
 {
@@ -1283,6 +1350,9 @@ ufs_survey(void)
 		    (bio->media->last_block + 1) * bio->media->block_size >> 10);
 		if ((r = ufs_reference_of(name)) >= 0) {
 			ufs_hash_partition(bio, name, ufs_references[r].bytes);
+		}
+		if (name[0] == 's' && name[1] == 'u' && name[2] == 'p' && name[3] == 'e' && name[4] == 'r' && name[5] == 0) {
+			ufs_dump_super(bio);
 		}
 	}
 	print("ufs: %d raw units, %d partitions\n", units, partitions);
