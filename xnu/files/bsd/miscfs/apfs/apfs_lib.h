@@ -120,6 +120,16 @@ struct apfs_nx {
 	uint32_t          fs_count;
 	uint8_t           uuid[16];
 	struct apfs_omap  omap;         /* resolves volume superblocks */
+	/*
+	 * The caller's lock round this container, which apfs_lib may let go of while it
+	 * does work that touches nothing shared -- decompressing a piece into a buffer of
+	 * its own -- and take back afterwards.  Everything else here (the block cache, the
+	 * cursors, a file's held piece) is only touched with it held.  NULL for a caller
+	 * with no lock, such as the single-threaded program on the build machine.
+	 */
+	void            (*unlock)(void *ctx);
+	void            (*relock)(void *ctx);
+	void             *lock_ctx;
 	struct apfs_buf   cache[APFS_CACHE_BLOCKS];
 	uint32_t          clock;
 	uint64_t          reads;

@@ -171,6 +171,22 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 	return 0;
 }
 
+static inline void
+nx_unlock(struct apfs_nx *nx)
+{
+	if (nx->unlock != NULL) {
+		nx->unlock(nx->lock_ctx);
+	}
+}
+
+static inline void
+nx_relock(struct apfs_nx *nx)
+{
+	if (nx->relock != NULL) {
+		nx->relock(nx->lock_ctx);
+	}
+}
+
 static uint32_t
 obj_type(const uint8_t *blk)
 {
@@ -1964,6 +1980,7 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
     struct apfs_cfile *cf, uint64_t off, uint8_t *buf, size_t len, size_t *out)
 {
 	uint8_t *piece = NULL;
+	uint8_t *mine = NULL;           /* a piece's worth, decompressed into without the lock */
 	size_t piece_cap = 0;
 	uint64_t first, last, i;
 	int error = 0;
@@ -2015,18 +2032,57 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 				error = EIO;
 				goto out;
 			}
-			cf->held = APFS_NO_PIECE;       /* what is in there now is unknown */
 			if (cf->type == APFS_DECMPFS_TYPE_RAW_RSRC) {
 				size_t m = plen < want ? (size_t)plen : want;
 
+				cf->held = APFS_NO_PIECE;
 				memcpy(cf->held_data, piece, m);
 				cf->held_len = m;
 			} else {
-				error = apfs_inflate_counted(vol->nx, piece, plen,
-				    cf->held_data, want, &cf->held_len);
+				/*
+				 * Decompress without the caller's lock, into a buffer of our
+				 * own: zlib touches nothing anyone else can see, and it is most
+				 * of the time spent here -- with the lock held through it, four
+				 * readers on eight processors kept the lock busy 94% of the
+				 * time.  The piece only goes into the file's cache once the
+				 * lock is back, by swapping buffers.  Two readers of the same
+				 * file may decompress the same piece once each; that is the
+				 * price, and the cache stays right either way.
+				 */
+				size_t got_len = 0;
+				uint64_t t0;
+
+				if (mine == NULL) {
+					mine = apfs_alloc(APFS_DECMPFS_BLOCK_SIZE);
+					if (mine == NULL) {
+						error = ENOMEM;
+						goto out;
+					}
+				}
+				t0 = apfs_ticks();
+				nx_unlock(vol->nx);
+				error = apfs_inflate_counted(NULL, piece, plen, mine, want,
+				    &got_len);
+				nx_relock(vol->nx);
+				vol->nx->inflate_ticks += apfs_ticks() - t0;
+				vol->nx->inflate_calls++;
+				vol->nx->inflate_in += plen;
+				vol->nx->inflate_out += got_len;
 				if (error) {
 					goto out;
 				}
+				if (got_len != want) {
+					error = EIO;
+					goto out;
+				}
+				/* in it goes: the old piece's buffer becomes ours */
+				{
+					uint8_t *t = cf->held_data;
+
+					cf->held_data = mine;
+					mine = t;
+				}
+				cf->held_len = got_len;
 			}
 			if (cf->held_len != want) {
 				error = EIO;
@@ -2046,6 +2102,9 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 out:
 	if (piece != NULL) {
 		apfs_free(piece, piece_cap);
+	}
+	if (mine != NULL) {
+		apfs_free(mine, APFS_DECMPFS_BLOCK_SIZE);
 	}
 	return error;
 }

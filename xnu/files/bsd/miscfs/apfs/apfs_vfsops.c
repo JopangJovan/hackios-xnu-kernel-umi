@@ -318,6 +318,19 @@ apfs_node_detach(struct apfs_node *an)
 	lck_mtx_unlock(&am->am_lock);
 }
 
+/* apfs_lib lets go of the mount's lock round decompression, through these */
+static void
+apfs_lib_unlock(void *ctx)
+{
+	apfs_unlock((struct apfs_mount *)ctx);
+}
+
+static void
+apfs_lib_relock(void *ctx)
+{
+	apfs_lock((struct apfs_mount *)ctx);
+}
+
 /* ------------------------------------------------------------------ mount */
 
 static void
@@ -381,6 +394,11 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 		apfs_free_mount(am);
 		return error;
 	}
+
+	/* apfs_nx_open() starts from a clean slate, so the lock is handed over only now */
+	am->am_nx.unlock = apfs_lib_unlock;
+	am->am_nx.relock = apfs_lib_relock;
+	am->am_nx.lock_ctx = am;
 
 	/* the first volume that has a root directory */
 	{
