@@ -1073,6 +1073,364 @@ charger_poll(void)
 	    (uint64_t)(uintptr_t)&charger_shared + sizeof(charger_shared));
 }
 
+/* ------------------------------------------------------------------------ */
+/* UFS survey (ufs=1): what the phone's storage holds, read only            */
+
+/*
+ * The phone's storage as Qualcomm's own UFS driver in this UEFI sees it (UFSDxe): every raw
+ * logical unit, every GPT partition with its name, place and size, and for the partitions there
+ * are reference images of -- firmware-update/ in the ROM's fw.zip -- an FNV-1a hash of exactly
+ * as many bytes as the image has, which tools/ufs-survey.py computes from the images on the host.
+ * Where the two agree, reading through this driver gives the bytes that are on the flash, and that
+ * is the ground a block device for the kernel is to stand on.
+ *
+ * Only read_blocks is ever called here: nothing is written, flushed or reset. It runs before the
+ * kernel is started, with UEFI's boot services whole and interrupts on.
+ */
+static const struct {
+	const char *name;
+	uint64_t bytes;
+} ufs_references[] = {
+	{ "bluetooth", 503808 }, { "abl", 208896 }, { "aop", 208896 }, { "xbl", 3706880 },
+	{ "tz", 3710976 }, { "hyp", 3653632 }, { "dsp", 67108864 }, { "modem", 214265856 },
+};
+
+static uint8_t ufs_buffer[1024 * 1024] __attribute__((aligned(4096)));
+
+static uint64_t
+ufs_fnv(uint64_t h, const uint8_t *p, uint64_t n)
+{
+	for (uint64_t i = 0; i < n; i++) {
+		h = (h ^ p[i]) * 0x100000001b3ULL;
+	}
+	return h;
+}
+
+/* the partition's name in ASCII (GPT names are UTF-16; these are all plain letters) */
+static void
+ufs_name(const efi_partition_info *info, char *out, unsigned size)
+{
+	unsigned i = 0;
+
+	for (; i + 1 < size && i < 36 && info->name[i] != 0; i++) {
+		out[i] = info->name[i] < 0x80 ? (char)info->name[i] : '?';
+	}
+	out[i] = 0;
+}
+
+/* "bluetooth_a" and "bluetooth_b" are both "bluetooth": the image is the same for either slot */
+static int
+ufs_reference_of(const char *name)
+{
+	for (unsigned r = 0; r < sizeof(ufs_references) / sizeof(ufs_references[0]); r++) {
+		const char *a = ufs_references[r].name, *b = name;
+
+		while (*a && *a == *b) {
+			a++;
+			b++;
+		}
+		if (*a == 0 && (*b == 0 || ((b[0] == '_') && (b[1] == 'a' || b[1] == 'b') && b[2] == 0))) {
+			return (int)r;
+		}
+	}
+	return -1;
+}
+
+static void
+ufs_hash_partition(efi_block_io *bio, const char *name, uint64_t bytes)
+{
+	uint64_t bs = bio->media->block_size, h = 0xcbf29ce484222325ULL, done = 0, started = READ_SYSREG(CNTVCT_EL0);
+	uint64_t chunk = sizeof(ufs_buffer) / bs * bs, lba = 0;
+
+	if (bs == 0 || bs > sizeof(ufs_buffer) || (bio->media->last_block + 1) * bs < bytes) {
+		print("ufs: %s: %d bytes asked for, the partition is smaller\n", name, bytes);
+		return;
+	}
+	while (done < bytes) {
+		uint64_t want = bytes - done < chunk ? (bytes - done + bs - 1) / bs * bs : chunk;
+		efi_status s = bio->read_blocks(bio, bio->media->media_id, lba, want, ufs_buffer);
+
+		if (EFI_ERROR(s)) {
+			print("ufs: %s: reading at block %d: error %x\n", name, lba, (uint64_t)s);
+			return;
+		}
+		if (done == 0) {
+			print("ufs: %s: begins", name);
+			for (int k = 0; k < 16; k++) {
+				print(" %x", (uint64_t)ufs_buffer[k]);
+			}
+			print("\n");
+		}
+		h = ufs_fnv(h, ufs_buffer, bytes - done < want ? bytes - done : want);
+		done += bytes - done < want ? bytes - done : want;
+		lba += want / bs;
+		if (wdt_armed) {
+			wdt_pet();
+		}
+	}
+	print("ufs: %s: fnv %x over %d bytes, %d ms\n", name, h, bytes,
+	    (READ_SYSREG(CNTVCT_EL0) - started) * 1000 / READ_SYSREG(CNTFRQ_EL0));
+}
+
+/* CRC-32 as GPT uses it (IEEE 802.3, reflected, 0xedb88320) */
+static uint32_t
+ufs_crc32(const uint8_t *p, uint64_t n)
+{
+	uint32_t c = 0xffffffffu;
+
+	for (uint64_t i = 0; i < n; i++) {
+		c ^= p[i];
+		for (int k = 0; k < 8; k++) {
+			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
+		}
+	}
+	return ~c;
+}
+
+/*
+ * A unit's GPT checks itself: its header carries a CRC-32 of the header and one of the table of
+ * partitions. Whatever firmware is on the phone, the bytes read are the bytes on the flash only if
+ * both come out right -- the one check here that does not depend on having the same images.
+ */
+static void
+ufs_check_gpt(efi_block_io *bio, uint64_t unit)
+{
+	uint64_t bs = bio->media->block_size, entries_lba, count, size, bytes, read;
+	uint32_t header_size, header_crc, entries_crc, got_header, got_entries;
+	uint8_t header[512];
+
+	if (bs < 512 || bs > sizeof(ufs_buffer) ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, ufs_buffer))) {
+		print("ufs: unit %d: the GPT header could not be read\n", unit);
+		return;
+	}
+	if (ufs_buffer[0] != 'E' || ufs_buffer[1] != 'F' || ufs_buffer[2] != 'I' || ufs_buffer[3] != ' ' ||
+	    ufs_buffer[4] != 'P' || ufs_buffer[5] != 'A' || ufs_buffer[6] != 'R' || ufs_buffer[7] != 'T') {
+		print("ufs: unit %d: no GPT header in block 1\n", unit);
+		return;
+	}
+	memcpy(header, ufs_buffer, sizeof(header));
+	header_size = *(uint32_t *)(header + 12);
+	header_crc = *(uint32_t *)(header + 16);
+	entries_lba = *(uint64_t *)(header + 72);
+	count = *(uint32_t *)(header + 80);
+	size = *(uint32_t *)(header + 84);
+	entries_crc = *(uint32_t *)(header + 88);
+	if (header_size < 92 || header_size > sizeof(header)) {
+		print("ufs: unit %d: GPT header size %d\n", unit, (uint64_t)header_size);
+		return;
+	}
+	*(uint32_t *)(header + 16) = 0;
+	got_header = ufs_crc32(header, header_size);
+	bytes = count * size;
+	if (bytes == 0 || bytes > sizeof(ufs_buffer)) {
+		print("ufs: unit %d: GPT header crc %s, a table of %d bytes not checked\n", unit,
+		    got_header == header_crc ? "right" : "WRONG", bytes);
+		return;
+	}
+	read = (bytes + bs - 1) / bs * bs;
+	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, entries_lba, read, ufs_buffer))) {
+		print("ufs: unit %d: the GPT table could not be read\n", unit);
+		return;
+	}
+	got_entries = ufs_crc32(ufs_buffer, bytes);
+	print("ufs: unit %d: GPT header crc %s (%x), table of %d entries crc %s (%x)\n", unit,
+	    got_header == header_crc ? "right" : "WRONG", (uint64_t)got_header, count,
+	    got_entries == entries_crc ? "right" : "WRONG", (uint64_t)got_entries);
+}
+
+static void
+ufs_survey(void)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	efi_handle *handles;
+	uint64_t count, units = 0, partitions = 0;
+
+	/* the raw logical units: the block devices that are not partitions of another */
+	if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &blk_guid, NULL, &count, &handles))) {
+		for (uint64_t i = 0; i < count; i++) {
+			efi_block_io *bio;
+
+			if (EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) || bio->media->logical) {
+				continue;
+			}
+			print("ufs: unit %d: media %d, %d blocks of %d (%d MB), %s, align %d\n", units++,
+			    (uint64_t)bio->media->media_id, bio->media->last_block + 1, (uint64_t)bio->media->block_size,
+			    (bio->media->last_block + 1) * bio->media->block_size >> 20,
+			    bio->media->read_only ? "read only" : "writable", (uint64_t)bio->media->io_align);
+			ufs_check_gpt(bio, units - 1);
+		}
+	}
+	/* the GPT partitions, with the hash of those there are images of */
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		print("ufs: no partition information in this UEFI\n");
+		return;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_partition_info *info;
+		efi_block_io *bio;
+		char name[40];
+		int r;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
+		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
+			continue;
+		}
+		ufs_name(info, name, sizeof(name));
+		partitions++;
+		print("ufs: part %s: lba %d..%d, %d KB\n", name, info->start_lba, info->end_lba,
+		    (bio->media->last_block + 1) * bio->media->block_size >> 10);
+		if ((r = ufs_reference_of(name)) >= 0) {
+			ufs_hash_partition(bio, name, ufs_references[r].bytes);
+		}
+	}
+	print("ufs: %d raw units, %d partitions\n", units, partitions);
+}
+
+/* ------------------------------------------------------------------------ */
+/* UFS block service (ufs=2): the kernel reads the phone's storage through  */
+/* this loader, and this loader through Qualcomm's own UFS driver           */
+
+/*
+ * The kernel has no driver for the phone's storage, and does not need one: UEFI never exits here,
+ * Qualcomm's UFS driver (UFSDxe) has the controller, its PHY, clocks and power up and stays
+ * resident, and this loader already serves the kernel from core 0 while the kernel runs on another
+ * (the battery). So the kernel asks for blocks through a page both can see, and core 0 reads them
+ * with that driver's ReadBlocks into a buffer both can see. The kernel's side is
+ * bsd/dev/redwood_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
+ *
+ * Read only, by construction: this service calls read_blocks and nothing else, the kernel's side
+ * refuses writes before they are asked for, and there is no field in the page that could ask for
+ * one.
+ *
+ * Each side writes its own cache lines only: the kernel the request, core 0 the answer (and the
+ * table, once, before the kernel starts). A line one side cleans out of its cache therefore never
+ * carries a stale copy of what the other side wrote into it. Core 0 never writes into the data
+ * buffer itself, so after the controller's DMA there is nothing of its own in its cache to write
+ * back over the data.
+ */
+#define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
+#define BLOCK_VERSION      1
+#define BLOCK_MAX_PARTS    128
+#define BLOCK_BUFFER_SIZE  (4u << 20)
+
+struct loader_block_part {
+	char name[36];
+	uint32_t block_size;
+	uint64_t blocks;
+};
+
+struct loader_block {
+	/* written by the loader, once, before the kernel starts */
+	uint64_t magic;
+	uint32_t version, size;
+	uint32_t parts, buffer_size;
+	uint64_t buffer_pa;
+	/* written by the kernel: what it wants, then request is advanced */
+	struct {
+		volatile uint32_t request;
+		uint32_t part;
+		uint64_t lba, count;           /* in the partition's own blocks */
+	} ask __attribute__((aligned(128)));
+	/* written by the loader: answered becomes request when the data is in the buffer */
+	struct {
+		volatile uint32_t answered;
+		uint32_t reserved;
+		int64_t status;                /* the EFI status of the read, 0 when it went well */
+		uint64_t served, failed, bytes, ticks;
+	} answer __attribute__((aligned(128)));
+	struct loader_block_part part[BLOCK_MAX_PARTS] __attribute__((aligned(128)));
+};
+
+/* (8 KB is as far as this target aligns; the kernel maps whole 16 KB pages around both) */
+static struct loader_block block_shared __attribute__((aligned(0x2000)));
+static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
+static efi_block_io *block_bios[BLOCK_MAX_PARTS];
+static int block_enabled;
+
+static void
+block_start(void)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	efi_handle *handles;
+	uint64_t count;
+
+	memset(&block_shared, 0, sizeof(block_shared));
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		print("ufs: no partition information: the block service is off\n");
+		return;
+	}
+	for (uint64_t i = 0; i < count && block_shared.parts < BLOCK_MAX_PARTS; i++) {
+		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
+		efi_partition_info *info;
+		efi_block_io *bio;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
+		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) ||
+		    bio->media->block_size == 0 || bio->media->block_size > BLOCK_BUFFER_SIZE) {
+			continue;
+		}
+		ufs_name(info, bp->name, sizeof(bp->name));
+		bp->block_size = bio->media->block_size;
+		bp->blocks = bio->media->last_block + 1;
+		block_bios[block_shared.parts++] = bio;
+	}
+	block_shared.magic = BLOCK_MAGIC;
+	block_shared.version = BLOCK_VERSION;
+	block_shared.size = sizeof(block_shared);
+	block_shared.buffer_size = BLOCK_BUFFER_SIZE;
+	block_shared.buffer_pa = (uint64_t)(uintptr_t)block_buffer;
+	clean_dcache((uint64_t)(uintptr_t)&block_shared, (uint64_t)(uintptr_t)&block_shared + sizeof(block_shared));
+	block_enabled = 1;
+	print("ufs: block service: %d partitions, page %x, buffer %x of %d KB\n", (uint64_t)block_shared.parts,
+	    (uint64_t)(uintptr_t)&block_shared, block_shared.buffer_pa, (uint64_t)(BLOCK_BUFFER_SIZE >> 10));
+}
+
+/* one request, if there is one: called from core 0's watch loop while the kernel runs */
+static void
+block_poll(void)
+{
+	uint64_t ask = (uint64_t)(uintptr_t)&block_shared.ask;
+	uint32_t request, part;
+	uint64_t lba, count, bytes, started;
+	efi_status s = 0x8000000000000002ULL;     /* EFI_INVALID_PARAMETER: a request out of bounds */
+
+	/* the kernel writes the request into memory past this core's cache: look at memory */
+	flush_dcache(ask, ask + sizeof(block_shared.ask));
+	request = block_shared.ask.request;
+	if (request == block_shared.answer.answered) {
+		return;
+	}
+	part = block_shared.ask.part;
+	lba = block_shared.ask.lba;
+	count = block_shared.ask.count;
+	started = READ_SYSREG(CNTVCT_EL0);
+	bytes = 0;
+	if (part < block_shared.parts && count != 0 && count <= BLOCK_BUFFER_SIZE / block_shared.part[part].block_size &&
+	    lba < block_shared.part[part].blocks && count <= block_shared.part[part].blocks - lba) {
+		efi_block_io *bio = block_bios[part];
+
+		bytes = count * block_shared.part[part].block_size;
+		s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+		/* what the controller wrote is in memory; drop whatever this core held of the buffer */
+		flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
+	}
+	block_shared.answer.status = (int64_t)s;
+	block_shared.answer.ticks += READ_SYSREG(CNTVCT_EL0) - started;
+	if (EFI_ERROR(s)) {
+		block_shared.answer.failed++;
+	} else {
+		block_shared.answer.served++;
+		block_shared.answer.bytes += bytes;
+	}
+	__asm__ volatile ("dmb sy");
+	block_shared.answer.answered = request;
+	clean_dcache((uint64_t)(uintptr_t)&block_shared.answer,
+	    (uint64_t)(uintptr_t)&block_shared.answer + sizeof(block_shared.answer));
+}
+
 static void
 charger_start(void)
 {
@@ -1254,6 +1612,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				log_of_hung_kernel(live, slide);
 				status = OTHER_CPU_HUNG;
 			}
+		}
+		if (block_enabled) {
+			block_poll();
 		}
 		usb_poll_command();
 		for (volatile int i = 0; i < 20000; i++) {
@@ -1734,7 +2095,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
-	int more_cores = 0, battery_requested = 0;
+	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
@@ -1751,9 +2112,19 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
+		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
+		    (c[5] == 0 || c[5] == ' ')) {
+			ufs_requested = c[4] - '0';
+		}
 	}
 	if (battery_requested) {
 		charger_start();
+	}
+	if (ufs_requested >= 1) {
+		ufs_survey();
+	}
+	if (ufs_requested >= 2) {
+		block_start();
 	}
 	if (checkpoint == CHECKPOINT_SELFTEST) {
 		kernel_mpidr = this_mpidr;
@@ -1856,6 +2227,19 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		for (const char *c = "hv_wdt_pet=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
 			ba->commandLine[n++] = *c;
 		}
+	}
+	if (block_enabled) {
+		static const char prefix[] = "ufs_shared_pa=0x";
+		static const char hex[] = "0123456789abcdef";
+		uint64_t address = (uint64_t)(uintptr_t)&block_shared;
+
+		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
+		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
+			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
+		}
+		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
 	}
 	if (battery_requested) {
 		static const char prefix[] = "battery_shared_pa=0x";
