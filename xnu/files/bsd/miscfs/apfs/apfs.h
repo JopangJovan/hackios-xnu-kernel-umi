@@ -57,6 +57,13 @@ struct apfs_node {
 	 * Guarded by am_lock, like everything else that reaches apfs_lib.
 	 */
 	struct apfs_cfile  an_cf;
+	/*
+	 * The inode record as it was when the vnode was made.  Nothing on this volume can
+	 * change -- the mount is read only and there is no writer anywhere -- so there is
+	 * nothing to invalidate, and a read no longer walks the tree for the record and the
+	 * decmpfs header on every call.
+	 */
+	struct apfs_inode  an_ino;
 };
 
 #define APFS_MP(mp)       ((struct apfs_mount *)vfs_fsprivate(mp))

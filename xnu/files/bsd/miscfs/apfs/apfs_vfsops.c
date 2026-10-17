@@ -144,6 +144,7 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	an->an_parent = ino.parent_id;
 	an->an_mode = ino.mode;
 	an->an_size = size;
+	an->an_ino = ino;       /* nothing here can change: the mount is read only */
 
 	bzero(&vfsp, sizeof(vfsp));
 	vfsp.vnfs_mp = am->am_mp;

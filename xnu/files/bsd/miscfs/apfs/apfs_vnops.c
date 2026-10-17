@@ -101,20 +101,8 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 	uint64_t size = 0;
 	int error;
 
-	apfs_lock(am);
-	error = apfs_vp_inode(vp, &ino);
-	if (error == 0) {
-		error = apfs_inode_size(&am->am_vol, &ino, &size);
-		if (error) {
-			size = ino.size;
-			error = 0;
-		}
-	}
-	apfs_unlock(am);
-	if (error) {
-		return error;
-	}
-	an->an_size = size;
+	ino = an->an_ino;
+	size = an->an_size;
 
 	VATTR_RETURN(vap, va_rdev, (dev_t)ino.rdev);
 	VATTR_RETURN(vap, va_nlink, vnode_isdir(vp) ? 2 : (uint32_t)(ino.nchildren > 0
@@ -171,7 +159,7 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	struct apfs_inode ino;
 	uint8_t *buf;
 	uint64_t size = 0;
-	int error;
+	int error = 0;
 
 	if (vnode_isdir(vp)) {
 		return EISDIR;
@@ -182,15 +170,8 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	if (uio_offset(uio) < 0) {
 		return EINVAL;
 	}
-	apfs_lock(am);
-	error = apfs_vp_inode(vp, &ino);
-	if (error == 0) {
-		error = apfs_inode_size(&am->am_vol, &ino, &size);
-	}
-	apfs_unlock(am);
-	if (error) {
-		return error;
-	}
+	ino = APFS_VP(vp)->an_ino;
+	size = APFS_VP(vp)->an_size;
 	buf = kalloc_data(APFS_IOBUF, Z_WAITOK);
 	if (buf == NULL) {
 		return ENOMEM;
@@ -244,13 +225,9 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	    (upl_offset & PAGE_MASK)) {
 		error = EINVAL;
 	} else {
-		apfs_lock(am);
-		error = apfs_vp_inode(vp, &ino);
-		if (error == 0) {
-			error = apfs_inode_size(&am->am_vol, &ino, &size);
-		}
-		apfs_unlock(am);
-		if (error == 0 && ubc_upl_map(upl, &address) != KERN_SUCCESS) {
+		ino = APFS_VP(vp)->an_ino;
+		size = APFS_VP(vp)->an_size;
+		if (ubc_upl_map(upl, &address) != KERN_SUCCESS) {
 			error = ENOMEM;
 		}
 	}
@@ -262,6 +239,20 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 		return error;
 	}
 
+	/*
+	 * Say once how big a range the paging machinery asks for.  It decides how much the
+	 * holding of a decompressed piece can save: if a request already covers a whole
+	 * 64 KB piece, the piece was being decompressed once per request anyway.
+	 */
+	{
+		static bool said;
+
+		if (!said) {
+			said = true;
+			printf("apfs: pagein asks for %u bytes at a time (page size %u)\n",
+			    (unsigned)ap->a_size, (unsigned)PAGE_SIZE);
+		}
+	}
 	end = offset + (off_t)ap->a_size;
 	for (at = offset; at < end;) {
 		uint8_t *dst = (uint8_t *)address + upl_offset + (at - offset);
