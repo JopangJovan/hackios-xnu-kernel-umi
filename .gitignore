@@ -6,7 +6,6 @@
 !/README.md
 !/docs/
 !/xl
-!/mkpackfs.py
 !/mkxnuimg.py
 !/xnu-build.sh
 !/xnu-env.sh

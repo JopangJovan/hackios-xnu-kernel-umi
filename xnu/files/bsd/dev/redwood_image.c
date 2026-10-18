@@ -4,9 +4,9 @@
  * (redwood_wifi.c), the audio DSP's (redwood_adsp.c) -- "fw/NAME" of the image that travels with
  * the kernel (md1; md0 when there is nothing else) or of the resident one (md0).
  *
- * The image is APFS (tools/apfs/mkapfs.py: what userland/build.sh makes) or, until packfs is
- * gone, packfs.  A file stored as it is in one piece is used where it lies in the RAM disk's
- * memory, as the drivers always did (build.sh has mkapfs.py store fw/ that way: --plain fw).
+ * The image is an APFS container (tools/apfs/mkapfs.py: what userland/build.sh makes).  A file
+ * stored as it is in one piece is used where it lies in the RAM disk's memory, as the drivers
+ * always did (build.sh has mkapfs.py store fw/ that way: --plain fw).
  * Any other APFS file is read out once by apfs_lib -- the same code as the volume's when
  * mounted, compressed or not -- into memory of its own, and kept: firmware is asked for once
  * or twice a session and its driver keeps it while the phone runs, so nothing gives it back.
@@ -19,58 +19,11 @@
 #include <sys/stat.h>
 #include <sys/systm.h>
 #include <miscfs/apfs/apfs_lib.h>
-#include <miscfs/packfs/packfs.h>
 
 extern dev_t mdevlookup(int devid);
 extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
 
 const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
-
-/* ---- packfs ---- */
-
-static const struct packfs_dnode *
-pack_entry(const uint8_t *image, const struct packfs_super *super, const struct packfs_dnode *directory,
-    const char *name)
-{
-	const struct packfs_dnode *nodes = (const struct packfs_dnode *)(image + super->ps_nodes_off);
-	size_t length = strlen(name);
-
-	if (directory == NULL || !S_ISDIR(directory->pd_mode) || directory->pd_data + directory->pd_size > super->ps_node_count) {
-		return NULL;
-	}
-	for (uint64_t i = 0; i < directory->pd_size; i++) {
-		const struct packfs_dnode *node = &nodes[directory->pd_data + i];
-
-		if (node->pd_name_len == length && (uint64_t)node->pd_name + length <= super->ps_strings_size &&
-		    memcmp(image + super->ps_strings_off + node->pd_name, name, length) == 0) {
-			return node;
-		}
-	}
-	return NULL;
-}
-
-static const uint8_t *
-pack_file(const uint8_t *base, uint64_t length, const char *dir, const char *name, uint64_t *size)
-{
-	const struct packfs_super *super = (const struct packfs_super *)base;
-	const struct packfs_dnode *file;
-
-	if (length < PACKFS_SUPER_SIZE || memcmp(super->ps_magic, PACKFS_MAGIC, sizeof(super->ps_magic)) != 0 ||
-	    super->ps_image_size > length || super->ps_node_count == 0 ||
-	    super->ps_nodes_off + (uint64_t)super->ps_node_count * sizeof(struct packfs_dnode) > super->ps_image_size ||
-	    super->ps_strings_off + super->ps_strings_size > super->ps_image_size) {
-		return NULL;
-	}
-	file = (const struct packfs_dnode *)(base + super->ps_nodes_off);       /* the root directory */
-	file = pack_entry(base, super, file, dir);
-	file = pack_entry(base, super, file, name);
-	if (file != NULL && S_ISREG(file->pd_mode) && !(file->pd_flags & PACKFS_F_CHUNKED) &&
-	    file->pd_data + file->pd_size <= super->ps_image_size) {
-		*size = file->pd_size;
-		return base + file->pd_data;
-	}
-	return NULL;
-}
 
 /* ---- APFS ---- */
 
@@ -222,10 +175,7 @@ redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_
 		if (dev == (dev_t)-1 || mdevgetkernelrange(dev, &base, &length) != 0) {
 			continue;
 		}
-		data = pack_file((const uint8_t *)base, length, dir, name, size);
-		if (data == NULL) {
-			data = apfs_file(disk, (const uint8_t *)base, length, dir, name, size);
-		}
+		data = apfs_file(disk, (const uint8_t *)base, length, dir, name, size);
 		if (data != NULL) {
 			if (disk_out != NULL) {
 				*disk_out = disk;

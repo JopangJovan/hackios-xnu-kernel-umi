@@ -10,9 +10,9 @@
  * addresses.  The APFS driver above cannot tell the difference: every block it asks for is
  * there, at the address it asks for.
  *
- * The image rides at the end of the resident RAM disk, after the packfs image that is the
- * root -- packfs reads only as far as its own superblock says, so what follows is ignored
- * by it -- and apfs_sparse is the byte offset where it starts.
+ * The image rides at the end of the resident RAM disk, after the image that is the root -- an
+ * APFS container, which ends where its own superblock says, so what follows is nothing to it
+ * -- and apfs_sparse is the byte offset where it starts.
  *
  * A block that is not in the image reads as zeros and is counted.  Nothing should ask for
  * one; the count is printed so that it does not go unnoticed if something does.

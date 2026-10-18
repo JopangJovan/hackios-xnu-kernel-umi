@@ -2,9 +2,10 @@
 # Build the user-space side of the bring-up.
 #
 #   hello            one raw-syscall program; as a RAM disk on its own it boots through mockfs
-#   root.packfs      the small image: our init and test programs, etc/rc, and the launchd jobs
-#                    (LaunchDaemons/). It travels in the payload next to the kernel (first RAM
-#                    disk, /dev/md0) and is mounted on /redwood. Rebuilt every time.
+#   root.apfs        the small image: our init and test programs, etc/rc, and the launchd jobs
+#                    (LaunchDaemons/), an APFS container (../tools/apfs/mkapfs.py). It travels in
+#                    the payload next to the kernel (the second RAM disk, /dev/md1) and is mounted
+#                    on /redwood. Rebuilt every time.
 #                      RC=<file>    etc/rc: rc.launchd (default) hands process 1 to the iOS launchd
 #                                   after init's checks; rc.ios runs a few iOS programs and halts
 #                      JOBS="..."   labels of the stock iOS launchd jobs to load (default: IOS_JOBS)
@@ -34,17 +35,19 @@
 #                                   kernel's adsp_step=N, bsd/dev/redwood_adsp.c, which runs before the root is
 #                                   mounted). Not beside GL=1: the two do not fit the 64 MB the loader takes with
 #                                   the kernel. adsp=1 needs none of it: the system image has the firmware in /fw.
-#   system.packfs    the system image, the root filesystem (second RAM disk, /dev/md1): the part of
-#                    iOS 16.5 chosen by ../ios165/select-system.py at its real paths, the dyld
-#                    shared cache, and src/stage0.c as /sbin/launchd (the real one is
-#                    /sbin/launchd.ios). 3 GB; upload once per loader session with
-#                    `xl ramdisk userland/system.packfs`. Rebuilt when missing, when its inputs
+#   system.apfs      the system image, the root filesystem (the resident RAM disk, /dev/md0), an
+#                    APFS container: the part of iOS 16.5 chosen by ../ios165/select-system.py at
+#                    its real paths, the dyld shared cache, and src/stage0.c as /sbin/launchd (the
+#                    real one is /sbin/launchd.ios). 2.5 GB; upload once per loader session with
+#                    `xl ramdisk userland/system.apfs`. Rebuilt when missing, when its inputs
 #                    (stage0, the manifest, the cryptex files) are newer, or with SYSTEM=1 (after
 #                    changing the recipe below).
+#   flashboot.apfs   FLASHBOOT=1: the RAM part of a boot whose root is the iOS volume on the phone's
+#                    flash (see below)
 #
 #   PREBUILT=1       do not compile anything: take our programs from ../prebuilt/userland (this is also
 #                    what happens when the cross toolchain is not set up, see ../xnu-deps/setup.sh);
-#                    the images are then made of them and of the iOS files alone (python3 + liblz4)
+#                    the images are then made of them and of the iOS files alone (python3)
 set -e
 cd "$(dirname "$(readlink -f "$0")")"
 source ../xnu-env.sh
@@ -80,7 +83,7 @@ if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
 if [ -n "$PREBUILT" ]; then
 	echo "build.sh: not compiling, using the programs in prebuilt/userland"
 	for f in ../prebuilt/userland/*; do
-		# keep a file that did not change (and its time stamp): system.packfs depends on stage0
+		# keep a file that did not change (and its time stamp): system.apfs depends on stage0
 		cmp -s "$f" "obj/$(basename "$f")" || cp "$f" obj/
 	done
 	cp obj/hello hello
@@ -90,7 +93,7 @@ else
 	$CC -c libmini/start.S -o obj/start.o
 	for prog in init child stage0; do
 		$CC -Ilibmini $LD -o obj/$prog.new src/$prog.c obj/mini.o obj/start.o
-		# keep the old file (and its time stamp) when nothing changed: system.packfs depends on stage0
+		# keep the old file (and its time stamp) when nothing changed: system.apfs depends on stage0
 		cmp -s obj/$prog.new obj/$prog && rm obj/$prog.new || mv obj/$prog.new obj/$prog
 	done
 fi
@@ -265,7 +268,7 @@ if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
 fi
 # When the iOS volume on the phone's flash is to become the root (boot-arg root_apfs=ufs_darwin,
-# with flashboot.packfs resident; src/init.c, flash_root): an empty directory to hide iOS's
+# with flashboot.apfs resident; src/init.c, flash_root): an empty directory to hide iOS's
 # NanoLaunchDaemons and LaunchAngels with,
 # xpc without launchd.plist (launchd would read that list of all of iOS's jobs instead of
 # LaunchDaemons) and the audio server's plug-in directory with only our device in it.
@@ -274,25 +277,27 @@ for f in extensions.plist extensions.plist.sig; do
 	[ -f $IOS/rootfs/System/Library/xpc/$f ] && cp $IOS/rootfs/System/Library/xpc/$f root/xpc/
 done
 [ -d root/lib/RedwoodAudio.driver ] && ln -s /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
-../mkpackfs.py -o root.packfs root
-# ... and the same tree as an APFS container (tools/apfs/mkapfs.py), what takes the place of packfs
-# (stage0 mounts whichever of the two travels with the kernel: XL_RAMDISK=userland/root.apfs); fw/
+# the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (bsd/dev/redwood_image.c)
 python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
 
-# --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.packfs ------------------------------
+# --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.apfs --------------------------------
 # With the iOS volume on the phone's flash as the root, all that has to come from RAM is what is not
-# on it -- the OS cryptex with the dyld shared cache -- and what starts the boot. This image is the
-# root the kernel starts from (rd=md0, the resident image): stage0 as /sbin/launchd mounts the small
-# image on /redwood and runs its init, which with boot-arg root_apfs=DEV mounts the volume on /flash,
-# makes it the root and moves this image to the volume's /private/preboot -- where the volume's own
-# /System/Cryptexes/OS points, and where the kernel lets a shared cache come from (src/init.c,
-# flash_root). Upload it with `xl ramdisk userland/flashboot.packfs`.
+# on it -- the OS cryptex with the dyld shared cache -- and what starts the boot: two APFS containers
+# back to back in the one resident image. The first, the boot volume, is the root the kernel starts
+# from (rd=md0): stage0 as /sbin/launchd mounts the small image on /redwood and runs its init, which
+# with boot-arg root_apfs=DEV mounts the volume on /flash, makes it the root and moves the boot volume
+# to the volume's /private/preboot, then mounts the second container -- the OS cryptex -- on the boot
+# volume's empty Cryptexes/OS: /private/preboot/Cryptexes/OS, where the volume's own
+# /System/Cryptexes/OS points and where iOS grafts the cryptex (src/init.c, flash_root; the kernel's
+# apfs takes "/dev/md0,c=1", and bsd/vm/vm_unix.c takes a shared cache from there). CRYPTEX_IMAGE=FILE:
+# Apple's own image of the cryptex as it is instead of this one remade (2.6 GB against 1 GB: too much
+# for the phone's memory beside iOS, not for QEMU's). Upload it with `xl ramdisk userland/flashboot.apfs`.
 if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
-	rm -rf flashboot
-	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes
+	rm -rf flashboot flashboot.os
+	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS
 	cp obj/stage0 flashboot/sbin/launchd
-	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot/Cryptexes/OS; else mkdir -p flashboot/Cryptexes/OS; fi
+	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
 	# the audio DSP's firmware and the speaker amplifiers' configuration, as in the system image's /fw: the kernel
 	# reads the firmware as soon as there is a root (this image, adsp=1), the configuration maybe later -- by then
 	# from the iOS volume's /fw, which src/init.c (flash_root) binds to this
@@ -304,40 +309,28 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 		mkdir -p flashboot/fw
 		cp ../fw-audio/aw882xx_acf.bin flashboot/fw/
 	fi
-	D=flashboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld
+	D=flashboot.os/System/Library/Caches/com.apple.dyld
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do
 		case "$f" in *.symbols) continue ;; esac
 		ln "$f" $D/
 	done
-	if [ -n "$PLAIN" ]; then pack="-b 4096 -a 16384"; elif [ -n "$ZSTD" ]; then pack="--zstd"; else pack="-z"; fi
-	../mkpackfs.py $pack -o flashboot.packfs flashboot
-	# ... and as APFS, flashboot.apfs: two containers back to back in the one resident image, the boot
-	# volume -- all of the above but the cryptex, its Cryptexes/OS empty -- and the OS cryptex with the
-	# shared cache, which init mounts on that empty directory once the volume on the flash is the root
-	# (src/init.c, flash_root; the kernel's apfs takes "/dev/md0,c=1"). CRYPTEX_IMAGE=FILE: Apple's own
-	# image of the cryptex as it is instead of this one remade (2.6 GB against 1 GB: too much for the
-	# phone's memory beside iOS, not for QEMU's).
-	rm -rf flashboot.boot
-	cp -al flashboot flashboot.boot
-	rm -rf flashboot.boot/Cryptexes/OS
-	mkdir -p flashboot.boot/Cryptexes/OS
-	python3 ../tools/apfs/mkapfs.py -z --plain fw -o flashboot.boot.apfs Boot=flashboot.boot | tail -1
+	python3 ../tools/apfs/mkapfs.py -z --plain fw -o flashboot.boot.apfs Boot=flashboot | tail -1
 	if [ -n "$CRYPTEX_IMAGE" ]; then
 		cat flashboot.boot.apfs "$CRYPTEX_IMAGE" > flashboot.apfs
 	else
-		python3 ../tools/apfs/mkapfs.py -z -o flashboot.os.apfs OS=flashboot/Cryptexes/OS | tail -1
+		python3 ../tools/apfs/mkapfs.py -z -o flashboot.os.apfs OS=flashboot.os | tail -1
 		cat flashboot.boot.apfs flashboot.os.apfs > flashboot.apfs
 		rm -f flashboot.os.apfs
 	fi
-	rm -rf flashboot.boot flashboot.boot.apfs flashboot
+	rm -rf flashboot flashboot.os flashboot.boot.apfs
 	echo "flashboot.apfs: $(( $(stat -c %s flashboot.apfs) / 1048576 )) MB"
 fi
 
 # --- the system image -----------------------------------------------------------------------------
 if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
-	{ [ ! -f system.packfs ] || [ obj/stage0 -nt system.packfs ] || [ $IOS/system.manifest -nt system.packfs ] ||
-	  [ $IOS/cryptex -nt system.packfs ] || [ -n "$SYSTEM" ] || { [ -n "$APFS" ] && [ ! -f system.apfs ]; }; }; then
+	{ [ ! -f system.apfs ] || [ obj/stage0 -nt system.apfs ] || [ $IOS/system.manifest -nt system.apfs ] ||
+	  [ $IOS/cryptex -nt system.apfs ] || [ -n "$SYSTEM" ]; }; then
 	# what ios165/select-system.py has chosen since ios165/rootfs was extracted is not in it, and would not be
 	# in the image either (so it was once with the audio plug-ins and the system's sounds: iOS found no
 	# speaker and played nothing, though our device was there and the kernel's side worked)
@@ -387,15 +380,8 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		case "$f" in *.symbols) continue ;; esac     # symbolication data, never mapped
 		ln "$f" $D/
 	done
-	# thousands of small files: 4K blocks for them, the kernel's 16K pages for everything bigger
-	# compressed (read in place by packfs): half the size with LZ4, which is what fits into the phone's RAM;
-	# ZSTD=1 compresses with Zstandard instead (a quarter smaller again, slower to build and to read),
-	# PLAIN=1 builds the image uncompressed
-	if [ -n "$PLAIN" ]; then pack="-b 4096 -a 16384"; elif [ -n "$ZSTD" ]; then pack="--zstd"; else pack="-z"; fi
-	../mkpackfs.py $pack -m $IOS/system.manifest -o system.packfs sysroot
-	# APFS=1: the same root as an APFS container too, system.apfs (zlib where it saves room: 1.5 GB)
-	if [ -n "$APFS" ]; then
-		python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
-	fi
+	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
+	# files in 2.5 GB, what fits into the phone's RAM beside iOS
+	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
 	rm -rf sysroot
 fi

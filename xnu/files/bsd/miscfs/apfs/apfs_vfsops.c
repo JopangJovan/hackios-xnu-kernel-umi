@@ -1389,8 +1389,9 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		bzero(cap, sizeof(*cap));
 		/*
 		 * An object's identifier never changes and apfs_vget() finds an object by it,
-		 * which is what lets fsgetpath(2) and /.vol work for this volume -- see the
-		 * note in packfs about what breaks in user space without it.
+		 * which is what lets fsgetpath(2) and /.vol work for this volume: without it,
+		 * what asks for a file's path by its identifier (LaunchServices among them) gets
+		 * nothing.
 		 */
 		cap->capabilities[VOL_CAPABILITIES_FORMAT] =
 		    VOL_CAP_FMT_PERSISTENTOBJECTIDS |

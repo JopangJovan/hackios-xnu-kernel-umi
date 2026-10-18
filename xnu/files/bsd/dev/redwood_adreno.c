@@ -95,7 +95,6 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
-#include <miscfs/packfs/packfs.h>
 #include <pexpert/pexpert.h>
 #include <sys/redwood_input.h>
 #include <sys/stat.h>
@@ -1613,7 +1612,7 @@ static const uint8_t *
 image_file(const char *directory, const char *name, uint64_t *size)
 {
 	int disk = -1;
-	const uint8_t *data = redwood_image_file(directory, name, size, &disk);  /* (redwood_image.c: APFS or packfs) */
+	const uint8_t *data = redwood_image_file(directory, name, size, &disk);  /* (redwood_image.c) */
 
 	if (data != NULL) {
 		if (!image_asked_quietly) {

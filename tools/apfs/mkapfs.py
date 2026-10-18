@@ -6,8 +6,8 @@ usage: mkapfs.py -o IMAGE [-z [--plain DIR]...] [--time SECONDS] [--slack BLOCKS
 Each NAME=DIR becomes one volume of the container (volume 0 first), case-sensitive and
 normalization-insensitive like the iOS volumes, unencrypted, read-only content laid out once.
 Permission bits and symbolic links are taken from DIR; everything is owned by root:wheel
-unless a manifest says otherwise (the same lines as mkpackfs.py -m: mode in octal with the
-type bits, uid, gid, path, [link target]; a directory or symbolic link that is only in the
+unless a manifest says otherwise (lines of: mode in octal with the type bits, uid, gid, path,
+[link target]; ios165/system.manifest is one; a directory or symbolic link that is only in the
 manifest is made). With -z a regular file is stored compressed when that makes it smaller,
 as Apple stores most of the iOS root volume: a small one whole in its decmpfs attribute (type
 3, no block of its own at all), a bigger one in 64 KB zlib pieces in its resource fork (type 4); but not what is under a --plain DIR (relative to the volume's root), which stays as
@@ -160,7 +160,7 @@ def apply_manifest(root, manifest):
                 else:
                     continue
             # (owner, group and permissions; not the kind: a link this tree has where the manifest
-            # says directory -- the system image's LaunchDaemons -- stays a link, as with mkpackfs.py)
+            # says directory -- the system image's LaunchDaemons -- stays a link)
             if stat.S_IFMT(leaf.mode) == stat.S_IFMT(mode):
                 leaf.mode, leaf.uid, leaf.gid = mode, uid, gid
 

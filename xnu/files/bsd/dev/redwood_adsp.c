@@ -85,7 +85,6 @@
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <vm/memory_types.h>
-#include <miscfs/packfs/packfs.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/kauth.h>
@@ -1037,7 +1036,7 @@ static const uint8_t *
 image_file(const char *name, uint64_t *size)
 {
 	{
-		const uint8_t *data = redwood_image_file("fw", name, size, NULL);  /* (redwood_image.c: APFS or packfs) */
+		const uint8_t *data = redwood_image_file("fw", name, size, NULL);  /* (redwood_image.c) */
 
 		if (data != NULL) {
 			return data;

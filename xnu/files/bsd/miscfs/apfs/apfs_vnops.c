@@ -328,7 +328,7 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 	 * What is there is found whatever the caller means to do with it -- VFS refuses the
 	 * change itself on a read-only mount, and mkdir of a directory that exists is to fail
 	 * with EEXIST, not EROFS (xpcproxy gives up on the latter).  Only a name that is not
-	 * there and is to be made is refused here, as packfs does.
+	 * there and is to be made is refused here.
 	 */
 	if (error == ENOENT && (cnp->cn_flags & ISLASTCN) &&
 	    (cnp->cn_nameiop == CREATE || cnp->cn_nameiop == RENAME)) {
@@ -1189,7 +1189,7 @@ apfs_vnop_reclaim(struct vnop_reclaim_args *ap)
 /*
  * No ioctl or fsctl means anything here.  ENOTTY is what callers take for "this filesystem
  * does not have that"; the default, ENOTSUP, is not -- the iOS dyld, probing the root
- * volume for APFS features, gives up on it (see packfs_ioctl).
+ * volume for APFS features, gives up on it.
  */
 static int
 apfs_vnop_ioctl(__unused struct vnop_ioctl_args *ap)

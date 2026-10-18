@@ -1319,8 +1319,8 @@ redwood_apfs_check_init(void)
 	if (mode >= 4) {
 		/*
 		 * The volume is the root (or mode 6, which mounts it here), and bsd_init is
-		 * about to exec /sbin/launchd off it, which on anything but our own packfs
-		 * image ends in a panic.  So the walk has to be over before this returns.
+		 * about to exec /sbin/launchd off it, which on anything but an image of ours
+		 * (stage0 as /sbin/launchd) ends in a panic.  So the walk has to be over before this returns.
 		 *
 		 * It does not run on this thread, though.  This is the boot thread: it runs
 		 * above the threads that service thread calls, and a walk off a RAM disk never

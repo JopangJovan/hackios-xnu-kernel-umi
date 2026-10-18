@@ -45,7 +45,7 @@ done
 for f in rootfs.dmg rootfs.slt extracted; do
 	[ -e "$ROOT/ios165/$f" ] && ln -s "$ROOT/ios165/$f" ios165/
 done
-cp -a --reflink=auto "$ROOT/userland/obj" "$ROOT/userland/system.packfs" "$ROOT/userland/root.packfs" "$ROOT/userland/hello" userland/
+cp -a --reflink=auto "$ROOT/userland/obj" "$ROOT/userland/system.apfs" "$ROOT/userland/root.apfs" "$ROOT/userland/hello" userland/
 [ -f "$ROOT/xnuloader/loader.efi" ] && cp -a "$ROOT/xnuloader/loader.efi" xnuloader/
 [ -f "$ROOT/qemu/kernel.syms" ] && cp -a "$ROOT/qemu/kernel.syms" qemu/
 echo "$INSTANCE" > qemu/instance

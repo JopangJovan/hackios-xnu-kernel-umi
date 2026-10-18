@@ -62,7 +62,7 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..dc897f572180 100644
+index 44274016a4cf..44c2d6435caf 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
@@ -103,7 +103,7 @@ index 44274016a4cf..dc897f572180 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +186,15 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +186,12 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -112,14 +112,11 @@ index 44274016a4cf..dc897f572180 100644
 +bsd/miscfs/apfs/apfs_lib.c		optional apfs
 +bsd/miscfs/apfs/apfs_vfsops.c		optional apfs
 +bsd/miscfs/apfs/apfs_vnops.c		optional apfs
-+bsd/miscfs/packfs/packfs_vfsops.c	optional packfs
-+bsd/miscfs/packfs/packfs_vnops.c	optional packfs
-+bsd/miscfs/packfs/packfs_zstd.c	optional packfs
 +bsd/miscfs/ramfs/ramfs.c			optional ramfs
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +401,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +398,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -127,7 +124,7 @@ index 44274016a4cf..dc897f572180 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +424,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +421,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -978,18 +975,13 @@ index cbaa0b221894..78315a2d54cf 100644
  	int eofflag;
  	uint64_t options;
 diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
-index bae70cda3a96..d7bf8c05b527 100644
+index bae70cda3a96..031613b10643 100644
 --- a/bsd/vfs/vfs_conf.c
 +++ b/bsd/vfs/vfs_conf.c
-@@ -103,6 +103,20 @@ extern  struct vfsops mockfs_vfsops;
+@@ -103,6 +103,15 @@ extern  struct vfsops mockfs_vfsops;
  extern  int mockfs_mountroot(mount_t, vnode_t, vfs_context_t);
  #endif /* MOCKFS */
  
-+#if PACKFS
-+extern  struct vfsops packfs_vfsops;
-+extern  int packfs_mountroot(mount_t, vnode_t, vfs_context_t);
-+#endif /* PACKFS */
-+
 +#if RAMFS
 +extern  struct vfsops ramfs_vfsops;
 +#endif /* RAMFS */
@@ -1002,19 +994,18 @@ index bae70cda3a96..d7bf8c05b527 100644
  enum fs_type_num {
  	FT_NFS = 2,
  	FT_DEVFS = 19,
-@@ -110,7 +124,10 @@ enum fs_type_num {
+@@ -110,7 +119,9 @@ enum fs_type_num {
  	FT_ROUTEFS = 21,
  	FT_NULLFS = 22,
  	FT_BINDFS = 23,
 -	FT_MOCKFS  = 0x6D6F636B
 +	FT_MOCKFS  = 0x6D6F636B,
-+	FT_PACKFS  = 0x7061636B,
 +	FT_RAMFS   = 0x72616D66,
 +	FT_APFS    = 0x61706673
  };
  
  int fstypenumstart = FT_BINDFS + 1;
-@@ -194,6 +211,73 @@ static struct vfstable vfstbllist[] = {
+@@ -194,6 +205,54 @@ static struct vfstable vfstbllist[] = {
  	},
  #endif /* BINDFS */
  
@@ -1039,9 +1030,9 @@ index bae70cda3a96..d7bf8c05b527 100644
 +
 +#if APFS
 +	/*
-+	 * Apple File System, read only.  Before packfs so that a device holding a real
-+	 * APFS container is recognised as one; a device that is not comes back EINVAL and
-+	 * vfs_mountroot() goes on to the next.
++	 * Apple File System, read only: the root and every image of this port's (the RAM
++	 * disks are APFS containers).  Before mockfs, which accepts any root device: a device
++	 * that is not APFS comes back EINVAL and vfs_mountroot() goes on to the next.
 +	 */
 +	{
 +		.vfc_vfsops = &apfs_vfsops,
@@ -1066,35 +1057,13 @@ index bae70cda3a96..d7bf8c05b527 100644
 +	},
 +#endif /* APFS */
 +
-+#if PACKFS
-+	/* Read-only boot image; must come before mockfs, which accepts any root device */
-+	{
-+		.vfc_vfsops = &packfs_vfsops,
-+		.vfc_name = "packfs",
-+		.vfc_typenum = FT_PACKFS,
-+		.vfc_refcount = 0,
-+		.vfc_flags = MNT_LOCAL | MNT_RDONLY,
-+		.vfc_mountroot = packfs_mountroot,
-+		.vfc_next = NULL,
-+		.vfc_reserved1 = 0,
-+		.vfc_reserved2 = 0,
-+		.vfc_vfsflags = VFC_VFSLOCALARGS | VFC_VFS64BITREADY,
-+		.vfc_descptr = NULL,
-+		.vfc_descsize = 0,
-+		.vfc_sysctl = NULL
-+	},
-+#endif /* PACKFS */
-+
  #if MOCKFS
  	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
  	{
-@@ -298,6 +382,18 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
+@@ -298,6 +357,15 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
  extern const struct vnodeopv_desc mockfs_vnodeop_opv_desc;
  #endif /* MOCKFS */
  
-+#if PACKFS
-+extern const struct vnodeopv_desc packfs_vnodeop_opv_desc;
-+#endif /* PACKFS */
 +
 +#if RAMFS
 +extern const struct vnodeopv_desc ramfs_vnodeop_opv_desc;
@@ -1107,13 +1076,10 @@ index bae70cda3a96..d7bf8c05b527 100644
  extern const struct vnodeopv_desc nullfs_vnodeop_opv_desc;
  extern const struct vnodeopv_desc bindfs_vnodeop_opv_desc;
  
-@@ -327,5 +423,14 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
+@@ -327,5 +395,11 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
  #if MOCKFS
  	&mockfs_vnodeop_opv_desc,
  #endif /* MOCKFS */
-+#if PACKFS
-+	&packfs_vnodeop_opv_desc,
-+#endif /* PACKFS */
 +#if RAMFS
 +	&ramfs_vnodeop_opv_desc,
 +#endif /* RAMFS */
@@ -1321,21 +1287,20 @@ index 60c8b9eedd50..b0029de5ef21 100644
  					("shared_region: %p [%d(%s)] map(%p:'%s'): "
  					"not on process' root volume nor preboot volume\n",
 diff --git a/config/MASTER b/config/MASTER
-index 07147cb3188b..671fb11422b1 100644
+index 07147cb3188b..e937e62bf4c3 100644
 --- a/config/MASTER
 +++ b/config/MASTER
-@@ -113,6 +113,9 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
+@@ -113,6 +113,8 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
  #	4.4 filesystems
  #
  options		MOCKFS		# Boot from an executable	# <mockfs>
-+options		PACKFS		# Read-only boot image filesystem	# <packfs>
 +options		APFS		# Apple File System, read only	# <apfs>
 +options		RAMFS		# Read-write filesystem in memory	# <ramfs>
  options		FIFO		# fifo support			# <fifo>
  options		FDESC		# fdesc_fs support		# <fdesc>
  options		DEVFS		# devfs support			# <devfs>
 diff --git a/config/MASTER.arm64.bcm2837 b/config/MASTER.arm64.bcm2837
-index 1ed75eea2052..db1bee93f003 100644
+index 1ed75eea2052..54c5e12d2271 100644
 --- a/config/MASTER.arm64.bcm2837
 +++ b/config/MASTER.arm64.bcm2837
 @@ -16,15 +16,15 @@
@@ -1354,7 +1319,7 @@ index 1ed75eea2052..db1bee93f003 100644
 -#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs]
 +#  BSD_DEV =        [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
 +#  BSD_DEBUG =      [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
-+#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs packfs ramfs apfs ]
++#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs ramfs apfs ]
  #  FILESYS_RELEASE= [ FILESYS_BASE ]
  #  FILESYS_DEV =    [ FILESYS_BASE config_union_mounts fdesc ]
  #  FILESYS_DEBUG =  [ FILESYS_BASE config_union_mounts fdesc ]

@@ -115,9 +115,9 @@ synthetic_dir(const char *path)
 
 /*
  * root_apfs=DEV: the root is to be the iOS root volume on /dev/DEV -- the phone's flash, read
- * only.  The kernel has started off flashboot.packfs (the resident image, md0: stage0, the OS
- * cryptex with the dyld shared cache, mount points) and stage0 has mounted this image on
- * /redwood.  What the big system image changes in iOS (userland/build.sh) is put in place on
+ * only.  The kernel has started off the boot volume of flashboot.apfs (the resident image, md0,
+ * its first container: stage0, firmware, mount points; the OS cryptex with the dyld shared cache
+ * is its second container) and stage0 has mounted this image on /redwood.  What the big system image changes in iOS (userland/build.sh) is put in place on
  * the volume instead, without writing to it:
  *   - our choice of launchd jobs instead of iOS's 500 (this image's LaunchDaemons, and
  *     nothing for NanoLaunchDaemons, LaunchAngels, nor xpc's launchd.plist, which launchd
@@ -128,9 +128,10 @@ synthetic_dir(const char *path)
  *     entry of the volume -- not a mount, which whatever registers the system's
  *     applications passed over), made before /private/var is covered by a memory
  *     filesystem.
- * Then the volume becomes the root (sysctl kern.redwood_switch_root) and flashboot.packfs
- * goes to its /private/preboot: the volume's /System/Cryptexes/OS points to
- * /private/preboot/Cryptexes/OS, and the kernel takes a shared cache from there.  This
+ * Then the volume becomes the root (sysctl kern.redwood_switch_root) and the boot volume
+ * goes to its /private/preboot, the cryptex onto that volume's Cryptexes/OS: the iOS volume's
+ * /System/Cryptexes/OS points to /private/preboot/Cryptexes/OS, and the kernel takes a shared
+ * cache from there.  This
  * image goes along with it, to /private/preboot/redwood, and is bound back on /redwood, a
  * synthetic directory of the volume.  The boot-args stay those of a RAM disk (rd=md0),
  * which is what launchd reads to leave out the boot tasks of a real device.
@@ -210,8 +211,8 @@ flash_root(const char *dev)
 	 * When the RAM part of the boot is APFS (flashboot.apfs), the OS cryptex is not inside it
 	 * but its own container right after it in md0: mounted where iOS grafts it, the empty
 	 * Cryptexes/OS of the boot volume -- now /private/preboot/Cryptexes/OS -- where the
-	 * kernel takes a shared cache from (bsd/vm/vm_unix.c).  No second container (the packfs
-	 * image, with the cryptex inside): EINVAL, nothing to do.
+	 * kernel takes a shared cache from (bsd/vm/vm_unix.c).  No second container (a boot image
+	 * with the cryptex inside): EINVAL, nothing to do.
 	 */
 #ifndef EINVAL
 #define EINVAL 22
@@ -355,7 +356,7 @@ test_files(void)
 	unsigned char *map;
 
 	printf("\n-- read-only filesystem --\n");
-	check(list_tree(*base ? base : "/", 3) >= 8, "packfs: walk our image (readdir, lstat, readlink)");
+	check(list_tree(*base ? base : "/", 3) >= 8, "walk our image (readdir, lstat, readlink)");
 	check(stat("/usr/lib/dyld", &st) != 0 || st.st_size > 100000, "the system image has the dynamic linker");
 
 	fd = open(in_image("/etc/motd"), O_RDONLY, 0);

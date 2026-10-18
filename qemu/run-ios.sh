@@ -29,8 +29,8 @@
 cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 [ -f $K ] || { K=prebuilt/mach.development.bcm2837; echo "run-ios.sh: no kernel built here, using $K" >&2; }
-IMG=${IMG:-userland/system.packfs}
-ROOT=${ROOT:-userland/root.packfs}
+IMG=${IMG:-userland/system.apfs}
+ROOT=${ROOT:-userland/root.apfs}
 [ -f "$IMG" ] && [ -f "$ROOT" ] || { echo "run-ios.sh: $IMG or $ROOT is missing (userland/build.sh makes them)"; exit 1; }
 SECS=${1:-60}; shift
 RAM_BASE=0x40000000 RD_ADDR=0xFC000000

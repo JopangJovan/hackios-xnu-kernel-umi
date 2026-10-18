@@ -30,7 +30,7 @@ for n in $COUNTS; do
 		sleep 5
 	done
 	log="$LOGS/bench-$(date +%H%M%S)-$n.log"
-	QEMU_SMP=$SMP IMG="$IMAGE" ROOT=userland/root.packfs \
+	QEMU_SMP=$SMP IMG="$IMAGE" ROOT=userland/root.apfs \
 		CMDLINE="cpus=$SMP apfs_check=5 apfs_threads=$n $EXTRA" \
 		timeout 900 qemu/run-ios.sh 600 > "$log" 2>&1
 	wall=$(grep -ao "$n readers done in [0-9]*" "$log" | head -1 | awk '{print $5}')

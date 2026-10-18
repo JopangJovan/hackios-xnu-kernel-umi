@@ -8,7 +8,7 @@ Two files are written:
   system.files      the regular files to extract ("7z x -orootfs rootfs.dmg @system.files")
   system.manifest   every chosen file, directory and symbolic link with its owner, group and mode,
                     tab separated: mode(octal, with the type bits) uid gid path [link target].
-                    mkpackfs.py builds the image from the extracted files and this manifest,
+                    tools/apfs/mkapfs.py builds the image from the extracted files and this manifest,
                     because extraction on Linux keeps neither owners nor all of the symlinks.
 
 The whole root is 7.9 GB and the kernel on the phone has about 4 GB of RAM for everything, so:
