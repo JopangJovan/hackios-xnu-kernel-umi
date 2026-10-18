@@ -2,7 +2,7 @@
 # Fetch what Sileo needs into jb/ (never in the repository, like fw-*): the Procursus bootstrap for
 # iOS and the Sileo package, both for arm64 and both "rootless" -- everything under /var/jb.
 #
-# Rootless is what fits this port: / is a packfs image that cannot be written to, and /private/var
+# Rootless is what fits this port: / is an APFS image that cannot be written to, and /private/var
 # is the only writable filesystem there is (a memory filesystem, made afresh at every boot), so the
 # whole prefix has to live under /var. The binaries of the rootless distribution are built for
 # iOS 15 and up (dpkg 1.22.6, apt 2.9.4) and Sileo for iOS 11 and up; the "1800" in the path is the
@@ -31,6 +31,17 @@ rm -rf "$OUT/root"
 mkdir -p "$OUT/root"
 zstd -dc "$OUT/debs/bootstrap.tar.zst" | tar -C "$OUT/root" -xf -
 [ -d "$OUT/root/var/jb" ] || { echo "mk-jb.sh: the bootstrap has no var/jb in it" >&2; exit 1; }
+# Unpacking as an ordinary user drops the set-user-ID and set-group-ID bits; they are put back on what
+# the bootstrap has them on: login above all (NewTerm logs the user in with "login -fp mobile", which
+# without the bit ends at once -- "Session Ended"), su, sudo, passwd, chpass, newgrp, quota. In the
+# image these files belong to root, so the bits mean what they say there.
+zstd -dc "$OUT/debs/bootstrap.tar.zst" | tar -tvf - | awk '$1 ~ /^-/ && ($1 ~ /^-..[sS]/ || $1 ~ /^-.....[sS]/) {
+	print substr($1, 4, 1) substr($1, 7, 1), $NF }' | while read -r bits path; do
+	[ -f "$OUT/root/$path" ] || continue
+	case $bits in [sS]?) chmod u+s "$OUT/root/$path" ;; esac
+	case $bits in ?[sS]) chmod g+s "$OUT/root/$path" ;; esac
+	echo "mk-jb.sh: set-ID bits back on ${path#./}"
+done
 
 # Sileo on top of it: a .deb is an ar archive of control and data, and the data is the tree itself
 TMP=$(mktemp -d)
