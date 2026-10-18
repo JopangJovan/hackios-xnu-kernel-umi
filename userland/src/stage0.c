@@ -5,7 +5,9 @@
  * and a half to upload to the phone, so nothing that changes often lives in
  * it. All of that - the real init, its tests, the list of launchd jobs - is
  * in the small image that travels with the kernel (the second RAM disk,
- * /dev/md1). This program mounts it on /redwood and hands over.
+ * /dev/md1). This program mounts it on /redwood and hands over.  The image
+ * is an APFS container (tools/apfs/mkapfs.py) or, until packfs is gone, a
+ * packfs one: APFS is tried first.
  */
 #include "mini.h"
 
@@ -28,7 +30,8 @@ main(int argc, char **argv, char **envp)
 		close(fd);
 	}
 
-	if (mount("packfs", "/redwood", MNT_RDONLY, &args) != 0) {
+	if (mount("apfs", "/redwood", MNT_RDONLY, (void *)"/dev/md1") != 0 &&
+	    mount("packfs", "/redwood", MNT_RDONLY, &args) != 0) {
 		printf("stage0: cannot mount /dev/md1 on /redwood: %s\n", strerror(errno));
 	} else {
 		execve(init_argv[0], init_argv, envp);

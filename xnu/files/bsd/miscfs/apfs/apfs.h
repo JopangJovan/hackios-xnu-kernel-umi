@@ -66,6 +66,9 @@ struct apfs_mount {
 	struct apfs_vol    am_vol;
 	uint32_t           am_devblock;
 	bool               am_owns_devvp;  /* we opened it, so we close it */
+	bool               am_shares_devvp; /* another container of a device one of ours has open: not opened again */
+	dev_t              am_rdev;         /* the device, for those other containers to find (apfs_mounts) */
+	struct apfs_mount *am_next;         /* in apfs_mounts */
 	struct apfs_node  *am_hash[APFS_HASH_BUCKETS];
 	uint64_t           am_root_id;
 	/*

@@ -275,6 +275,9 @@ for f in extensions.plist extensions.plist.sig; do
 done
 [ -d root/lib/RedwoodAudio.driver ] && ln -s /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
 ../mkpackfs.py -o root.packfs root
+# ... and the same tree as an APFS container (tools/apfs/mkapfs.py), what takes the place of packfs
+# (stage0 mounts whichever of the two travels with the kernel: XL_RAMDISK=userland/root.apfs)
+python3 ../tools/apfs/mkapfs.py -z -o root.apfs redwood=root | tail -1
 
 # --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.packfs ------------------------------
 # With the iOS volume on the phone's flash as the root, all that has to come from RAM is what is not
@@ -308,13 +311,32 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	done
 	if [ -n "$PLAIN" ]; then pack="-b 4096 -a 16384"; elif [ -n "$ZSTD" ]; then pack="--zstd"; else pack="-z"; fi
 	../mkpackfs.py $pack -o flashboot.packfs flashboot
-	rm -rf flashboot
+	# ... and as APFS, flashboot.apfs: two containers back to back in the one resident image, the boot
+	# volume -- all of the above but the cryptex, its Cryptexes/OS empty -- and the OS cryptex with the
+	# shared cache, which init mounts on that empty directory once the volume on the flash is the root
+	# (src/init.c, flash_root; the kernel's apfs takes "/dev/md0,c=1"). CRYPTEX_IMAGE=FILE: Apple's own
+	# image of the cryptex as it is instead of this one remade (2.6 GB against 1 GB: too much for the
+	# phone's memory beside iOS, not for QEMU's).
+	rm -rf flashboot.boot
+	cp -al flashboot flashboot.boot
+	rm -rf flashboot.boot/Cryptexes/OS
+	mkdir -p flashboot.boot/Cryptexes/OS
+	python3 ../tools/apfs/mkapfs.py -z -o flashboot.boot.apfs Boot=flashboot.boot | tail -1
+	if [ -n "$CRYPTEX_IMAGE" ]; then
+		cat flashboot.boot.apfs "$CRYPTEX_IMAGE" > flashboot.apfs
+	else
+		python3 ../tools/apfs/mkapfs.py -z -o flashboot.os.apfs OS=flashboot/Cryptexes/OS | tail -1
+		cat flashboot.boot.apfs flashboot.os.apfs > flashboot.apfs
+		rm -f flashboot.os.apfs
+	fi
+	rm -rf flashboot.boot flashboot.boot.apfs flashboot
+	echo "flashboot.apfs: $(( $(stat -c %s flashboot.apfs) / 1048576 )) MB"
 fi
 
 # --- the system image -----------------------------------------------------------------------------
 if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	{ [ ! -f system.packfs ] || [ obj/stage0 -nt system.packfs ] || [ $IOS/system.manifest -nt system.packfs ] ||
-	  [ $IOS/cryptex -nt system.packfs ] || [ -n "$SYSTEM" ]; }; then
+	  [ $IOS/cryptex -nt system.packfs ] || [ -n "$SYSTEM" ] || { [ -n "$APFS" ] && [ ! -f system.apfs ]; }; }; then
 	# what ios165/select-system.py has chosen since ios165/rootfs was extracted is not in it, and would not be
 	# in the image either (so it was once with the audio plug-ins and the system's sounds: iOS found no
 	# speaker and played nothing, though our device was there and the kernel's side worked)
@@ -370,5 +392,9 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# PLAIN=1 builds the image uncompressed
 	if [ -n "$PLAIN" ]; then pack="-b 4096 -a 16384"; elif [ -n "$ZSTD" ]; then pack="--zstd"; else pack="-z"; fi
 	../mkpackfs.py $pack -m $IOS/system.manifest -o system.packfs sysroot
+	# APFS=1: the same root as an APFS container too, system.apfs (zlib where it saves room: 1.5 GB)
+	if [ -n "$APFS" ]; then
+		python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	fi
 	rm -rf sysroot
 fi

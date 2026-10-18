@@ -206,6 +206,22 @@ flash_root(const char *dev)
 		return;
 	}
 	chdir("/");
+	/*
+	 * When the RAM part of the boot is APFS (flashboot.apfs), the OS cryptex is not inside it
+	 * but its own container right after it in md0: mounted where iOS grafts it, the empty
+	 * Cryptexes/OS of the boot volume -- now /private/preboot/Cryptexes/OS -- where the
+	 * kernel takes a shared cache from (bsd/vm/vm_unix.c).  No second container (the packfs
+	 * image, with the cryptex inside): EINVAL, nothing to do.
+	 */
+#ifndef EINVAL
+#define EINVAL 22
+#endif
+	if (mount("apfs", "/private/preboot/Cryptexes/OS", MNT_RDONLY, (void *)"/dev/md0,c=1") == 0) {
+		check(1, "the OS cryptex (md0, its second container) on /private/preboot/Cryptexes/OS");
+	} else if (errno != EINVAL) {
+		printf("  the OS cryptex: %s\n", strerror(errno));
+		check(0, "the OS cryptex (md0, its second container) on /private/preboot/Cryptexes/OS");
+	}
 	check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
 	flash_root_mode = 1;
 }

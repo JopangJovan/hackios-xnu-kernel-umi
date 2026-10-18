@@ -40,6 +40,7 @@ static LCK_GRP_DECLARE(apfs_lck_grp, "apfs");
 struct apfs_devctx {
 	vnode_t  dc_devvp;
 	uint32_t dc_devblock;
+	uint64_t dc_base;               /* where on the device the container starts (bytes) */
 };
 
 static int
@@ -48,6 +49,7 @@ apfs_dev_read(void *ctx, uint64_t off, void *buf, size_t len)
 	struct apfs_devctx *dc = ctx;
 	char *out = buf;
 
+	off += dc->dc_base;
 	if ((off % dc->dc_devblock) != 0) {
 		return EINVAL;
 	}
@@ -94,6 +96,7 @@ apfs_dev_read_data(void *ctx, uint64_t off, void *buf, size_t len)
 	struct apfs_devctx *dc = ctx;
 	char *out = buf;
 
+	off += dc->dc_base;
 	if ((off % dc->dc_devblock) != 0 || (len % dc->dc_devblock) != 0) {
 		return EINVAL;
 	}
@@ -137,6 +140,45 @@ apfs_dev_read_data(void *ctx, uint64_t off, void *buf, size_t len)
  * volume is mounted and cleared when it goes away.
  */
 static struct apfs_mount *apfs_the_mount;
+static LCK_MTX_DECLARE(apfs_pool_lock, &apfs_lck_grp);   /* the pool's threads, and apfs_mounts */
+
+/*
+ * Every APFS mount, for a mount of another container of the same device to find that the
+ * device is open already (apfs_mount): the root's RAM disk holds the boot volume and the OS
+ * cryptex, each its own container.  Under apfs_pool_lock.
+ */
+static struct apfs_mount *apfs_mounts;
+
+static bool
+apfs_device_held(dev_t rdev)
+{
+	struct apfs_mount *m;
+	bool held = false;
+
+	lck_mtx_lock(&apfs_pool_lock);
+	for (m = apfs_mounts; m != NULL && !held; m = m->am_next) {
+		held = (m->am_rdev == rdev);
+	}
+	lck_mtx_unlock(&apfs_pool_lock);
+	return held;
+}
+
+/*
+ * Which volume kern.apfs_stats is about: the root's, when the root is APFS (the iOS volume on
+ * the flash, once init has switched to it); else the one mounted last.
+ */
+extern vnode_t rootvnode;
+
+static struct apfs_mount *
+apfs_stats_mount(void)
+{
+	mount_t mp = rootvnode != NULLVP ? vnode_mount(rootvnode) : NULL;
+
+	if (mp != NULL && strcmp(vfs_statfs(mp)->f_fstypename, "apfs") == 0 && vfs_fsprivate(mp) != NULL) {
+		return vfs_fsprivate(mp);
+	}
+	return apfs_the_mount;
+}
 
 static uint64_t
 apfs_ticks_ms(uint64_t ticks)
@@ -234,7 +276,7 @@ static int
 sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
-	struct apfs_mount *am = apfs_the_mount;
+	struct apfs_mount *am = apfs_stats_mount();
 	size_t cap = 16384;
 	char *text = kalloc_data(cap, Z_WAITOK | Z_ZERO);
 	int error;
@@ -342,7 +384,7 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 void
 apfs_stats_print(void)
 {
-	struct apfs_mount *am = apfs_the_mount;
+	struct apfs_mount *am = apfs_stats_mount();
 	struct apfs_nx *nx;
 
 	if (am == NULL) {
@@ -790,7 +832,6 @@ struct apfs_pjob {
 	uint32_t          pj_active;    /* helpers inside the job now; under apfs_pool_lock */
 };
 
-static LCK_MTX_DECLARE(apfs_pool_lock, &apfs_lck_grp);
 static struct apfs_pjob *apfs_pool_jobs;        /* oldest first */
 static uint32_t apfs_pool_threads;
 static uint32_t apfs_par_max;                   /* threads on one request, the caller's included */
@@ -940,15 +981,22 @@ apfs_free_mount(struct apfs_mount *am)
 	kfree_type(struct apfs_mount, am);
 }
 
+/*
+ * Which container of the device and which volume of it: containers lie back to back, each
+ * saying in its superblock how big it is (nx_block_count blocks of nx_block_size), so the
+ * N-th starts where the one before it ends -- the RAM disks of this port hold several (the
+ * boot volume, a cryptex) and so may the phone's darwin partition.  volume < 0: the first
+ * that has a root directory.
+ */
 static int
-apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
+apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t container, int volume)
 {
 	struct apfs_mount *am;
 	struct apfs_devctx *dc;
 	struct apfs_dev dev;
 	struct vfsstatfs *sp;
 	uint32_t devblock = 0;
-	uint64_t devblocks = 0;
+	uint64_t devblocks = 0, nx_size = 0;
 	int error;
 
 	if (VNOP_IOCTL(devvp, DKIOCGETBLOCKSIZE, (caddr_t)&devblock, 0, ctx) != 0 ||
@@ -982,10 +1030,54 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	}
 	dc->dc_devvp = devvp;
 	dc->dc_devblock = devblock;
+	{
+		uint8_t *sb = kalloc_data(APFS_META_CHUNK, Z_WAITOK);
+		uint64_t devsize = devblocks * (uint64_t)devblock;
+		uint32_t i;
+
+		error = (sb == NULL) ? ENOMEM : 0;
+		for (i = 0; error == 0; i++) {
+			uint32_t bs;
+			uint64_t bc;
+
+			error = apfs_dev_read(dc, 0, sb, APFS_META_CHUNK);
+			if (error == 0 && memcmp(sb + 32, "NXSB", 4) != 0) {
+				error = EINVAL;         /* (no container here: as the root, the next filesystem's turn) */
+			}
+			if (error) {
+				break;
+			}
+			bs = (uint32_t)sb[36] | (uint32_t)sb[37] << 8 | (uint32_t)sb[38] << 16 | (uint32_t)sb[39] << 24;
+			bc = 0;
+			for (int b = 7; b >= 0; b--) {
+				bc = (bc << 8) | sb[40 + b];
+			}
+			nx_size = bc * bs;
+			if (bs < 4096 || bc == 0 || (nx_size % devblock) != 0 ||
+			    (devsize != 0 && dc->dc_base + nx_size > devsize)) {
+				printf("apfs: container %u: %llu blocks of %u do not fit the device\n", i,
+				    (unsigned long long)bc, bs);
+				error = EINVAL;
+				break;
+			}
+			if (i == container) {
+				break;
+			}
+			dc->dc_base += nx_size;
+		}
+		if (sb != NULL) {
+			kfree_data(sb, APFS_META_CHUNK);
+		}
+		if (error) {
+			kfree_type(struct apfs_devctx, dc);
+			apfs_free_mount(am);
+			return error;
+		}
+	}
 
 	bzero(&dev, sizeof(dev));
 	dev.ctx = dc;
-	dev.size = devblocks * (uint64_t)devblock;
+	dev.size = nx_size;
 	dev.read = apfs_dev_read;
 	dev.read_data = apfs_dev_read_data;
 
@@ -1052,7 +1144,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 		for (i = 0; i < APFS_NX_MAX_FILE_SYSTEMS && !got; i++) {
 			struct apfs_inode ino;
 
-			if (am->am_nx.fs_oid[i] == 0) {
+			if (am->am_nx.fs_oid[i] == 0 || (volume >= 0 && i != (uint32_t)volume)) {
 				continue;
 			}
 			if (apfs_vol_open(&am->am_nx, i, &am->am_vol) != 0) {
@@ -1085,23 +1177,38 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	sp->f_bused = am->am_vol.alloc_count;
 	sp->f_files = am->am_vol.num_files + am->am_vol.num_dirs;
 	sp->f_ffree = 0;
+	/* (several volumes of one device are told apart by which container and volume) */
 	sp->f_fsid.val[0] = (int32_t)vnode_specrdev(devvp);
-	sp->f_fsid.val[1] = vfs_typenum(mp);
+	sp->f_fsid.val[1] = (int32_t)((vfs_typenum(mp) & 0xff) | (container << 8) | (am->am_vol.index << 20));
 	strlcpy(sp->f_fstypename, "apfs", sizeof(sp->f_fstypename));
 
 	apfs_the_mount = am;
-	printf("apfs: volume \"%s\": %llu files, %llu directories, %llu blocks of %u used\n",
-	    am->am_vol.name, (unsigned long long)am->am_vol.num_files,
+	am->am_rdev = vnode_specrdev(devvp);
+	lck_mtx_lock(&apfs_pool_lock);
+	am->am_next = apfs_mounts;
+	apfs_mounts = am;
+	lck_mtx_unlock(&apfs_pool_lock);
+	printf("apfs: volume %u \"%s\" of container %u (at %llu MB): %llu files, %llu directories, %llu blocks of %u used\n",
+	    am->am_vol.index, am->am_vol.name, container, (unsigned long long)(dc->dc_base >> 20), (unsigned long long)am->am_vol.num_files,
 	    (unsigned long long)am->am_vol.num_dirs,
 	    (unsigned long long)am->am_vol.alloc_count, am->am_nx.block_size);
 	return 0;
 }
 
-/* As the root filesystem: EINVAL lets vfs_mountroot() try the next quietly. */
+/*
+ * As the root filesystem: EINVAL lets vfs_mountroot() try the next quietly.  Boot-args
+ * apfs_root_c=N and apfs_root_v=M say which container of the device and which volume of it
+ * (default: the first container, its first volume with a root directory).
+ */
 int
 apfs_mountroot(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 {
-	return apfs_mount_common(mp, devvp, ctx);
+	uint32_t c = 0;
+	int v = -1;
+
+	(void)PE_parse_boot_argn("apfs_root_c", &c, sizeof(c));
+	(void)PE_parse_boot_argn("apfs_root_v", &v, sizeof(v));
+	return apfs_mount_common(mp, devvp, ctx, c, v);
 }
 
 /*
@@ -1116,6 +1223,8 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	char *path;
 	vnode_t vp = NULLVP;
 	size_t len = 0;
+	uint32_t container = 0;
+	int volume = -1;
 	int error;
 
 	if (vfs_isupdate(mp)) {
@@ -1124,7 +1233,7 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	}
 	if (devvp != NULLVP) {
 		/* mounted as the root: VFS found the device and owns the vnode */
-		return apfs_mount_common(mp, devvp, ctx);
+		return apfs_mountroot(mp, devvp, ctx);
 	}
 	if (data == USER_ADDR_NULL) {
 		return EINVAL;
@@ -1140,6 +1249,24 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 	} else {
 		error = copyinstr(data, path, MAXPATHLEN, &len);
 	}
+	/* "DEVICE[,c=N][,v=M]": the container (from 0) and the volume (by index) */
+	if (error == 0) {
+		char *opt = strchr(path, ',');
+
+		while (opt != NULL) {
+			char *next = strchr(opt + 1, ',');
+
+			*opt = '\0';
+			if (strncmp(opt + 1, "c=", 2) == 0) {
+				container = (uint32_t)strtoul(opt + 3, NULL, 10);
+			} else if (strncmp(opt + 1, "v=", 2) == 0) {
+				volume = (int)strtoul(opt + 3, NULL, 10);
+			} else {
+				error = EINVAL;
+			}
+			opt = next;
+		}
+	}
 	if (error == 0) {
 		error = vnode_lookup(path, 0, &vp, ctx);
 	}
@@ -1147,20 +1274,40 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 		error = ENOTBLK;
 	}
 	if (error == 0) {
+		bool shared = false;
+
 		error = VNOP_OPEN(vp, FREAD, ctx);
+		if (error == EBUSY && apfs_device_held(vnode_specrdev(vp))) {
+			/*
+			 * Mounted already -- by us, another container of it (the root's RAM disk and the
+			 * cryptex after the boot volume): read through it as it is open, not opened
+			 * again.  Anything else mounted on a device stays EBUSY.
+			 */
+			shared = true;
+			error = 0;
+		}
 		if (error == 0) {
 			/*
 			 * The iocount from the lookup is kept for as long as the volume is
 			 * mounted; apfs_unmount() closes and drops it.
 			 */
-			error = apfs_mount_common(mp, vp, ctx);
+			error = apfs_mount_common(mp, vp, ctx, container, volume);
 			if (error == 0) {
 				APFS_MP(mp)->am_owns_devvp = true;
+				APFS_MP(mp)->am_shares_devvp = shared;
 				/* what mount(8) and df show as where it came from */
-				if (vfs_statfs(mp)->f_mntfromname[0] == '\0') {
-					strlcpy(vfs_statfs(mp)->f_mntfromname, path, MAXPATHLEN);
+				if (vfs_statfs(mp)->f_mntfromname[0] == '\0' || container != 0 || volume >= 0) {
+					char opts[40] = "";
+
+					if (container != 0) {
+						snprintf(opts, sizeof(opts), ",c=%u", container);
+					}
+					if (volume >= 0) {
+						snprintf(opts + strlen(opts), sizeof(opts) - strlen(opts), ",v=%d", volume);
+					}
+					snprintf(vfs_statfs(mp)->f_mntfromname, MAXPATHLEN, "%s%s", path, opts);
 				}
-			} else {
+			} else if (!shared) {
 				(void)VNOP_CLOSE(vp, FREAD, ctx);
 			}
 		}
@@ -1186,9 +1333,19 @@ apfs_unmount(mount_t mp, int mntflags, vfs_context_t ctx)
 	if (apfs_the_mount == am) {
 		apfs_the_mount = NULL;
 	}
+	lck_mtx_lock(&apfs_pool_lock);
+	for (struct apfs_mount **pp = &apfs_mounts; *pp != NULL; pp = &(*pp)->am_next) {
+		if (*pp == am) {
+			*pp = am->am_next;
+			break;
+		}
+	}
+	lck_mtx_unlock(&apfs_pool_lock);
 	vfs_setfsprivate(mp, NULL);
 	if (am->am_owns_devvp && am->am_devvp != NULLVP) {
-		(void)VNOP_CLOSE(am->am_devvp, FREAD, ctx);
+		if (!am->am_shares_devvp) {
+			(void)VNOP_CLOSE(am->am_devvp, FREAD, ctx);
+		}
 		vnode_put(am->am_devvp);
 	}
 	apfs_free_mount(am);
