@@ -184,8 +184,11 @@ open_image(const char *path, struct apfs_nx *nx, struct apfs_vol *vol)
 		host_locking(nx);
 		op_begin();
 	}
-	/* the first volume that has a root directory, like apfs.py picks it */
+	/* the first volume that has a root directory, like apfs.py picks it; or APFS_TOOL_VOLUME=N */
 	for (i = 0; i < APFS_NX_MAX_FILE_SYSTEMS; i++) {
+		if (getenv("APFS_TOOL_VOLUME") != NULL && (long)i != strtol(getenv("APFS_TOOL_VOLUME"), NULL, 0)) {
+			continue;
+		}
 		struct apfs_inode ino;
 
 		if (nx->fs_oid[i] == 0) {
