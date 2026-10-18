@@ -12,6 +12,8 @@
  *                                    build machine for the same file
  *        vol_ls sysctl NAME...       a string the kernel keeps (kern.apfs_stats: where the APFS
  *                                    driver's time went -- reads, page-ins, the lock)
+ *        vol_ls zero NAME...         write to it (kern.apfs_stats: its counters zeroed)
+ *        vol_ls cpuload SECONDS      how busy each processor is over the next SECONDS
  */
 #include <dirent.h>
 #include <errno.h>
@@ -24,6 +26,8 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <mach/mach.h>
+#include <mach/processor_info.h>
 
 #define FNV_INIT  0xcbf29ce484222325ULL
 #define FNV_PRIME 0x100000001b3ULL
@@ -216,6 +220,70 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[1], "cat") == 0) {
 		return do_cat(argv[2], argc > 3 ? atol(argv[3]) : 4096);
+	}
+	if (strcmp(argv[1], "cpuload") == 0) {
+		/*
+		 * How busy every processor was over the next SECONDS: user, system, idle, and its
+		 * interrupts (IPIs among them).  On the phone the slower cores' (4-6) idle count runs
+		 * ~56 times too fast -- the "all" line comes out at 1% user while each fast core shows
+		 * ~43% -- so their "99% idle" says nothing; their IPIs and the threads that run there
+		 * (kern.apfs_stats: where long waits ended) show they work.
+		 */
+		processor_info_array_t a = NULL, b = NULL, sa = NULL, sb = NULL;
+		mach_msg_type_number_t na = 0, nb = 0, nsa = 0, nsb = 0;
+		natural_t ncpu = 0, n2 = 0, n3 = 0, n4 = 0;
+		unsigned seconds = (unsigned)atoi(argv[2]);
+		unsigned long long tu = 0, ts = 0, ti = 0;
+
+		if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &ncpu, &a, &na) != KERN_SUCCESS) {
+			printf("cpuload: host_processor_info failed\n");
+			return 1;
+		}
+		(void)host_processor_info(mach_host_self(), PROCESSOR_CPU_STAT64, &n3, &sa, &nsa);
+		sleep(seconds);
+		(void)host_processor_info(mach_host_self(), PROCESSOR_CPU_STAT64, &n4, &sb, &nsb);
+		if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &n2, &b, &nb) != KERN_SUCCESS || n2 != ncpu) {
+			printf("cpuload: host_processor_info failed\n");
+			return 1;
+		}
+		for (natural_t c = 0; c < ncpu; c++) {
+			const unsigned *x = (const unsigned *)a + c * CPU_STATE_MAX, *y = (const unsigned *)b + c * CPU_STATE_MAX;
+			unsigned u = y[CPU_STATE_USER] - x[CPU_STATE_USER] + y[CPU_STATE_NICE] - x[CPU_STATE_NICE];
+			unsigned sy = y[CPU_STATE_SYSTEM] - x[CPU_STATE_SYSTEM], id = y[CPU_STATE_IDLE] - x[CPU_STATE_IDLE];
+			unsigned all = u + sy + id;
+
+			printf("cpuload: cpu %u over %u s: user %u%%, system %u%%, idle %u%%", c, seconds,
+			    all ? u * 100 / all : 0, all ? sy * 100 / all : 0, all ? id * 100 / all : 0);
+			if (sa != NULL && sb != NULL && n3 == ncpu && n4 == ncpu) {
+				/* (the 64-bit form: packed, 4-byte aligned, so read field by field) */
+				const struct processor_cpu_stat64 *p = (const struct processor_cpu_stat64 *)sa + c;
+				const struct processor_cpu_stat64 *q = (const struct processor_cpu_stat64 *)sb + c;
+
+				printf("; interrupts %llu, of them IPIs %llu, timer %llu",
+				    (unsigned long long)(q->irq_ex_cnt - p->irq_ex_cnt), (unsigned long long)(q->ipi_cnt - p->ipi_cnt),
+				    (unsigned long long)(q->timer_cnt - p->timer_cnt));
+			}
+			printf("\n");
+			tu += u;
+			ts += sy;
+			ti += id;
+		}
+		printf("cpuload: all %u processors over %u s: user %llu%%, system %llu%%, idle %llu%%\n", ncpu, seconds,
+		    (tu + ts + ti) ? tu * 100 / (tu + ts + ti) : 0, (tu + ts + ti) ? ts * 100 / (tu + ts + ti) : 0,
+		    (tu + ts + ti) ? ti * 100 / (tu + ts + ti) : 0);
+		return 0;
+	}
+	if (strcmp(argv[1], "zero") == 0) {
+		/* (kern.apfs_stats: writing anything zeroes the counters) */
+		for (i = 2; i < argc; i++) {
+			char zero = 0;
+
+			if (sysctlbyname(argv[i], NULL, NULL, &zero, 1) != 0) {
+				printf("%s: %s\n", argv[i], strerror(errno));
+				bad++;
+			}
+		}
+		return bad ? 1 : 0;
 	}
 	if (strcmp(argv[1], "sysctl") == 0) {
 		for (i = 2; i < argc; i++) {

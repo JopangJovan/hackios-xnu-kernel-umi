@@ -750,6 +750,7 @@ run_command(char *line)
 {
 	char *argv[64];
 	char *envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/", "TERM=dumb", NULL };
+	const char *append_to = NULL;
 	int argc = 0, status = 0, background = 0;
 	pid_t pid;
 
@@ -779,6 +780,25 @@ run_command(char *line)
 		background = 1;
 		argv[--argc] = NULL;
 	}
+	/* "... >> FILE": its output added to FILE (a list keeps results there and shows them at its end) */
+	if (argc > 2 && strcmp(argv[argc - 2], ">>") == 0) {
+		append_to = argv[argc - 1];
+		argc -= 2;
+		argv[argc] = NULL;
+	}
+
+	/* "sleep seconds": nothing for that long, without starting a program (a list's pause during a boot) */
+	if (strcmp(argv[0], "sleep") == 0 && argc > 1) {
+		int seconds = 0;
+
+		for (const char *d = argv[1]; *d >= '0' && *d <= '9'; d++) {
+			seconds = seconds * 10 + (*d - '0');
+		}
+		for (int left = seconds * 5; left > 0; left--) {
+			usleep(200000);
+		}
+		return;
+	}
 
 	/* "exec program args": become that program, keeping process number 1 */
 	if (strcmp(argv[0], "exec") == 0 && argc > 1) {
@@ -792,6 +812,15 @@ run_command(char *line)
 
 	pid = fork();
 	if (pid == 0) {
+		if (append_to != NULL) {
+			int fd = open(append_to, O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+			if (fd >= 0) {
+				dup2(fd, 1);
+				dup2(fd, 2);
+				close(fd);
+			}
+		}
 		execve(argv[0], argv, envp);
 		printf("%s: %s\n", argv[0], strerror(errno));
 		_exit(127);

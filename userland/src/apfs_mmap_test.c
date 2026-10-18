@@ -14,8 +14,9 @@
  * The hash is FNV-1a over the whole file, which is what verify.py and the in-kernel walk
  * use, so a line here can be compared with a line from either.
  *
- * usage: apfs_mmap_test mmap [PATH]
- *        apfs_mmap_test read [PATH] [CHUNK]
+ * usage: apfs_mmap_test [-q] mmap [PATH]
+ *        apfs_mmap_test [-q] read [PATH] [CHUNK]
+ * -q: no line for each file, only the files' count, bytes, line-hash sum and time.
  * PATH defaults to /private/var/apfs-check/usr, CHUNK to 4096.  PATH may be anywhere on a
  * mounted volume: the lines name files from that volume's mount point (statfs), which is
  * what makes them the host's lines.
@@ -45,6 +46,7 @@ static size_t mount_len = sizeof(MOUNT) - 1;   /* the mount point's length in a 
 static const char *tag;         /* what to print each line under */
 static int chunk_size = 4096;
 static int use_mmap;
+static int quiet;               /* -q: no line a file, only what they add up to */
 
 static unsigned long long total_sum;
 static unsigned long long total_bytes;
@@ -80,7 +82,7 @@ stats_reset(void)
 static void
 stats_print(void)
 {
-	char buf[1024];
+	static char buf[16384];
 	size_t n = sizeof(buf);
 	char *line, *next;
 
@@ -180,7 +182,9 @@ do_file(const char *path, off_t size)
 	}
 	snprintf(line, sizeof(line), "%s\t%lld\t%016llx\n", path + mount_len,
 	    (long long)size, h);
-	printf("%s %s", tag, line);
+	if (!quiet) {
+		printf("%s %s", tag, line);
+	}
 	total_sum += fnv1a((const unsigned char *)line, strlen(line), FNV_INIT);
 	total_files++;
 	total_bytes += (unsigned long long)size;
@@ -231,9 +235,16 @@ main(int argc, char **argv)
 {
 	static char path[PATH_MAX];
 	const char *where = MOUNT "/usr";
-	const char *mode = argc > 1 ? argv[1] : "mmap";
+	const char *mode;
 	double t0, t1;
 	int tries;
+
+	if (argc > 1 && strcmp(argv[1], "-q") == 0) {
+		quiet = 1;
+		argv++;
+		argc--;
+	}
+	mode = argc > 1 ? argv[1] : "mmap";
 
 	use_mmap = (strcmp(mode, "read") != 0);
 	tag = use_mmap ? "apfs-mmap:" : "apfs-read:";
