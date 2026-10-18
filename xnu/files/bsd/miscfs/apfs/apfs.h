@@ -73,6 +73,8 @@ struct apfs_mount {
 	 * counters (waiting for the device, decompressing).  Ticks; see apfs_ticks().
 	 */
 	uint64_t           am_pagein_calls, am_pagein_ticks, am_pagein_bytes;
+	/* read(2) through the page cache: bytes copied from pages already there, bytes read into it (atomic) */
+	uint64_t           am_read_cached, am_read_filled;
 	uint64_t           am_read_calls, am_read_ticks, am_read_bytes;
 	/*
 	 * What the one lock round apfs_lib costs: how long callers stood waiting for it, and
@@ -140,6 +142,8 @@ struct apfs_mount {
 		uint64_t   read_ticks, pagein_ticks;     /* time in them, added without the lock (atomic) */
 	}                 *am_procs;
 	uint32_t           am_nprocs;
+	lck_spin_t         am_procs_spin;   /* finding or adding an entry (a read from the page cache has no am_lock) */
+	bool               am_ubc_read;     /* read(2) through the page cache (boot-arg apfs_ubc_read, default 1) */
 	uint32_t           am_nops;
 	uint32_t           am_untracked;    /* operations the table had no room for: nothing is freed meanwhile */
 	/* how long it was held: up to 10 us, 100 us, 1 ms, 10 ms, more; and the longest */
@@ -195,6 +199,9 @@ struct apfs_node {
 	 * Put in once (atomically), read without the lock, freed with the vnode.
 	 */
 	struct apfs_link  *an_link;
+	/* read(2) through the page cache: where a reader in order would read next, and how much it was given ahead (hints, atomic) */
+	uint64_t           an_read_next;
+	uint32_t           an_read_window;
 };
 
 struct apfs_link {

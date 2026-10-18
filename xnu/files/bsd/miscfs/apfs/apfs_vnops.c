@@ -33,7 +33,8 @@ extern void thread_runnable_and_run_self(uint64_t *runnable, uint64_t *run);
 static struct apfs_lock_proc *
 lock_proc(struct apfs_mount *am)
 {
-	static struct apfs_lock_proc nowhere;   /* (no table: counted, under the lock, and never shown) */
+	static struct apfs_lock_proc nowhere;   /* (no table: counted, and never shown) */
+	struct apfs_lock_proc *lp;
 	char name[MAXCOMLEN + 1];
 	uint32_t i;
 
@@ -41,20 +42,26 @@ lock_proc(struct apfs_mount *am)
 		return &nowhere;
 	}
 	proc_selfname(name, sizeof(name));
+	lck_spin_lock(&am->am_procs_spin);
 	for (i = 0; i < am->am_nprocs; i++) {
 		if (strncmp(am->am_procs[i].name, name, sizeof(name)) == 0) {
-			return &am->am_procs[i];
+			lp = &am->am_procs[i];
+			goto out;
 		}
 	}
 	if (am->am_nprocs < APFS_LOCK_PROCS - 1) {
 		strlcpy(am->am_procs[am->am_nprocs].name, name, sizeof(name));
-		return &am->am_procs[am->am_nprocs++];
+		lp = &am->am_procs[am->am_nprocs++];
+		goto out;
 	}
 	if (am->am_nprocs == APFS_LOCK_PROCS - 1) {
 		strlcpy(am->am_procs[am->am_nprocs].name, "(the rest)", sizeof(name));
 		am->am_nprocs++;
 	}
-	return &am->am_procs[APFS_LOCK_PROCS - 1];
+	lp = &am->am_procs[APFS_LOCK_PROCS - 1];
+out:
+	lck_spin_unlock(&am->am_procs_spin);
+	return lp;
 }
 
 /* The statistics of a caller of apfs_lock (with the lock held) */
@@ -438,8 +445,160 @@ apfs_iobuf_put(struct apfs_mount *am, uint8_t *buf)
 	}
 }
 
+/*
+ * read(2) through the page cache, as decmpfs reads a compressed HFS file
+ * (decmpfs_read_compressed): what the cache has is copied from it; for the rest the file's
+ * pages are taken in a UPL, the ones not valid yet read into it by apfs_read_file -- what
+ * pagein does -- and the UPL committed, so that the pages stay: the next read(2) of them
+ * finds them, and so does a mapping of the file, which is the same pages.  At least
+ * APFS_FILL_ALIGN at a time, aligned to it: a compressed file is kept in 64 KB pieces, and a
+ * piece decompressed for a small read would be decompressed again for the next one.
+ */
+#define APFS_FILL_ALIGN         (64 * 1024)
+#define APFS_FILL_MAX           (1024 * 1024)   /* at most this much in one UPL */
+/*
+ * A reader going through a file in order (it starts where the last read(2) of the file ended)
+ * is given more than it asked for, twice as much each time it comes to the end of what it was
+ * given, up to APFS_FILL_MAX: fewer UPLs, larger requests to the device.  The cluster layer
+ * does the same for a file system that uses it.
+ */
+
+/* [at, at + len) of the file into dst, as pagein reads it; past the end, zeros */
 static int
-apfs_vnop_read(struct vnop_read_args *ap)
+apfs_fill(struct apfs_mount *am, vnode_t vp, struct apfs_inode *ino, uint64_t size, off_t at,
+    uint8_t *dst, size_t len, uint64_t *filled)
+{
+	int error = 0;
+
+	while (len > 0) {
+		size_t want, got = 0;
+
+		if ((uint64_t)at >= size) {
+			bzero(dst, len);
+			break;
+		}
+		want = (size_t)MIN((uint64_t)len, size - (uint64_t)at);
+		os_atomic_inc(&am->am_nx.requests, relaxed);
+		apfs_lock(am);
+		error = apfs_read_file(&am->am_vol, ino, &APFS_VP(vp)->an_cf, (uint64_t)at, dst, want, &got);
+		apfs_unlock(am);
+		os_atomic_dec(&am->am_nx.requests, relaxed);
+		if (error) {
+			break;
+		}
+		if (got == 0) {
+			bzero(dst, len);        /* (shorter than its size says: zeros, as pagein gives) */
+			break;
+		}
+		at += (off_t)got;
+		dst += got;
+		len -= got;
+		*filled += got;
+	}
+	return error;
+}
+
+static int
+apfs_read_cached(struct apfs_mount *am, vnode_t vp, struct uio *uio, struct apfs_inode *ino,
+    uint64_t size, uint64_t *cached, uint64_t *filled)
+{
+	int error = 0;
+
+	while (uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < size) {
+		uint64_t left = MIN((uint64_t)uio_resid(uio), size - (uint64_t)uio_offset(uio));
+		int count = (int)MIN(left, (uint64_t)INT_MAX), resid = count, copy, copy_resid, npages, i;
+		off_t pos, want_end, upl_pos, upl_end;
+		upl_page_info_t *pl = NULL;
+		vm_offset_t address = 0;
+		upl_t upl = NULL;
+		int upl_size;
+
+		/* what the cache has already, up to the first page it has not */
+		error = cluster_copy_ubc_data(vp, uio, &resid, 0);
+		*cached += (uint64_t)(count - resid);
+		if (error) {
+			break;
+		}
+		if (resid == 0) {
+			continue;
+		}
+
+		/* the rest: the pages from there, the missing ones read in */
+		pos = uio_offset(uio);
+		left = MIN((uint64_t)uio_resid(uio), size - (uint64_t)pos);
+		want_end = pos + (off_t)left;
+		upl_pos = pos & ~((off_t)APFS_FILL_ALIGN - 1);
+		upl_end = (want_end + APFS_FILL_ALIGN - 1) & ~((off_t)APFS_FILL_ALIGN - 1);
+		{
+			struct apfs_node *an = APFS_VP(vp);
+			uint32_t window = APFS_FILL_ALIGN;
+
+			/* (where this read(2) began: before what the cache gave it just now) */
+			if ((uint64_t)pos - (uint64_t)(count - resid) == os_atomic_load(&an->an_read_next, relaxed)) {
+				window = MIN(MAX(os_atomic_load(&an->an_read_window, relaxed) * 2,
+				    (uint32_t)APFS_FILL_ALIGN), (uint32_t)APFS_FILL_MAX);
+			}
+			os_atomic_store(&an->an_read_window, window, relaxed);
+			if (upl_end < upl_pos + (off_t)window) {
+				upl_end = upl_pos + (off_t)window;
+			}
+		}
+		if (upl_end > (off_t)round_page_64(size)) {
+			upl_end = (off_t)round_page_64(size);
+		}
+		if (upl_end - upl_pos > APFS_FILL_MAX) {
+			upl_end = upl_pos + APFS_FILL_MAX;
+		}
+		upl_size = (int)(upl_end - upl_pos);
+		if (ubc_create_upl_kernel(vp, upl_pos, upl_size, &upl, &pl, UPL_SET_LITE,
+		    VM_KERN_MEMORY_FILE) != KERN_SUCCESS || upl == NULL) {
+			error = EIO;
+			break;
+		}
+		if (ubc_upl_map(upl, &address) != KERN_SUCCESS || address == 0) {
+			ubc_upl_abort_range(upl, 0, (upl_size_t)upl_size, UPL_ABORT_FREE_ON_EMPTY);
+			error = EIO;
+			break;
+		}
+		npages = upl_size / PAGE_SIZE;
+		for (i = 0; i < npages && error == 0;) {
+			int j;
+
+			if (upl_valid_page(pl, i)) {
+				i++;
+				continue;
+			}
+			for (j = i + 1; j < npages && !upl_valid_page(pl, j); j++) {
+			}
+			error = apfs_fill(am, vp, ino, size, upl_pos + (off_t)i * PAGE_SIZE,
+			    (uint8_t *)address + (size_t)i * PAGE_SIZE, (size_t)(j - i) * PAGE_SIZE, filled);
+			i = j;
+		}
+		(void)ubc_upl_unmap(upl);
+		if (error) {
+			ubc_upl_abort_range(upl, 0, (upl_size_t)upl_size, UPL_ABORT_FREE_ON_EMPTY);
+			break;
+		}
+		/* out of the UPL what this read asked for; then the pages go into the cache */
+		copy = (int)(MIN(upl_end, want_end) - pos);
+		copy_resid = copy;
+		error = cluster_copy_upl_data(uio, upl, (int)(pos - upl_pos), &copy_resid);
+		ubc_upl_commit_range(upl, 0, (upl_size_t)upl_size, UPL_COMMIT_FREE_ON_EMPTY |
+		    UPL_COMMIT_INACTIVATE | UPL_COMMIT_CLEAR_DIRTY | UPL_COMMIT_WRITTEN_BY_KERNEL);
+		if (error) {
+			break;
+		}
+		if (copy_resid == copy) {
+			error = EIO;            /* (nothing copied: cannot happen, and must not loop) */
+			break;
+		}
+	}
+	return error;
+}
+
+/* read(2) the old way: into a buffer of the driver's and out of it, every time (apfs_ubc_read=0) */
+static int
+apfs_read_direct(struct vnop_read_args *ap)
 {
 	vnode_t vp = ap->a_vp;
 	struct uio *uio = ap->a_uio;
@@ -451,15 +610,6 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	struct apfs_lock_proc *lp = NULL;
 	int error = 0;
 
-	if (vnode_isdir(vp)) {
-		return EISDIR;
-	}
-	if (!vnode_isreg(vp)) {
-		return EINVAL;
-	}
-	if (uio_offset(uio) < 0) {
-		return EINVAL;
-	}
 	ino = APFS_VP(vp)->an_ino;
 	size = APFS_VP(vp)->an_size;
 	t0 = apfs_ticks();
@@ -473,8 +623,9 @@ apfs_vnop_read(struct vnop_read_args *ap)
 		apfs_lock(am);
 		{
 			lp = lock_proc(am);
-			lp->read_calls++;
-			lp->read_bytes += (uint64_t)MIN((uint64_t)uio_resid(uio), size - (uint64_t)uio_offset(uio));
+			os_atomic_inc(&lp->read_calls, relaxed);
+			os_atomic_add(&lp->read_bytes,
+			    (uint64_t)MIN((uint64_t)uio_resid(uio), size - (uint64_t)uio_offset(uio)), relaxed);
 		}
 		/*
 		 * The lock is held for the reading of each round and let go of for its uiomove;
@@ -513,6 +664,49 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	os_atomic_add(&am->am_read_ticks, apfs_ticks() - t0, relaxed);
 	os_atomic_inc(&am->am_read_calls, relaxed);
 	os_atomic_add(&am->am_read_bytes, read_bytes, relaxed);
+	return error;
+}
+
+static int
+apfs_vnop_read(struct vnop_read_args *ap)
+{
+	vnode_t vp = ap->a_vp;
+	struct uio *uio = ap->a_uio;
+	struct apfs_mount *am = APFS_VP_MOUNT(vp);
+	struct apfs_inode ino;
+	struct apfs_lock_proc *lp;
+	uint64_t size, t0, before, cached = 0, filled = 0;
+	int error = 0;
+
+	if (vnode_isdir(vp)) {
+		return EISDIR;
+	}
+	if (!vnode_isreg(vp)) {
+		return EINVAL;
+	}
+	if (uio_offset(uio) < 0) {
+		return EINVAL;
+	}
+	if (!am->am_ubc_read || !UBCINFOEXISTS(vp)) {
+		return apfs_read_direct(ap);
+	}
+	ino = APFS_VP(vp)->an_ino;
+	size = APFS_VP(vp)->an_size;
+	t0 = apfs_ticks();
+	before = (uint64_t)uio_resid(uio);
+	lp = lock_proc(am);
+	os_atomic_inc(&lp->read_calls, relaxed);
+	if (uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < size) {
+		error = apfs_read_cached(am, vp, uio, &ino, size, &cached, &filled);
+	}
+	os_atomic_store(&APFS_VP(vp)->an_read_next, (uint64_t)uio_offset(uio), relaxed);
+	os_atomic_add(&lp->read_bytes, before - (uint64_t)uio_resid(uio), relaxed);
+	os_atomic_add(&lp->read_ticks, apfs_ticks() - t0, relaxed);
+	os_atomic_add(&am->am_read_ticks, apfs_ticks() - t0, relaxed);
+	os_atomic_inc(&am->am_read_calls, relaxed);
+	os_atomic_add(&am->am_read_bytes, before - (uint64_t)uio_resid(uio), relaxed);
+	os_atomic_add(&am->am_read_cached, cached, relaxed);
+	os_atomic_add(&am->am_read_filled, filled, relaxed);
 	return error;
 }
 

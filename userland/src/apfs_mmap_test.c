@@ -16,7 +16,11 @@
  *
  * usage: apfs_mmap_test [-q] mmap [PATH]
  *        apfs_mmap_test [-q] read [PATH] [CHUNK]
+ *        apfs_mmap_test drop [PATH]
  * -q: no line for each file, only the files' count, bytes, line-hash sum and time.
+ * drop: each file's pages are put out of the page cache (a shared mapping of it, msync with
+ * MS_INVALIDATE), so that the next pass over PATH reads it from the volume again: a cold pass
+ * without a reboot.  Nothing is hashed, and the driver's counters are left alone.
  * PATH defaults to /private/var/apfs-check/usr, CHUNK to 4096.  PATH may be anywhere on a
  * mounted volume: the lines name files from that volume's mount point (statfs), which is
  * what makes them the host's lines.
@@ -47,6 +51,7 @@ static const char *tag;         /* what to print each line under */
 static int chunk_size = 4096;
 static int use_mmap;
 static int quiet;               /* -q: no line a file, only what they add up to */
+static int drop_mode;           /* drop: out of the page cache, nothing read */
 
 static unsigned long long total_sum;
 static unsigned long long total_bytes;
@@ -95,6 +100,14 @@ stats_print(void)
 		next = strchr(line, '\n');
 		if (next != NULL) {
 			*next++ = '\0';
+		}
+		/* -q: the totals only (the per-caller and per-process tables are for vol_ls sysctl) */
+		if (quiet && strncmp(line, "pagein ", 7) != 0 && strncmp(line, "read ", 5) != 0 &&
+		    strncmp(line, "device ", 7) != 0 && strncmp(line, "data ", 5) != 0 &&
+		    strncmp(line, "inflate ", 8) != 0 && strncmp(line, "blocks ", 7) != 0 &&
+		    !(strncmp(line, "lock ", 5) == 0 && strstr(line, " takes ") != NULL &&
+		    strstr(line, "metadata") != NULL)) {
+			continue;
 		}
 		if (*line != '\0') {
 			printf("%s kernel: %s\n", tag, line);
@@ -167,12 +180,49 @@ hash_read(const char *path, off_t size, unsigned long long *out)
 	return 0;
 }
 
+/* One file's pages out of the page cache: they are the same ones every mapping of it shares. */
+static int
+drop_file(const char *path, off_t size)
+{
+	int fd = open(path, O_RDONLY);
+	void *map;
+	int rc;
+
+	if (fd < 0) {
+		return -1;
+	}
+	if (size == 0) {
+		close(fd);
+		return 0;
+	}
+	map = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED) {
+		return -1;
+	}
+	rc = msync(map, (size_t)size, MS_INVALIDATE);
+	munmap(map, (size_t)size);
+	return rc;
+}
+
 static void
 do_file(const char *path, off_t size)
 {
 	unsigned long long h = 0;
 	char line[2048];
-	int rc = use_mmap ? hash_mapped(path, size, &h) : hash_read(path, size, &h);
+	int rc;
+
+	if (drop_mode) {
+		if (drop_file(path, size) != 0) {
+			printf("%s %s: cannot drop it: %s\n", tag, path + mount_len, strerror(errno));
+			total_errors++;
+			return;
+		}
+		total_files++;
+		total_bytes += (unsigned long long)size;
+		return;
+	}
+	rc = use_mmap ? hash_mapped(path, size, &h) : hash_read(path, size, &h);
 
 	if (rc != 0) {
 		printf("%s %s: cannot read it: %s\n", tag, path + mount_len,
@@ -246,8 +296,9 @@ main(int argc, char **argv)
 	}
 	mode = argc > 1 ? argv[1] : "mmap";
 
+	drop_mode = (strcmp(mode, "drop") == 0);
 	use_mmap = (strcmp(mode, "read") != 0);
-	tag = use_mmap ? "apfs-mmap:" : "apfs-read:";
+	tag = drop_mode ? "apfs-drop:" : use_mmap ? "apfs-mmap:" : "apfs-read:";
 	if (argc > 2) {
 		where = argv[2];
 	}
@@ -277,6 +328,15 @@ main(int argc, char **argv)
 		}
 	}
 
+	if (drop_mode) {
+		snprintf(path, sizeof(path), "%s", where);
+		t0 = now_ms();
+		walk(path, strlen(path));
+		t1 = now_ms();
+		printf("%s %s: files %ld  bytes %llu  errors %ld, out of the page cache in %.0f ms\n", tag, where,
+		    total_files, total_bytes, total_errors, t1 - t0);
+		return total_errors ? 1 : 0;
+	}
 	printf("%s %s, %s%s\n", tag, where, use_mmap ? "through a mapping" : "with read(2)",
 	    use_mmap ? "" : " in pieces");
 	if (!use_mmap) {

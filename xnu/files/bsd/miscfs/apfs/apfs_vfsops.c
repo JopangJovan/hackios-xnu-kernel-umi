@@ -249,7 +249,7 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 
 		snprintf(text, cap,
 		    "pagein   %llu calls  %llu ms  %llu bytes\n"
-		    "read     %llu calls  %llu ms  %llu bytes\n"
+		    "read     %llu calls  %llu ms  %llu bytes; from the page cache %llu, read into it %llu (%s)\n"
 		    "device   %llu calls  %llu ms  %llu bytes\n"
 		    "data     %llu calls  %llu ms  %llu bytes\n"
 		    "inflate  %llu calls  %llu ms  %llu bytes in  %llu bytes out  %llu by zlib\n"
@@ -262,6 +262,9 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    (unsigned long long)am->am_read_calls,
 		    (unsigned long long)apfs_ticks_ms(am->am_read_ticks),
 		    (unsigned long long)am->am_read_bytes,
+		    (unsigned long long)am->am_read_cached,
+		    (unsigned long long)am->am_read_filled,
+		    am->am_ubc_read ? "read(2) through it" : "read(2) past it: apfs_ubc_read=0",
 		    (unsigned long long)nx->dev_calls,
 		    (unsigned long long)apfs_ticks_ms(nx->dev_ticks),
 		    (unsigned long long)nx->dev_bytes,
@@ -314,10 +317,13 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		memset(am->am_long_queued, 0, sizeof(am->am_long_queued));
 		memset(am->am_long_oncpu, 0, sizeof(am->am_long_oncpu));
 		memset(am->am_long_cpu, 0, sizeof(am->am_long_cpu));
+		lck_spin_lock(&am->am_procs_spin);
 		if (am->am_procs != NULL) {
 			memset(am->am_procs, 0, APFS_LOCK_PROCS * sizeof(am->am_procs[0]));
 		}
 		am->am_nprocs = 0;
+		lck_spin_unlock(&am->am_procs_spin);
+		am->am_read_cached = am->am_read_filled = 0;
 		for (uint32_t i = 0; i < APFS_LOCK_SITES; i++) {
 			const char *name = am->am_sites[i].name;
 
@@ -409,6 +415,22 @@ apfs_stats_print(void)
 		    nx->retired_now, nx->retired_most, am->am_nops);
 	}
 }
+
+/* kern.redwood_memory: the kernel's line about memory (osfmk/arm64/loader_return.c), for a job list to keep */
+extern void redwood_memory_line(char *buf, size_t len);
+
+static int
+sysctl_redwood_memory SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	char line[256];
+
+	redwood_memory_line(line, sizeof(line));
+	return SYSCTL_OUT(req, line, strlen(line) + 1);
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, redwood_memory, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, sysctl_redwood_memory, "A", "where the memory is, in MB");
 
 SYSCTL_PROC(_kern, OID_AUTO, apfs_stats, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, sysctl_apfs_stats, "A", "APFS: where the time goes; write to zero it");
@@ -913,6 +935,7 @@ apfs_free_mount(struct apfs_mount *am)
 		kfree_data(am->am_procs, APFS_LOCK_PROCS * sizeof(am->am_procs[0]));
 	}
 	lck_spin_destroy(&am->am_iobuf_spin, &apfs_lck_grp);
+	lck_spin_destroy(&am->am_procs_spin, &apfs_lck_grp);
 	lck_mtx_destroy(&am->am_lock, &apfs_lck_grp);
 	kfree_type(struct apfs_mount, am);
 }
@@ -940,6 +963,13 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	}
 	lck_mtx_init(&am->am_lock, &apfs_lck_grp, LCK_ATTR_NULL);
 	lck_spin_init(&am->am_iobuf_spin, &apfs_lck_grp, LCK_ATTR_NULL);
+	lck_spin_init(&am->am_procs_spin, &apfs_lck_grp, LCK_ATTR_NULL);
+	{
+		uint32_t ubc = 1;
+
+		(void)PE_parse_boot_argn("apfs_ubc_read", &ubc, sizeof(ubc));
+		am->am_ubc_read = (ubc != 0);
+	}
 	am->am_procs = kalloc_data(APFS_LOCK_PROCS * sizeof(am->am_procs[0]), Z_WAITOK | Z_ZERO);
 	am->am_mp = mp;
 	am->am_devvp = devvp;

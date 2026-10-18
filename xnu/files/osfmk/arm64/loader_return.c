@@ -524,16 +524,19 @@ extern void MiniIOSurfaceUsage(uint32_t *count, uint64_t *bytes);
  * daemons, and once none is left and it is below the second, whatever is next in line -- the
  * window server included.
  */
-static void
-memory_report(void)
+void redwood_memory_line(char *buf, size_t len);
+
+/* The line itself (also kern.redwood_memory, for a job list to keep: bsd/miscfs/apfs/apfs_vfsops.c) */
+void
+redwood_memory_line(char *buf, size_t len)
 {
 #define MB(pages)       ((unsigned int)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
 	uint32_t surfaces = 0;
 	uint64_t surface_bytes = 0;
 
 	MiniIOSurfaceUsage(&surfaces, &surface_bytes);
-	printf("memory: free %u, files %u, programs %u, wired %u (%u surfaces %u, ramfs %u), compressor %u (holding %u) MB; "
-	    "available %u, kills below %u (the idle) and %u (anybody)\n",
+	snprintf(buf, len, "memory: free %u, files %u, programs %u, wired %u (%u surfaces %u, ramfs %u), compressor %u "
+	    "(holding %u) MB; available %u, kills below %u (the idle) and %u (anybody)\n",
 	    MB(vm_page_free_count), MB(vm_page_pageable_external_count), MB(vm_page_pageable_internal_count),
 	    MB(vm_page_wire_count), surfaces, (unsigned int)(surface_bytes >> 20),
 	    MB(os_atomic_load(&ramfs_pages_in_use, relaxed)),
@@ -541,6 +544,15 @@ memory_report(void)
 	    MB(memorystatus_available_pages),
 	    MB(memorystatus_available_pages_critical), MB(memorystatus_available_pages_critical_base));
 #undef MB
+}
+
+static void
+memory_report(void)
+{
+	char line[256];
+
+	redwood_memory_line(line, sizeof(line));
+	printf("%s", line);
 	redwood_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
 }
 
