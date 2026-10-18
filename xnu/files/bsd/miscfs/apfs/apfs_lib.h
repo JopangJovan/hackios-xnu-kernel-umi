@@ -200,10 +200,11 @@ struct apfs_nx {
 	uint32_t          parallel_max;         /* threads it can bring, the caller's included */
 	/*
 	 * Reads in flight on the container, kept by the caller with the lock held.  The
-	 * threads nx->parallel brings are shared out among them: all of them to a request
-	 * that is alone, none to one among parallel_max or more -- the processors are busy
-	 * already, and on the phone four readers came out 7% slower with helpers than
-	 * without.  0 (the program on the build machine) counts as alone.
+	 * threads nx->parallel brings are shared out among them, parallel_max / requests
+	 * each: with four, all of them to a request that is alone, two each to two, none
+	 * from three up -- the processors are busy already, and on the phone four readers
+	 * came out 7% slower with helpers than without.  0 (the program on the build
+	 * machine) counts as alone.
 	 */
 	uint32_t          requests;
 	uint64_t          batch_calls, batch_pieces;   /* how many requests used it, for how much */
