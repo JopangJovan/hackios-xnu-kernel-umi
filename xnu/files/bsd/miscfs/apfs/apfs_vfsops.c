@@ -781,6 +781,10 @@ apfs_mount(mount_t mp, vnode_t devvp, user_addr_t data, vfs_context_t ctx)
 			error = apfs_mount_common(mp, vp, ctx);
 			if (error == 0) {
 				APFS_MP(mp)->am_owns_devvp = true;
+				/* what mount(8) and df show as where it came from */
+				if (vfs_statfs(mp)->f_mntfromname[0] == '\0') {
+					strlcpy(vfs_statfs(mp)->f_mntfromname, path, MAXPATHLEN);
+				}
 			} else {
 				(void)VNOP_CLOSE(vp, FREAD, ctx);
 			}

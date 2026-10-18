@@ -16,7 +16,9 @@
  *
  * usage: apfs_mmap_test mmap [PATH]
  *        apfs_mmap_test read [PATH] [CHUNK]
- * PATH defaults to /private/var/apfs-check/usr, CHUNK to 4096.
+ * PATH defaults to /private/var/apfs-check/usr, CHUNK to 4096.  PATH may be anywhere on a
+ * mounted volume: the lines name files from that volume's mount point (statfs), which is
+ * what makes them the host's lines.
  */
 
 #include <dirent.h>
@@ -28,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <time.h>
@@ -37,6 +40,7 @@
 #define FNV_PRIME 0x100000001b3ULL
 
 #define MOUNT "/private/var/apfs-check"
+static size_t mount_len = sizeof(MOUNT) - 1;   /* the mount point's length in a path */
 
 static const char *tag;         /* what to print each line under */
 static int chunk_size = 4096;
@@ -169,12 +173,12 @@ do_file(const char *path, off_t size)
 	int rc = use_mmap ? hash_mapped(path, size, &h) : hash_read(path, size, &h);
 
 	if (rc != 0) {
-		printf("%s %s: cannot read it: %s\n", tag, path + sizeof(MOUNT) - 1,
+		printf("%s %s: cannot read it: %s\n", tag, path + mount_len,
 		    strerror(errno));
 		total_errors++;
 		return;
 	}
-	snprintf(line, sizeof(line), "%s\t%lld\t%016llx\n", path + sizeof(MOUNT) - 1,
+	snprintf(line, sizeof(line), "%s\t%lld\t%016llx\n", path + mount_len,
 	    (long long)size, h);
 	printf("%s %s", tag, line);
 	total_sum += fnv1a((const unsigned char *)line, strlen(line), FNV_INIT);
@@ -190,7 +194,7 @@ walk(char *path, size_t len)
 
 	if (d == NULL) {
 		printf("%s %s: cannot open the directory: %s\n", tag,
-		    path + sizeof(MOUNT) - 1, strerror(errno));
+		    path + mount_len, strerror(errno));
 		total_errors++;
 		return;
 	}
@@ -209,7 +213,7 @@ walk(char *path, size_t len)
 		memcpy(path + len + 1, de->d_name, n + 1);
 		/* lstat, not stat: a symbolic link is not followed and not read */
 		if (lstat(path, &st) != 0) {
-			printf("%s %s: lstat failed: %s\n", tag, path + sizeof(MOUNT) - 1,
+			printf("%s %s: lstat failed: %s\n", tag, path + mount_len,
 			    strerror(errno));
 			total_errors++;
 		} else if (S_ISDIR(st.st_mode)) {
@@ -242,11 +246,6 @@ main(int argc, char **argv)
 			chunk_size = 4096;
 		}
 	}
-	if (strncmp(where, MOUNT, sizeof(MOUNT) - 1) != 0) {
-		printf("%s a path under %s, please\n", tag, MOUNT);
-		return 2;
-	}
-
 	/* the kernel mounts the volume as soon as /private/var is there; wait for it */
 	for (tries = 0; tries < 120; tries++) {
 		struct stat st;
@@ -255,6 +254,16 @@ main(int argc, char **argv)
 			break;
 		}
 		sleep(1);
+	}
+	{
+		struct statfs sf;
+
+		if (statfs(where, &sf) == 0 && strncmp(where, sf.f_mntonname,
+		    strlen(sf.f_mntonname)) == 0) {
+			mount_len = strcmp(sf.f_mntonname, "/") == 0 ? 0 : strlen(sf.f_mntonname);
+			printf("%s %s is %s on %s\n", tag, sf.f_mntonname, sf.f_mntfromname,
+			    sf.f_fstypename);
+		}
 	}
 
 	printf("%s %s, %s%s\n", tag, where, use_mmap ? "through a mapping" : "with read(2)",

@@ -945,11 +945,53 @@ apfs_check_runner(void *arg, wait_result_t wr)
 	apfs_check_finished = 1;
 }
 
+/*
+ * apfs_volume=DEV: a volume for user space in an ordinary boot.  Mounted read only (and
+ * nosuid, nodev) on apfs_volume_at -- by default /System/Volumes/iOS, which the system image
+ * has for it (userland/build.sh) -- right here, after the root and devfs and before launchd,
+ * so that all of user space sees it from the start.  apfs_volume=ufs_darwin is the iOS root
+ * container on the phone's flash (ufs=2 for the loader, bootcpu=7).
+ */
+static void
+apfs_volume_mount(void)
+{
+	char dev[48], at[256] = "/System/Volumes/iOS", path[64];
+	vfs_context_t ctx = vfs_context_kernel();
+	uint64_t t0, ns = 0;
+	vnode_t vp = NULLVP;
+	int error, tries;
+
+	if (!PE_parse_boot_arg_str("apfs_volume", dev, sizeof(dev)) || dev[0] == '\0') {
+		return;
+	}
+	(void)PE_parse_boot_arg_str("apfs_volume_at", at, sizeof(at));
+	snprintf(path, sizeof(path), "/dev/%s", dev);
+	/* a node devfs_make_node() has just made is not in /dev at once (see apfs_check_thread) */
+	for (tries = 0; tries < 100; tries++) {
+		if (vnode_lookup(path, 0, &vp, ctx) == 0) {
+			vnode_put(vp);
+			break;
+		}
+		delay_for_interval(50, NSEC_PER_MSEC);
+	}
+	t0 = mach_absolute_time();
+	error = kernel_mount("apfs", NULLVP, NULLVP, at, path, 0,
+	    MNT_RDONLY | MNT_NOSUID | MNT_NODEV, KERNEL_MOUNT_NOAUTH, ctx);
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	if (error) {
+		printf("apfs: mounting %s on %s failed: %d\n", path, at, error);
+	} else {
+		printf("apfs: %s mounted on %s, read only, in %llu ms\n", path, at, ns / 1000000);
+	}
+}
+
 void
 redwood_apfs_check_init(void)
 {
 	uint32_t mode = 0;
 	thread_t th;
+
+	apfs_volume_mount();
 
 	if (!PE_parse_boot_argn("apfs_check", &mode, sizeof(mode)) || mode == 0) {
 		return;

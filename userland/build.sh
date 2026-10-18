@@ -124,6 +124,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework IOSurface -o obj/cg_test src/cg_test.c
 		$DYN -o obj/shm_test src/shm_test.c
 		$DYN -o obj/apfs_mmap_test src/apfs_mmap_test.c
+		$DYN -o obj/vol_ls src/vol_ls.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
@@ -169,6 +170,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
 	[ -f obj/shm_test ] && cp obj/shm_test root/bin/
 	[ -f obj/apfs_mmap_test ] && cp obj/apfs_mmap_test root/bin/
+	[ -f obj/vol_ls ] && cp obj/vol_ls root/bin/
 	[ -f obj/snap_test ] && cp obj/snap_test root/bin/
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
@@ -282,6 +284,9 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		sysroot/System/Library/LaunchAngels sysroot/System/Library/xpc/launchd.plist
 	ln -s /redwood/LaunchDaemons sysroot/System/Library/LaunchDaemons
 	mkdir -p sysroot/redwood sysroot/sbin
+	# where the kernel mounts the iOS root container off the phone's flash (boot-arg apfs_volume=):
+	# iOS has no /System/Volumes, and nothing can make a directory in this image once it is built
+	mkdir -p sysroot/System/Volumes/iOS
 	# the applications iOS installs on its first boot are system applications here (see select-system.py)
 	if [ -d sysroot/private/var/staged_system_apps ]; then
 		mv sysroot/private/var/staged_system_apps/* sysroot/Applications/
