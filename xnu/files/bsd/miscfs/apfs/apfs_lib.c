@@ -2299,6 +2299,40 @@ ext_next(struct ext_iter *it, uint64_t *logical, uint64_t *length, uint64_t *phy
 }
 
 int
+apfs_file_in_place(struct apfs_vol *vol, const struct apfs_inode *ino, uint64_t *addr)
+{
+	bool compressed = false, in_rsrc = false;
+	uint32_t type = 0;
+	uint64_t csize = 0, logical, length, phys;
+	struct ext_iter it;
+	int error;
+
+	if ((ino->mode & APFS_S_IFMT) != APFS_S_IFREG || !ino->has_dstream || ino->size == 0) {
+		return ENOENT;
+	}
+	error = cfile_header(vol, ino, &compressed, &type, &csize, &in_rsrc);
+	if (error) {
+		return error;
+	}
+	if (compressed) {
+		return ENOENT;
+	}
+	error = ext_begin(vol, ino->private_id, 0, &it);
+	if (error == 0) {
+		error = ext_next(&it, &logical, &length, &phys);
+	}
+	if (error) {
+		return error == ENOENT ? ENOENT : error;
+	}
+	if (logical != 0 || length < ino->size || phys == 0 || phys >= vol->nx->block_count ||
+	    (length / vol->nx->block_size) > vol->nx->block_count - phys) {
+		return ENOENT;
+	}
+	*addr = phys;
+	return 0;
+}
+
+int
 apfs_read_stream(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_size,
     uint64_t off, void *buf, size_t len, size_t *out)
 {

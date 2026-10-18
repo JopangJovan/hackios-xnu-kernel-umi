@@ -1599,26 +1599,6 @@ step_trustzone(void)
 extern dev_t mdevlookup(int devid);
 extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
 
-/* An entry of a directory of a packfs image in memory, by name. */
-static const struct packfs_dnode *
-image_entry(const uint8_t *image, const struct packfs_super *super, const struct packfs_dnode *directory, const char *name)
-{
-	const struct packfs_dnode *nodes = (const struct packfs_dnode *)(image + super->ps_nodes_off);
-	size_t length = strlen(name);
-
-	if (directory == NULL || !S_ISDIR(directory->pd_mode) || directory->pd_data + directory->pd_size > super->ps_node_count) {
-		return NULL;
-	}
-	for (uint64_t i = 0; i < directory->pd_size; i++) {
-		const struct packfs_dnode *node = &nodes[directory->pd_data + i];
-
-		if (node->pd_name_len == length && (uint64_t)node->pd_name + length <= super->ps_strings_size &&
-		    memcmp(image + super->ps_strings_off + node->pd_name, name, length) == 0) {
-			return node;
-		}
-	}
-	return NULL;
-}
 
 /*
  * A file of the small image that travels with the kernel -- userland/build.sh puts what is in
@@ -1628,38 +1608,18 @@ image_entry(const uint8_t *image, const struct packfs_super *super, const struct
  */
 static bool image_asked_quietly;        /* image_file() says nothing: is the file there at all */
 
+extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 static const uint8_t *
 image_file(const char *directory, const char *name, uint64_t *size)
 {
-	for (int disk = 1; disk >= 0; disk--) {
-		const struct packfs_super *super;
-		const struct packfs_dnode *file;
-		vm_offset_t base = 0;
-		uint64_t length = 0;
-		dev_t dev = mdevlookup(disk);
+	int disk = -1;
+	const uint8_t *data = redwood_image_file(directory, name, size, &disk);  /* (redwood_image.c: APFS or packfs) */
 
-		if (dev == (dev_t)-1 || mdevgetkernelrange(dev, &base, &length) != 0 || length < PACKFS_SUPER_SIZE) {
-			continue;
+	if (data != NULL) {
+		if (!image_asked_quietly) {
+			printf("adreno: %u: %s/%s: %llu bytes in the image of /dev/md%d\n", step, directory, name, *size, disk);
 		}
-		super = (const struct packfs_super *)base;
-		if (memcmp(super->ps_magic, PACKFS_MAGIC, sizeof(super->ps_magic)) != 0 || super->ps_image_size > length ||
-		    super->ps_node_count == 0 ||
-		    super->ps_nodes_off + (uint64_t)super->ps_node_count * sizeof(struct packfs_dnode) > super->ps_image_size ||
-		    super->ps_strings_off + super->ps_strings_size > super->ps_image_size) {
-			continue;
-		}
-		file = (const struct packfs_dnode *)(base + super->ps_nodes_off);       /* the root directory */
-		file = image_entry((const uint8_t *)base, super, file, directory);
-		file = image_entry((const uint8_t *)base, super, file, name);
-		if (file != NULL && S_ISREG(file->pd_mode) && !(file->pd_flags & PACKFS_F_CHUNKED) &&
-		    file->pd_data + file->pd_size <= super->ps_image_size) {
-			if (!image_asked_quietly) {
-				printf("adreno: %u: %s/%s: %llu bytes in the image of /dev/md%d\n", step, directory, name, file->pd_size,
-				    disk);
-			}
-			*size = file->pd_size;
-			return (const uint8_t *)base + file->pd_data;
-		}
+		return data;
 	}
 	if (!image_asked_quietly) {
 		printf("adreno: %u: no %s/%s in the small image: put the phone's /vendor/firmware/%s into fw-gpu/ and run "

@@ -1,0 +1,13 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The iOS root volume on the phone's flash as the root, everything in RAM as APFS (flashboot.apfs resident,
+# root.apfs with the kernel; root_apfs=ufs_darwin ufs=2 ufs_native=1 adsp=1 sound=4 rec_sound=12 wifi=1):
+# what is mounted from where, the firmware on /fw, something to hear (a tone of three seconds, the lock
+# sound, a click, a fanfare: ./xl sound), the network over the phone's Wi-Fi (an address by DHCP, a name,
+# a page over HTTPS) -- what packfs did, done with APFS alone.
+/sbin/mount
+/redwood/bin/vol_ls fs / /redwood /private/preboot /private/preboot/Cryptexes/OS
+/redwood/bin/vol_ls ls /fw
+/redwood/bin/net_test show dhcp en0 waitaddr en0 60 store
+/redwood/bin/net_test resolve example.com fetch https://example.com/ fetch https://www.apple.com/library/test/success.html
+/redwood/bin/sound_test springboard wait 5 tone 3 wait 3 system 1100 wait 3 system 1104 wait 3 file /System/Library/Audio/UISounds/New/Fanfare.caf
+/bin/ps -A

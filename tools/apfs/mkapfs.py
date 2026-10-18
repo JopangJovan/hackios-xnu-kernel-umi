@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build an APFS container from directories: the port's own read-only volumes, as images.
 
-usage: mkapfs.py -o IMAGE [-z] [--time SECONDS] [--slack BLOCKS] NAME=DIR[,manifest=FILE] [NAME=DIR ...]
+usage: mkapfs.py -o IMAGE [-z [--plain DIR]...] [--time SECONDS] [--slack BLOCKS] NAME=DIR[,manifest=FILE] [NAME=DIR ...]
 
 Each NAME=DIR becomes one volume of the container (volume 0 first), case-sensitive and
 normalization-insensitive like the iOS volumes, unencrypted, read-only content laid out once.
@@ -10,7 +10,8 @@ unless a manifest says otherwise (the same lines as mkpackfs.py -m: mode in octa
 type bits, uid, gid, path, [link target]; a directory or symbolic link that is only in the
 manifest is made). With -z a regular file is stored compressed when that makes it smaller:
 zlib in 64 KB pieces in its resource fork (decmpfs type 4), as Apple stores most of the iOS
-root volume.  Times are all --time (default: 2023-05-12, the iOS 16.5 images'), so the same
+root volume; but not what is under a --plain DIR (relative to the volume's root), which stays as
+it is and in one piece -- the firmware a driver uses where it lies in memory.  Times are all --time (default: 2023-05-12, the iOS 16.5 images'), so the same
 input gives the same image byte for byte.
 
 The image is what Apple's newfs_apfs and a single transaction would leave (one checkpoint,
@@ -285,8 +286,9 @@ def xfields(fields):
 
 
 class Volume:
-    def __init__(self, index, name, root, compress, when, spool=None):
+    def __init__(self, index, name, root, compress, when, spool=None, plain=()):
         self.spool = spool              # where compressed resource forks wait to be written (a file)
+        self.plain = tuple(d.strip('/') + '/' for d in plain)   # never compressed below these
         self.index = index
         self.name = name
         self.root = root
@@ -307,14 +309,15 @@ class Volume:
         self.items = []                 # (node, parent oid)
         self.root.oid = ROOT_DIR_INO
 
-        def walk(node, parent):
+        def walk(node, parent, path):
             for name in sorted(node.children):
                 child = node.children[name]
                 child.oid = self.new_oid()
+                child.path = path + name
                 self.items.append((child, node.oid))
                 if stat.S_ISDIR(child.mode):
-                    walk(child, child.oid)
-        walk(self.root, ROOT_DIR_INO)
+                    walk(child, child.oid, child.path + '/')
+        walk(self.root, ROOT_DIR_INO, '')
         # private id -> where its bytes are: ('file', path, size) or ('spool', offset, size); never in memory
         self.data = {}
         self.decmpfs = {}               # file oid -> (header, rsrc stream id)
@@ -325,11 +328,12 @@ class Volume:
         if self.compress:
             # compressed by as many processes as there are processors, taken in the files' order
             pool = concurrent.futures.ProcessPoolExecutor()
-            forks = pool.map(compressed_fork, [n.source for n in files if n.size > 0], chunksize=16)
+            forks = pool.map(compressed_fork, [n.source for n in files if n.size > 0 and not self.is_plain(n)],
+                             chunksize=16)
         for node in files:
             if node.size == 0:
                 continue
-            if self.compress:
+            if self.compress and not self.is_plain(node):
                 rsrc = next(forks)
                 if rsrc is not None:
                     sid = self.new_oid()
@@ -341,6 +345,9 @@ class Volume:
             self.data[node.oid] = ('file', node.source, node.size)
         if self.compress:
             pool.shutdown()
+
+    def is_plain(self, node):
+        return any(node.path.startswith(p) for p in self.plain)
 
     def place(self, first_block):
         """Data in order of private id, each stream in one extent.  Returns the next free block."""
@@ -879,6 +886,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('-o', '--output', required=True)
     ap.add_argument('-z', '--compress', action='store_true', help='zlib in the resource fork where it saves space')
+    ap.add_argument('--plain', action='append', default=[], help='with -z: never compress what is under this directory')
     ap.add_argument('--time', type=int, default=1683900000, help='every timestamp, in seconds')
     ap.add_argument('--slack', type=int, default=256, help='free blocks to leave (at least)')
     ap.add_argument('volumes', nargs='+', help='NAME=DIR[,manifest=FILE]')
@@ -893,7 +901,7 @@ def main():
             k, _, val = opt.partition('=')
             if k == 'manifest':
                 apply_manifest(root, val)
-        vols.append(Volume(i, name, root, args.compress, args.time * 1000000000, spool))
+        vols.append(Volume(i, name, root, args.compress, args.time * 1000000000, spool, args.plain))
     c = Container(vols, args.slack, os.path.basename(args.output))
     c.layout()
     free = c.write(args.output)

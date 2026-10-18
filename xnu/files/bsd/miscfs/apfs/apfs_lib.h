@@ -536,6 +536,13 @@ void apfs_cfile_fini(struct apfs_cfile *cf);
 int apfs_read_file(struct apfs_vol *vol, const struct apfs_inode *ino,
     struct apfs_cfile *cf, uint64_t off, void *buf, size_t len, size_t *out);
 
+/*
+ * Where a file's bytes lie on the device, when they lie in one piece as they are: not
+ * compressed, and one extent from its start covering its size.  *addr is that extent's first
+ * block.  ENOENT otherwise (compressed, in pieces, empty).
+ */
+int apfs_file_in_place(struct apfs_vol *vol, const struct apfs_inode *ino, uint64_t *addr);
+
 /* ---- odds and ends worth testing on their own ---- */
 
 uint64_t apfs_fletcher64(const uint8_t *data, size_t len);

@@ -276,8 +276,9 @@ done
 [ -d root/lib/RedwoodAudio.driver ] && ln -s /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
 ../mkpackfs.py -o root.packfs root
 # ... and the same tree as an APFS container (tools/apfs/mkapfs.py), what takes the place of packfs
-# (stage0 mounts whichever of the two travels with the kernel: XL_RAMDISK=userland/root.apfs)
-python3 ../tools/apfs/mkapfs.py -z -o root.apfs redwood=root | tail -1
+# (stage0 mounts whichever of the two travels with the kernel: XL_RAMDISK=userland/root.apfs); fw/
+# as it is, which the kernel's drivers use where it lies in memory (bsd/dev/redwood_image.c)
+python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
 
 # --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.packfs ------------------------------
 # With the iOS volume on the phone's flash as the root, all that has to come from RAM is what is not
@@ -321,7 +322,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	cp -al flashboot flashboot.boot
 	rm -rf flashboot.boot/Cryptexes/OS
 	mkdir -p flashboot.boot/Cryptexes/OS
-	python3 ../tools/apfs/mkapfs.py -z -o flashboot.boot.apfs Boot=flashboot.boot | tail -1
+	python3 ../tools/apfs/mkapfs.py -z --plain fw -o flashboot.boot.apfs Boot=flashboot.boot | tail -1
 	if [ -n "$CRYPTEX_IMAGE" ]; then
 		cat flashboot.boot.apfs "$CRYPTEX_IMAGE" > flashboot.apfs
 	else
