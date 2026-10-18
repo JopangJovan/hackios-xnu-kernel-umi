@@ -287,19 +287,20 @@ python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -
 
 # --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.apfs --------------------------------
 # With the iOS volume on the phone's flash as the root, all that has to come from RAM is what is not
-# on it -- the OS cryptex with the dyld shared cache -- and what starts the boot: two APFS containers
-# back to back in the one resident image. The first, the boot volume, is the root the kernel starts
-# from (rd=md0): stage0 as /sbin/launchd mounts the small image on /redwood and runs its init, which
-# with boot-arg root_apfs=DEV mounts the volume on /flash, makes it the root and moves the boot volume
-# to the volume's /private/preboot, then mounts the second container -- the OS cryptex -- on the boot
-# volume's empty Cryptexes/OS: /private/preboot/Cryptexes/OS, where the volume's own
-# /System/Cryptexes/OS points and where iOS grafts the cryptex (src/init.c, flash_root; the kernel's
-# apfs takes "/dev/md0,c=1", and bsd/vm/vm_unix.c takes a shared cache from there). CRYPTEX_IMAGE=FILE:
+# on it -- the two cryptexes, OS with the dyld shared cache and App -- and what starts the boot: three
+# APFS containers back to back in the one resident image. The first, the boot volume, is the root the
+# kernel starts from (rd=md0): stage0 as /sbin/launchd mounts the small image on /redwood and runs its
+# init, which with boot-arg root_apfs=DEV mounts the volume on /flash, makes it the root and moves the
+# boot volume to the volume's /private/preboot, then mounts the second container -- the OS cryptex -- on
+# the boot volume's empty Cryptexes/OS and the third -- Apple's App cryptex as it is -- on Cryptexes/App:
+# /private/preboot/Cryptexes/OS and App, where the volume's own /System/Cryptexes/OS and App point and
+# where iOS grafts the cryptexes (src/init.c, flash_root; the kernel's apfs takes "/dev/md0,c=1" and
+# "c=2", and bsd/vm/vm_unix.c takes a shared cache from Cryptexes/OS). CRYPTEX_IMAGE=FILE:
 # Apple's own image of the cryptex as it is instead of this one remade (2.6 GB against 1 GB: too much
 # for the phone's memory beside iOS, not for QEMU's). Upload it with `xl ramdisk userland/flashboot.apfs`.
 if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	rm -rf flashboot flashboot.os
-	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS
+	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
 	cp obj/stage0 flashboot/sbin/launchd
 	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
 	# the audio DSP's firmware and the speaker amplifiers' configuration, as in the system image's /fw: the kernel
@@ -321,12 +322,15 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	done
 	python3 ../tools/apfs/mkapfs.py -z --plain fw -o flashboot.boot.apfs Boot=flashboot | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh flashboot.boot.apfs Boot=flashboot
+	# the third container: Apple's App cryptex as it is (10 MB; fetch.sh), for the boot volume's Cryptexes/App
+	APP=""
+	[ -f $IOS/cryptex-app.dmg ] && APP=$IOS/cryptex-app.dmg
 	if [ -n "$CRYPTEX_IMAGE" ]; then
-		cat flashboot.boot.apfs "$CRYPTEX_IMAGE" > flashboot.apfs
+		cat flashboot.boot.apfs "$CRYPTEX_IMAGE" $APP > flashboot.apfs
 	else
 		python3 ../tools/apfs/mkapfs.py -z -o flashboot.os.apfs OS=flashboot.os | tail -1
 		[ -z "$CHECK" ] || ../tools/apfs/check-image.sh flashboot.os.apfs OS=flashboot.os
-		cat flashboot.boot.apfs flashboot.os.apfs > flashboot.apfs
+		cat flashboot.boot.apfs flashboot.os.apfs $APP > flashboot.apfs
 		rm -f flashboot.os.apfs
 	fi
 	rm -rf flashboot flashboot.os flashboot.boot.apfs
@@ -336,7 +340,7 @@ fi
 # --- the system image -----------------------------------------------------------------------------
 if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	{ [ ! -f system.apfs ] || [ obj/stage0 -nt system.apfs ] || [ $IOS/system.manifest -nt system.apfs ] ||
-	  [ $IOS/cryptex -nt system.apfs ] || [ -n "$SYSTEM" ]; }; then
+	  [ $IOS/cryptex -nt system.apfs ] || [ $IOS/cryptex-app -nt system.apfs ] || [ -n "$SYSTEM" ]; }; then
 	# what ios165/select-system.py has chosen since ios165/rootfs was extracted is not in it, and would not be
 	# in the image either (so it was once with the audio plug-ins and the system's sounds: iOS found no
 	# speaker and played nothing, though our device was there and the kernel's side worked)
@@ -380,6 +384,9 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# shared cache (dyld looks there first) and a few libraries and resources outside the cache.
 	mkdir -p sysroot/System/Cryptexes
 	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex sysroot/System/Cryptexes/OS; fi
+	# the App cryptex, the same way: Safari's daemons (eight launchd jobs run them from there), its settings and
+	# the bundles around it, which the root's links reach (System/Library/PreferenceBundles/MobileSafariSettings.bundle...)
+	if [ -d $IOS/cryptex-app ]; then cp -al $IOS/cryptex-app sysroot/System/Cryptexes/App; fi
 	D=sysroot/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do

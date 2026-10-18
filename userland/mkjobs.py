@@ -49,6 +49,20 @@ if rest:
 src_root, dest, labels = args[0], args[1], args[2:]
 oslog = os.environ.get('OSLOG', '').split()
 src = f'{src_root}/System/Library/LaunchDaemons'
+# A program in a cryptex -- on a device a volume of its own, grafted at /System/Cryptexes/NAME (eight of
+# Safari's daemons are in the App cryptex) -- is looked for where fetch.sh unpacked that cryptex, beside
+# the root filesystem; the images have it at the same place (build.sh).
+CRYPTEXES = {'/System/Cryptexes/OS/': 'cryptex', '/System/Cryptexes/App/': 'cryptex-app'}
+
+
+def present(program):
+    for prefix, unpacked in CRYPTEXES.items():
+        if program.startswith(prefix):
+            return os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(src_root)), unpacked,
+                                               program[len(prefix):]))
+    return os.path.isfile(f'{src_root}{program}')
+
+
 angels = f'{src_root}/System/Library/LaunchAngels'
 os.makedirs(dest, exist_ok=True)
 for label in labels:
@@ -63,7 +77,7 @@ for label in labels:
     with open(f'{dest}/{label}.plist', 'wb') as f:
         plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
     program = job.get('Program') or job['ProgramArguments'][0]
-    missing = '' if os.path.isfile(f'{src_root}{program}') else '   (NOT in the system image!)'
+    missing = '' if present(program) else '   (NOT in the system image!)'
     print(f'  job {label}: {program}{missing}')
 
 if rest:
@@ -78,7 +92,7 @@ if rest:
         with open(f'{directory}/{name}', 'rb') as f:
             job = plistlib.load(f)
         program = job.get('Program') or (job.get('ProgramArguments') or [''])[0]
-        if not job.get('MachServices') or not os.path.isfile(f'{src_root}{program}'):
+        if not job.get('MachServices') or not present(program):
             continue
         for key in ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
                     'QueueDirectories', 'StartOnMount', 'LaunchEvents'):

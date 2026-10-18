@@ -129,9 +129,9 @@ synthetic_dir(const char *path)
  *     applications passed over), made before /private/var is covered by a memory
  *     filesystem.
  * Then the volume becomes the root (sysctl kern.redwood_switch_root) and the boot volume
- * goes to its /private/preboot, the cryptex onto that volume's Cryptexes/OS: the iOS volume's
- * /System/Cryptexes/OS points to /private/preboot/Cryptexes/OS, and the kernel takes a shared
- * cache from there.  This
+ * goes to its /private/preboot, the cryptexes onto that volume's Cryptexes/OS and App: the iOS
+ * volume's /System/Cryptexes/OS and App point to /private/preboot/Cryptexes/OS and App, and the
+ * kernel takes a shared cache from the first.  This
  * image goes along with it, to /private/preboot/redwood, and is bound back on /redwood, a
  * synthetic directory of the volume.  The boot-args stay those of a RAM disk (rd=md0),
  * which is what launchd reads to leave out the boot tasks of a real device.
@@ -222,6 +222,16 @@ flash_root(const char *dev)
 	} else if (errno != EINVAL) {
 		printf("  the OS cryptex: %s\n", strerror(errno));
 		check(0, "the OS cryptex (md0, its second container) on /private/preboot/Cryptexes/OS");
+	}
+	/*
+	 * The third container, when there is one: Apple's App cryptex as it is, on Cryptexes/App, where the
+	 * iOS volume's /System/Cryptexes/App points -- Safari's daemons, its settings, the bundles around it.
+	 */
+	if (mount("apfs", "/private/preboot/Cryptexes/App", MNT_RDONLY, (void *)"/dev/md0,c=2") == 0) {
+		check(1, "the App cryptex (md0, its third container) on /private/preboot/Cryptexes/App");
+	} else if (errno != EINVAL) {
+		printf("  the App cryptex: %s\n", strerror(errno));
+		check(0, "the App cryptex (md0, its third container) on /private/preboot/Cryptexes/App");
 	}
 	check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
 	flash_root_mode = 1;
