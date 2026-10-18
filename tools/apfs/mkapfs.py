@@ -158,7 +158,10 @@ def apply_manifest(root, manifest):
                     leaf = node.children[parts[-1]] = Node(parts[-1], mode, target=fields[4])
                 else:
                     continue
-            leaf.mode, leaf.uid, leaf.gid = mode, uid, gid
+            # (owner, group and permissions; not the kind: a link this tree has where the manifest
+            # says directory -- the system image's LaunchDaemons -- stays a link, as with mkpackfs.py)
+            if stat.S_IFMT(leaf.mode) == stat.S_IFMT(mode):
+                leaf.mode, leaf.uid, leaf.gid = mode, uid, gid
 
 
 # ---------------------------------------------------------------------- b-tree nodes
