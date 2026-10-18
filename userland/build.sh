@@ -152,6 +152,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood.dylib src/inject.c
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libredwood-sb.dylib src/inject_sb.c
+		# ... and inside an application, to say what killed it (src/inject_app.c)
+		$DYN -dynamiclib -install_name /redwood/lib/libredwood-app.dylib -lobjc \
+			-o obj/libredwood-app.dylib src/inject_app.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libredwood-media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -196,6 +199,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
+	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
 	if [ -f obj/RedwoodAudio ]; then
 		mkdir -p root/lib/RedwoodAudio.driver
 		cp obj/RedwoodAudio root/lib/RedwoodAudio.driver/
@@ -224,6 +228,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	done >> root/etc/var.skel
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
+	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
+	# lines about its own business in the first minutes and pushes everything else out of the
+	# kernel's log; the daemons keep their own standard error on the console all the same.
+	rm -f root/etc/quiet
+	[ -n "$QUIET" ] && : > root/etc/quiet
 	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory)
 	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $IOS/rootfs root/LaunchDaemons $IOS_JOBS
@@ -382,6 +391,19 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	if [ -f ../fw-audio/aw882xx_acf.bin ]; then
 		mkdir -p sysroot/fw
 		cp ../fw-audio/aw882xx_acf.bin sysroot/fw/
+	fi
+	# the package manager's prefix, when tools/mk-jb.sh has fetched one: the Procursus bootstrap with
+	# Sileo in it, as /jb. It cannot live at /var/jb in the image -- /private/var is a memory
+	# filesystem made afresh at every boot -- so init copies it there (src/init.c, copy_tree).
+	if [ -d ../jb/root/var/jb ]; then
+		rm -rf sysroot/jb
+		cp -a ../jb/root/var/jb sysroot/jb
+		# the applications of the prefix are system applications here: LaunchServices builds its
+		# database afresh at every boot by walking /Applications, which is how their icons appear
+		for app in sysroot/jb/Applications/*.app; do
+			[ -d "$app" ] && cp -a "$app" sysroot/Applications/
+		done
+		echo "  the package manager's prefix: $(du -sh sysroot/jb | cut -f1) as /jb (init puts it at /var/jb)"
 	fi
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
