@@ -76,6 +76,7 @@
 #include <sys/vnode.h>
 #include <sys/vnode_if.h>
 #include <sys/vnode_internal.h>
+#include <sys/redwood_input.h>
 #include <pexpert/pexpert.h>
 #include <libkern/OSAtomic.h>
 #include <sys/redwood_apfs_check.h>
@@ -900,6 +901,7 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 	}
 
 walk:
+	redwood_ufs_report("before the walk");
 	start = mach_absolute_time();
 	cs.t0 = start;
 	watch_start(&cs);
@@ -918,8 +920,16 @@ walk:
 	printf("apfs-check: content bytes %llu\n", cs.bytes);
 	printf("apfs-check: line-hash sum %016llx\n", (unsigned long long)cs.sum);
 	printf("apfs-check: errors %u\n", cs.errors);
+	{
+		uint64_t hash_ns = 0;
+
+		absolutetime_to_nanoseconds(cs.hash_ticks, &hash_ns);
+		printf("apfs-check: of it the checker's own hashing %llu ms%s\n", hash_ns / 1000000,
+		    cs.no_hash ? " (apfs_hash=0)" : "");
+	}
 	apfs_stats_print();
 	redwood_sparse_report();
+	redwood_ufs_report("after the walk");
 	printf("apfs-check: compare with tools/apfs/verify.py sum\n");
 
 	kfree_data(cs.path, PATH_CAP);

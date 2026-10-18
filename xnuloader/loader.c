@@ -1716,7 +1716,20 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			block_poll();
 		}
 		usb_poll_command();
-		for (volatile int i = 0; i < 20000; i++) {
+		if (block_enabled) {
+			/*
+			 * The pause is spent looking at the kernel's mailbox: with one look a pass, a
+			 * request waited 60-75 us on average before this core noticed it, more than a
+			 * 4 KB ReadBlocks takes (27 us). Same length of pause as below.
+			 */
+			for (int k = 0; k < 64; k++) {
+				block_poll();
+				for (volatile int i = 0; i < 300; i++) {
+				}
+			}
+		} else {
+			for (volatile int i = 0; i < 20000; i++) {
+			}
 		}
 	}
 	running_live = NULL;

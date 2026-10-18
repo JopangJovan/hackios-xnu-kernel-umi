@@ -43,6 +43,7 @@ void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virti
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
 void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
+void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
 int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */

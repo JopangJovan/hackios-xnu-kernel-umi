@@ -17,8 +17,9 @@
  *
  * One request at a time (the page has one), so requests are serialized by a mutex and split into
  * pieces of the buffer's size. The kernel writes only the request's cache lines and core 0 only
- * the answer's (see the loader), both through mappings that do not cache here, so neither side
- * ever overwrites the other's.
+ * the answer's (see the loader), both through a mapping that does not cache here, so neither side
+ * ever overwrites the other's. The data buffer, which only core 0's reads fill, is mapped cacheable
+ * and the part of it an answer covers is invalidated here before it is copied out.
  *
  * ufs_check=1 reads, once at start, the partitions there are images of in the ROM's
  * firmware-update/ (bluetooth, xbl, tz, ...) through the same path and prints an FNV-1a hash of
@@ -44,6 +45,8 @@
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void IOSleep(unsigned int milliseconds);
+extern void loader_return(void);        /* osfmk/arm64/loader_return.c */
+extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm64/caches_asm.s */
 
 /* the page the loader publishes: the same layout as struct loader_block in xnuloader/loader.c */
 #define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
@@ -85,6 +88,8 @@ static uint32_t ufs_bsize[BLOCK_MAX_PARTS];   /* the block size each device is c
 static int ufs_bmajor = -1, ufs_cmajor = -1;
 static bool ufs_ready, ufs_dead;
 static uint64_t ufs_requests, ufs_errors, ufs_bytes, ufs_wait_us;
+static uint64_t ufs_copy_us;                    /* copying out of the loader's buffer */
+static uint64_t ufs_small, ufs_medium, ufs_large; /* requests of <= 4 KB, <= 64 KB, more */
 
 static LCK_GRP_DECLARE(ufs_lck_grp, "redwood-ufs");
 static LCK_MTX_DECLARE(ufs_lock, &ufs_lck_grp);
@@ -98,6 +103,8 @@ SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &uf
     "bytes read from the phone's storage");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_wait_us,
     "microseconds spent waiting for core 0's answers");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_copy_us,
+    "microseconds spent copying out of the loader's buffer");
 
 /*
  * Native blocks [lba, lba + count) of partition part, into dst: one request of at most the
@@ -128,7 +135,8 @@ ufs_request(uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst)
 		absolutetime_to_nanoseconds(mach_absolute_time() - started, &us);
 		us /= 1000;
 		if (us < 2000) {
-			delay(20);
+			/* the answer to a small request comes in tens of microseconds: look often */
+			__builtin_arm_yield();
 			continue;
 		}
 		IOSleep(1);
@@ -155,10 +163,50 @@ ufs_request(uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst)
 		ufs_errors++;
 		return EIO;
 	}
+	started = mach_absolute_time();
+	/*
+	 * The buffer is mapped cacheable here (copying out of an uncached mapping went at 870 MB/s,
+	 * as slow as the storage itself). This side never writes it, and core 0 cleans and
+	 * invalidates it after every read; whatever this core may still hold of an earlier read --
+	 * a line brought in by a prefetch, say -- goes before the copy.
+	 */
+	FlushPoC_DcacheRegion((vm_offset_t)ufs_buffer, (size_t)bytes);
 	memcpy(dst, ufs_buffer, (size_t)bytes);
+	{
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
+		ufs_copy_us += ns / 1000;
+	}
 	ufs_requests++;
 	ufs_bytes += bytes;
+	if (bytes <= 4096) {
+		ufs_small++;
+	} else if (bytes <= 65536) {
+		ufs_medium++;
+	} else {
+		ufs_large++;
+	}
 	return 0;
+}
+
+/*
+ * Where the time of reading the storage went, so far: waiting for core 0's answer (of which
+ * the loader's own clock says how long ReadBlocks itself took) and copying out of its buffer.
+ */
+void
+redwood_ufs_report(const char *when)
+{
+	uint64_t loader_ns = 0;
+
+	if (!ufs_ready) {
+		return;
+	}
+	absolutetime_to_nanoseconds(ufs_page->answer.ticks, &loader_ns);
+	printf("ufs: %s: %llu requests (%llu of 4 KB or less, %llu to 64 KB, %llu more), %llu errors, "
+	    "%llu bytes; waiting %llu ms, of it in ReadBlocks %llu ms; copying %llu ms\n", when,
+	    ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_errors, ufs_bytes, ufs_wait_us / 1000,
+	    loader_ns / 1000000, ufs_copy_us / 1000);
 }
 
 /*
@@ -418,6 +466,54 @@ ufs_check(__unused void *arg, __unused wait_result_t wr)
 	    ufs_requests, ufs_errors, ufs_bytes, ufs_wait_us / 1000);
 }
 
+/*
+ * ufs_bench=1: what one request through the loader costs, by size. The partition "darwin" is
+ * read from the front, a different stretch for every size so that nothing the storage itself may
+ * have kept is read twice; for each size, MB/s and microseconds a request, split into the time
+ * core 0 spent in ReadBlocks (its clock in the page, read before and after), the rest of waiting
+ * for its answer (noticing the request, answering), and copying out of its buffer.
+ */
+static void
+ufs_bench(__unused void *arg, __unused wait_result_t wr)
+{
+	static const uint32_t sizes[] = { 4096, 16384, 65536, 262144, 1048576, 4194304 };
+	uint8_t *dst = kalloc_data(ufs_buffer_size, Z_WAITOK);
+	uint32_t part = BLOCK_MAX_PARTS;
+	uint64_t base = 0;
+
+	for (uint32_t i = 0; i < ufs_parts; i++) {
+		if (strcmp((const char *)ufs_page->part[i].name, "darwin") == 0) {
+			part = i;
+		}
+	}
+	if (dst == NULL || part == BLOCK_MAX_PARTS) {
+		printf("ufs: bench: no partition darwin, or no memory\n");
+		return;
+	}
+	for (unsigned z = 0; z < sizeof(sizes) / sizeof(sizes[0]); z++) {
+		uint64_t total = sizes[z] <= 16384 ? (16ULL << 20) : (128ULL << 20), done = 0, n = 0;
+		uint64_t wait0 = ufs_wait_us, copy0 = ufs_copy_us, loader0 = ufs_page->answer.ticks;
+		uint64_t started = mach_absolute_time(), ns, loader_ns;
+		int error = 0;
+
+		while (done < total && error == 0) {
+			error = ufs_read(part, base + done, dst, sizes[z]);
+			done += sizes[z];
+			n++;
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
+		absolutetime_to_nanoseconds(ufs_page->answer.ticks - loader0, &loader_ns);
+		printf("ufs: bench: %7u bytes a request: %4llu MB/s, %llu requests, %llu us each: "
+		    "ReadBlocks %llu, the rest of waiting %llu, copying %llu%s\n", sizes[z],
+		    ns ? (done * 1000ULL) / ns : 0, n, ns / 1000 / n, loader_ns / 1000 / n,
+		    (ufs_wait_us - wait0 - loader_ns / 1000) / n, (ufs_copy_us - copy0) / n,
+		    error ? " (an error)" : "");
+		base += total;
+	}
+	kfree_data(dst, ufs_buffer_size);
+	redwood_ufs_report("after the bench");
+}
+
 /* ---- bringing it up ---- */
 
 void
@@ -443,7 +539,7 @@ redwood_ufs_init(void)
 	ufs_buffer_size = ufs_page->buffer_size;
 	buffer_pa = ufs_page->buffer_pa;
 	ufs_buffer = (const uint8_t *)(ml_io_map_unmappable((vm_offset_t)(buffer_pa & ~(UFS_PAGE - 1)),
-	    ((buffer_pa & (UFS_PAGE - 1)) + ufs_buffer_size + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_WCOMB) +
+	    ((buffer_pa & (UFS_PAGE - 1)) + ufs_buffer_size + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_DEFAULT) +
 	    (buffer_pa & (UFS_PAGE - 1)));
 	ufs_seq = ufs_page->answer.answered;      /* a loader that served an earlier kernel counts on from there */
 
@@ -470,6 +566,12 @@ redwood_ufs_init(void)
 	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
 
+	if (PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
+		/* right here, in bsd_init's thread, and then back to the loader: nothing else is wanted */
+		ufs_bench(NULL, THREAD_AWAKENED);
+		loader_return();
+	}
+	check = 0;
 	if (PE_parse_boot_argn("ufs_check", &check, sizeof(check)) && check != 0) {
 		thread_t thread;
 
