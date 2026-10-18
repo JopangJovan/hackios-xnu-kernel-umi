@@ -81,9 +81,13 @@ IOS_JOBS=${JOBS-"
 # What Sileo runs from /bin (see the package manager's prefix below): the system image's /bin, or the
 # boot volume's bin, bound over the iOS volume's /bin when that is the root (src/init.c, flash_root).
 SILEO_BIN="chmod cp mkdir mv rm"
+# (libredwood-tweaks is the tweak loader of the package manager's prefix, src/inject_tweaks.c: in
+# SpringBoard the library above opens it, here it is named for the programs that have no library of
+# ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
 INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libredwood-sb.dylib SpringBoard
-/redwood/lib/libredwood-media.dylib mediaserverd"}
+/redwood/lib/libredwood-media.dylib mediaserverd
+/redwood/lib/libredwood-tweaks.dylib Preferences"}
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -155,6 +159,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood.dylib src/inject.c
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libredwood-sb.dylib src/inject_sb.c
+		# ... the tweak loader of the package manager's prefix (src/inject_tweaks.c): it goes into a
+		# program either as the one library the kernel inserts or opened by a library of ours
+		$DYN -dynamiclib -install_name /redwood/lib/libredwood-tweaks.dylib -framework CoreFoundation -lobjc \
+			-o obj/libredwood-tweaks.dylib src/inject_tweaks.c
 		# ... and inside an application, to say what killed it (src/inject_app.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-app.dylib -lobjc \
 			-o obj/libredwood-app.dylib src/inject_app.c
@@ -203,6 +211,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
+	[ -f obj/libredwood-tweaks.dylib ] && cp obj/libredwood-tweaks.dylib root/lib/
 	if [ -f obj/RedwoodAudio ]; then
 		mkdir -p root/lib/RedwoodAudio.driver
 		cp obj/RedwoodAudio root/lib/RedwoodAudio.driver/
@@ -215,7 +224,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	fi
 	# a program is not started with a library that is not there: it would not start at all
 	echo "$INJECT" | while read -r library names; do
-		[ -z "$library" ] || [ ! -f "root/lib/${library#/redwood/lib/}" ] || echo "$library $names"
+		# a /redwood/lib library only if it was actually built; any other path (e.g. a tweak loader
+		# in /var/jb) as it is, since it lives on the prefix and is there at run time
+		case "$library" in
+		"") ;;
+		/redwood/lib/*) [ -f "root/lib/${library#/redwood/lib/}" ] && echo "$library $names" ;;
+		*) echo "$library $names" ;;
+		esac
 	done > root/etc/inject.conf
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo

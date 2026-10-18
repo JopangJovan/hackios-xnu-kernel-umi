@@ -67,6 +67,37 @@ mkdir -p "$TMP/control" && tar -C "$TMP/control" -xf "$TMP"/control.tar.* 2>/dev
 	echo
 } >> "$OUT/root/var/jb/Library/dpkg/status"
 
+# ElleKit: the tweak-injection framework (Cydia Substrate's modern replacement). It is what loads a
+# tweak's .dylib into a process and does the function and method hooking; on a rootless jailbreak the
+# jailbreak itself installs it, and it is not in the apt repository, so it is fetched here from its own
+# distribution. Its libraries are fat (arm64 and arm64e): the arm64 slice runs on this phone's
+# Qualcomm chip. mobilesubstrate and org.coolstar.libhooker are virtual packages it Provides, which is
+# what preferenceloader and nearly every tweak depend on. The loader /var/jb/usr/lib/TweakLoader.dylib
+# (ellekit/libinjector) reads /var/jb/usr/lib/TweakInject/*.plist, matches the process by the Filter
+# and dlopens the tweak; src/init.c (etc/inject.conf) inserts it into SpringBoard, Preferences and the
+# apps. Tweaks link /var/jb/usr/lib/lib{substrate,hooker}.dylib and CydiaSubstrate.framework, all
+# ElleKit.
+EK=ellekit_${ELLEKIT:-0.4.5}_iphoneos-arm64.deb
+get "https://ellekit.space/pool/$EK" "$EK"
+EKTMP=$(mktemp -d); trap 'rm -rf "$TMP" "$EKTMP"' EXIT
+(cd "$EKTMP" && ar x "$OUT/debs/$EK")
+mkdir -p "$EKTMP/data" && { tar -C "$EKTMP/data" -xf "$EKTMP"/data.tar.* 2>/dev/null ||
+	zstd -dc "$EKTMP"/data.tar.zst | tar -C "$EKTMP/data" -xf -; }
+cp -a "$EKTMP/data/var/jb/." "$OUT/root/var/jb/"
+mkdir -p "$OUT/root/var/jb/usr/lib/TweakInject"
+# the old tweak directory, a symlink to the new one, as ElleKit's own preinst makes it
+mkdir -p "$OUT/root/var/jb/Library/MobileSubstrate"
+rm -rf "$OUT/root/var/jb/Library/MobileSubstrate/DynamicLibraries"
+ln -s /var/jb/usr/lib/TweakInject "$OUT/root/var/jb/Library/MobileSubstrate/DynamicLibraries"
+# dpkg is to know ElleKit is installed, with what it Provides, so apt satisfies tweaks' "mobilesubstrate"
+{
+	mkdir -p "$EKTMP/control" && { tar -C "$EKTMP/control" -xf "$EKTMP"/control.tar.* 2>/dev/null ||
+		zstd -dc "$EKTMP"/control.tar.zst | tar -C "$EKTMP/control" -xf -; }
+	sed '/^$/d' "$EKTMP/control/control"
+	echo "Status: install ok installed"
+	echo
+} >> "$OUT/root/var/jb/Library/dpkg/status"
+
 # the repositories Sileo starts with: Procursus itself, where everything here came from
 mkdir -p "$OUT/root/var/jb/etc/apt/sources.list.d"
 cat > "$OUT/root/var/jb/etc/apt/sources.list.d/procursus.sources" <<EOF

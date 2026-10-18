@@ -372,7 +372,7 @@ index 95192dd62449..b00da803b5b4 100644
  
  	/*
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 1d71c66629fb..fd94fd8a588a 100644
+index 1d71c66629fb..3e1737c21b86 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1157,6 +1157,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -565,7 +565,7 @@ index 1d71c66629fb..fd94fd8a588a 100644
  	ret = persona_proc_adopt(p, persona, cred);
  
  	kauth_cred_unref(&cred);
-@@ -5586,10 +5685,61 @@ bad:
+@@ -5586,10 +5685,75 @@ bad:
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
@@ -573,9 +573,11 @@ index 1d71c66629fb..fd94fd8a588a 100644
 + * Bring-up aid: the sysctl kern.exec_inject holds "LIBRARY NAME NAME ..."; every program
 + * whose file name is one of the NAMEs is started with DYLD_INSERT_LIBRARIES=LIBRARY in its
 + * environment, so that dyld loads our library into it. Several such groups may follow each
-+ * other, separated by ";". launchd refuses to pass DYLD_ variables from a job description,
-+ * which is why the kernel adds this one. Set once by our init (from etc/inject.conf) before
-+ * it hands over to launchd.
++ * other, separated by ";". A program named in more than one group gets every one of those
++ * libraries, joined with ":" in the one DYLD_INSERT_LIBRARIES, so SpringBoard can carry both
++ * our window-server library and the tweak loader. launchd refuses to pass DYLD_ variables
++ * from a job description, which is why the kernel adds this one. Set once by our init (from
++ * etc/inject.conf) before it hands over to launchd.
 + */
 +static char exec_inject_conf[512];
 +SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
@@ -585,16 +587,19 @@ index 1d71c66629fb..fd94fd8a588a 100644
 +exec_inject_env(struct image_params *imgp, char *env, size_t size)
 +{
 +	const char *name, *p = exec_inject_conf;
-+	size_t namelen;
++	size_t namelen, used;
++	bool any = false;
 +
 +	if (*p == 0 || imgp->ip_ndp == NULL) {
 +		return false;
 +	}
 +	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
 +	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	used = strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
 +	while (*p != 0) {
 +		const char *library;
 +		size_t liblen;
++		bool matched = false;
 +
 +		while (*p == ' ' || *p == ';') {
 +			p++;
@@ -610,24 +615,33 @@ index 1d71c66629fb..fd94fd8a588a 100644
 +			while (*p != 0 && *p != ' ' && *p != ';') {
 +				p++;
 +			}
-+			if ((size_t)(p - word) == namelen && namelen != 0 && liblen != 0 && strncmp(word, name, namelen) == 0) {
-+				snprintf(env, size, "DYLD_INSERT_LIBRARIES=%.*s", (int)liblen, library);
-+				return true;
++			if (!matched && (size_t)(p - word) == namelen && namelen != 0 && liblen != 0 &&
++			    strncmp(word, name, namelen) == 0) {
++				matched = true;         /* this group names this program; its library is added once */
 +			}
 +		}
++		if (matched && liblen != 0 && used + 1 + liblen < size) {
++			if (any) {
++				env[used++] = ':';      /* dyld takes several libraries separated by ":" */
++			}
++			memcpy(env + used, library, liblen);
++			used += liblen;
++			env[used] = 0;
++			any = true;
++		}
 +	}
-+	return false;
++	return any;
 +}
 +
  __attribute__((noinline))
  static int
  exec_extract_strings(struct image_params *imgp)
  {
-+	char            inject_env[300];
++	char            inject_env[512];
  	int error = 0;
  	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
  	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-@@ -5759,6 +5909,33 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5759,6 +5923,33 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
@@ -661,7 +675,7 @@ index 1d71c66629fb..fd94fd8a588a 100644
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
-@@ -6636,7 +6813,23 @@ handle_mac_transition:
+@@ -6636,7 +6827,23 @@ handle_mac_transition:
  	}
  
  	/* Update the process' identity version and set the security token */
@@ -686,7 +700,7 @@ index 1d71c66629fb..fd94fd8a588a 100644
  	task_set_uniqueid(task);
  	set_security_token_task_internal(p, task);
  
-@@ -7538,6 +7731,11 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -7538,6 +7745,11 @@ process_signature(proc_t p, struct image_params *imgp)
  	}
  
  done:

@@ -33,12 +33,14 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
+#include <sys/stat.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -842,6 +844,27 @@ control_center_fades(const char *arguments)
 	method_setImplementation(add, (IMP)add_animation_cc);
 }
 
+/*
+ * Open the tweak loader of the package manager's prefix, when there is one. Nothing here depends on
+ * it: without a prefix (or without ElleKit in it) the file is not there and this does nothing.
+ */
+#define REDWOOD_TWEAK_LOADER    "/redwood/lib/libredwood-tweaks.dylib"
+
+static void
+load_tweaks(void)
+{
+	struct stat st;
+
+	if (stat("/var/jb/usr/lib/TweakInject", &st) != 0) {
+		return;                 /* no package manager's prefix here, so no tweaks */
+	}
+	if (dlopen(REDWOOD_TWEAK_LOADER, RTLD_NOW | RTLD_GLOBAL) == NULL) {
+		say("redwood: the tweak loader %s: %s\n", REDWOOD_TWEAK_LOADER, dlerror());
+	} else {
+		say("redwood: tweaks: %s opened\n", REDWOOD_TWEAK_LOADER);
+	}
+}
+
 __attribute__((constructor))
 static void
 redwood_springboard_init(void)
@@ -868,6 +891,14 @@ redwood_springboard_init(void)
 		});
 		return;
 	}
+	/*
+	 * The tweaks of the package manager's prefix, if one is installed: ElleKit's loader
+	 * (/var/jb/usr/lib/TweakLoader.dylib) reads /var/jb/usr/lib/TweakInject and opens the tweaks
+	 * whose Filter names this process. The kernel could insert it as well (etc/inject.conf), but
+	 * only one inserted library per program is reliable here, and SpringBoard's is this one; so
+	 * this one opens it, the way a jailbreak's own hook does.
+	 */
+	load_tweaks();
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);
 	original_set_setup_required_reason = (void (*)(id, SEL, long))replace_method("SBSetupManager",
