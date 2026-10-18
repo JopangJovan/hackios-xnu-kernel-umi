@@ -1168,6 +1168,8 @@ redwood_ufs_quiesce(void)
 	}
 	hc_closed = true;
 	__asm__ volatile ("dsb sy" ::: "memory");
+	hc_say_late("ufs: native: at the end: entered with doorbell %08x, %u reads of this kernel's in flight, its list %s\n",
+	    hc_read(UFSHC_UTRLDBR), hc_in_flight, hc_in ? "in" : "out");
 	if (!hc_in && hc_read(UFSHC_UTRLBA) == hc_loader.uefi_lo && hc_read(UFSHC_UTRLBAU) == hc_loader.uefi_hi &&
 	    (hc_read(UFSHC_UTRLRSR) & 1)) {
 		hc_say_late("ufs: native: at the end: UEFI's list is in (doorbell %08x)\n", hc_read(UFSHC_UTRLDBR));

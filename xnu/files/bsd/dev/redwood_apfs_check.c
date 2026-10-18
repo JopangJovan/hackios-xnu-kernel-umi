@@ -60,11 +60,13 @@
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 #include <kern/kalloc.h>
+#include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <sys/dirent.h>
 #include <sys/errno.h>
 #include <sys/kauth.h>
+#include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/mount_internal.h>
 #include <sys/namei.h>
@@ -186,6 +188,8 @@ struct census {
 	 * how long the walk itself takes, the directories and the inodes.
 	 */
 	bool      no_contents;
+	/* apfs_walkers=N: one of N walkers; a subdirectory is left on the shared stack (par_push) */
+	bool      par;
 };
 
 /* The boot-args both kinds of walk take the same way. */
@@ -371,6 +375,12 @@ out:
 }
 
 static void census_dir(struct census *cs);
+static void par_push(const char *path, size_t len, int depth);
+
+/* the walkers of a parallel walk, for the watch's count of progress */
+#define PAR_MAX 16
+static struct census *volatile par_cs[PAR_MAX];
+static volatile uint32_t par_n;
 
 /*
  * A walk that stops making progress, rather than one that fails.  On the phone a walk of
@@ -390,13 +400,19 @@ static void
 watch_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	struct census *cs = watch_cs;
-	uint64_t deadline;
+	uint64_t deadline, progress;
 
 	if (cs == NULL) {
 		return;                 /* the walk is over */
 	}
 	/* entries and bytes both count as progress: one big file can take a while */
-	if (cs->entries + cs->bytes == watch_last) {
+	progress = cs->entries + cs->bytes;
+	for (uint32_t i = 0; i < par_n; i++) {
+		if (par_cs[i] != NULL) {
+			progress += par_cs[i]->entries + par_cs[i]->bytes;
+		}
+	}
+	if (progress == watch_last) {
 		printf("apfs-check: STUCK: no progress for %d s after entry %llu, at %s, in %s\n",
 		    WATCH_SECONDS, cs->entries, cs->path + cs->rel, watch_phase);
 		apfs_stats_print();
@@ -407,7 +423,7 @@ watch_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	}
 	/* a sign the timer got to run at all: a walk can starve every thread call */
 	printf("apfs-check: tick, %llu entries\n", cs->entries);
-	watch_last = cs->entries + cs->bytes;
+	watch_last = progress;
 	clock_interval_to_deadline(WATCH_SECONDS, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(watch_call, deadline);
 }
@@ -483,9 +499,13 @@ census_child(struct census *cs, const char *name, size_t name_len, uint8_t d_typ
 	if (census_entry(cs, d_type) && d_type == DT_DIR && cs->depth < MAX_DEPTH &&
 	    (cs->max_depth == 0 || (uint32_t)cs->depth + 1 < cs->max_depth) &&
 	    !census_skipped(cs)) {
-		cs->depth++;
-		census_dir(cs);
-		cs->depth--;
+		if (cs->par) {
+			par_push(cs->path, cs->len, cs->depth + 1);
+		} else {
+			cs->depth++;
+			census_dir(cs);
+			cs->depth--;
+		}
 	}
 	cs->len = saved;
 	cs->path[cs->len] = '\0';
@@ -570,6 +590,174 @@ census_dir(struct census *cs)
 	}
 	kfree_data(dbuf, DIR_CHUNK);
 	vnode_put(dvp);
+}
+
+/*
+ * apfs_walkers=N (mode 6): N threads walk the volume at once. They take directories off one
+ * shared stack -- a directory's own entries are done by the walker that took it, its
+ * subdirectories pushed for any of them -- so that as many files are read at once as there are
+ * walkers, and the storage has that many requests to work on. The per-line hashes add up the
+ * same whatever the order: the sum and the counts are those of the walk on one thread.
+ */
+struct par_dir {
+	char  *path;
+	size_t len;
+	int    depth;
+};
+
+static LCK_GRP_DECLARE(par_lck_grp, "apfs-check-walkers");
+static LCK_MTX_DECLARE(par_lock, &par_lck_grp);
+static struct par_dir *par_stack;
+static uint32_t par_count, par_cap, par_busy, par_finished, par_most;
+static bool par_failed;
+
+static void
+par_push(const char *path, size_t len, int depth)
+{
+	char *copy = kalloc_data(len + 1, Z_WAITOK);
+
+	lck_mtx_lock(&par_lock);
+	if (par_count == par_cap) {
+		uint32_t cap = par_cap ? par_cap * 2 : 1024;
+		struct par_dir *grown = kalloc_data(cap * sizeof(*grown), Z_WAITOK);
+
+		if (grown == NULL) {
+			par_failed = true;
+			lck_mtx_unlock(&par_lock);
+			kfree_data(copy, len + 1);
+			return;
+		}
+		if (par_stack != NULL) {
+			memcpy(grown, par_stack, par_count * sizeof(*grown));
+			kfree_data(par_stack, par_cap * sizeof(*grown));
+		}
+		par_stack = grown;
+		par_cap = cap;
+	}
+	if (copy == NULL) {
+		par_failed = true;
+	} else {
+		memcpy(copy, path, len + 1);
+		par_stack[par_count++] = (struct par_dir){ copy, len, depth };
+		if (par_count > par_most) {
+			par_most = par_count;
+		}
+		wakeup(&par_stack);
+	}
+	lck_mtx_unlock(&par_lock);
+}
+
+static void
+par_walker(void *arg, __unused wait_result_t wr)
+{
+	struct census *cs = arg;
+
+	for (;;) {
+		struct par_dir d;
+
+		lck_mtx_lock(&par_lock);
+		while (par_count == 0 && par_busy > 0) {
+			msleep(&par_stack, &par_lock, PRIBIO, "apfs-walkers", NULL);
+		}
+		if (par_count == 0) {
+			/* nothing left, and no walker that could leave more */
+			par_finished++;
+			wakeup(&par_stack);
+			lck_mtx_unlock(&par_lock);
+			return;
+		}
+		d = par_stack[--par_count];
+		par_busy++;
+		lck_mtx_unlock(&par_lock);
+
+		memcpy(cs->path, d.path, d.len + 1);
+		cs->len = d.len;
+		cs->depth = d.depth;
+		kfree_data(d.path, d.len + 1);
+		if (!cs->stop) {
+			census_dir(cs);
+		}
+
+		lck_mtx_lock(&par_lock);
+		par_busy--;
+		wakeup(&par_stack);
+		lck_mtx_unlock(&par_lock);
+	}
+}
+
+/* The whole walk on n threads, its totals into cs */
+static void
+par_walk(struct census *cs, uint32_t n)
+{
+	struct census *w[PAR_MAX];
+	uint32_t started = 0;
+
+	par_count = par_busy = par_finished = par_most = 0;
+	par_failed = false;
+	par_push(cs->path, cs->len, cs->depth);
+	for (uint32_t i = 0; i < n; i++) {
+		w[i] = kalloc_type(struct census, Z_WAITOK | Z_ZERO);
+		if (w[i] == NULL) {
+			break;
+		}
+		*w[i] = *cs;
+		w[i]->par = true;
+		w[i]->sum = w[i]->entries = w[i]->dirs = w[i]->files = w[i]->links = w[i]->others = w[i]->bytes = 0;
+		w[i]->errors = 0;
+		w[i]->hash_ticks = 0;
+		w[i]->path = kalloc_data(PATH_CAP, Z_WAITOK | Z_ZERO);
+		w[i]->buf = kalloc_data(READ_CHUNK, Z_WAITOK);
+		if (w[i]->path == NULL || w[i]->buf == NULL) {
+			break;
+		}
+		par_cs[i] = w[i];
+		started = i + 1;
+	}
+	par_n = started;
+	printf("apfs-check: %u walkers at once\n", started);
+	for (uint32_t i = 0; i < started; i++) {
+		thread_t th;
+
+		if (kernel_thread_start(par_walker, w[i], &th) == KERN_SUCCESS) {
+			thread_deallocate(th);
+		} else {
+			lck_mtx_lock(&par_lock);
+			par_finished++;
+			lck_mtx_unlock(&par_lock);
+		}
+	}
+	lck_mtx_lock(&par_lock);
+	while (par_finished < started) {
+		msleep(&par_stack, &par_lock, PRIBIO, "apfs-walk", NULL);
+	}
+	lck_mtx_unlock(&par_lock);
+	par_n = 0;
+	for (uint32_t i = 0; i < started; i++) {
+		par_cs[i] = NULL;
+		cs->sum += w[i]->sum;
+		cs->entries += w[i]->entries;
+		cs->dirs += w[i]->dirs;
+		cs->files += w[i]->files;
+		cs->links += w[i]->links;
+		cs->others += w[i]->others;
+		cs->bytes += w[i]->bytes;
+		cs->errors += w[i]->errors;
+		cs->hash_ticks += w[i]->hash_ticks;
+		printf("apfs-check: walker %u: %llu entries, %llu bytes\n", i, w[i]->entries, w[i]->bytes);
+		kfree_data(w[i]->path, PATH_CAP);
+		kfree_data(w[i]->buf, READ_CHUNK);
+		kfree_type(struct census, w[i]);
+	}
+	if (par_failed) {
+		printf("apfs-check: the walkers ran out of memory for their stack: the walk is NOT whole\n");
+		cs->errors++;
+	}
+	printf("apfs-check: at most %u directories waited on the walkers' stack\n", par_most);
+	if (par_stack != NULL) {
+		kfree_data(par_stack, par_cap * sizeof(*par_stack));
+		par_stack = NULL;
+		par_cap = 0;
+	}
 }
 
 /* ---- getting there ---- */
@@ -906,7 +1094,16 @@ walk:
 	start = mach_absolute_time();
 	cs.t0 = start;
 	watch_start(&cs);
-	census_dir(&cs);
+	{
+		uint32_t walkers = 1;
+
+		PE_parse_boot_argn("apfs_walkers", &walkers, sizeof(walkers));
+		if (mode == 6 && walkers > 1) {
+			par_walk(&cs, walkers > PAR_MAX ? PAR_MAX : walkers);
+		} else {
+			census_dir(&cs);
+		}
+	}
 	watch_stop();
 	end = mach_absolute_time();
 
