@@ -98,6 +98,19 @@ memset(void *dst, int c, size_t n)
 	return dst;
 }
 
+int
+memcmp(const void *a, const void *b, size_t n)
+{
+	const uint8_t *x = a, *y = b;
+
+	for (; n > 0; n--, x++, y++) {
+		if (*x != *y) {
+			return *x < *y ? -1 : 1;
+		}
+	}
+	return 0;
+}
+
 void *
 memcpy(void *dst, const void *src, size_t n)
 {
@@ -280,6 +293,9 @@ find_log_partition(void)
  * fetches over USB (fastboot get_staged).
  */
 static char out_buf[2 * 1024 * 1024];
+/* the storage's reads for the kernel land here (block_poll); also where the log is read back */
+#define BLOCK_BUFFER_SIZE  (4u << 20)
+static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
 static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
 static uint64_t staged_len;
 
@@ -325,9 +341,24 @@ write_logs(const char *klog, uint64_t klog_len)
 	}
 	uint64_t bs = bio->media->block_size;
 	uint64_t len = (staged_len + 1 + bs - 1) / bs * bs;
-	if (!EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf))) {
+	efi_status ws = bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf), rs = 0;
+	int same = 0;
+
+	if (!EFI_ERROR(ws)) {
 		bio->flush_blocks(bio);
+		/*
+		 * And read back: that the log is in the partition is what a run of the kernel's own UFS
+		 * driver must leave possible (the controller is shared with this one). The line goes into
+		 * the copy the host fetches over USB, not into the partition, which already has the rest.
+		 */
+		if (len <= sizeof(block_buffer)) {
+			rs = bio->read_blocks(bio, bio->media->media_id, 0, len, block_buffer);
+			same = !EFI_ERROR(rs) && memcmp(block_buffer, out_buf, len) == 0;
+		}
 	}
+	print("log: %d bytes written to logdump (%x), read back %s (%x)\n", len, ws,
+	    EFI_ERROR(ws) ? "not tried" : same ? "the same" : "DIFFERENT", rs);
+	compose_logs(klog, klog_len);
 }
 
 static void
@@ -1410,14 +1441,26 @@ ufs_survey(void)
  * back over the data.
  */
 #define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
-#define BLOCK_VERSION      1
-#define BLOCK_MAX_PARTS    128
-#define BLOCK_BUFFER_SIZE  (4u << 20)
+#define BLOCK_VERSION      2
+#define BLOCK_MAX_PARTS    160
+#define BLOCK_MAX_UNITS    16
+#define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
 
+/*
+ * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
+ * ... in the order UEFI lists them). Each partition says which of those it is on and where it
+ * begins there, so that a reader of the units themselves -- the kernel's own UFS driver -- finds
+ * it; a unit says its logical unit number if its device path does.
+ */
 struct loader_block_part {
 	char name[36];
 	uint32_t block_size;
 	uint64_t blocks;
+	uint64_t start_lba;            /* where it begins on its unit, in the unit's blocks (0 for a unit) */
+	uint16_t unit;                 /* the unit it is on, its number among the units; 0xffff: not known */
+	uint8_t lun;                   /* a unit's logical unit number as its device path says; 0xff: it does not */
+	uint8_t flags;                 /* BLOCK_PART_UNIT */
+	uint32_t reserved;
 };
 
 struct loader_block {
@@ -1446,9 +1489,72 @@ struct loader_block {
 static struct loader_block block_shared __attribute__((aligned(0x2000)));
 static void block_io2_probe(efi_handle h, efi_block_io *bio);
 static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at block_start() */
-static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
 static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
+
+/* the bytes of a device path before its end node */
+static uint64_t
+device_path_bytes(const efi_device_path *dp)
+{
+	const uint8_t *p = (const uint8_t *)dp;
+	uint64_t n = 0;
+
+	for (int nodes = 0; nodes < 64; nodes++) {
+		uint64_t len = p[n + 2] | (uint64_t)p[n + 3] << 8;
+
+		if (p[n] == 0x7f || len < 4) {
+			break;
+		}
+		n += len;
+	}
+	return n;
+}
+
+/*
+ * A unit's device path, a node at a time ("ufs: unit N: path TYPE.SUBTYPE[data] ..."), and its
+ * logical unit number if a UFS node (messaging, subtype 0x19: target, then LUN) says it.
+ */
+static uint8_t
+device_path_print(uint64_t unit, const efi_device_path *dp)
+{
+	const uint8_t *p = (const uint8_t *)dp;
+	uint64_t n = 0, total = device_path_bytes(dp);
+	uint8_t lun = 0xff;
+
+	print("ufs: unit %d: path", unit);
+	while (n < total) {
+		uint64_t len = p[n + 2] | (uint64_t)p[n + 3] << 8;
+
+		print(" %x.%x[", (uint64_t)p[n], (uint64_t)p[n + 1]);
+		for (uint64_t i = 4; i < len && i < 4 + 24; i++) {
+			print("%s%x", (uint64_t)p[n + i] < 16 ? "0" : "", (uint64_t)p[n + i]);
+		}
+		print("%s]", len > 4 + 24 ? "..." : "");
+		if (p[n] == 3 && p[n + 1] == 0x19 && len >= 6) {
+			lun = p[n + 5];
+		}
+		n += len;
+	}
+	print(lun == 0xff ? "\n" : " (LUN %d)\n", (uint64_t)lun);
+	return lun;
+}
+
+/*
+ * The firmware's configuration tables, by GUID (an ACPI or device tree table among them would say
+ * where the storage controller is).
+ */
+static void
+block_tables(void)
+{
+	for (uint64_t i = 0; ST->tables != NULL && i < ST->nr_tables && i < 32; i++) {
+		const efi_guid *g = &ST->tables[i].guid;
+
+		print("ufs: firmware table %d: %x-%x-%x-%x%x-%x%x%x%x%x%x at %x\n", i, (uint64_t)g->a, (uint64_t)g->b,
+		    (uint64_t)g->c, (uint64_t)g->d[0], (uint64_t)g->d[1], (uint64_t)g->d[2], (uint64_t)g->d[3],
+		    (uint64_t)g->d[4], (uint64_t)g->d[5], (uint64_t)g->d[6], (uint64_t)g->d[7],
+		    (uint64_t)(uintptr_t)ST->tables[i].table);
+	}
+}
 
 static void
 block_start(void)
@@ -1458,15 +1564,44 @@ block_start(void)
 	efi_handle *handles;
 	uint64_t count;
 
+	static const efi_guid dp_guid = EFI_DEVICE_PATH_GUID;
+	static struct {
+		efi_block_io *bio;
+		const efi_device_path *path;
+		uint64_t path_bytes;
+		uint8_t lun;
+	} units[BLOCK_MAX_UNITS];
+	uint64_t nunits = 0;
+
 	memset(&block_shared, 0, sizeof(block_shared));
+	block_tables();
+	/* the logical units: the block devices that are not partitions of another */
+	if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &blk_guid, NULL, &count, &handles))) {
+		for (uint64_t i = 0; i < count && nunits < BLOCK_MAX_UNITS; i++) {
+			efi_block_io *bio;
+			efi_device_path *dp;
+
+			if (EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) || bio->media->logical ||
+			    bio->media->block_size == 0 || bio->media->block_size > BLOCK_BUFFER_SIZE ||
+			    EFI_ERROR(BS->handle_protocol(handles[i], &dp_guid, (void **)&dp))) {
+				continue;
+			}
+			units[nunits].bio = bio;
+			units[nunits].path = dp;
+			units[nunits].path_bytes = device_path_bytes(dp);
+			units[nunits].lun = device_path_print(nunits, dp);
+			nunits++;
+		}
+	}
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
 		print("ufs: no partition information: the block service is off\n");
 		return;
 	}
-	for (uint64_t i = 0; i < count && block_shared.parts < BLOCK_MAX_PARTS; i++) {
+	for (uint64_t i = 0; i < count && block_shared.parts + nunits < BLOCK_MAX_PARTS; i++) {
 		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
 		efi_partition_info *info;
 		efi_block_io *bio;
+		efi_device_path *dp;
 
 		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2 ||
 		    EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) ||
@@ -1476,11 +1611,42 @@ block_start(void)
 		ufs_name(info, bp->name, sizeof(bp->name));
 		bp->block_size = bio->media->block_size;
 		bp->blocks = bio->media->last_block + 1;
+		bp->start_lba = info->start_lba;
+		bp->unit = 0xffff;
+		bp->lun = 0xff;
+		/* its unit: the one whose device path its own begins with */
+		if (!EFI_ERROR(BS->handle_protocol(handles[i], &dp_guid, (void **)&dp))) {
+			uint64_t bytes = device_path_bytes(dp);
+
+			for (uint64_t u = 0; u < nunits; u++) {
+				if (units[u].path_bytes < bytes &&
+				    memcmp(units[u].path, dp, units[u].path_bytes) == 0) {
+					bp->unit = (uint16_t)u;
+					bp->lun = units[u].lun;
+				}
+			}
+		}
 		block_bios[block_shared.parts++] = bio;
 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
 		    bp->name[3] == 'w' && bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == 0) {
 			block_io2_probe(handles[i], bio);
 		}
+	}
+	for (uint64_t u = 0; u < nunits; u++) {
+		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
+		char *n = bp->name;
+
+		n[0] = 'u', n[1] = 'n', n[2] = 'i', n[3] = 't';
+		n[4] = (char)('0' + u / 10 % 10), n[5] = (char)('0' + u % 10), n[6] = 0;
+		if (u < 10) {
+			n[4] = n[5], n[5] = 0;
+		}
+		bp->block_size = units[u].bio->media->block_size;
+		bp->blocks = units[u].bio->media->last_block + 1;
+		bp->unit = (uint16_t)u;
+		bp->lun = units[u].lun;
+		bp->flags = BLOCK_PART_UNIT;
+		block_bios[block_shared.parts++] = units[u].bio;
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -1489,8 +1655,9 @@ block_start(void)
 	block_shared.buffer_pa = (uint64_t)(uintptr_t)block_buffer;
 	clean_dcache((uint64_t)(uintptr_t)&block_shared, (uint64_t)(uintptr_t)&block_shared + sizeof(block_shared));
 	block_enabled = 1;
-	print("ufs: block service: %d partitions, page %x, buffer %x of %d KB\n", (uint64_t)block_shared.parts,
-	    (uint64_t)(uintptr_t)&block_shared, block_shared.buffer_pa, (uint64_t)(BLOCK_BUFFER_SIZE >> 10));
+	print("ufs: block service: %d partitions and %d units, page %x, buffer %x of %d KB\n",
+	    (uint64_t)block_shared.parts - nunits, nunits, (uint64_t)(uintptr_t)&block_shared, block_shared.buffer_pa,
+	    (uint64_t)(BLOCK_BUFFER_SIZE >> 10));
 }
 
 /*

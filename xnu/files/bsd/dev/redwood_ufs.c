@@ -41,6 +41,7 @@
 #include <sys/systm.h>
 #include <sys/sysctl.h>
 #include <sys/redwood_input.h>
+#include <libkern/crc.h>
 #include <vm/memory_types.h>
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
@@ -50,13 +51,20 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 
 /* the page the loader publishes: the same layout as struct loader_block in xnuloader/loader.c */
 #define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
-#define BLOCK_VERSION      1
-#define BLOCK_MAX_PARTS    128
+#define BLOCK_VERSION      2
+#define BLOCK_MAX_PARTS    160
+#define BLOCK_MAX_UNITS    16
+#define BLOCK_PART_UNIT    1u                          /* a whole logical unit, not a partition */
 
 struct loader_block_part {
 	char name[36];
 	uint32_t block_size;
 	uint64_t blocks;
+	uint64_t start_lba;            /* where it begins on its unit, in the unit's blocks */
+	uint16_t unit;                 /* the unit it is on, its number among the units; 0xffff: not known */
+	uint8_t lun;                   /* a unit's logical unit number as its device path says; 0xff: it does not */
+	uint8_t flags;                 /* BLOCK_PART_UNIT */
+	uint32_t reserved;
 };
 
 struct loader_block {
@@ -93,6 +101,21 @@ static uint64_t ufs_small, ufs_medium, ufs_large; /* requests of <= 4 KB, <= 64 
 static uint64_t ufs_sequential;                 /* requests that start where the one before ended */
 static uint32_t ufs_last_part = ~0u;
 static uint64_t ufs_last_end;
+
+/*
+ * This kernel's own UFS driver (redwood_ufshc.c), with ufs_native=1: each partition's logical
+ * unit and where it begins there, in bytes; reads go that way unless it fails, and then through
+ * the loader again.
+ */
+extern bool ufshc_probe(bool only);
+extern bool ufshc_available(void);
+extern int ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len);
+extern void ufshc_report(const char *when);
+static uint8_t ufs_lun[BLOCK_MAX_PARTS];         /* 0xff: not known, read through the loader */
+static uint64_t ufs_lun_offset[BLOCK_MAX_PARTS];
+static bool ufs_native_mapped;
+static volatile bool ufs_native_on;
+static uint64_t ufs_native_fallbacks;
 
 static LCK_GRP_DECLARE(ufs_lck_grp, "redwood-ufs");
 static LCK_MTX_DECLARE(ufs_lock, &ufs_lck_grp);
@@ -218,6 +241,7 @@ redwood_ufs_report(const char *when)
 	if (!ufs_ready) {
 		return;
 	}
+	ufshc_report(when);
 	absolutetime_to_nanoseconds(ufs_page->answer.ticks, &loader_ns);
 	printf("ufs: %s: %llu requests (%llu of 4 KB or less, %llu to 64 KB, %llu more; %llu right after "
 	    "the one before), %llu errors, %llu bytes; waiting %llu ms, of it in ReadBlocks %llu ms; "
@@ -226,11 +250,12 @@ redwood_ufs_report(const char *when)
 }
 
 /*
- * Bytes [offset, offset + len) of partition part into dst, whatever their alignment: the native
- * blocks that cover them are read a buffer at a time and the wanted bytes copied out.
+ * Bytes [offset, offset + len) of partition part into dst, whatever their alignment, through the
+ * loader: the native blocks that cover them are read a buffer at a time and the wanted bytes
+ * copied out.
  */
 static int
-ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
+ufs_read_mailbox(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 {
 	uint64_t nbs = ufs_page->part[part].block_size, per = ufs_buffer_size / nbs;
 	static uint8_t *bounce;
@@ -270,6 +295,34 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 	return error;
 }
 
+/* The same, through this kernel's own driver: the partition's unit, from where it begins there */
+static int
+ufs_read_native(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
+{
+	if (part >= ufs_parts || ufs_lun[part] == 0xff) {
+		return ENXIO;
+	}
+	return ufshc_read(ufs_lun[part], ufs_lun_offset[part] + offset, dst, len);
+}
+
+/* The way chosen (ufs_native=, kern.redwood.ufs_native); if this kernel's own fails, the loader's */
+static int
+ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
+{
+	if (ufs_native_on && ufs_lun[part] != 0xff) {
+		int error = ufs_read_native(part, offset, dst, len);
+
+		if (error == 0) {
+			return 0;
+		}
+		ufs_native_on = false;
+		ufs_native_fallbacks++;
+		printf("ufs: %s: bytes %llu..%llu: this kernel's own read failed (%d); through the loader from now on\n",
+		    ufs_page->part[part].name, offset, offset + len - 1, error);
+	}
+	return ufs_read_mailbox(part, offset, dst, len);
+}
+
 static uint64_t
 ufs_part_bytes(uint32_t part)
 {
@@ -281,7 +334,7 @@ ufs_part_bytes(uint32_t part)
 static int
 ufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
 {
-	if (!ufs_ready || (uint32_t)minor(dev) >= ufs_parts) {
+	if (!ufs_ready || (uint32_t)minor(dev) >= ufs_parts || (ufs_page->part[minor(dev)].flags & BLOCK_PART_UNIT)) {
 		return ENXIO;
 	}
 	if (flags & FWRITE) {
@@ -530,6 +583,269 @@ ufs_bench(__unused void *arg, __unused wait_result_t wr)
 	redwood_ufs_report("after the bench");
 }
 
+/* ---- this kernel's own driver: which unit is which, and whether it reads what the loader reads ---- */
+
+static uint64_t
+ufs_fnv(uint64_t h, const uint8_t *p, uint64_t n)
+{
+	for (uint64_t i = 0; i < n; i++) {
+		h = (h ^ p[i]) * 0x100000001b3ULL;
+	}
+	return h;
+}
+
+/*
+ * Each unit's logical unit number: the one its device path gives, if it gives one, else the first
+ * of 0..7 not yet taken whose block 1 (the GPT header, with the unit's own GUID in it) is what the
+ * loader reads as block 1 of that unit. Either way it is so only if the two are the same.
+ */
+static bool
+ufs_native_map(void)
+{
+	uint8_t *a = kalloc_data(2 * 4096, Z_WAITOK), *b = a + 4096;
+	uint8_t unit_lun[BLOCK_MAX_UNITS];
+	uint32_t taken = 0, units = 0;
+	bool all = true;
+
+	memset(unit_lun, 0xff, sizeof(unit_lun));
+	memset(ufs_lun, 0xff, sizeof(ufs_lun));
+	if (a == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < ufs_parts && all; i++) {
+		volatile struct loader_block_part *e = &ufs_page->part[i];
+		bool found = false;
+
+		if ((e->flags & BLOCK_PART_UNIT) == 0) {
+			continue;
+		}
+		units++;
+		if (e->unit >= BLOCK_MAX_UNITS || e->block_size != 4096 || ufs_read_mailbox(i, 4096, a, 4096) != 0 ||
+		    memcmp(a, "EFI PART", 8) != 0) {
+			printf("ufs: native: %s: no GPT header to know it by (block size %u)\n", e->name, e->block_size);
+			all = false;
+			break;
+		}
+		for (uint32_t k = 0; k < 8 && !found; k++) {
+			uint32_t lun = e->lun != 0xff ? e->lun : (k == 0 ? e->unit : k - 1);
+
+			if (lun >= 8 || (taken & (1u << lun)) || (e->lun != 0xff && k > 0)) {
+				continue;
+			}
+			if (ufshc_read((uint8_t)lun, 4096, b, 4096) == 0 && memcmp(a, b, 4096) == 0) {
+				unit_lun[e->unit] = (uint8_t)lun;
+				taken |= 1u << lun;
+				found = true;
+				printf("ufs: native: %s is LUN %u (%s; its GPT header read both ways is the same)\n", e->name, lun,
+				    e->lun != 0xff ? "its device path says so" : "found by its GPT header");
+			}
+		}
+		if (!found) {
+			printf("ufs: native: %s: no logical unit reads as it does through the loader\n", e->name);
+			all = false;
+		}
+	}
+	kfree_data(a, 2 * 4096);
+	if (!all || units == 0) {
+		memset(ufs_lun, 0xff, sizeof(ufs_lun));
+		return false;
+	}
+	for (uint32_t i = 0; i < ufs_parts; i++) {
+		volatile struct loader_block_part *e = &ufs_page->part[i];
+
+		if (e->unit < BLOCK_MAX_UNITS && unit_lun[e->unit] != 0xff && e->block_size == 4096) {
+			ufs_lun[i] = unit_lun[e->unit];
+			ufs_lun_offset[i] = e->start_lba * 4096;
+		}
+	}
+	return true;
+}
+
+static uint64_t ufs_cmp_mailbox_ns, ufs_cmp_native_ns, ufs_cmp_bytes, ufs_cmp_regions, ufs_cmp_differ;
+
+/*
+ * Bytes [offset, offset + len) of entry part, read both ways a megabyte at a time and compared;
+ * FNV-1a of what was read (each way), and of its first ref bytes if ref is not 0.
+ */
+static bool
+ufs_compare(uint32_t part, uint64_t offset, uint64_t len, uint64_t ref, const char *what, bool quiet)
+{
+	static uint8_t *x, *y;
+	uint64_t hx = 0xcbf29ce484222325ULL, hy = hx, href = 0, done = 0, t, ns, mailbox_ns = 0, native_ns = 0;
+	int ex = 0, ey = 0;
+	bool same = true;
+
+	if (x == NULL) {
+		x = kalloc_data(2 << 20, Z_WAITOK);
+		y = x + (1 << 20);
+	}
+	while (done < len && same && ex == 0 && ey == 0) {
+		uint64_t n = len - done < (1 << 20) ? len - done : (1 << 20);
+
+		t = mach_absolute_time();
+		ex = ufs_read_mailbox(part, offset + done, x, n);
+		absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
+		mailbox_ns += ns;
+		t = mach_absolute_time();
+		ey = ufs_read_native(part, offset + done, y, n);
+		absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
+		native_ns += ns;
+		if (ex == 0 && ey == 0 && memcmp(x, y, n) != 0) {
+			uint64_t at = 0;
+
+			while (x[at] == y[at]) {
+				at++;
+			}
+			printf("ufs: native check: %s %s: DIFFERENT at byte %llu (%02x through the loader, %02x here)\n",
+			    ufs_page->part[part].name, what, offset + done + at, x[at], y[at]);
+			same = false;
+		}
+		if (ref != 0 && done < ref) {
+			uint64_t m = ref - done < n ? ref - done : n;
+
+			href = ufs_fnv(done == 0 ? 0xcbf29ce484222325ULL : href, x, m);
+		}
+		hx = ufs_fnv(hx, x, n);
+		hy = ufs_fnv(hy, y, n);
+		done += n;
+	}
+	if (ex != 0 || ey != 0) {
+		printf("ufs: native check: %s %s: read failed (through the loader %d, here %d)\n", ufs_page->part[part].name,
+		    what, ex, ey);
+		same = false;
+	}
+	ufs_cmp_regions++;
+	ufs_cmp_bytes += done;
+	ufs_cmp_mailbox_ns += mailbox_ns;
+	ufs_cmp_native_ns += native_ns;
+	ufs_cmp_differ += !same;
+	if (!quiet || !same) {
+		printf("ufs: native check: %s %s: %llu bytes from %llu %s: fnv %llx / %llx; loader %llu ms, here %llu ms\n",
+		    ufs_page->part[part].name, what, done, offset, same ? "the same" : "NOT THE SAME", hx, hy,
+		    mailbox_ns / 1000000, native_ns / 1000000);
+		if (ref != 0) {
+			printf("ufs: native check: %s: fnv %llx over the first %llu bytes (the loader's and ufs_check's hash)\n",
+			    ufs_page->part[part].name, href, ref);
+		}
+	}
+	return same;
+}
+
+static uint32_t
+ufs_entry(const char *name)
+{
+	for (uint32_t i = 0; i < ufs_parts; i++) {
+		if (strcmp((const char *)ufs_page->part[i].name, name) == 0) {
+			return i;
+		}
+	}
+	return BLOCK_MAX_PARTS;
+}
+
+/*
+ * ufs_native_check=1: what this kernel's own driver reads is what the loader reads, byte for
+ * byte: every unit's GPT (protective MBR, header, table, and the backup table and header at the
+ * end), the partitions the loader hashes (the ROM's images: xbl, tz, modem, ...) whole, the start
+ * of super (its geometry and metadata), and of darwin 64 spread megabytes, 512 scattered blocks
+ * and some reads that begin and end inside a block.
+ */
+static void
+ufs_native_check(void)
+{
+	uint8_t *h = kalloc_data(4096, Z_WAITOK);
+	uint32_t part;
+	uint64_t seed = 0x9e3779b97f4a7c15ULL;
+
+	printf("ufs: native check: through the loader and through this kernel's own driver, compared\n");
+	for (uint32_t i = 0; h != NULL && i < ufs_parts; i++) {
+		volatile struct loader_block_part *e = &ufs_page->part[i];
+		uint64_t entries_lba, count, size, table, alt, alt_entries;
+
+		if ((e->flags & BLOCK_PART_UNIT) == 0 || ufs_read_mailbox(i, 4096, h, 4096) != 0) {
+			continue;
+		}
+		entries_lba = *(uint64_t *)(h + 72);
+		count = *(uint32_t *)(h + 80);
+		size = *(uint32_t *)(h + 84);
+		alt = *(uint64_t *)(h + 32);
+		table = (count * size + 4095) / 4096;
+		{
+			uint32_t want = *(uint32_t *)(h + 16), got;
+
+			*(uint32_t *)(h + 16) = 0;
+			got = crc32(0, h, *(uint32_t *)(h + 12));
+			printf("ufs: native check: %s: GPT header crc %s, table at block %llu, %llu entries of %llu bytes, backup "
+			    "header at block %llu\n", e->name, got == want ? "right" : "WRONG", entries_lba, count, size, alt);
+		}
+		ufs_compare(i, 0, (entries_lba + table) * 4096, 0, "GPT (MBR, header, table)", false);
+		if (alt < e->blocks && ufs_read_mailbox(i, alt * 4096, h, 4096) == 0 && memcmp(h, "EFI PART", 8) == 0) {
+			alt_entries = *(uint64_t *)(h + 72);
+			if (alt_entries <= alt) {
+				ufs_compare(i, alt_entries * 4096, (alt + 1 - alt_entries) * 4096, 0, "backup GPT (table, header)",
+				    false);
+			}
+		}
+	}
+	for (part = 0; part < ufs_parts; part++) {
+		if (ufs_page->part[part].flags & BLOCK_PART_UNIT) {
+			continue;
+		}
+		for (unsigned r = 0; r < sizeof(ufs_references) / sizeof(ufs_references[0]); r++) {
+			if (ufs_is_reference((const char *)ufs_page->part[part].name, ufs_references[r].name)) {
+				ufs_compare(part, 0, ufs_part_bytes(part), ufs_references[r].bytes, "whole", false);
+			}
+		}
+	}
+	if ((part = ufs_entry("super")) < BLOCK_MAX_PARTS) {
+		ufs_compare(part, 0, 8 << 20, 0, "first 8 MB (geometry, metadata)", false);
+	}
+	if ((part = ufs_entry("darwin")) < BLOCK_MAX_PARTS) {
+		uint64_t bytes = ufs_part_bytes(part), r0 = ufs_cmp_regions, d0 = ufs_cmp_differ;
+
+		for (uint64_t k = 0; k < 64; k++) {
+			ufs_compare(part, (bytes - (1 << 20)) / 64 * k / 4096 * 4096, 1 << 20, 0, "spread megabyte", true);
+		}
+		for (uint64_t k = 0; k < 512; k++) {
+			seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+			ufs_compare(part, (seed >> 16) % (bytes / 4096) * 4096, 4096, 0, "scattered block", true);
+		}
+		for (uint64_t k = 0; k < 64; k++) {
+			seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+			ufs_compare(part, (seed >> 16) % (bytes - (2 << 20)), 1 + (seed >> 40) % (1 << 20), 0, "unaligned piece", true);
+		}
+		printf("ufs: native check: darwin: %llu spread megabytes, scattered blocks and unaligned pieces: %llu not the same\n",
+		    ufs_cmp_regions - r0, ufs_cmp_differ - d0);
+	}
+	if (h != NULL) {
+		kfree_data(h, 4096);
+	}
+	printf("ufs: native check done: %llu regions, %llu bytes, %llu NOT THE SAME; through the loader %llu ms, "
+	    "through this kernel's own driver %llu ms\n", ufs_cmp_regions, ufs_cmp_bytes, ufs_cmp_differ,
+	    ufs_cmp_mailbox_ns / 1000000, ufs_cmp_native_ns / 1000000);
+	ufshc_report("after the check");
+}
+
+/* kern.redwood.ufs_native: 1 while reads go through this kernel's own driver; 0 or 1 may be set */
+static int
+ufs_sysctl_native(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = ufs_native_on, error, changed = 0;
+
+	error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+	if (error != 0 || !changed) {
+		return error;
+	}
+	if (value != 0 && !(ufs_native_mapped && ufshc_available())) {
+		return ENXIO;
+	}
+	ufs_native_on = value != 0;
+	return 0;
+}
+SYSCTL_PROC(_kern_redwood, OID_AUTO, ufs_native, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    ufs_sysctl_native, "I", "1: the phone's storage is read by this kernel's own UFS driver, 0: through the loader");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_native_fallbacks, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_native_fallbacks,
+    "times a read of this kernel's own UFS driver failed and the loader's was used instead");
+
 /* ---- bringing it up ---- */
 
 void
@@ -569,6 +885,9 @@ redwood_ufs_init(void)
 		char name[48];
 
 		ufs_bsize[i] = ufs_page->part[i].block_size;
+		if (ufs_page->part[i].flags & BLOCK_PART_UNIT) {
+			continue;               /* the units are for this kernel's own driver to be checked against */
+		}
 		snprintf(name, sizeof(name), "ufs_%s", ufs_page->part[i].name);
 		if (devfs_make_node(makedev(ufs_bmajor, i), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "%s", name) == NULL) {
 			printf("ufs: no node for %s (the same name twice?)\n", name);
@@ -581,6 +900,27 @@ redwood_ufs_init(void)
 	ufs_ready = true;
 	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
+
+	/* ufs_native=1: through this kernel's own driver instead, if the controller is as expected; 2: only look */
+	check = 0;
+	memset(ufs_lun, 0xff, sizeof(ufs_lun));
+	if (PE_parse_boot_argn("ufs_native", &check, sizeof(check)) && check != 0) {
+		if (ufshc_probe(check == 2) && ufs_native_map()) {
+			ufs_native_mapped = true;
+			ufs_native_on = true;
+			printf("ufs: the partitions are read by this kernel's own UFS driver (kern.redwood.ufs_native=0: "
+			    "through the loader)\n");
+		} else if (check != 2) {
+			printf("ufs: this kernel's own UFS driver is not used: through the loader\n");
+		}
+		check = 0;
+		if (ufs_native_mapped && PE_parse_boot_argn("ufs_native_check", &check, sizeof(check)) && check != 0) {
+			/* right here, in bsd_init's thread, and then back to the loader */
+			ufs_native_check();
+			redwood_ufs_report("after the check");
+			loader_return();
+		}
+	}
 
 	if (PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
 		/* right here, in bsd_init's thread, and then back to the loader: nothing else is wanted */
