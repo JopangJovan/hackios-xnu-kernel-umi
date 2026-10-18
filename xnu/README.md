@@ -58,7 +58,7 @@ xnu-deps/setup.sh        # ~30 с: исходники зависимостей, 
 | `osfmk/minicrypto/` | замена corecrypto: MD5/SHA-1/SHA-2, HMAC, DRBG, AES (исходники Apple corecrypto не использованы) |
 | `iokit/Kernel/GenericARMPE.cpp` | эксперт платформы и CPU |
 | `iokit/Kernel/MiniIOSurface.*`, `MiniIOMobileFramebuffer.cpp`, `MiniAppleKeyStore.cpp` | замены закрытых драйверов: поверхности, экран (с масштабированием в панель и записью экрана), хранилище ключей |
-| `bsd/miscfs/packfs/`, `bsd/miscfs/ramfs/` | свои ФС: сжатый образ только для чтения (корень) и записываемая ФС в памяти |
+| `bsd/miscfs/apfs/`, `bsd/miscfs/ramfs/` | свои ФС: APFS только для чтения (корень на флеше и образы в памяти) и записываемая ФС в памяти |
 | `bsd/kern/kern_minimac.c`, `libkern/amfi/` | заглушки AMFI и Sandbox (MAC-политики), права из подписи программы |
 | `bsd/dev/redwood_input.c`, `redwood_goodix.c`, `redwood_virtio_input.c` | ввод: `/dev/redwood-touch`, драйвер Goodix GT9916 (SPI бит-бангом по GPIO), virtio-input для QEMU |
 | `bsd/dev/redwood_cpufreq.c` | частота процессора (Qualcomm EPSS) |

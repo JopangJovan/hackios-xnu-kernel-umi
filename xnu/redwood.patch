@@ -45,11 +45,27 @@ index 222158a93918..68bb0f3e56bf 100755
  set path = ($path .)
  ######################################################################
  # HISTORY
+diff --git a/bsd/conf/Makefile.arm64 b/bsd/conf/Makefile.arm64
+index a4d25040f38f..aad72993d139 100644
+--- a/bsd/conf/Makefile.arm64
++++ b/bsd/conf/Makefile.arm64
+@@ -5,6 +5,11 @@
+ # Inline assembly doesn't interact well with LTO
+ fbt_arm.o_CFLAGS_ADD += $(CFLAGS_NOLTO_FLAG)
+ 
++# libdeflate's arm headers (bsd/miscfs/apfs/libdeflate) include the compiler's own <arm_acle.h>
++# and <arm_neon.h>, which the kernel's include paths do not have: they come after those paths,
++# so the kernel's <stdint.h> and the rest are still the ones found.
++apfs_deflate.o_CFLAGS_ADD += -idirafter $(shell $(CC) -print-resource-dir)/include
++
+ kern_csr.o_INCFLAGS += -I$(SRCROOT)/osfmk
+ kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
+ 
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..9f1fe3efd685 100644
+index 44274016a4cf..44c2d6435caf 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,31 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -58,6 +74,8 @@ index 44274016a4cf..9f1fe3efd685 100644
 +bsd/dev/redwood_goodix.c	standard
 +bsd/dev/redwood_buttons.c	standard
 +bsd/dev/redwood_battery.c	standard
++bsd/dev/redwood_ufs.c	standard
++bsd/dev/redwood_ufshc.c	standard
 +bsd/dev/redwood_net.c		standard
 +bsd/dev/redwood_virtio_net.c	standard
 +bsd/dev/redwood_apple80211.c	standard
@@ -73,6 +91,10 @@ index 44274016a4cf..9f1fe3efd685 100644
 +bsd/dev/redwood_mic.c		standard
 +bsd/dev/redwood_wifi.c		standard
 +bsd/dev/redwood_adsp.c		standard
++bsd/dev/redwood_image.c		standard
++bsd/dev/redwood_virtio_blk.c	standard
++bsd/dev/redwood_sparse.c	standard
++bsd/dev/redwood_apfs_check.c	optional apfs
 +bsd/dev/redwood_sound.c		standard
 +bsd/dev/redwood_qmi.c		standard
 +bsd/dev/redwood_wlfw.c		standard
@@ -81,18 +103,20 @@ index 44274016a4cf..9f1fe3efd685 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +180,10 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +186,12 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
-+bsd/miscfs/packfs/packfs_vfsops.c	optional packfs
-+bsd/miscfs/packfs/packfs_vnops.c	optional packfs
-+bsd/miscfs/packfs/packfs_zstd.c	optional packfs
++bsd/miscfs/apfs/apfs_deflate.c		optional apfs
++bsd/miscfs/apfs/apfs_zbitmap.c		optional apfs
++bsd/miscfs/apfs/apfs_lib.c		optional apfs
++bsd/miscfs/apfs/apfs_vfsops.c		optional apfs
++bsd/miscfs/apfs/apfs_vnops.c		optional apfs
 +bsd/miscfs/ramfs/ramfs.c			optional ramfs
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +390,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +398,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -100,7 +124,7 @@ index 44274016a4cf..9f1fe3efd685 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +413,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +421,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -293,19 +317,24 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..d532c567ba6b 100644
+index 4df41ba1f61b..16cf4fd8d8f1 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,8 @@
+@@ -147,6 +147,13 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
 +#include <sys/redwood_input.h>
 +#include <sys/redwood_audio.h>
++#include <sys/redwood_virtio_blk.h>
++#include <sys/redwood_sparse.h>
++#if APFS
++#include <sys/redwood_apfs_check.h>
++#endif
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +492,7 @@ bsd_init(void)
+@@ -490,7 +497,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -314,12 +343,18 @@ index 4df41ba1f61b..d532c567ba6b 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +978,8 @@ bsd_init(void)
+@@ -976,6 +983,14 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
 +		redwood_input_init();           /* /dev/redwood-touch */
 +		redwood_audio_init();           /* /dev/redwood-audio */
++		redwood_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
++		redwood_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
++#if APFS
++		/* mounts and walks /dev/rvblk0 once userland has /private/var up */
++		redwood_apfs_check_init();
++#endif
  	}
  #endif /* DEVFS */
  
@@ -847,6 +882,25 @@ index dce802fc36f1..e2e6b3a3f3db 100644
  		size_t  uiolen;
  		user_ssize_t    rlen;
  		off_t   pgoff;
+diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
+index 412f9ecfc22c..f6595c0401a3 100644
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -139,8 +139,12 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 		return ENOTSUP;
+ 	}
+ 
+-	/* check entitlement */
+-	if (!IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT)) {
++	/*
++	 * check entitlement -- redwood: or process 1, the port's own init, unsigned, which binds
++	 * its choice of launchd jobs and the like onto the read-only iOS root volume before it
++	 * hands over to launchd (userland/src/init.c, root_apfs=)
++	 */
++	if (!IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT) && proc_getpid(current_proc()) != 1) {
+ 		return EPERM;
+ 	}
+ 
 diff --git a/bsd/miscfs/mockfs/mockfs.h b/bsd/miscfs/mockfs/mockfs.h
 index 07c91ffaf686..5ce41d043901 100644
 --- a/bsd/miscfs/mockfs/mockfs.h
@@ -1024,21 +1078,21 @@ index cbaa0b221894..78315a2d54cf 100644
  	int eofflag;
  	uint64_t options;
 diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
-index bae70cda3a96..d0e50606b15e 100644
+index bae70cda3a96..031613b10643 100644
 --- a/bsd/vfs/vfs_conf.c
 +++ b/bsd/vfs/vfs_conf.c
 @@ -103,6 +103,15 @@ extern  struct vfsops mockfs_vfsops;
  extern  int mockfs_mountroot(mount_t, vnode_t, vfs_context_t);
  #endif /* MOCKFS */
  
-+#if PACKFS
-+extern  struct vfsops packfs_vfsops;
-+extern  int packfs_mountroot(mount_t, vnode_t, vfs_context_t);
-+#endif /* PACKFS */
-+
 +#if RAMFS
 +extern  struct vfsops ramfs_vfsops;
 +#endif /* RAMFS */
++
++#if APFS
++extern  struct vfsops apfs_vfsops;
++extern  int apfs_mountroot(mount_t, vnode_t, vfs_context_t);
++#endif /* APFS */
 +
  enum fs_type_num {
  	FT_NFS = 2,
@@ -1049,12 +1103,12 @@ index bae70cda3a96..d0e50606b15e 100644
  	FT_BINDFS = 23,
 -	FT_MOCKFS  = 0x6D6F636B
 +	FT_MOCKFS  = 0x6D6F636B,
-+	FT_PACKFS  = 0x7061636B,
-+	FT_RAMFS   = 0x72616D66
++	FT_RAMFS   = 0x72616D66,
++	FT_APFS    = 0x61706673
  };
  
  int fstypenumstart = FT_BINDFS + 1;
-@@ -194,6 +205,44 @@ static struct vfstable vfstbllist[] = {
+@@ -194,6 +205,54 @@ static struct vfstable vfstbllist[] = {
  	},
  #endif /* BINDFS */
  
@@ -1077,53 +1131,64 @@ index bae70cda3a96..d0e50606b15e 100644
 +	},
 +#endif /* RAMFS */
 +
-+#if PACKFS
-+	/* Read-only boot image; must come before mockfs, which accepts any root device */
++#if APFS
++	/*
++	 * Apple File System, read only: the root and every image of this port's (the RAM
++	 * disks are APFS containers).  Before mockfs, which accepts any root device: a device
++	 * that is not APFS comes back EINVAL and vfs_mountroot() goes on to the next.
++	 */
 +	{
-+		.vfc_vfsops = &packfs_vfsops,
-+		.vfc_name = "packfs",
-+		.vfc_typenum = FT_PACKFS,
++		.vfc_vfsops = &apfs_vfsops,
++		.vfc_name = "apfs",
++		.vfc_typenum = FT_APFS,
 +		.vfc_refcount = 0,
 +		.vfc_flags = MNT_LOCAL | MNT_RDONLY,
-+		.vfc_mountroot = packfs_mountroot,
++		.vfc_mountroot = apfs_mountroot,
 +		.vfc_next = NULL,
 +		.vfc_reserved1 = 0,
 +		.vfc_reserved2 = 0,
-+		.vfc_vfsflags = VFC_VFSLOCALARGS | VFC_VFS64BITREADY,
++		/*
++		 * Generic args, not local: a kernel mount of a filesystem marked
++		 * VFC_VFSLOCALARGS is refused outright (mount_common), and this one has to be
++		 * mountable from the kernel.  So apfs_mount() takes the device's path as its
++		 * mount data and opens it itself.
++		 */
++		.vfc_vfsflags = VFC_VFSGENERICARGS | VFC_VFS64BITREADY | VFC_VFSNATIVEXATTR,
 +		.vfc_descptr = NULL,
 +		.vfc_descsize = 0,
 +		.vfc_sysctl = NULL
 +	},
-+#endif /* PACKFS */
++#endif /* APFS */
 +
  #if MOCKFS
  	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
  	{
-@@ -298,6 +347,14 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
+@@ -298,6 +357,15 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
  extern const struct vnodeopv_desc mockfs_vnodeop_opv_desc;
  #endif /* MOCKFS */
  
-+#if PACKFS
-+extern const struct vnodeopv_desc packfs_vnodeop_opv_desc;
-+#endif /* PACKFS */
 +
 +#if RAMFS
 +extern const struct vnodeopv_desc ramfs_vnodeop_opv_desc;
 +#endif /* RAMFS */
 +
++#if APFS
++extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;
++#endif /* APFS */
++
  extern const struct vnodeopv_desc nullfs_vnodeop_opv_desc;
  extern const struct vnodeopv_desc bindfs_vnodeop_opv_desc;
  
-@@ -327,5 +384,11 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
+@@ -327,5 +395,11 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
  #if MOCKFS
  	&mockfs_vnodeop_opv_desc,
  #endif /* MOCKFS */
-+#if PACKFS
-+	&packfs_vnodeop_opv_desc,
-+#endif /* PACKFS */
 +#if RAMFS
 +	&ramfs_vnodeop_opv_desc,
 +#endif /* RAMFS */
++#if APFS
++	&apfs_vnodeop_opv_desc,
++#endif /* APFS */
  	NULL
  };
 diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
@@ -1299,21 +1364,46 @@ index 5b51e9c46a8d..6872b94631c9 100644
  
  	context.vc_thread = current_thread();
  	context.vc_ucred = cred;
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index 60c8b9eedd50..b0029de5ef21 100644
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2538,7 +2538,19 @@ after_root_check:
+ #define PREBOOT_CRYPTEX_PATH "/private/preboot/Cryptexes"
+ #endif
+ 			error = vnode_lookup(PREBOOT_CRYPTEX_PATH, 0, &preboot_vp, vfs_context_current());
+-			if (error || srfmp->vp->v_mount != preboot_vp->v_mount) {
++			/*
++			 * (redwood) Or a volume of its own mounted on a directory right inside it: iOS
++			 * grafts each cryptex image into the Preboot volume (graftdmg), so its files are
++			 * that volume's; this port mounts the image there as it is (bsd/miscfs/apfs), a
++			 * mount of its own whose covered directory is Preboot's Cryptexes/<name>.
++			 */
++			if (error == 0 && srfmp->vp->v_mount != preboot_vp->v_mount &&
++			    srfmp->vp->v_mount != NULL && srfmp->vp->v_mount->mnt_vnodecovered != NULLVP &&
++			    srfmp->vp->v_mount->mnt_vnodecovered->v_mount == preboot_vp->v_mount &&
++			    srfmp->vp->v_mount->mnt_vnodecovered->v_parent == preboot_vp) {
++				(void)vnode_put(preboot_vp);
++				preboot_vp = NULL;
++			} else if (error || srfmp->vp->v_mount != preboot_vp->v_mount) {
+ 				SHARED_REGION_TRACE_ERROR(
+ 					("shared_region: %p [%d(%s)] map(%p:'%s'): "
+ 					"not on process' root volume nor preboot volume\n",
 diff --git a/config/MASTER b/config/MASTER
-index 07147cb3188b..a6e1990998c8 100644
+index 07147cb3188b..e937e62bf4c3 100644
 --- a/config/MASTER
 +++ b/config/MASTER
 @@ -113,6 +113,8 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
  #	4.4 filesystems
  #
  options		MOCKFS		# Boot from an executable	# <mockfs>
-+options		PACKFS		# Read-only boot image filesystem	# <packfs>
++options		APFS		# Apple File System, read only	# <apfs>
 +options		RAMFS		# Read-write filesystem in memory	# <ramfs>
  options		FIFO		# fifo support			# <fifo>
  options		FDESC		# fdesc_fs support		# <fdesc>
  options		DEVFS		# devfs support			# <devfs>
 diff --git a/config/MASTER.arm64.bcm2837 b/config/MASTER.arm64.bcm2837
-index 1ed75eea2052..551cfb9d5126 100644
+index 1ed75eea2052..54c5e12d2271 100644
 --- a/config/MASTER.arm64.bcm2837
 +++ b/config/MASTER.arm64.bcm2837
 @@ -16,15 +16,15 @@
@@ -1332,7 +1422,7 @@ index 1ed75eea2052..551cfb9d5126 100644
 -#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs]
 +#  BSD_DEV =        [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
 +#  BSD_DEBUG =      [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
-+#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs packfs ramfs ]
++#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs ramfs apfs ]
  #  FILESYS_RELEASE= [ FILESYS_BASE ]
  #  FILESYS_DEV =    [ FILESYS_BASE config_union_mounts fdesc ]
  #  FILESYS_DEBUG =  [ FILESYS_BASE config_union_mounts fdesc ]
@@ -2875,6 +2965,37 @@ index bec97fbf7243..203e1f48783f 100644
  #endif
  
  #if CONFIG_DTRACE
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 384ef23fe0e1..d5ab6db0edbc 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -3065,6 +3065,26 @@ thread_get_tag(thread_t th)
+ 	return thread_get_tag_internal(th);
+ }
+ 
++/*
++ * For apfs's lock statistics (bsd/miscfs/apfs/apfs_vnops.c): how long the current thread has
++ * been runnable (running included) and how long it has run, in mach_absolute_time() units.
++ * Taken before and after a wait for a lock, the two tell the wait apart: blocked, queued for
++ * a processor, or spinning on one.
++ */
++void thread_runnable_and_run_self(uint64_t *runnable, uint64_t *run);
++
++void
++thread_runnable_and_run_self(uint64_t *runnable, uint64_t *run)
++{
++	thread_t thread = current_thread();
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	uint64_t now = mach_absolute_time();
++
++	*runnable = thread->runnable_timer.all_bits + (now - thread->runnable_timer.tstamp);
++	*run = recount_current_thread_time_mach();
++	ml_set_interrupts_enabled(istate);
++}
++
+ uint64_t
+ thread_last_run_time(thread_t th)
+ {
 diff --git a/osfmk/kern/work_interval.c b/osfmk/kern/work_interval.c
 index f2b9ce24bd8d..3aed167fe32e 100644
 --- a/osfmk/kern/work_interval.c

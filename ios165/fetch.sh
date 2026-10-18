@@ -6,6 +6,10 @@
 #   system.files/.manifest   what was chosen, with owners, modes and symbolic links
 #   var.skel                 the skeleton of /private/var (see mkvarskel.py)
 #   cryptex/                 the OS cryptex without the dyld shared cache
+#   cryptex-app.dmg          the App cryptex as Apple ships it (10 MB, an APFS container: Safari's
+#                            daemons, its settings and the bundles around it, which the root volume's
+#                            launchd jobs and links reach through /System/Cryptexes/App)
+#   cryptex-app/             ... and its files
 #   20F66__iPhone10,3_6/     the dyld shared cache (arm64)
 #
 # Nothing of this is in the repository: the two disk images are fetched out of the IPSW on
@@ -19,6 +23,7 @@ set -e
 cd "$(dirname "$0")"
 ROOTFS_DMG=096-04088-077.dmg                    # the root filesystem, APFS
 CRYPTEX_DMG=096-04666-078.dmg                   # the OS cryptex: dyld shared cache and a few libraries
+APP_CRYPTEX_DMG=096-03536-083.dmg               # the App cryptex (BuildManifest: Cryptex1,AppOS)
 CACHE=20F66__iPhone10,3_6
 UNZBM=../xnu-deps/host/bin/unzbm
 
@@ -81,4 +86,21 @@ if [ ! -f .done-cryptex ]; then
 	touch .done-cryptex
 	[ -n "$KEEP" ] || rm -f cryptex-os.dmg
 fi
-echo "fetch.sh: done: $(du -sh rootfs | cut -f1) rootfs, $(du -sh cryptex | cut -f1) cryptex, $(du -sh $CACHE | cut -f1) dyld shared cache"
+
+# --- the App cryptex ------------------------------------------------------------------------------
+# kept as it is (the boot off the flash puts it in memory unchanged, ../userland/build.sh FLASHBOOT=1)
+# and unpacked (the system image has its files at /System/Cryptexes/App)
+if [ ! -f .done-cryptex-app ]; then
+	if [ ! -f cryptex-app.dmg ]; then
+		echo "fetch.sh: downloading the App cryptex image (10 MB)"
+		python3 fetch-from-ipsw.py $APP_CRYPTEX_DMG cryptex-app.dmg.part
+		mv cryptex-app.dmg.part cryptex-app.dmg
+	fi
+	echo "fetch.sh: extracting the App cryptex"
+	rm -rf cryptex-app
+	7z x -y -ocryptex-app cryptex-app.dmg > extract-cryptex-app.log 2>&1 || true
+	unzbm_all cryptex-app
+	[ -f cryptex-app/usr/libexec/webbookmarksd ] || { echo "fetch.sh: the App cryptex is incomplete"; exit 1; }
+	touch .done-cryptex-app
+fi
+echo "fetch.sh: done: $(du -sh rootfs | cut -f1) rootfs, $(du -sh cryptex | cut -f1) cryptex, $(du -sh cryptex-app | cut -f1) App cryptex, $(du -sh $CACHE | cut -f1) dyld shared cache"

@@ -3,7 +3,7 @@
 #
 #   xl enter            get the phone into the resident loader (from Android or stock fastboot)
 #   xl run [N]          upload the current kernel, run it (optionally stop at checkpoint N), fetch the log
-#   xl ramdisk [FILE]   upload the big system image (default userland/system.packfs) once; it stays in
+#   xl ramdisk [FILE]   upload the big system image (default userland/system.apfs) once; it stays in
 #                       the phone's RAM across kernel runs and is the root filesystem (/dev/md0)
 #                       ("xl ramdisk none" forgets it; the image sent with the kernel is then the root)
 #   xl screenshot [F]   save what is in the phone's framebuffer as a PNG (default logs/screen.png);
@@ -33,7 +33,7 @@
 #               kernel that hangs still gets its log out); cpufreq=1 sets that core to its top speed;
 #               touchscreen=1 turns the touch screen on.
 #   XL_RAMDISK  the image sent with the kernel: the small one that is mounted on /redwood
-#               (default userland/root.packfs; "none" sends none). Without a system image in the
+#               (default userland/root.apfs; "none" sends none). Without a system image in the
 #               phone's RAM it is the root itself (e.g. XL_RAMDISK=userland/hello).
 # One phone, several working copies: a run holds a lock, and `stop` and `reboot` from another working
 # copy than the one it was started from are refused (XL_FORCE=1 to end it all the same).
@@ -104,7 +104,7 @@ run() { # run <oem command> <label>
 	stamp=$(date +%H%M%S); log="logs/$stamp-$2.log"
 	if [ "$1" != "oem selftest" ]; then
 		# The kernel hands control back after XL_SECS seconds even if it is just waiting.
-		local rd=${XL_RAMDISK:-userland/root.packfs}
+		local rd=${XL_RAMDISK:-userland/root.apfs}
 		case "$rd" in
 		none|resident) rd= ;;
 		*) [ -f "$rd" ] || { echo "xl: ramdisk $rd not found"; return 1; } ;;
@@ -187,7 +187,7 @@ camera() { # camera [prefix]: the frames the last run's camera left (boot-arg ca
 ramdisk() { # ramdisk [<file>|none]
 	enter || return 1
 	if [ "$1" = none ]; then fb oem ramdisk none >/dev/null; echo "xl: resident ramdisk dropped"; return; fi
-	set -- "${1:-userland/system.packfs}"
+	set -- "${1:-userland/system.apfs}"
 	[ -f "$1" ] || { echo "xl: $1 not found"; return 1; }
 	local t0=$(date +%s) size=$(stat -c %s "$1")
 	fb oem ramdisk | grep -q OKAY || { echo "xl: the loader refused (no memory window?)"; return 1; }

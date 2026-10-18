@@ -6,7 +6,6 @@
 !/README.md
 !/docs/
 !/xl
-!/mkpackfs.py
 !/mkxnuimg.py
 !/xnu-build.sh
 !/xnu-env.sh
@@ -79,3 +78,4 @@ __pycache__/
 !/xnu-deps/build/lzbitmap/unzbm.c
 !/xnu-deps/build/lzbitmap/libzbitmap.c
 !/xnu-deps/build/lzbitmap/libzbitmap.h
+/tools/android/f2fs-resize

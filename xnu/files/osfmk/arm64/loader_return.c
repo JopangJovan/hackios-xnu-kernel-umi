@@ -56,6 +56,7 @@ extern void redwood_haptic_quiesce(void);
 extern void redwood_torch_quiesce(void);
 extern void redwood_camera_quiesce(void);
 extern void redwood_mic_quiesce(void);
+extern void redwood_ufs_quiesce(void);
 void loader_checkpoint(uint64_t n);
 
 /* Also referenced from the early exception vector in start.s. */
@@ -367,6 +368,7 @@ loader_return(void)
 	 */
 	psci_smp_stop_others();
 #endif
+	redwood_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	redwood_adsp_quiesce();         /* nor the audio DSP */
@@ -522,16 +524,19 @@ extern void MiniIOSurfaceUsage(uint32_t *count, uint64_t *bytes);
  * daemons, and once none is left and it is below the second, whatever is next in line -- the
  * window server included.
  */
-static void
-memory_report(void)
+void redwood_memory_line(char *buf, size_t len);
+
+/* The line itself (also kern.redwood_memory, for a job list to keep: bsd/miscfs/apfs/apfs_vfsops.c) */
+void
+redwood_memory_line(char *buf, size_t len)
 {
 #define MB(pages)       ((unsigned int)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
 	uint32_t surfaces = 0;
 	uint64_t surface_bytes = 0;
 
 	MiniIOSurfaceUsage(&surfaces, &surface_bytes);
-	printf("memory: free %u, files %u, programs %u, wired %u (%u surfaces %u, ramfs %u), compressor %u (holding %u) MB; "
-	    "available %u, kills below %u (the idle) and %u (anybody)\n",
+	snprintf(buf, len, "memory: free %u, files %u, programs %u, wired %u (%u surfaces %u, ramfs %u), compressor %u "
+	    "(holding %u) MB; available %u, kills below %u (the idle) and %u (anybody)\n",
 	    MB(vm_page_free_count), MB(vm_page_pageable_external_count), MB(vm_page_pageable_internal_count),
 	    MB(vm_page_wire_count), surfaces, (unsigned int)(surface_bytes >> 20),
 	    MB(os_atomic_load(&ramfs_pages_in_use, relaxed)),
@@ -539,6 +544,15 @@ memory_report(void)
 	    MB(memorystatus_available_pages),
 	    MB(memorystatus_available_pages_critical), MB(memorystatus_available_pages_critical_base));
 #undef MB
+}
+
+static void
+memory_report(void)
+{
+	char line[256];
+
+	redwood_memory_line(line, sizeof(line));
+	printf("%s", line);
 	redwood_adreno_minute();                /* (and how warm the GPU is, if it is in use) */
 }
 
