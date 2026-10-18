@@ -35,6 +35,7 @@
  * arrives.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <objc/message.h>
@@ -283,6 +284,119 @@ audio_source_start(id self, SEL selector, id *error)
 	return true;
 }
 
+/*
+ * A photograph's quality prioritization, "speed" at the most. Asked for "balanced" (Camera.app's) or
+ * "quality", the capture device takes a scene for a low-light one whenever a frame was exposed at
+ * least as long as the sensor's still image stabilization threshold
+ * (-[BWFigVideoCaptureDevice _isLowLightSceneUsingFrameStatisticsByPortType:]) -- a threshold from
+ * the sensor's tuning in CameraSetup.plist, 0 for a sensor it has no tuning for, as ours -- and
+ * then asks the stream for a bracket of four frames for SIS fusion (captureType 4, BWSISNode), which
+ * this port has nothing to fuse with: the photograph never came. With "speed" it asks for one frame
+ * (-_resolveStillImageCaptureTypeFromStatisticsByPortType:..., captureType 1), which the stream
+ * gives (camera_device.c, StillImageCaptureNow).
+ */
+static IMP original_quality_prioritization;
+
+static int
+quality_prioritization(id self, SEL selector)
+{
+	int asked = ((int (*)(id, SEL))original_quality_prioritization)(self, selector);
+	static bool said;
+
+	if (asked > 1 && !said) {
+		said = true;
+		say("redwood: mediaserverd: a photograph's quality prioritization %d taken as 1 (speed): one frame, no SIS bracket\n",
+		    asked);
+	}
+	return asked > 1 ? 1 : asked;
+}
+
+/*
+ * A photograph's noise reduction (BWGNRNode, between the still image coordinator and the photo
+ * encoder) is a FigSampleBufferProcessor of the iPhone's, which is handed the picture and never
+ * hands one back here: the photograph stopped there, with no error, and the request with it (the
+ * shutter's second press asked for nothing more). The picture goes past it to the node's output as
+ * it came, as with no noise reduction to do.
+ */
+static void
+gnr_render(id self, SEL selector, void *sample_buffer, id input)
+{
+	id output = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("output"));
+	static bool said;
+
+	(void)selector, (void)input;
+	if (!said) {
+		said = true;
+		say("redwood: mediaserverd: a photograph goes past the noise reduction, which has nothing to do it with here\n");
+	}
+	if (output != nil) {
+		((void (*)(id, SEL, void *))objc_msgSend)(output, sel_registerName("emitSampleBuffer:"), sample_buffer);
+	}
+}
+
+/*
+ * A node's output given no sample buffer at all, which no node takes: the session's audio source
+ * (-[BWAudioSourceNode _generateSamples]), whose audio unit never started here (see audio_source_start
+ * above), fills the silence by a timer with buffers it fails to make and emits them all the same --
+ * NULL. Live Photo's staging node added that to an array (-[BWIrisStagingNode renderSampleBuffer:forInput:])
+ * and mediaserverd died of the NSInvalidArgumentException, every half a minute with Live Photo on, the
+ * preview black for a second each time. A NULL is not passed on.
+ */
+static IMP original_emit_sample_buffer;
+
+static void
+emit_sample_buffer(id self, SEL selector, void *sample_buffer)
+{
+	static bool said;
+
+	if (sample_buffer == NULL) {
+		if (!said) {
+			said = true;
+			say("redwood: mediaserverd: a node's output was given no sample buffer (the silent audio source's): not passed on\n");
+		}
+		return;
+	}
+	((void (*)(id, SEL, void *))original_emit_sample_buffer)(self, selector, sample_buffer);
+}
+
+/*
+ * The photograph's encoder. Camera.app asks for HEIC -- HEVC inside a HEIF file, which CMPhoto makes
+ * through VideoToolbox -- and VideoToolbox here has no HEVC encoder but the iPhone's hardware ones
+ * (com.apple.videotoolbox.videoencoder.hevc and .hevc.gva, behind its AVE): the photo encoder node
+ * failed with kVTCouldNotFindVideoEncoderErr (-12908). Apple's software HEVC codec is in the system
+ * all the same, VCPHEVC.videocodec, whose decoder VideoToolbox takes here for every HEIC picture (see
+ * the top), and there is an encoder in it, HEVCVideoEncoder_CreateInstance, that iOS never registers:
+ * the codec's VCPHEVCRegisterEncoder is an empty function. It is registered here, as the codec
+ * registers its decoder (VTRegisterVideoDecoderWithInfo, not hardware accelerated).
+ */
+static void
+register_hevc_encoder(void)
+{
+	void *codec = dlopen("/System/Library/VideoCodecs/VCPHEVC.videocodec", RTLD_NOW | RTLD_LOCAL);
+	void *vt = dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
+	void *create = codec != NULL ? dlsym(codec, "HEVCVideoEncoder_CreateInstance") : NULL;
+	int (*register_encoder)(uint32_t, CFDictionaryRef, void *) = vt != NULL ? dlsym(vt, "VTRegisterVideoEncoderWithInfo") : NULL;
+	CFStringRef *id_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_EncoderID") : NULL;
+	CFStringRef *name_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_EncoderName") : NULL;
+	CFStringRef *hardware_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_IsHardwareAccelerated") : NULL;
+	int status;
+
+	if (create == NULL || register_encoder == NULL || id_key == NULL || name_key == NULL || hardware_key == NULL) {
+		say("redwood: mediaserverd: no software HEVC encoder to register (%s)\n", codec == NULL ? "no VCPHEVC.videocodec" :
+		    create == NULL ? "no HEVCVideoEncoder_CreateInstance" : "VideoToolbox without VTRegisterVideoEncoderWithInfo");
+		return;
+	}
+	const void *keys[] = { *id_key, *name_key, *hardware_key };
+	const void *values[] = { CFSTR("com.apple.videotoolbox.videoencoder.hevc.vcp"), CFSTR("HEVC (VCPHEVC, software)"),
+		kCFBooleanFalse };
+	CFDictionaryRef info = CFDictionaryCreate(NULL, keys, values, 3, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+
+	status = register_encoder('hvc1', info, create);
+	CFRelease(info);
+	say("redwood: mediaserverd: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (%d)\n", status);
+}
+
 struct method_spec {
 	const char *selector, *types;
 	IMP imp;
@@ -342,6 +456,10 @@ static struct replacement {
 	  (IMP)video_stabilization_method, NULL, true, false },
 	{ "FigVideoCaptureConnectionConfiguration", "videoStabilizationType", 0x1a20d8f48UL,
 	  (IMP)video_stabilization_type, NULL, true, false },
+	{ "FigCaptureStillImageSettings", "qualityPrioritization", 0x1a1f533dcUL,
+	  (IMP)quality_prioritization, &original_quality_prioritization, true, false },
+	{ "BWGNRNode", "renderSampleBuffer:forInput:", 0x1a1ec83b8UL, (IMP)gnr_render, NULL, true, false },
+	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ea37e0UL, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
 };
 
 static void
@@ -393,6 +511,7 @@ redwood_media_init(void)
 	}
 	if (camera) {
 		say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera)\n");
+		register_hevc_encoder();
 	}
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
 }

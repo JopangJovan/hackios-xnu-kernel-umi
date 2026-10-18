@@ -1,39 +1,34 @@
 /*
- * The wide camera as iOS's capture stack wants a camera: a FigCaptureDevice with one FigCaptureStream
- * (the back camera), made for mediaserverd's BWFigCaptureDeviceVendor in place of the one Apple's
- * H10ISP.mediacapture makes of the iPhone's ISP (part of libredwood-media.dylib; inject_media.c
- * gives the vendor our device's create function when the kernel has a camera: cam=5).
+ * The phone's cameras as iOS's capture stack wants them: a FigCaptureDevice with two FigCaptureStreams,
+ * the wide camera as the back camera and the front one as the front camera, made for mediaserverd's
+ * BWFigCaptureDeviceVendor in place of the device Apple's H10ISP.mediacapture makes of the iPhone's ISP
+ * (part of libredwood-media.dylib; inject_media.c gives the vendor our device's create function when
+ * the kernel has a camera: cam=5).
  *
  * Both are CoreMedia "derived objects" (CMDerivedObjectCreate): a table of functions for the base
  * class (properties) and one for the device or stream class, as H10ISP's are laid out in iOS 16.5:
  *   device  RequestStreams, RelinquishStreams (and a processing session and Pearl calibration, not here)
  *   stream  Start, Stop, AddAttachmentsToSampleBuffer
- * The stream's frames go to the capture graph through the blocks it is given in its property
+ * A stream's frames go to the capture graph through the blocks it is given in its property
  * "VideoOutputHandlers" ({ output: { PixelBufferHandler: ^(CVPixelBufferRef, CMTime) } }), for the
- * outputs "VideoOutputConfigurations" describes (size, pixel format) and "VideoOutputsEnabled"
+ * outputs "VideoOutputConfigurations" describes (the graph's own buffer pools) and "VideoOutputsEnabled"
  * switches on. A frame: read from the kernel's /dev/redwood-camera (RAW10), made into a picture by
- * camera_isp.c (exposure, white balance, gamma, scaling), one pixel buffer for each output.
+ * camera_isp.c (exposure, white balance kept to the sensor's reference lights, the colour matrix and
+ * lens shading of the camera's own tuning, gamma, zoom), one pixel buffer for each output, with the
+ * metadata the graph keeps its frame statistics and its zoom by. The kernel gives one sensor's frames
+ * at a time: a stream that starts stops the other's frames and has the kernel change sensors.
  *
- * The formats the stream offers are named as the iPhone X's back camera's are in CMCapture's
- * D22/AVCaptureSession.plist (FigCaptureStreamFormats "Photo" and "Video-60", by the sensor sizes
- * and frame rates the plist matches them by), so that its AVCaptureDevice formats and session presets
- * resolve: the pictures are scaled from the sensor's 4000x3000 to whatever size is asked for.
+ * The formats the streams offer are named as the iPhone X's cameras' are in CMCapture's
+ * D22/AVCaptureSession.plist (FigCaptureStreamFormats, by the sensor sizes and frame rates the plist
+ * matches them by), so that their AVCaptureDevice formats and session presets resolve: the pictures
+ * are scaled from the sensor's frames to whatever size is asked for.
  *
- * Everything asked of the device and the stream that is not answered here is said in mediaserverd's
+ * The shutter: StillImageCaptureNow asks for one frame of the whole sensor on the StillImage output
+ * (the time machine's TimeMachineSuspendNow/ResumeNow are taken and ignored). Focus, where there is
+ * a lens motor (the wide camera's): by contrast, continuous, and on the window a tap gives (af_frame()).
+ *
+ * Everything asked of the device and the streams that is not answered here is said in mediaserverd's
  * log ("redwood: camera: ..."), once per property.
- *
- * The graph builds, the session runs, and the pictures of the PrimaryScaler output are Camera.app's
- * preview, steadily.
- *
- * NOT FINISHED: no photograph is taken. The shutter reaches mediaserverd (-[BWStillImageCoordinatorNode
- * initiateStillImageCaptureNowWithSettings:] and then -[BWFigVideoCaptureDevice
- * _captureStillImageNowWithSettings:]), and there it quietly comes to nothing: the device's
- * _convertStillImageCaptureSettings:toStillImageCaptureNowOptions:captureStreamPropertyValues: gives
- * back no stream settings for this port, so _captureStillImageNowOnStreamWithOptions: writes nothing
- * on the stream, reports success, and no "StillImageCaptureNow" ever arrives here. What this side
- * would do with it is written below and waits for that: one frame of the sensor, the whole of it, to
- * the StillImage output. (Those methods of CMCapture are objc_direct: they cannot be replaced to be
- * looked into, which is as far as this went.)
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
@@ -43,6 +38,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -117,6 +113,40 @@ static void *(*derived_storage)(CMBaseObjectRef);
 static CMBaseClassID (*device_class_id)(void);
 static CMBaseClassID (*stream_class_id)(void);
 static CFStringRef port_back;           /* kFigCapturePortType_BackFacingCamera */
+static CFStringRef port_front;          /* kFigCapturePortType_FrontFacingCamera */
+
+/*
+ * The frames' metadata: what H10ISP's stream attaches to every frame (a dictionary under
+ * kFigCaptureSampleBufferAttachmentKey_MetadataDictionary, through the stream's
+ * AddAttachmentsToSampleBuffer when the graph defers it), and what the capture device keeps its frame
+ * statistics of. -[BWFrameStatisticsByPortType updateWithFrameMetadata:updateFocusDistance:] counts
+ * a frame only for a buffer that has it, and -[BWFigVideoCaptureDevice
+ * _stillImageCaptureInProgressSubstateForFrameStatisticsByPortType:...] puts a standard photograph
+ * off until more than four frames have been counted (then only while AFStatus is 2, a coarse focus
+ * scan): without it the shutter's capture was put off on every frame (the retry in
+ * _updateStateUsingVideoSampleBuffer:fromCaptureStream:), for ever, and StillImageCaptureNow never
+ * came. The dictionary goes on the pixel buffer too, and mutable, as the ISP's does: FigImageControl_Focus
+ * (the device's camera controls, on every frame once the sample buffer has metadata) reads it from
+ * the pixel buffer with no check that it is there -- CFDictionaryGetValue(NULL, ...): mediaserverd
+ * died of SIGSEGV -- and adds its own keys to it. The keys are CoreMedia's; the values come from the
+ * frame's header and our ISP's levels, in Apple's units where they are known (the exposure in seconds,
+ * gains with 256 for 1x); lux and SNR are rough.
+ */
+enum {
+	MD_PORT, MD_PTS, MD_EXPOSURE, MD_AGC, MD_ISP_DGAIN, MD_SENSOR_DGAIN, MD_ISO_BASE, MD_FRAME_RATE, MD_LUX, MD_SNR,
+	MD_AF_STATUS, MD_FOCUSING, MD_AE_STABLE, MD_AE_LOCKED, MD_AWB_STABLE, MD_AWB_LOCKED, MD_AF_LOCKED, MD_ZOOM, MD_KEYS
+};
+static const char *const md_names[MD_KEYS] = {
+	"kFigCaptureStreamMetadata_PortType", "kFigCaptureSampleBufferAttachmentKey_OriginalPresentationTimeStamp",
+	"kFigCaptureStreamMetadata_ExposureTime", "kFigCaptureStreamMetadata_AGC", "kFigCaptureStreamMetadata_ispDGain",
+	"kFigCaptureStreamMetadata_sensorDGain", "kFigCaptureStreamMetadata_ISOBase", "kFigCaptureStreamMetadata_CurrentFrameRate",
+	"kFigCaptureStreamMetadata_LuxLevel", "kFigCaptureStreamMetadata_NormalizedSNR", "kFigCaptureStreamMetadata_AFStatus",
+	"kFigCaptureStreamMetadata_FocusingMethod", "kFigCaptureStreamMetadata_AEStable", "kFigCaptureStreamMetadata_AELocked",
+	"kFigCaptureStreamMetadata_AWBStable", "kFigCaptureStreamMetadata_AWBLocked", "kFigCaptureStreamMetadata_AFLocked",
+	"kFigCaptureStreamMetadata_ZoomFactor",
+};
+static CFStringRef md_key[MD_KEYS];
+static CFStringRef md_attachment;       /* kFigCaptureSampleBufferAttachmentKey_MetadataDictionary */
 
 static bool
 find_functions(void)
@@ -129,7 +159,24 @@ find_functions(void)
 	stream_class_id = dlsym(RTLD_DEFAULT, "FigCaptureStreamGetClassID");
 	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_BackFacingCamera");
 	port_back = port != NULL ? *port : NULL;
-	if (derived_create == NULL || derived_storage == NULL || device_class_id == NULL || stream_class_id == NULL || port_back == NULL) {
+	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_FrontFacingCamera");
+	port_front = port != NULL ? *port : NULL;
+	port = dlsym(RTLD_DEFAULT, "kFigCaptureSampleBufferAttachmentKey_MetadataDictionary");
+	md_attachment = port != NULL ? *port : NULL;
+	for (int i = 0; i < MD_KEYS; i++) {
+		port = dlsym(RTLD_DEFAULT, md_names[i]);
+		md_key[i] = port != NULL ? *port : NULL;
+		if (md_key[i] == NULL) {
+			say("%s is not there: the frames' metadata go without it", md_names[i]);
+		}
+	}
+	if (md_attachment == NULL || md_key[MD_PORT] == NULL) {
+		say("kFigCaptureSampleBufferAttachmentKey_MetadataDictionary or the port's key is not there: frames without "
+		    "metadata, and the shutter will wait for ever");
+		md_attachment = NULL;
+	}
+	if (derived_create == NULL || derived_storage == NULL || device_class_id == NULL || stream_class_id == NULL || port_back == NULL ||
+	    port_front == NULL) {
 		say("CoreMedia's or CMCapture's functions are not there: no camera");
 		return false;
 	}
@@ -142,23 +189,10 @@ static CFMutableSetRef said_names;
 static pthread_mutex_t said_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
-say_once(const char *what, CFStringRef key, CFTypeRef value)
+say_value(const char *what, CFStringRef key, CFTypeRef value)
 {
 	char name[160] = "?", text[300] = "";
-	CFStringRef tag = CFStringCreateWithFormat(NULL, NULL, CFSTR("%s %@"), what, key);
 
-	pthread_mutex_lock(&said_lock);
-	if (said_names == NULL) {
-		said_names = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
-	}
-	bool first = !CFSetContainsValue(said_names, tag);
-
-	CFSetAddValue(said_names, tag);
-	pthread_mutex_unlock(&said_lock);
-	CFRelease(tag);
-	if (!first) {
-		return;
-	}
 	CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8);
 	if (value != NULL) {
 		CFStringRef d = CFCopyDescription(value);
@@ -170,6 +204,25 @@ say_once(const char *what, CFStringRef key, CFTypeRef value)
 		}
 	}
 	say("%s %s%s%s", what, name, value ? " = " : "", text);
+}
+
+static void
+say_once(const char *what, CFStringRef key, CFTypeRef value)
+{
+	CFStringRef tag = CFStringCreateWithFormat(NULL, NULL, CFSTR("%s %@"), what, key);
+
+	pthread_mutex_lock(&said_lock);
+	if (said_names == NULL) {
+		said_names = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
+	}
+	bool first = !CFSetContainsValue(said_names, tag);
+
+	CFSetAddValue(said_names, tag);
+	pthread_mutex_unlock(&said_lock);
+	CFRelease(tag);
+	if (first) {
+		say_value(what, key, value);
+	}
 }
 
 /* ---- numbers and dictionaries ---------------------------------------------------------------------- */
@@ -242,6 +295,11 @@ static const struct prop stream_props[] = {
 	{ "RegionOfInterestForCameraControls", "Collection", "ReadWrite" }, { "AEMeteringMode", "Number", "ReadWrite" },
 	{ "MaxFrameCoalescingDuration", "Number", "ReadWrite" }, { "LimitAERange", "Boolean", "ReadWrite" },
 	{ "TimeMachineSuspendNow", "Boolean", "WriteOnly" }, { "TimeMachineResumeNow", "Boolean", "WriteOnly" },
+	/* focus (the wide camera's lens motor; see af_frame()) */
+	{ "AutoFocusNow", "Collection", "WriteOnly" }, { "ContinuousAutoFocusNow", "Collection", "WriteOnly" },
+	{ "FocusNow", "Collection", "WriteOnly" }, { "PeakTrackingFocusNow", "Collection", "WriteOnly" },
+	{ "LockAFNow", "Boolean", "WriteOnly" }, { "ManualFocusNow", "Collection", "WriteOnly" },
+	{ "AFWindowParams", "Collection", "ReadWrite" }, { "AutoFocusMode", "Number", "ReadWrite" },
 }, device_props[] = {
 	{ "StreamArray", "Collection", "ReadOnly" }, { "Clock", "Clock", "ReadOnly" }, { "ClientIsActive", "Boolean", "ReadWrite" },
 	{ "SupportedSynchronizedStreamsGroups", "Collection", "ReadOnly" }, { "MemoryPoolID", "Number", "ReadWrite" },
@@ -289,7 +347,7 @@ output_info(int width, int height)
 }
 
 static CFDictionaryRef
-format(int sensor_width, int sensor_height, int max_fps, bool binned)
+format(int sensor_width, int sensor_height, int max_fps, bool binned, double fov)
 {
 	CFMutableDictionaryRef f = (CFMutableDictionaryRef)new_dict(), outputs = (CFMutableDictionaryRef)new_dict();
 	CMVideoFormatDescriptionRef fd = NULL;
@@ -303,7 +361,7 @@ format(int sensor_width, int sensor_height, int max_fps, bool binned)
 	put(f, "VideoIsBinned", CFRetain(binned ? kCFBooleanTrue : kCFBooleanFalse));
 	put(f, "VideoBinningFactorHorizontal", number_i(binned ? 2 : 1));
 	put(f, "VideoBinningFactorVertical", number_i(binned ? 2 : 1));
-	put(f, "VideoFieldOfView", number_f(65.0));
+	put(f, "VideoFieldOfView", number_f(fov));
 	put(f, "VideoMinIntegrationTime", number_i(100));
 	put(f, "VideoMaxIntegrationTime", number_i(1000000 / 15));
 	put(f, "VideoRawBitDepth", number_i(10));
@@ -345,18 +403,51 @@ struct output {
 	void *          handler;                /* a block: ^(CVPixelBufferRef, CMTime) */
 	bool            said_shape;
 	uint64_t        delivered, refused;
+	CVPixelBufferRef held;                  /* the picture given last, kept from the pool (see deliver) */
+	bool            said_pool;
 };
+
+static void let_go(struct output *out);
 
 #define OUTPUTS 3
 static const char *const output_names[OUTPUTS] = { "PrimaryScaler", "SecondaryScaler", "StillImage" };
+
+#define MAX_ZOOM        16              /* (the most the iPhone X's wide camera zooms digitally) */
+
+/*
+ * The device's cameras, a stream each, as the iPhone X's are in CMCapture's D22/AVCaptureSession.plist
+ * (its devices' uniqueIDs, and the stream formats its formats and presets are matched to by sensor size
+ * and frame rate): the wide camera as the back camera, the front one as the front camera. The kernel
+ * gives one sensor's frames at a time; a stream's frames start with its own sensor's (see worker()).
+ */
+static const struct camera {
+	uint32_t        sensor;         /* the kernel's (the frames' sensor, REDWOOD_CAMERA_SENSOR) */
+	const char      *name, *unique_id;
+	bool            turned;         /* its sensor the other way up from the iPhone's: the pictures turned half round */
+	double          focal_length, f_number, pixel_size, fov;
+	int             formats[2][3];  /* sensor width, height, frames a second of "Photo" and of a video format */
+} cameras[2] = {
+	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.0, 1.8, 1.22, 65.0,
+	  { { 4032, 3024, 30 }, { 4224, 2376, 60 } } },        /* "Photo", "Video-60" */
+	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.87, 2.2, 1.0, 70.0,
+	  { { 3088, 2320, 30 }, { 3840, 2160, 30 } } },        /* "Photo", "Video-30" */
+};
 
 struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
 	CFDictionaryRef colour_info;    /* from VideoOutputsColorInfo */
+	CFDictionaryRef metadata;       /* the last frame's (frame_metadata()), for a buffer that has none of its own */
+	pthread_mutex_t metadata_lock;  /* (not `lock': AddAttachmentsToSampleBuffer may come while a frame is given out) */
 	unsigned        stills_wanted;  /* photographs asked for by StillImageCaptureNow, not yet given */
 	int             format_index;
 	double          min_fps, max_fps;
+	float           zoom;           /* ZoomFactor: the picture is the middle 1/zoom of the sensor each way */
+	const struct camera *camera;
+	CFStringRef     port;
+	bool            af_now;         /* a focus asked for (AutoFocusNow and the like): a search at the next frame */
+	bool            af_locked;      /* LockAFNow: no search but one asked for */
+	float           af_window[4];   /* AFWindowParams: where to focus, as fractions of the frame (x0, y0, x1, y1) */
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
 	pthread_t       worker;
@@ -392,11 +483,11 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 
 	(void)allocator;
 	if (key_is(key, "PortType")) {
-		value = CFRetain(port_back);
+		value = CFRetain(s->port);
 	} else if (key_is(key, "UniqueID") || key_is(key, "ModelID")) {
-		value = CFRetain(CFSTR("com.apple.avfoundation.avcapturedevice.built-in_video:0"));
+		value = CFStringCreateWithCString(NULL, s->camera->unique_id, kCFStringEncodingUTF8);
 	} else if (key_is(key, "NonLocalizedName") || key_is(key, "LocalizedName")) {
-		value = CFRetain(CFSTR("Back Camera"));
+		value = CFStringCreateWithCString(NULL, s->camera->name, kCFStringEncodingUTF8);
 	} else if (key_is(key, "Manufacturer")) {
 		value = CFRetain(CFSTR("Apple Inc."));
 	} else if (key_is(key, "SupportedFormatsArray")) {
@@ -452,22 +543,22 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 	} else if (key_is(key, "SupportedPropertiesDictionary")) {
 		value = CFRetain(s->supported);
 	} else if (key_is(key, "FocalLength")) {
-		value = number_f(4.0);          /* (the iPhone X's wide camera's, in millimetres) */
+		value = number_f(s->camera->focal_length);     /* (the iPhone X's cameras', in millimetres) */
 	} else if (key_is(key, "LensFNumber")) {
-		value = number_f(1.8);
+		value = number_f(s->camera->f_number);
 	} else if (key_is(key, "PixelSize")) {
 		/*
 		 * The capture-graph builder REQUIRES this of the stream: -[BWFigVideoCaptureStream
 		 * initWithCaptureStream:...] does a getProperty: (not IfSupported:) for it, and without it the
 		 * init fails, so FigVideoCaptureSourcesActivateAndCreateDevices errors and the graph is never
-		 * built. The sensor's pixel pitch in micrometres (the iPhone X wide camera's); any value in
+		 * built. The sensor's pixel pitch in micrometres (the iPhone X cameras'); any value in
 		 * (0, 100) is accepted.
 		 */
-		value = number_f(1.22);
+		value = number_f(s->camera->pixel_size);
 	} else if (key_is(key, "MaxZoomFactor")) {
-		value = number_f(16);
+		value = number_f(MAX_ZOOM);
 	} else if (key_is(key, "ZoomFactor")) {
-		value = number_f(1);
+		value = number_f(s->zoom);
 	} else if (key_is(key, "SupportedColorSpaces")) {
 		CFNumberRef srgb = number_i(0);
 
@@ -488,6 +579,57 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 
 static void torch_set(struct stream *s, CFTypeRef value);
 
+static double
+dict_number(CFDictionaryRef d, const char *name, double otherwise)
+{
+	CFStringRef k = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+	CFTypeRef v = CFDictionaryGetValue(d, k);
+	double n = otherwise;
+
+	CFRelease(k);
+	if (v != NULL && CFGetTypeID(v) == CFNumberGetTypeID()) {
+		CFNumberGetValue(v, kCFNumberDoubleType, &n);
+	}
+	return n;
+}
+
+/* AFWindowParams: the first window, as fractions of the frame; none (or not one) is the middle */
+static void
+af_window(struct stream *s, CFTypeRef value)
+{
+	CFDictionaryRef w = NULL;
+	double x0, y0, width, height;
+
+	if (value != NULL && CFGetTypeID(value) == CFArrayGetTypeID() && CFArrayGetCount(value) > 0) {
+		w = CFArrayGetValueAtIndex(value, 0);
+	}
+	if (w == NULL || CFGetTypeID(w) != CFDictionaryGetTypeID() || (width = dict_number(w, "width", 0)) <= 0 ||
+	    (height = dict_number(w, "height", 0)) <= 0) {
+		s->af_window[0] = s->af_window[1] = 0.3f;
+		s->af_window[2] = s->af_window[3] = 0.7f;
+		return;
+	}
+	x0 = dict_number(w, "hStart", 0) / 1000;
+	y0 = dict_number(w, "vStart", 0) / 1000;
+	width /= 1000;
+	height /= 1000;
+	/* (at least a tenth of the frame each way, about the middle of what was asked) */
+	if (width < 0.1) {
+		x0 -= (0.1 - width) / 2;
+		width = 0.1;
+	}
+	if (height < 0.1) {
+		y0 -= (0.1 - height) / 2;
+		height = 0.1;
+	}
+	x0 = x0 < 0 ? 0 : x0 + width > 1 ? 1 - width : x0;
+	y0 = y0 < 0 ? 0 : y0 + height > 1 ? 1 - height : y0;
+	s->af_window[0] = (float)x0;
+	s->af_window[1] = (float)y0;
+	s->af_window[2] = (float)(x0 + width);
+	s->af_window[3] = (float)(y0 + height);
+}
+
 static OSStatus
 stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 {
@@ -504,6 +646,24 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		}
 		s->format_index = (int)i;
 		say("stream: format %lld", (long long)i);
+		return 0;
+	}
+	if (key_is(key, "ZoomFactor")) {
+		/*
+		 * The zoom: the camera's pictures -- moving and still alike -- made of the middle of the sensor
+		 * (src/camera_isp.c, crop()), as the iPhone's ISP crops for it. Digital: no more detail than
+		 * that part of the sensor has.
+		 */
+		double zoom = 1;
+
+		if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
+			CFNumberGetValue(value, kCFNumberDoubleType, &zoom);
+		}
+		zoom = zoom < 1 ? 1 : zoom > MAX_ZOOM ? MAX_ZOOM : zoom;
+		if (fabs(zoom - s->zoom) >= 0.25 || (zoom == 1) != (s->zoom == 1)) {
+			say("stream: zoom %.2fx", zoom);
+		}
+		s->zoom = (float)zoom;
 		return 0;
 	}
 	if (key_is(key, "MinimumFrameRate") || key_is(key, "MaximumFrameRate")) {
@@ -541,6 +701,7 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 				if (out->config != NULL) {
 					CFRelease(out->config);
 				}
+				let_go(out);
 				out->config = CFGetTypeID(values[i]) == CFDictionaryGetTypeID() ? CFRetain(values[i]) : NULL;
 			} else if (enabled) {
 				int64_t on = 1;
@@ -590,6 +751,30 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	}
 	if (key_is(key, "TorchLevel")) {
 		torch_set(s, value);
+		return 0;
+	}
+	if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
+	    key_is(key, "PeakTrackingFocusNow") || key_is(key, "LockAFNow") || key_is(key, "ManualFocusNow") ||
+	    key_is(key, "AFWindowParams") || key_is(key, "AutoFocusMode")) {
+		/*
+		 * Camera.app's tap: AutoFocusMode "AutoFocusModeWeightedSum", AFWindowParams an array of
+		 * { hStart, vStart, width, height, weight } in thousandths of the frame (the first window is
+		 * the one taken here; an empty value is the middle), then AutoFocusNow (true). LockAFNow
+		 * keeps the lens where it is until focus is asked for again.
+		 */
+		if (!key_is(key, "AFWindowParams") || (value != NULL && CFGetTypeID(value) == CFArrayGetTypeID() &&
+		    CFArrayGetCount(value) > 0)) {
+			say_value("stream: focus:", key, value);        /* (an empty window, the middle: often, unsaid) */
+		}
+		if (key_is(key, "AFWindowParams")) {
+			af_window(s, value);
+		} else if (key_is(key, "LockAFNow")) {
+			s->af_locked = true;
+		} else if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
+		    key_is(key, "PeakTrackingFocusNow")) {
+			s->af_locked = false;
+			s->af_now = true;
+		}
 		return 0;
 	}
 	say_once("stream: set (not used)", key, value);
@@ -671,7 +856,15 @@ output_buffer(struct output *out)
 		}
 		return NULL;
 	}
-	if (CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb) != kCVReturnSuccess) {
+	if (CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb) != kCVReturnSuccess && out->held != NULL) {
+		let_go(out);            /* a pool that will not grow by one: the picture kept is the one to have */
+		(void)CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb);
+		if (!out->said_pool) {
+			out->said_pool = true;
+			say("%s: the graph's pool has no second buffer: the picture on the screen is drawn over", out->name);
+		}
+	}
+	if (pb == NULL) {
 		/*
 		 * The preview pool holds one buffer (MinimumBufferCount 1): while the graph still has it,
 		 * there is none to be had, and this frame is not given out. Said at most every 300th frame.
@@ -688,7 +881,68 @@ output_buffer(struct output *out)
 typedef void (^pixel_buffer_handler)(CVPixelBufferRef, CMTime);
 
 static void
-deliver(struct stream *s, struct output *out, const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw)
+let_go(struct output *out)
+{
+	if (out->held != NULL) {
+		CVPixelBufferRelease(out->held);
+		out->held = NULL;
+	}
+}
+
+static void
+md_put(CFMutableDictionaryRef m, int key, CFTypeRef value)
+{
+	if (md_key[key] != NULL && value != NULL) {
+		CFDictionarySetValue(m, md_key[key], value);
+	}
+	if (value != NULL) {
+		CFRelease(value);
+	}
+}
+
+/* the frame's metadata, as H10ISP's stream gives them (see md_names) */
+static CFDictionaryRef
+frame_metadata(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_stats *st, CFStringRef port)
+{
+	CFMutableDictionaryRef m;
+	double exposure = f->exposure_lines * (double)f->line_ns / 1e9, analog = f->gain_unity ? (double)f->gain / f->gain_unity : 1;
+	double total = analog * isp->digital, fps = f->frame_lines && f->line_ns ? 1e9 / ((double)f->frame_lines * f->line_ns) : 30;
+	/* (green's level for a second at 1x, a quarter of it: a room's 70 or so, daylight's tens of thousands) */
+	double lux = exposure > 0 && total > 0 ? st->mean[1] / (exposure * total) / 4 : 0;
+
+	if (md_attachment == NULL) {
+		return NULL;
+	}
+	m = (CFMutableDictionaryRef)new_dict();
+	md_put(m, MD_PORT, CFRetain(port));
+	md_put(m, MD_PTS, CMTimeCopyAsDictionary(CMClockMakeHostTimeFromSystemUnits(f->time), NULL));
+	md_put(m, MD_EXPOSURE, number_f(exposure));
+	md_put(m, MD_AGC, number_i((int64_t)(analog * 256 + 0.5)));
+	md_put(m, MD_ISP_DGAIN, number_i((int64_t)(isp->digital * 256 + 0.5)));
+	md_put(m, MD_SENSOR_DGAIN, number_i(256));
+	md_put(m, MD_ISO_BASE, number_f(32));
+	md_put(m, MD_FRAME_RATE, number_f(fps));
+	md_put(m, MD_LUX, number_i((int64_t)(lux + 0.5)));
+	md_put(m, MD_SNR, number_f(40 - 10 * log10(total < 1 ? 1 : total)));
+	md_put(m, MD_AF_STATUS, number_i(0));
+	md_put(m, MD_FOCUSING, number_i(0));
+	md_put(m, MD_AE_STABLE, CFRetain(kCFBooleanTrue));
+	md_put(m, MD_AE_LOCKED, CFRetain(kCFBooleanFalse));
+	md_put(m, MD_AWB_STABLE, CFRetain(kCFBooleanTrue));
+	md_put(m, MD_AWB_LOCKED, CFRetain(kCFBooleanFalse));
+	md_put(m, MD_AF_LOCKED, CFRetain(kCFBooleanFalse));
+	/*
+	 * The zoom the picture was made with: the source node takes it for what the ISP applied
+	 * (-[BWMultiStreamCameraSourceNode _ispAppliedZoomFactorFromSampleBufferMetadataDictionary:outputIndex:])
+	 * and would make up the rest of what was asked for itself; without it, a zoomed preview stood still.
+	 */
+	md_put(m, MD_ZOOM, number_f(isp->zoom));
+	return m;
+}
+
+static void
+deliver(struct stream *s, struct output *out, const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw,
+    CFDictionaryRef metadata)
 {
 	CVPixelBufferRef pb = output_buffer(out);
 	uint32_t pf, width, height;
@@ -720,13 +974,301 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
 	    kCVAttachmentMode_ShouldPropagate);
 
+	if (metadata != NULL) {
+		CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, metadata);
+
+		CVBufferSetAttachment(pb, md_attachment, m, kCVAttachmentMode_ShouldPropagate);
+		CFRelease(m);
+	}
+
 	CMTime pts = CMClockMakeHostTimeFromSystemUnits(f->time);
 
 	((pixel_buffer_handler)out->handler)(pb, pts);
-	CVPixelBufferRelease(pb);
+	/*
+	 * The moving picture's buffer is kept until the next one is given. The preview's pool would
+	 * otherwise hand the same buffer straight back -- the graph lets go of it as soon as it has passed
+	 * it on -- while the window server is still copying it to the screen, and the next frame drawn
+	 * into it showed as bands of two frames, torn across. Kept, it makes the pool take another.
+	 */
+	if (strcmp(out->name, "StillImage") != 0) {
+		let_go(out);
+		out->held = pb;
+	} else {
+		CVPixelBufferRelease(pb);
+	}
 	if (out->delivered++ == 0) {
 		say("%s: the first picture given (%ux%u %c%c%c%c)", out->name, width, height, pf >> 24, pf >> 16 & 255,
 		    pf >> 8 & 255, pf & 255);
+	}
+}
+
+/*
+ * The scene's light as the cameras' tuning measures it (Qualcomm's lux index, higher is darker): about
+ * 46 a doubling of exposure times gain, 197 at a 33 ms exposure and 1x -- the black level's ranges in
+ * the tuning of the wide camera pair lux indexes with gains, 195-200 with 1-1.1x and 380-385 with
+ * 15.9-16x, at the longest exposure a frame at 30 a second allows.
+ */
+static float
+lux_index(const struct isp *isp, const struct redwood_camera_frame *f)
+{
+	double exposure = f->exposure_lines * (double)f->line_ns / 1e9 * f->gain / f->gain_unity * isp->digital;
+
+	return (float)(197 + 46 * log2(exposure > 1e-6 ? exposure / 0.0333 : 1e-6 / 0.0333));
+}
+
+/*
+ * The light's colour temperature: where the white balance is on the line of the tuning's reference
+ * lights; without them, guessed from how much more the blue is raised than the red, by what is typical of a phone's sensor --
+ * blue's gain over red's about 0.8 in daylight (6500 K), 1.3 under a fluorescent tube (4000 K), 2 under
+ * a filament lamp (2850 K) -- between those on the logarithm of the ratio, and no further.
+ */
+static float
+colour_temperature(const struct isp *isp)
+{
+	static const float ratio[3] = { 0.8f, 1.3f, 2.0f }, kelvin[3] = { 6500, 4000, 2850 };
+	float r = isp->wb[0] > 0 ? isp->wb[2] / isp->wb[0] : 1, cct = isp_cct(isp);
+
+	if (cct > 0) {
+		return cct;     /* (by the tuning's reference lights) */
+	}
+
+	if (r <= ratio[0]) {
+		return kelvin[0];
+	}
+	for (int i = 1; i < 3; i++) {
+		if (r <= ratio[i]) {
+			float t = logf(r / ratio[i - 1]) / logf(ratio[i] / ratio[i - 1]);
+
+			return kelvin[i - 1] + t * (kelvin[i] - kelvin[i - 1]);
+		}
+	}
+	return kelvin[2];
+}
+
+/*
+ * Focus, where the camera has a lens motor (the frames' focus is a position, not REDWOOD_CAMERA_NO_FOCUS:
+ * the wide camera's): by contrast, as there is nothing else to go by -- the sensor's phase-detection
+ * pixels are not read. A search climbs from where the lens is: a step of AF_STEP one way, on that way
+ * while the middle of the picture gets sharper, back the other way if the first step was not, until
+ * two steps in a row are less sharp than the sharpest (or the travel, AF_NEAR to AF_FAR, ends); then
+ * around the sharpest in steps of AF_FINE, and there it stays. Each place is measured two frames after
+ * the lens was told to go there (it settles in less than one). The lens is only ever moved a step at a
+ * time: thrown across its travel it knocked, audibly, against its stop at 0. In focus, it stays until
+ * the middle has been a good deal less sharp or quite differently lit for a second, and then until
+ * the picture has kept still for a third of one: no searching while the phone is being moved.
+ * A focus asked for (a tap: AutoFocusNow, on the window AFWindowParams gave) sweeps instead: the
+ * lens is walked to the nearer end of its travel, then measured towards the other in steps of
+ * AF_STEP until it is past the sharpest (two steps in a row well under it), then around the sharpest
+ * -- it finds what was tapped however far out of focus it was, where the climb gave up on the flat
+ * of the curve.
+ */
+enum { AF_WATCH, AF_STEADY, AF_CLIMB, AF_SWEEP, AF_FINE_SEARCH, AF_SETTLE };
+#define AF_NEAR         16              /* (off the stop at 0) */
+#define AF_FAR          768             /* (its module file's actuator region goes to 700; near 1023 the PM8008i's LDO5 said over-current) */
+#define AF_STEP         48
+#define AF_FINE         12
+
+struct af {
+	int             state;
+	uint32_t        at, target;     /* where the lens was told to go; where it is going a step at a time */
+	unsigned        wait;           /* frames before the next measurement */
+	int             way;            /* +1 nearer, -1 further */
+	bool            turned;
+	unsigned        worse;          /* steps in a row less sharp than the sharpest */
+	uint32_t        start, best, fine_to;
+	float           best_sharpness;
+	float           sharpness, level;       /* in focus: the middle's, to watch */
+	float           last_sharpness, last_level;
+	unsigned        unlike, steady, steps;
+	bool            now;            /* asked for: no waiting for the picture to keep still */
+	bool            sweep;          /* ... and the whole travel measured */
+	float           sum_sharpness, sum_level;
+	unsigned        measured;
+};
+
+static void
+af_go(int device, struct af *af, uint32_t target)
+{
+	struct redwood_camera_command c = { .command = REDWOOD_CAMERA_FOCUS };
+
+	af->target = target < AF_NEAR ? AF_NEAR : target > AF_FAR ? AF_FAR : target;
+	c.a = af->at < af->target ? (af->target - af->at > AF_STEP ? af->at + AF_STEP : af->target) :
+	    (af->at - af->target > AF_STEP ? af->at - AF_STEP : af->target);
+	af->at = c.a;
+	/*
+	 * The lens settles in a few milliseconds; what is spoilt is the frame being exposed while it moved
+	 * (written at a frame's end, the next one's exposure has begun): one frame let go by before a
+	 * measurement, none on the way.
+	 */
+	af->wait = af->at == af->target ? 1 : 0;
+	af->steps++;
+	af->sum_sharpness = af->sum_level = 0;
+	af->measured = 0;
+	(void)write(device, &c, sizeof(c));
+}
+
+static void
+af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const uint8_t *raw, const float window[4], bool locked)
+{
+	float level, sharpness;
+	unsigned needed = f->gain >= 16 * f->gain_unity ? 2 : 1;      /* (in the dark, two frames to a measurement) */
+
+	if (f->focus == REDWOOD_CAMERA_NO_FOCUS) {
+		return;
+	}
+	if (af->at == 0 && af->target == 0) {
+		af->at = af->target = f->focus;         /* (where the kernel put it) */
+	}
+	if (af->wait > 0) {
+		af->wait--;
+		return;
+	}
+	if (af->at != af->target) {
+		af_go(device, af, af->target);          /* (the next step of a longer way) */
+		return;
+	}
+	sharpness = isp_sharpness(f, raw, window[0], window[1], window[2], window[3], &level);
+	af->sum_sharpness += sharpness;
+	af->sum_level += level;
+	if (++af->measured < needed) {
+		return;
+	}
+	sharpness = af->sum_sharpness / af->measured;
+	level = af->sum_level / af->measured;
+	af->sum_sharpness = af->sum_level = 0;
+	af->measured = 0;
+	switch (af->state) {
+	case AF_WATCH:
+		if (locked || (af->sharpness > 0 && sharpness > af->sharpness * 0.6f && level > af->level * 0.7f &&
+		    level < af->level * 1.4f)) {
+			af->unlike = 0;
+			return;
+		}
+		if (af->sharpness > 0 && ++af->unlike < 30) {
+			return;
+		}
+		af->state = AF_STEADY;
+		af->steady = 0;
+		af->last_sharpness = sharpness;
+		af->last_level = level;
+		return;
+	case AF_STEADY:
+		if (fabsf(sharpness - af->last_sharpness) < 0.15f * af->last_sharpness && fabsf(level - af->last_level) < 0.1f * af->last_level) {
+			af->steady++;
+		} else {
+			af->steady = 0;
+		}
+		af->last_sharpness = sharpness;
+		af->last_level = level;
+		if (af->steady < 10 && !af->now) {
+			return;
+		}
+		af->now = false;
+		if (af->sweep) {
+			af->sweep = false;
+			af->state = AF_SWEEP;
+			af->best_sharpness = -1;
+			af->worse = 0;
+			af->steps = 0;
+			af->way = af->at - AF_NEAR < AF_FAR - af->at ? 1 : -1;
+			af_go(device, af, af->way > 0 ? AF_NEAR : AF_FAR);     /* (walked there a step at a time) */
+			return;
+		}
+		af->state = AF_CLIMB;
+		af->best = af->start = af->at;
+		af->best_sharpness = sharpness;
+		af->way = af->at + AF_STEP > AF_FAR ? -1 : 1;
+		af->turned = false;
+		af->worse = 0;
+		af->steps = 0;
+		af_go(device, af, (uint32_t)((int)af->at + af->way * AF_STEP));
+		return;
+	case AF_CLIMB: {
+		int next = (int)af->at + af->way * AF_STEP;
+		bool end = next < AF_NEAR || next > AF_FAR;
+
+		if (sharpness > af->best_sharpness * 1.02f) {
+			af->best = af->at;
+			af->best_sharpness = sharpness;
+			af->worse = 0;
+		} else {
+			af->worse++;
+		}
+		if (af->worse < 2 && !end) {
+			af_go(device, af, (uint32_t)next);
+			return;
+		}
+		next = (int)af->best - af->way * AF_STEP;
+		if (!af->turned && af->best == af->start && next >= AF_NEAR && next <= AF_FAR) {
+			/* not sharper that way at all: the other way, from where it started */
+			af->turned = true;
+			af->way = -af->way;
+			af->worse = 0;
+			af_go(device, af, (uint32_t)next);
+			return;
+		}
+		af->state = AF_FINE_SEARCH;
+		af->fine_to = af->best + 2 * AF_FINE > AF_FAR ? AF_FAR : af->best + 2 * AF_FINE;
+		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
+		return;
+	}
+	case AF_SWEEP:
+		say("focus: sweep: %u %.4f", af->at, sharpness);
+		if (sharpness > af->best_sharpness) {
+			af->best = af->at;
+			af->best_sharpness = sharpness;
+			af->worse = 0;
+		} else if (sharpness < af->best_sharpness * 0.85f) {
+			af->worse++;
+		}
+		if (af->worse < 2 && (int)af->at + af->way * AF_STEP >= AF_NEAR && (int)af->at + af->way * AF_STEP <= AF_FAR) {
+			af_go(device, af, (uint32_t)((int)af->at + af->way * AF_STEP));
+			return;
+		}
+		af->state = AF_FINE_SEARCH;
+		af->fine_to = af->best + 2 * AF_FINE > AF_FAR ? AF_FAR : af->best + 2 * AF_FINE;
+		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
+		return;
+	case AF_FINE_SEARCH:
+		if (sharpness > af->best_sharpness) {
+			af->best = af->at;
+			af->best_sharpness = sharpness;
+		}
+		if (af->at + AF_FINE <= af->fine_to) {
+			af_go(device, af, af->at + AF_FINE);
+			return;
+		}
+		af->state = AF_SETTLE;
+		af_go(device, af, af->best);
+		return;
+	case AF_SETTLE:
+		af->state = AF_WATCH;
+		af->sharpness = sharpness;
+		af->level = level;
+		af->unlike = 0;
+		say("focus: the lens at %u after %u moves (sharpness %.3f)", af->at, af->steps, sharpness);
+		return;
+	}
+}
+
+/* the sensor's colour tuning, when the image has one (fw/camera-<sensor>.isp, tools/camtuning.py) */
+static void
+load_tuning(struct isp *isp, uint32_t sensor)
+{
+	static const char *const names[] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7" };
+	char path[96];
+
+	if (sensor >= sizeof(names) / sizeof(names[0])) {
+		return;
+	}
+	snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", names[sensor]);
+	if (isp_load_tuning(isp, path)) {
+		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
+		    isp->tuning->ccm.lights, isp->tuning->lsc.lights);
+	} else {
+		say("no colour tuning for the %s (%s): no colour matrix, no lens shading", names[sensor], path);
+		isp_set_ccm(isp, (const float[9]){ 1, 0, 0, 0, 1, 0, 0, 0, 1 });
+		isp->lsc.on = false;
 	}
 }
 
@@ -740,6 +1282,10 @@ worker(void *context)
 	struct isp_stats st;
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
+	uint32_t tuned_for = ~0u;
+	bool switched = false;
+	float lux = -1, cct = -1;
+	struct af af = { 0 };
 	int device = open(REDWOOD_CAMERA_DEVICE, O_RDWR), failures = 0;
 
 	pthread_setname_np("redwood-camera");
@@ -761,9 +1307,20 @@ worker(void *context)
 				}
 				continue;
 			}
+			if (head.sensor != s->camera->sensor) {
+				/* another camera's frames (the kernel's last sensor): changed, and the next ones are this one's */
+				if (!switched) {
+					struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u };
+
+					switched = true;
+					say("the kernel's frames are camera %u's: to %u, the %s", head.sensor, s->camera->sensor, s->camera->name);
+					(void)write(device, &c, sizeof(c));
+				}
+				continue;
+			}
 			bytes = sizeof(head) + (size_t)head.stride * head.height;
 			buffer = malloc(bytes);
-			say("frames of %ux%u from the kernel", head.width, head.height);
+			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
 			continue;
 		}
 		n = read(device, buffer, bytes);
@@ -781,12 +1338,36 @@ worker(void *context)
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct redwood_camera_command c;
 
-		isp_measure(f, raw, &st);
+		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
+		if (f->sensor != tuned_for) {
+			tuned_for = f->sensor;
+			load_tuning(&isp, f->sensor);
+		}
+		/*
+		 * Slowly, a second or so: the colour temperature is guessed from the white balance, the tuning it
+		 * picks changes what the white balance sees, and the colour matrix makes every swing of it plain.
+		 */
+		lux = lux < 0 ? lux_index(&isp, f) : lux * 0.9f + lux_index(&isp, f) * 0.1f;
+		cct = cct < 0 ? colour_temperature(&isp) : cct * 0.97f + colour_temperature(&isp) * 0.03f;
+		isp_tune(&isp, lux, cct);
+		isp.zoom = s->zoom;
+		isp.turned = s->camera->turned;
 		if (isp_ae(&isp, f, &st, &c)) {
 			(void)write(device, &c, sizeof(c));
 		}
+		if (s->af_now) {
+			s->af_now = false;
+			/* (whatever it was doing: at once, from the next frame) */
+			af.state = AF_STEADY;
+			af.now = true;
+			af.sweep = true;
+		}
+		af_frame(device, &af, f, raw, s->af_window, s->af_locked);
 		s->frames++;
+
+		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
+
 		/*
 		 * Only once the graph has started the stream. Its PixelBufferHandler blocks hand the buffer
 		 * to multiStreamCameraSourceNode_sendBufferToBufferServicingThread, which reaches into the
@@ -794,6 +1375,14 @@ worker(void *context)
 		 * it walks a pointer that is not there yet and mediaserverd dies of SIGSEGV. The frames
 		 * before that are read and thrown away, which is also what settles the exposure.
 		 */
+		if (metadata != NULL) {
+			pthread_mutex_lock(&s->metadata_lock);
+			if (s->metadata != NULL) {
+				CFRelease(s->metadata);
+			}
+			s->metadata = CFRetain(metadata);
+			pthread_mutex_unlock(&s->metadata_lock);
+		}
 		pthread_mutex_lock(&s->lock);
 		for (int i = 0; s->graph_running && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
@@ -811,16 +1400,20 @@ worker(void *context)
 			if (still && s->stills_wanted == 0) {
 				continue;
 			}
-			deliver(s, out, &isp, f, raw);
+			deliver(s, out, &isp, f, raw, metadata);
 			if (still) {
 				s->stills_wanted--;
 				say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
 			}
 		}
 		pthread_mutex_unlock(&s->lock);
+		if (metadata != NULL) {
+			CFRelease(metadata);
+		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
-			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black", f->sequence,
-			    f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / f->gain_unity, isp.digital, st.mean[1]);
+			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
+			    "B %.2f, lux index %.0f, about %.0f K", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
+			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct);
 		}
 	}
 	free(buffer);
@@ -835,6 +1428,9 @@ worker(void *context)
  * takes a moment to settle and the exposure longer), the second only when the graph starts the
  * stream itself (`graph` true, the FigCaptureStream start method).
  */
+static CMBaseObjectRef all_streams[2];  /* the device's, back and front */
+static OSStatus stream_stop(CMBaseObjectRef o);
+
 static OSStatus
 stream_begin(CMBaseObjectRef o, bool graph)
 {
@@ -848,6 +1444,13 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	}
 	if (s->running) {
 		return 0;
+	}
+	/* one camera at a time: the kernel gives one sensor's frames (the other stream's worker stopped first) */
+	for (int i = 0; i < 2; i++) {
+		if (all_streams[i] != NULL && all_streams[i] != o && stream_of(all_streams[i])->running) {
+			say("stream: the %s's frames stop for the %s's", stream_of(all_streams[i])->camera->name, s->camera->name);
+			(void)stream_stop(all_streams[i]);
+		}
 	}
 	s->running = true;
 	s->frames = 0;
@@ -875,6 +1478,9 @@ stream_stop(CMBaseObjectRef o)
 	    (unsigned long long)s->out[0].delivered);
 	pthread_mutex_lock(&s->lock);
 	s->graph_running = false;
+	for (int i = 0; i < OUTPUTS; i++) {
+		let_go(&s->out[i]);
+	}
 	pthread_mutex_unlock(&s->lock);
 	s->running = false;
 	if (s->worker_started) {
@@ -884,17 +1490,60 @@ stream_stop(CMBaseObjectRef o)
 	return 0;
 }
 
+static void
+add_absent(const void *key, const void *value, void *context)
+{
+	if (!CFDictionaryContainsKey(context, key)) {
+		CFDictionarySetValue(context, key, value);
+	}
+}
+
+/*
+ * The frame's metadata into the sample buffer the graph made of our pixel buffer: the pixel buffer's
+ * own dictionary (deliver()), the same object, else the last frame's; whatever the graph has put in a
+ * dictionary of the sample buffer's already stays as it is.
+ */
 static OSStatus
 stream_add_attachments(CMBaseObjectRef o, CMSampleBufferRef sbuf, CFDictionaryRef options)
 {
+	struct stream *s = stream_of(o);
 	static bool said;
+	CVImageBufferRef image = sbuf != NULL ? CMSampleBufferGetImageBuffer(sbuf) : NULL;
+	CFTypeRef ours = image != NULL && md_attachment != NULL ? CVBufferGetAttachment(image, md_attachment, NULL) : NULL, theirs;
+	CFMutableDictionaryRef m;
 
-	(void)o;
-	(void)sbuf;
 	if (!said) {
 		said = true;
-		say("stream: AddAttachmentsToSampleBuffer (options %s)", options ? "given" : "none");
+		say("stream: AddAttachmentsToSampleBuffer (options %s): the frames' metadata %s", options ? "given" : "none",
+		    md_attachment != NULL ? "attached" : "NOT THERE");
 	}
+	if (md_attachment == NULL || sbuf == NULL) {
+		return 0;
+	}
+	if (ours != NULL && CFGetTypeID(ours) == CFDictionaryGetTypeID()) {
+		CFRetain(ours);
+	} else {
+		pthread_mutex_lock(&s->metadata_lock);
+		ours = s->metadata != NULL ? CFDictionaryCreateMutableCopy(NULL, 0, s->metadata) : NULL;
+		pthread_mutex_unlock(&s->metadata_lock);
+	}
+	if (ours == NULL) {
+		return 0;
+	}
+	theirs = CMGetAttachment(sbuf, md_attachment, NULL);
+	if (theirs == ours) {
+		CFRelease(ours);
+		return 0;
+	}
+	if (theirs != NULL && CFGetTypeID(theirs) == CFDictionaryGetTypeID()) {
+		m = CFDictionaryCreateMutableCopy(NULL, 0, theirs);
+		CFDictionaryApplyFunction(ours, add_absent, m);
+	} else {
+		m = (CFMutableDictionaryRef)CFRetain(ours);
+	}
+	CMSetAttachment(sbuf, md_attachment, m, kCMAttachmentMode_ShouldPropagate);
+	CFRelease(m);
+	CFRelease(ours);
 	return 0;
 }
 
@@ -928,6 +1577,9 @@ stream_finalize(CMBaseObjectRef o)
 	if (s->colour_info) {
 		CFRelease(s->colour_info);
 	}
+	if (s->metadata) {
+		CFRelease(s->metadata);
+	}
 	if (s->torch >= 0) {
 		close(s->torch);
 	}
@@ -948,7 +1600,7 @@ static const struct stream_class stream_derived = { 2, stream_start, stream_stop
 static const struct vtable stream_vtable = { NULL, &stream_base, &stream_derived };
 
 static CMBaseObjectRef
-stream_create(CFAllocatorRef allocator)
+stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef port)
 {
 	CMBaseObjectRef o = NULL;
 	struct stream *s;
@@ -960,15 +1612,21 @@ stream_create(CFAllocatorRef allocator)
 	s = stream_of(o);
 	memset(s, 0, sizeof(*s));
 	pthread_mutex_init(&s->lock, NULL);
+	pthread_mutex_init(&s->metadata_lock, NULL);
 	s->torch = -1;
 	s->min_fps = 2;
+	s->zoom = 1;
+	s->af_window[0] = s->af_window[1] = 0.3f;
+	s->af_window[2] = s->af_window[3] = 0.7f;
 	s->max_fps = 30;
+	s->camera = camera;
+	s->port = port;
 	for (int i = 0; i < OUTPUTS; i++) {
 		s->out[i].name = output_names[i];
 	}
 
-	/* "Photo" and "Video-60" of D22/AVCaptureSession.plist's back camera */
-	CFDictionaryRef f[2] = { format(4032, 3024, 30, false), format(4224, 2376, 60, false) };
+	CFDictionaryRef f[2] = { format(camera->formats[0][0], camera->formats[0][1], camera->formats[0][2], false, camera->fov),
+		format(camera->formats[1][0], camera->formats[1][1], camera->formats[1][2], false, camera->fov) };
 
 	s->formats = CFArrayCreate(NULL, (const void **)f, 2, &kCFTypeArrayCallBacks);
 	s->supported = supported(stream_props, sizeof(stream_props) / sizeof(stream_props[0]));
@@ -1102,7 +1760,7 @@ OSStatus
 redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out)
 {
 	static bool found, usable;
-	CMBaseObjectRef device = NULL, stream;
+	CMBaseObjectRef device = NULL, stream[2];
 	struct device *d;
 
 	(void)options;
@@ -1113,20 +1771,28 @@ redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, 
 	if (!usable || out == NULL) {
 		return ERR_UNSUPPORTED;
 	}
-	if ((stream = stream_create(allocator)) == NULL) {
+	if ((stream[0] = stream_create(allocator, &cameras[0], port_back)) == NULL) {
+		return ERR_UNSUPPORTED;
+	}
+	if ((stream[1] = stream_create(allocator, &cameras[1], port_front)) == NULL) {
+		CFRelease(stream[0]);
 		return ERR_UNSUPPORTED;
 	}
 	if (derived_create(allocator, &device_vtable, device_class_id(), &device) != 0 || device == NULL) {
-		CFRelease(stream);
+		CFRelease(stream[0]);
+		CFRelease(stream[1]);
 		say("the device cannot be made");
 		return ERR_UNSUPPORTED;
 	}
 	d = derived_storage(device);
 	memset(d, 0, sizeof(*d));
-	d->streams = CFArrayCreate(NULL, (const void **)&stream, 1, &kCFTypeArrayCallBacks);
+	d->streams = CFArrayCreate(NULL, (const void **)stream, 2, &kCFTypeArrayCallBacks);
+	all_streams[0] = stream[0];             /* (kept by the device's array) */
+	all_streams[1] = stream[1];
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
-	CFRelease(stream);
+	CFRelease(stream[0]);
+	CFRelease(stream[1]);
 	*out = device;
-	say("the device made: one stream, the back camera");
+	say("the device made: two streams, the back camera and the front one");
 	return 0;
 }
