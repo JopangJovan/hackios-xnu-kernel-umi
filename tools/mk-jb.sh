@@ -98,6 +98,17 @@ ln -s /var/jb/usr/lib/TweakInject "$OUT/root/var/jb/Library/MobileSubstrate/Dyna
 	echo
 } >> "$OUT/root/var/jb/Library/dpkg/status"
 
+# Newer versions of what the bootstrap carries, and anything else worth having before the first boot:
+# the bootstrap is a snapshot, and some of it is older than the repository (debianutils, launchctl).
+# apt on the phone would upgrade them, but only over the network and only after a boot, while what is
+# in the image is what a first boot has. PREINSTALL names them; mobilesubstrate is not among them
+# because there is no such package -- ElleKit above Provides it.
+PREINSTALL=${PREINSTALL-"debianutils launchctl preferenceloader"}
+if [ -n "$PREINSTALL" ]; then
+	get "$MIRROR/dists/iphoneos-arm64-rootless/$SUITE/main/binary-iphoneos-arm64/Packages" Packages
+	MIRROR="$MIRROR" python3 "$ROOT/tools/jb-preinstall.py" "$OUT/root" "$OUT/debs/Packages" "$OUT/debs" $PREINSTALL
+fi
+
 # the repositories Sileo starts with: Procursus itself, where everything here came from
 mkdir -p "$OUT/root/var/jb/etc/apt/sources.list.d"
 cat > "$OUT/root/var/jb/etc/apt/sources.list.d/procursus.sources" <<EOF

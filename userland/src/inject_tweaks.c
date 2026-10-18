@@ -35,7 +35,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define TWEAK_DIR       "/var/jb/usr/lib/TweakInject"
+/*
+ * Both places a package may put a tweak: the one ElleKit uses now, and the one Cydia Substrate used,
+ * which is a symbolic link to it on a phone -- but a package unpacked on this machine can leave it a
+ * real directory, and some packages still write there. Looking in both costs nothing.
+ */
+static const char *const tweak_dirs[] = {
+	"/var/jb/usr/lib/TweakInject",
+	"/var/jb/Library/MobileSubstrate/DynamicLibraries",
+};
 
 static void
 say(const char *format, ...)
@@ -207,35 +215,44 @@ load_the_tweaks(void)
 	char identifier[256];
 	const char *name = executable_name();
 	const char *who = bundle_identifier(identifier, sizeof(identifier)) ? identifier : NULL;
-	struct dirent *entry;
 	int opened = 0, tried = 0;
-	DIR *dir;
 
-	dir = opendir(TWEAK_DIR);
-	if (dir == NULL) {
-		return;                                 /* no prefix, or no tweaks in it */
-	}
-	while ((entry = readdir(dir)) != NULL) {
-		char plist[1024], dylib[1024];
-		size_t length = strlen(entry->d_name);
+	for (unsigned d = 0; d < sizeof(tweak_dirs) / sizeof(tweak_dirs[0]); d++) {
+		const char *where = tweak_dirs[d];
+		struct dirent *entry;
+		struct stat st;
+		DIR *dir;
 
-		if (length < 7 || strcmp(entry->d_name + length - 6, ".plist") != 0) {
+		/* the second is usually a link to the first: then it is the same directory, done already */
+		if (d > 0 && lstat(where, &st) == 0 && S_ISLNK(st.st_mode)) {
 			continue;
 		}
-		snprintf(plist, sizeof(plist), "%s/%s", TWEAK_DIR, entry->d_name);
-		snprintf(dylib, sizeof(dylib), "%s/%.*s.dylib", TWEAK_DIR, (int)(length - 6), entry->d_name);
-		if (!wanted_here(plist, name, who)) {
-			continue;
+		dir = opendir(where);
+		if (dir == NULL) {
+			continue;                       /* no prefix, or no tweaks in it */
 		}
-		tried++;
-		if (dlopen(dylib, RTLD_NOW | RTLD_GLOBAL) != NULL) {
-			opened++;
-			say("redwood: tweaks: %s\n", dylib);
-		} else {
-			say("redwood: tweaks: %s: %s\n", dylib, dlerror());
+		while ((entry = readdir(dir)) != NULL) {
+			char plist[1024], dylib[1024];
+			size_t length = strlen(entry->d_name);
+
+			if (length < 7 || strcmp(entry->d_name + length - 6, ".plist") != 0) {
+				continue;
+			}
+			snprintf(plist, sizeof(plist), "%s/%s", where, entry->d_name);
+			snprintf(dylib, sizeof(dylib), "%s/%.*s.dylib", where, (int)(length - 6), entry->d_name);
+			if (!wanted_here(plist, name, who)) {
+				continue;
+			}
+			tried++;
+			if (dlopen(dylib, RTLD_NOW | RTLD_GLOBAL) != NULL) {
+				opened++;
+				say("redwood: tweaks: %s\n", dylib);
+			} else {
+				say("redwood: tweaks: %s: %s\n", dylib, dlerror());
+			}
 		}
+		closedir(dir);
 	}
-	closedir(dir);
 	if (tried > 0) {
 		say("redwood: tweaks: %s (%s): %d of %d opened\n", name != NULL ? name : "?",
 		    who != NULL ? who : "no bundle", opened, tried);
