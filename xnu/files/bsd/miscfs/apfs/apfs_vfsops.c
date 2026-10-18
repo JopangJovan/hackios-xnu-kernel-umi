@@ -147,6 +147,83 @@ apfs_ticks_ms(uint64_t ticks)
 	return ns / 1000000;
 }
 
+/* The volume's lock by who takes it, and how many others waited, appended to buf */
+static void
+apfs_lock_report(struct apfs_mount *am, char *buf, size_t len)
+{
+	size_t at = strlen(buf);
+	uint32_t i;
+
+	at += scnprintf(buf + at, len - at, "lookups  %llu of names not there, now in the name cache as such; %llu "
+	    "answered by it so\n", am->am_lookup_negative, am->am_lookup_negative_hits);
+	at += scnprintf(buf + at, len - at, "inactive %llu with nothing to give back, without the lock\n",
+	    am->am_inactive_free);
+	at += scnprintf(buf + at, len - at, "vnodes   %llu found there already (%llu of them by a lookup, its name now in the "
+	    "name cache), %llu made; %llu lookups the name cache answered with the vnode\n", am->am_node_found,
+	    am->am_node_named, am->am_node_made, am->am_lookup_positive_hits);
+	at += scnprintf(buf + at, len - at, "lock     waited by priority (all ms; over 1 ms: how many, ms): background (<=4) %llu; "
+	    "%llu, %llu; utility (<=20) %llu; %llu, %llu; default (<=31) %llu; %llu, %llu; user-initiated (<=46) %llu; %llu, "
+	    "%llu; interactive %llu; %llu, %llu\n",
+	    apfs_ticks_ms(am->am_prio_wait[0]), am->am_prio_long[0], apfs_ticks_ms(am->am_prio_long_wait[0]),
+	    apfs_ticks_ms(am->am_prio_wait[1]), am->am_prio_long[1], apfs_ticks_ms(am->am_prio_long_wait[1]),
+	    apfs_ticks_ms(am->am_prio_wait[2]), am->am_prio_long[2], apfs_ticks_ms(am->am_prio_long_wait[2]),
+	    apfs_ticks_ms(am->am_prio_wait[3]), am->am_prio_long[3], apfs_ticks_ms(am->am_prio_long_wait[3]),
+	    apfs_ticks_ms(am->am_prio_wait[4]), am->am_prio_long[4], apfs_ticks_ms(am->am_prio_long_wait[4]));
+	{
+		static const char *const band[5] = { "background", "utility", "default", "user-initiated", "interactive" };
+
+		at += scnprintf(buf + at, len - at, "lock     waits over 1 ms, where the time went (ms: blocked, the lock not "
+		    "given / queued, runnable without a processor / on a processor):");
+		for (i = 0; i < 5; i++) {
+			at += scnprintf(buf + at, len - at, " %s %llu/%llu/%llu%s", band[i],
+			    (unsigned long long)apfs_ticks_ms(am->am_long_blocked[i]),
+			    (unsigned long long)apfs_ticks_ms(am->am_long_queued[i]),
+			    (unsigned long long)apfs_ticks_ms(am->am_long_oncpu[i]), i < 4 ? ";" : "\n");
+		}
+		at += scnprintf(buf + at, len - at, "lock     waits over 1 ms, the processor each ended on:");
+		for (i = 0; i < 8; i++) {
+			at += scnprintf(buf + at, len - at, " cpu %u %llu%s", i, am->am_long_cpu[i], i < 7 ? "," : "\n");
+		}
+	}
+	at += scnprintf(buf + at, len - at, "lock     takes with others waiting: none %llu, 1 %llu, 2-3 %llu, 4-7 %llu, "
+	    "8 or more %llu\n", am->am_waiters_hist[0], am->am_waiters_hist[1], am->am_waiters_hist[2],
+	    am->am_waiters_hist[3], am->am_waiters_hist[4]);
+	{
+		uint64_t max_ns;
+
+		absolutetime_to_nanoseconds(am->am_lock_hold_max, &max_ns);
+		at += scnprintf(buf + at, len - at, "lock     holds: %llu under 10 us, %llu to 100 us, %llu to 1 ms, %llu to "
+		    "10 ms, %llu longer; longest %llu us\n", am->am_lock_hold_hist[0], am->am_lock_hold_hist[1],
+		    am->am_lock_hold_hist[2], am->am_lock_hold_hist[3], am->am_lock_hold_hist[4], max_ns / 1000);
+	}
+	for (i = 0; i < APFS_LOCK_SITES && am->am_sites[i].name != NULL && at < len; i++) {
+		const struct apfs_lock_site *ls = &am->am_sites[i];
+		uint64_t wmax, hmax;
+
+		absolutetime_to_nanoseconds(ls->wait_max, &wmax);
+		absolutetime_to_nanoseconds(ls->hold_max, &hmax);
+		at += scnprintf(buf + at, len - at, "lock by  %-22s %7llu takes %7llu again; waited %6llu ms (longest %6llu us, "
+		    "%5llu over 1 ms); held %6llu ms (longest %6llu us, %5llu over 1 ms)\n", ls->name, ls->takes, ls->relocks,
+		    (unsigned long long)apfs_ticks_ms(ls->wait), wmax / 1000, ls->wait_long,
+		    (unsigned long long)apfs_ticks_ms(ls->hold), hmax / 1000, ls->hold_long);
+	}
+	for (i = 0; am->am_procs != NULL && i < APFS_LOCK_PROCS && i < am->am_nprocs && at < len; i++) {
+		const struct apfs_lock_proc *lp = &am->am_procs[i];
+		uint64_t wmax;
+
+		/* (only who waited 1 ms or more in all, or read 1 MB or more) */
+		if (apfs_ticks_ms(lp->wait) == 0 && lp->read_bytes + lp->pagein_bytes < (1 << 20)) {
+			continue;
+		}
+		absolutetime_to_nanoseconds(lp->wait_max, &wmax);
+		at += scnprintf(buf + at, len - at, "who      %-16.16s waited %6llu times over 10 us, %6llu ms (longest %7llu us, "
+		    "%4llu over 1 ms); read(2) %6llu calls %10llu bytes %6llu ms; pagein %6llu calls %10llu bytes %6llu ms\n",
+		    lp->name, lp->waits, (unsigned long long)apfs_ticks_ms(lp->wait), wmax / 1000, lp->wait_long,
+		    lp->read_calls, lp->read_bytes, (unsigned long long)apfs_ticks_ms(lp->read_ticks), lp->pagein_calls,
+		    lp->pagein_bytes, (unsigned long long)apfs_ticks_ms(lp->pagein_ticks));
+	}
+}
+
 /*
  * kern.apfs_stats: reading it says where the time went, writing anything zeroes the
  * counters.  The point is to tell apart, on one road through the driver, the time spent
@@ -158,15 +235,19 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
 	struct apfs_mount *am = apfs_the_mount;
-	char text[1024];
+	size_t cap = 16384;
+	char *text = kalloc_data(cap, Z_WAITOK | Z_ZERO);
 	int error;
 
+	if (text == NULL) {
+		return ENOMEM;
+	}
 	if (am == NULL) {
-		strlcpy(text, "apfs: nothing mounted\n", sizeof(text));
+		strlcpy(text, "apfs: nothing mounted\n", cap);
 	} else {
 		struct apfs_nx *nx = &am->am_nx;
 
-		snprintf(text, sizeof(text),
+		snprintf(text, cap,
 		    "pagein   %llu calls  %llu ms  %llu bytes\n"
 		    "read     %llu calls  %llu ms  %llu bytes\n"
 		    "device   %llu calls  %llu ms  %llu bytes\n"
@@ -200,8 +281,10 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    (unsigned long long)apfs_ticks_ms(am->am_lock_wait_ticks),
 		    (unsigned long long)apfs_ticks_ms(am->am_lock_held_ticks),
 		    (unsigned long long)nx->unlocked_fills);
+		apfs_lock_report(am, text, cap);
 	}
 	error = SYSCTL_OUT(req, text, strlen(text) + 1);
+	kfree_data(text, cap);
 	if (error || req->newptr == USER_ADDR_NULL) {
 		return error;
 	}
@@ -219,6 +302,28 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		am->am_lock_wait_max = 0;
 		memset(am->am_lock_hold_hist, 0, sizeof(am->am_lock_hold_hist));
 		am->am_lock_hold_max = 0;
+		memset(am->am_waiters_hist, 0, sizeof(am->am_waiters_hist));
+		am->am_lookup_negative = 0;
+		am->am_lookup_negative_hits = 0;
+		am->am_inactive_free = 0;
+		am->am_lookup_positive_hits = am->am_node_found = am->am_node_made = am->am_node_named = 0;
+		memset(am->am_prio_wait, 0, sizeof(am->am_prio_wait));
+		memset(am->am_prio_long, 0, sizeof(am->am_prio_long));
+		memset(am->am_prio_long_wait, 0, sizeof(am->am_prio_long_wait));
+		memset(am->am_long_blocked, 0, sizeof(am->am_long_blocked));
+		memset(am->am_long_queued, 0, sizeof(am->am_long_queued));
+		memset(am->am_long_oncpu, 0, sizeof(am->am_long_oncpu));
+		memset(am->am_long_cpu, 0, sizeof(am->am_long_cpu));
+		if (am->am_procs != NULL) {
+			memset(am->am_procs, 0, APFS_LOCK_PROCS * sizeof(am->am_procs[0]));
+		}
+		am->am_nprocs = 0;
+		for (uint32_t i = 0; i < APFS_LOCK_SITES; i++) {
+			const char *name = am->am_sites[i].name;
+
+			memset(&am->am_sites[i], 0, sizeof(am->am_sites[i]));
+			am->am_sites[i].name = name;
+		}
 		apfs_unlock(am);
 	}
 	return 0;
@@ -290,6 +395,15 @@ apfs_stats_print(void)
 		    am->am_lock_hold_hist[3], am->am_lock_hold_hist[4], max_ns / 1000);
 		printf("apfs: lookups %llu by the name's hash, %llu by reading the directory\n", nx->lookups_hashed,
 		    nx->lookups_scanned);
+		{
+			char *rep = kalloc_data(16384, Z_WAITOK | Z_ZERO);
+
+			if (rep != NULL) {
+				apfs_lock_report(am, rep, 16384);
+				printf("%s", rep);
+				kfree_data(rep, 16384);
+			}
+		}
 		printf("apfs: metadata read without the lock: %llu times, %llu of them already in by another's read; "
 		    "retired blocks %llu now, %llu at most; operations going on now %u\n", nx->unlocked_fills, nx->fill_races,
 		    nx->retired_now, nx->retired_most, am->am_nops);
@@ -330,6 +444,19 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 
 			apfs_unlock(am);
 			if (vnode_getwithvid(vp, vid) == 0) {
+				os_atomic_inc(&am->am_node_found, relaxed);
+				/*
+				 * Found by a lookup: the name goes into the name cache, as vnode_create
+				 * puts it there for a new vnode -- else every later lookup of this
+				 * name comes back here for the lock.  (The volume does not change;
+				 * a synthetic name is looked for only where there is no real one, and
+				 * adding one purges its directory's entries.)  The name cache keeps
+				 * one name per vnode and leaves one that has a name already as it is.
+				 */
+				if (dvp != NULLVP && cnp != NULL && (cnp->cn_flags & MAKEENTRY)) {
+					cache_enter(dvp, vp, cnp);
+					os_atomic_inc(&am->am_node_named, relaxed);
+				}
 				*vpp = vp;
 				return 0;
 			}
@@ -431,6 +558,7 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	am->am_hash[b] = an;
 	an->an_attached = true;
 	apfs_unlock(am);
+	os_atomic_inc(&am->am_node_made, relaxed);
 
 	*vpp = an->an_vp;
 	return 0;
@@ -569,6 +697,7 @@ apfs_sysctl_synthetic SYSCTL_HANDLER_ARGS
 	apfs_unlock(am);
 	/* the parent's entries changed: what the name cache has of it is stale */
 	cache_purge(dvp);
+	cache_purge_negatives(dvp);     /* (the new name was known not to be there) */
 	vnode_put(dvp);
 out:
 	if (tvp != NULLVP) {
@@ -780,6 +909,10 @@ apfs_free_mount(struct apfs_mount *am)
 		kfree_data(am->am_iobuf[--am->am_iobuf_kept], am->am_iobuf_size);
 	}
 	apfs_nx_close(&am->am_nx);
+	if (am->am_procs != NULL) {
+		kfree_data(am->am_procs, APFS_LOCK_PROCS * sizeof(am->am_procs[0]));
+	}
+	lck_spin_destroy(&am->am_iobuf_spin, &apfs_lck_grp);
 	lck_mtx_destroy(&am->am_lock, &apfs_lck_grp);
 	kfree_type(struct apfs_mount, am);
 }
@@ -806,6 +939,8 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 		return ENOMEM;
 	}
 	lck_mtx_init(&am->am_lock, &apfs_lck_grp, LCK_ATTR_NULL);
+	lck_spin_init(&am->am_iobuf_spin, &apfs_lck_grp, LCK_ATTR_NULL);
+	am->am_procs = kalloc_data(APFS_LOCK_PROCS * sizeof(am->am_procs[0]), Z_WAITOK | Z_ZERO);
 	am->am_mp = mp;
 	am->am_devvp = devvp;
 	am->am_devblock = devblock;

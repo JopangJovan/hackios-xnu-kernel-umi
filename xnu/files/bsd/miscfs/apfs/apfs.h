@@ -95,7 +95,51 @@ struct apfs_mount {
 	struct {
 		thread_t           th;
 		uint64_t           epoch;
+		const char        *site;        /* the function that began it */
 	}                  am_ops[APFS_OPS_MAX];
+	/*
+	 * The lock by who takes it (the function that called apfs_lock; apfs_lib's taking it back in
+	 * the middle of an operation counts for the operation's): takes, waiting (in all, the longest,
+	 * how many over 1 ms), holding (the same). Under am_lock.
+	 */
+#define APFS_LOCK_SITES 32
+	struct apfs_lock_site {
+		const char        *name;
+		uint64_t           takes, relocks;
+		uint64_t           wait, wait_max, wait_long;
+		uint64_t           hold, hold_max, hold_long;
+	}                  am_sites[APFS_LOCK_SITES];
+	const char        *am_lock_site;    /* the holder's */
+	uint32_t           am_lock_waiting; /* threads waiting for it now (atomic) */
+	uint64_t           am_waiters_hist[5];  /* others waiting when it was taken: 0, 1, 2-3, 4-7, 8 or more */
+	uint64_t           am_lookup_negative;  /* names not there, now known to the name cache */
+	uint64_t           am_lookup_negative_hits;     /* lookups the name cache answered with "not there" */
+	uint64_t           am_inactive_free;    /* vnop_inactive with nothing to give back: no lock taken */
+	uint64_t           am_lookup_positive_hits;     /* lookups the name cache answered with the vnode */
+	uint64_t           am_node_found, am_node_made; /* apfs_node_vnode: a vnode there already, a new one */
+	uint64_t           am_node_named;       /* of those there already, entered in the name cache by a lookup */
+	/* waiting by the waiter's base priority: up to 4, 20, 31, 46, higher (all waits; those over 1 ms) */
+	uint64_t           am_prio_wait[5], am_prio_long[5], am_prio_long_wait[5];
+	/*
+	 * The waits over 1 ms, by the same priorities, taken apart: blocked (the lock not given),
+	 * queued (runnable, no processor to run on), on a processor (spinning, the lock's own work).
+	 */
+	uint64_t           am_long_blocked[5], am_long_queued[5], am_long_oncpu[5];
+	uint64_t           am_long_cpu[8];      /* the processor each one ended on */
+	/*
+	 * Who waits (waits over 10 us) and who reads (read(2), pagein), by process name; the
+	 * first APFS_LOCK_PROCS-1 names, the last entry takes the rest.  Changed under am_lock,
+	 * entries only ever added; read without it.  Allocated with the mount (the mount itself
+	 * has to stay within kalloc_type's 16 KB); NULL if that failed: then not kept.
+	 */
+#define APFS_LOCK_PROCS 64
+	struct apfs_lock_proc {
+		char       name[MAXCOMLEN + 1];
+		uint64_t   waits, wait, wait_max, wait_long;
+		uint64_t   read_calls, read_bytes, pagein_calls, pagein_bytes;
+		uint64_t   read_ticks, pagein_ticks;     /* time in them, added without the lock (atomic) */
+	}                 *am_procs;
+	uint32_t           am_nprocs;
 	uint32_t           am_nops;
 	uint32_t           am_untracked;    /* operations the table had no room for: nothing is freed meanwhile */
 	/* how long it was held: up to 10 us, 100 us, 1 ms, 10 ms, more; and the longest */
@@ -107,6 +151,7 @@ struct apfs_mount {
 	 */
 	void              *am_iobuf[APFS_IOBUF_KEEP];
 	uint32_t           am_iobuf_kept;
+	lck_spin_t         am_iobuf_spin;   /* the two above: their own lock, not am_lock */
 	uint32_t           am_iobuf_size;
 	/*
 	 * Synthetic directories: empty directories that are not on the volume, for mount
@@ -144,6 +189,17 @@ struct apfs_node {
 	 * decmpfs header on every call.
 	 */
 	struct apfs_inode  an_ino;
+	/*
+	 * A symbolic link's target, read once: every path through the link asks for it again
+	 * (/var, /tmp, /etc -- thousands of times a second after a boot), and it cannot change.
+	 * Put in once (atomically), read without the lock, freed with the vnode.
+	 */
+	struct apfs_link  *an_link;
+};
+
+struct apfs_link {
+	size_t             len;
+	char               text[];
 };
 
 #define APFS_MP(mp)       ((struct apfs_mount *)vfs_fsprivate(mp))
@@ -163,7 +219,8 @@ void apfs_node_detach(struct apfs_node *an);
 /* the breakdown of where the time went, straight to the log (apfs_vfsops.c) */
 void apfs_stats_print(void);
 
-void apfs_lock(struct apfs_mount *am);           /* an operation begins */
+void apfs_lock_at(struct apfs_mount *am, const char *site);  /* an operation begins */
+#define apfs_lock(am) apfs_lock_at((am), __func__)
 void apfs_unlock(struct apfs_mount *am);         /* and ends */
 void apfs_lock_inner(struct apfs_mount *am);     /* the lock taken back in the middle of one (apfs_lib) */
 void apfs_unlock_inner(struct apfs_mount *am);   /* let go of in the middle of one */

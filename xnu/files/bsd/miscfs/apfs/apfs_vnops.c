@@ -21,15 +21,69 @@
 #include <sys/unistd.h>
 #include <sys/vnode_internal.h>
 #include <sys/xattr.h>
+#include <os/atomic_private.h>
 #include <vfs/vfs_support.h>
 
 /* How much is read out of a file at a time when copying into a uio. */
 
-void
-apfs_lock_inner(struct apfs_mount *am)
+extern integer_t thread_kern_get_pri(thread_t thr);    /* the thread's base priority */
+extern void thread_runnable_and_run_self(uint64_t *runnable, uint64_t *run);
+
+/* The statistics of the calling process (with the lock held) */
+static struct apfs_lock_proc *
+lock_proc(struct apfs_mount *am)
+{
+	static struct apfs_lock_proc nowhere;   /* (no table: counted, under the lock, and never shown) */
+	char name[MAXCOMLEN + 1];
+	uint32_t i;
+
+	if (am->am_procs == NULL) {
+		return &nowhere;
+	}
+	proc_selfname(name, sizeof(name));
+	for (i = 0; i < am->am_nprocs; i++) {
+		if (strncmp(am->am_procs[i].name, name, sizeof(name)) == 0) {
+			return &am->am_procs[i];
+		}
+	}
+	if (am->am_nprocs < APFS_LOCK_PROCS - 1) {
+		strlcpy(am->am_procs[am->am_nprocs].name, name, sizeof(name));
+		return &am->am_procs[am->am_nprocs++];
+	}
+	if (am->am_nprocs == APFS_LOCK_PROCS - 1) {
+		strlcpy(am->am_procs[am->am_nprocs].name, "(the rest)", sizeof(name));
+		am->am_nprocs++;
+	}
+	return &am->am_procs[APFS_LOCK_PROCS - 1];
+}
+
+/* The statistics of a caller of apfs_lock (with the lock held) */
+static struct apfs_lock_site *
+lock_site(struct apfs_mount *am, const char *name)
+{
+	uint32_t i;
+
+	for (i = 0; i < APFS_LOCK_SITES && am->am_sites[i].name != NULL; i++) {
+		if (am->am_sites[i].name == name) {
+			return &am->am_sites[i];
+		}
+	}
+	if (i == APFS_LOCK_SITES) {
+		i = APFS_LOCK_SITES - 1;        /* (more callers than kept: the last one takes the rest) */
+	} else {
+		am->am_sites[i].name = name;
+	}
+	return &am->am_sites[i];
+}
+
+/* The lock taken, by site: how long it was waited for, how many others were waiting */
+static void
+lock_take(struct apfs_mount *am, const char *site, bool relock)
 {
 	static uint64_t limits[4];
-	uint64_t t0 = apfs_ticks(), waited;
+	uint64_t t0 = apfs_ticks(), waited, long_wait, runnable0, run0;
+	uint32_t others = os_atomic_inc_orig(&am->am_lock_waiting, relaxed);
+	struct apfs_lock_site *ls;
 	unsigned k;
 
 	if (limits[3] == 0) {
@@ -38,8 +92,11 @@ apfs_lock_inner(struct apfs_mount *am)
 		nanoseconds_to_absolutetime(100000, &limits[2]);
 		nanoseconds_to_absolutetime(1000000, &limits[3]);
 	}
+	thread_runnable_and_run_self(&runnable0, &run0);
 	lck_mtx_lock(&am->am_lock);
+	os_atomic_dec(&am->am_lock_waiting, relaxed);
 	waited = apfs_ticks() - t0;
+	long_wait = limits[3];
 	/* (the holder's own: no atomics needed) */
 	am->am_lock_wait_ticks += waited;
 	am->am_lock_waits++;
@@ -49,7 +106,69 @@ apfs_lock_inner(struct apfs_mount *am)
 	if (waited > am->am_lock_wait_max) {
 		am->am_lock_wait_max = waited;
 	}
+	am->am_waiters_hist[others == 0 ? 0 : others == 1 ? 1 : others <= 3 ? 2 : others <= 7 ? 3 : 4]++;
+	{
+		int pri = thread_kern_get_pri(current_thread());
+		unsigned b = pri <= 4 ? 0 : pri <= 20 ? 1 : pri <= 31 ? 2 : pri <= 46 ? 3 : 4;
+
+		am->am_prio_wait[b] += waited;
+		if (waited >= limits[3]) {
+			uint64_t runnable, run;
+
+			am->am_prio_long[b]++;
+			am->am_prio_long_wait[b] += waited;
+			/* where the time went: runnable includes running, and the rest was blocked */
+			thread_runnable_and_run_self(&runnable, &run);
+			runnable -= runnable0;
+			run -= run0;
+			am->am_long_blocked[b] += waited > runnable ? waited - runnable : 0;
+			am->am_long_queued[b] += runnable > run ? runnable - run : 0;
+			am->am_long_oncpu[b] += run;
+			am->am_long_cpu[cpu_number() & 7]++;
+		}
+	}
+	if (waited >= limits[1]) {
+		struct apfs_lock_proc *lp = lock_proc(am);
+
+		lp->waits++;
+		lp->wait += waited;
+		if (waited > lp->wait_max) {
+			lp->wait_max = waited;
+		}
+		lp->wait_long += waited >= limits[3];
+	}
+	if (relock) {
+		/* apfs_lib taking it back in the middle of an operation: the operation's */
+		thread_t self = current_thread();
+		uint32_t i;
+
+		site = "apfs_lib";
+		for (i = 0; i < am->am_nops; i++) {
+			if (am->am_ops[i].th == self) {
+				site = am->am_ops[i].site;
+				break;
+			}
+		}
+	}
+	ls = lock_site(am, site);
+	if (relock) {
+		ls->relocks++;
+	} else {
+		ls->takes++;
+	}
+	ls->wait += waited;
+	if (waited > ls->wait_max) {
+		ls->wait_max = waited;
+	}
+	ls->wait_long += waited >= long_wait;
+	am->am_lock_site = site;
 	am->am_lock_t0 = apfs_ticks();
+}
+
+void
+apfs_lock_inner(struct apfs_mount *am)
+{
+	lock_take(am, NULL, true);
 }
 
 void
@@ -57,6 +176,7 @@ apfs_unlock_inner(struct apfs_mount *am)
 {
 	static uint64_t limits[4];
 	uint64_t held = apfs_ticks() - am->am_lock_t0;
+	struct apfs_lock_site *ls;
 	unsigned k;
 
 	if (limits[3] == 0) {
@@ -72,17 +192,26 @@ apfs_unlock_inner(struct apfs_mount *am)
 	if (held > am->am_lock_hold_max) {
 		am->am_lock_hold_max = held;
 	}
+	if (am->am_lock_site != NULL) {
+		ls = lock_site(am, am->am_lock_site);
+		ls->hold += held;
+		if (held > ls->hold_max) {
+			ls->hold_max = held;
+		}
+		ls->hold_long += held >= limits[2];
+	}
 	lck_mtx_unlock(&am->am_lock);
 }
 
 /* An operation begins: the lock, and the epoch it began at noted */
 void
-apfs_lock(struct apfs_mount *am)
+apfs_lock_at(struct apfs_mount *am, const char *site)
 {
-	apfs_lock_inner(am);
+	lock_take(am, site, false);
 	if (am->am_nops < APFS_OPS_MAX) {
 		am->am_ops[am->am_nops].th = current_thread();
 		am->am_ops[am->am_nops].epoch = am->am_nx.epoch;
+		am->am_ops[am->am_nops].site = site;
 		am->am_nops++;
 	} else {
 		am->am_untracked++;
@@ -156,6 +285,21 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 		return apfs_node_vnode(am, dn->an_parent, NULLVP, NULL, ap->a_vpp);
 	}
 
+	/*
+	 * The name cache first, as a file system's lookup is to ask it (namei's own quick path
+	 * leaves the entries for names that are not there to us): -1, the vnode, with an iocount;
+	 * ENOENT, known not to be there (for a CREATE or RENAME it says 0 and forgets the entry).
+	 */
+	error = cache_lookup(dvp, ap->a_vpp, cnp);
+	if (error == -1) {
+		os_atomic_inc(&am->am_lookup_positive_hits, relaxed);
+		return 0;
+	}
+	if (error == ENOENT) {
+		os_atomic_inc(&am->am_lookup_negative_hits, relaxed);
+		return ENOENT;
+	}
+
 	apfs_lock(am);
 	if (dn->an_id >= APFS_SYNTH_BASE) {
 		error = ENOENT;                 /* nothing of a synthetic directory is on the volume */
@@ -182,6 +326,15 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 	if (error == ENOENT && (cnp->cn_flags & ISLASTCN) &&
 	    (cnp->cn_nameiop == CREATE || cnp->cn_nameiop == RENAME)) {
 		return EROFS;
+	}
+	/*
+	 * A name that is not there stays not there (the volume cannot change; a synthetic
+	 * directory added later purges its parent's entries): the name cache says so from now on,
+	 * instead of asking again -- iOS asks for missing files thousands of times after a boot.
+	 */
+	if (error == ENOENT && cnp->cn_nameiop == LOOKUP && (cnp->cn_flags & MAKEENTRY)) {
+		cache_enter(dvp, NULLVP, cnp);
+		os_atomic_inc(&am->am_lookup_negative, relaxed);
 	}
 	if (error) {
 		return error;
@@ -251,6 +404,40 @@ apfs_vnop_getattr(struct vnop_getattr_args *ap)
 
 /* ------------------------------------------------------------------ reading */
 
+/*
+ * A buffer for one round of vnop_read: one of those kept, or a new one.  The kept ones have
+ * a lock of their own, so that a read takes am_lock only for the reading itself.
+ */
+static uint8_t *
+apfs_iobuf_get(struct apfs_mount *am)
+{
+	uint8_t *buf = NULL;
+
+	lck_spin_lock(&am->am_iobuf_spin);
+	if (am->am_iobuf_kept > 0) {
+		buf = am->am_iobuf[--am->am_iobuf_kept];
+	}
+	lck_spin_unlock(&am->am_iobuf_spin);
+	if (buf == NULL) {
+		buf = kalloc_data(am->am_iobuf_size, Z_WAITOK);
+	}
+	return buf;
+}
+
+static void
+apfs_iobuf_put(struct apfs_mount *am, uint8_t *buf)
+{
+	lck_spin_lock(&am->am_iobuf_spin);
+	if (am->am_iobuf_kept < APFS_IOBUF_KEEP) {
+		am->am_iobuf[am->am_iobuf_kept++] = buf;
+		buf = NULL;
+	}
+	lck_spin_unlock(&am->am_iobuf_spin);
+	if (buf != NULL) {
+		kfree_data(buf, am->am_iobuf_size);
+	}
+}
+
 static int
 apfs_vnop_read(struct vnop_read_args *ap)
 {
@@ -261,6 +448,7 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	uint8_t *buf;
 	uint64_t size = 0;
 	uint64_t t0, read_bytes = 0;
+	struct apfs_lock_proc *lp = NULL;
 	int error = 0;
 
 	if (vnode_isdir(vp)) {
@@ -275,50 +463,56 @@ apfs_vnop_read(struct vnop_read_args *ap)
 	ino = APFS_VP(vp)->an_ino;
 	size = APFS_VP(vp)->an_size;
 	t0 = apfs_ticks();
-	apfs_lock(am);
-	if (am->am_iobuf_kept > 0) {
-		buf = am->am_iobuf[--am->am_iobuf_kept];
-	} else {
-		apfs_unlock(am);
-		buf = kalloc_data(am->am_iobuf_size, Z_WAITOK);
+	if (uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < size) {
+		buf = apfs_iobuf_get(am);
 		if (buf == NULL) {
 			return ENOMEM;
 		}
+		/* (how many reads are going on: a hint to apfs_lib, kept without the lock) */
+		os_atomic_inc(&am->am_nx.requests, relaxed);
 		apfs_lock(am);
-	}
-	/* the lock is held at the top of every round and let go of only for uiomove */
-	am->am_nx.requests++;
-	while (uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < size) {
-		size_t round = (am->am_nx.requests <= 1)
-		    ? am->am_iobuf_size : MIN(am->am_iobuf_size, APFS_ROUND_SHARED);
-		size_t want = (size_t)MIN((user_ssize_t)round, uio_resid(uio));
-		size_t got = 0;
+		{
+			lp = lock_proc(am);
+			lp->read_calls++;
+			lp->read_bytes += (uint64_t)MIN((uint64_t)uio_resid(uio), size - (uint64_t)uio_offset(uio));
+		}
+		/*
+		 * The lock is held for the reading of each round and let go of for its uiomove;
+		 * taken again only if another round follows.  What comes after the last one (the
+		 * buffer given back, the counts) needs no am_lock.
+		 */
+		for (;;) {
+			size_t round = (os_atomic_load(&am->am_nx.requests, relaxed) <= 1)
+			    ? am->am_iobuf_size : MIN(am->am_iobuf_size, APFS_ROUND_SHARED);
+			size_t want = (size_t)MIN((user_ssize_t)round, uio_resid(uio));
+			size_t got = 0;
 
-		error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf,
-		    (uint64_t)uio_offset(uio), buf, want, &got);
-		if (error || got == 0) {
-			break;
+			error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf,
+			    (uint64_t)uio_offset(uio), buf, want, &got);
+			apfs_unlock(am);
+			if (error || got == 0) {
+				break;
+			}
+			error = uiomove((caddr_t)buf, (int)got, uio);
+			if (error) {
+				break;
+			}
+			read_bytes += got;
+			if (uio_resid(uio) <= 0 || (uint64_t)uio_offset(uio) >= size) {
+				break;
+			}
+			apfs_lock(am);
 		}
-		apfs_unlock(am);
-		error = uiomove((caddr_t)buf, (int)got, uio);
-		apfs_lock(am);
-		if (error) {
-			break;
-		}
-		read_bytes += got;
+		os_atomic_dec(&am->am_nx.requests, relaxed);
+		apfs_iobuf_put(am, buf);
 	}
-	am->am_nx.requests--;
-	if (am->am_iobuf_kept < APFS_IOBUF_KEEP) {
-		am->am_iobuf[am->am_iobuf_kept++] = buf;
-		buf = NULL;
+	if (lp != NULL) {
+		/* (the entry stays where it is; a zeroing meanwhile costs at most this one read's time) */
+		os_atomic_add(&lp->read_ticks, apfs_ticks() - t0, relaxed);
 	}
-	am->am_read_ticks += apfs_ticks() - t0;
-	am->am_read_calls++;
-	am->am_read_bytes += read_bytes;
-	apfs_unlock(am);
-	if (buf != NULL) {
-		kfree_data(buf, am->am_iobuf_size);
-	}
+	os_atomic_add(&am->am_read_ticks, apfs_ticks() - t0, relaxed);
+	os_atomic_inc(&am->am_read_calls, relaxed);
+	os_atomic_add(&am->am_read_bytes, read_bytes, relaxed);
 	return error;
 }
 
@@ -339,6 +533,7 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	vm_offset_t address = 0;
 	uint64_t size = 0;
 	uint64_t t0 = apfs_ticks();
+	struct apfs_lock_proc *lp = NULL;
 	off_t at, end;
 	int error = 0;
 
@@ -387,12 +582,17 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 			break;
 		}
 		want = (size_t)MIN(end - at, (off_t)(size - (uint64_t)at));
+		os_atomic_inc(&am->am_nx.requests, relaxed);
 		apfs_lock(am);
-		am->am_nx.requests++;
+		if (at == offset) {
+			lp = lock_proc(am);
+			lp->pagein_calls++;
+			lp->pagein_bytes += ap->a_size;
+		}
 		error = apfs_read_file(&am->am_vol, &ino, &APFS_VP(vp)->an_cf, (uint64_t)at,
 		    dst, want, &got);
-		am->am_nx.requests--;
 		apfs_unlock(am);
+		os_atomic_dec(&am->am_nx.requests, relaxed);
 		if (error) {
 			break;
 		}
@@ -410,11 +610,13 @@ apfs_vnop_pagein(struct vnop_pagein_args *ap)
 	}
 
 	ubc_upl_unmap(upl);
-	apfs_lock(am);
-	am->am_pagein_ticks += apfs_ticks() - t0;
-	am->am_pagein_calls++;
-	am->am_pagein_bytes += ap->a_size;
-	apfs_unlock(am);
+	/* (the counts: without the lock, which would be taken for nothing else) */
+	if (lp != NULL) {
+		os_atomic_add(&lp->pagein_ticks, apfs_ticks() - t0, relaxed);
+	}
+	os_atomic_add(&am->am_pagein_ticks, apfs_ticks() - t0, relaxed);
+	os_atomic_inc(&am->am_pagein_calls, relaxed);
+	os_atomic_add(&am->am_pagein_bytes, (uint64_t)ap->a_size, relaxed);
 	if (!(ap->a_flags & UPL_NOCOMMIT)) {
 		if (error) {
 			ubc_upl_abort_range(upl, upl_offset, (upl_size_t)ap->a_size,
@@ -548,6 +750,7 @@ apfs_vnop_readlink(struct vnop_readlink_args *ap)
 	vnode_t vp = ap->a_vp;
 	struct apfs_mount *am = APFS_VP_MOUNT(vp);
 	struct apfs_node *an = APFS_VP(vp);
+	struct apfs_link *link;
 	char *buf;
 	size_t n = 0;
 	int error;
@@ -555,18 +758,35 @@ apfs_vnop_readlink(struct vnop_readlink_args *ap)
 	if (!vnode_islnk(vp)) {
 		return EINVAL;
 	}
-	buf = kalloc_data(MAXPATHLEN, Z_WAITOK);
-	if (buf == NULL) {
-		return ENOMEM;
+	link = os_atomic_load(&an->an_link, acquire);
+	if (link == NULL) {
+		/* the first time: from the tree, with the lock; kept for every time after */
+		buf = kalloc_data(MAXPATHLEN, Z_WAITOK);
+		if (buf == NULL) {
+			return ENOMEM;
+		}
+		apfs_lock(am);
+		error = apfs_readlink(&am->am_vol, an->an_id, buf, MAXPATHLEN, &n);
+		apfs_unlock(am);
+		if (error) {
+			kfree_data(buf, MAXPATHLEN);
+			return error;
+		}
+		link = kalloc_data(sizeof(*link) + n, Z_WAITOK);
+		if (link == NULL) {
+			error = uiomove(buf, (int)n, ap->a_uio);
+			kfree_data(buf, MAXPATHLEN);
+			return error;
+		}
+		link->len = n;
+		memcpy(link->text, buf, n);
+		kfree_data(buf, MAXPATHLEN);
+		if (!os_atomic_cmpxchg(&an->an_link, NULL, link, release)) {
+			kfree_data(link, sizeof(*link) + n);        /* somebody else's is in */
+			link = os_atomic_load(&an->an_link, acquire);
+		}
 	}
-	apfs_lock(am);
-	error = apfs_readlink(&am->am_vol, an->an_id, buf, MAXPATHLEN, &n);
-	apfs_unlock(am);
-	if (error == 0) {
-		error = uiomove(buf, (int)n, ap->a_uio);
-	}
-	kfree_data(buf, MAXPATHLEN);
-	return error;
+	return uiomove(link->text, (int)link->len, ap->a_uio);
 }
 
 /* ------------------------------------------------------------------ attributes */
@@ -731,11 +951,24 @@ apfs_vnop_inactive(struct vnop_inactive_args *ap)
 {
 	struct apfs_node *an = APFS_VP(ap->a_vp);
 
-	if (an != NULL) {
-		apfs_lock(an->an_mount);
-		apfs_cfile_fini(&an->an_cf);
-		apfs_unlock(an->an_mount);
+	if (an == NULL) {
+		return 0;
 	}
+	/*
+	 * Most files hold nothing to give back (a directory, a link, a file not compressed): then
+	 * not even the lock. Looked at without it: a state being set up meanwhile is given back with
+	 * the vnode instead (apfs_vnop_reclaim), which is all a wrong "nothing" can cost.
+	 */
+	if (os_atomic_load(&an->an_cf.piece_off, relaxed) == NULL &&
+	    os_atomic_load(&an->an_cf.piece_len, relaxed) == NULL &&
+	    os_atomic_load(&an->an_cf.held_data, relaxed) == NULL &&
+	    os_atomic_load(&an->an_cf.ra_data, relaxed) == NULL) {
+		os_atomic_inc(&an->an_mount->am_inactive_free, relaxed);
+		return 0;
+	}
+	apfs_lock(an->an_mount);
+	apfs_cfile_fini(&an->an_cf);
+	apfs_unlock(an->an_mount);
 	return 0;
 }
 
@@ -751,6 +984,9 @@ apfs_vnop_reclaim(struct vnop_reclaim_args *ap)
 		apfs_unlock(an->an_mount);
 		apfs_node_detach(an);
 		vnode_clearfsnode(vp);
+		if (an->an_link != NULL) {
+			kfree_data(an->an_link, sizeof(*an->an_link) + an->an_link->len);
+		}
 		kfree_type(struct apfs_node, an);
 	}
 	return 0;
