@@ -189,13 +189,22 @@ cat > "$OUT/root/var/jb/prep.sh" <<'PREP'
 # Asked again every five seconds, two minutes at most, aside: right after SpringBoard it may be busy.
 for app in /var/jb/Applications/*.app; do
 	[ -d "/Applications/${app##*/}" ] && continue
-	real=$(/var/jb/usr/bin/readlink "$app/Info.plist") && app=${real%/Info.plist}
+	# by its own path in the prefix first: that is the one a later uicache -- the trigger of any package
+	# that brings an application -- finds again when it rebuilds the database, and an application
+	# registered under some other path is "uninstalled" by that rebuild, which makes SpringBoard kill it
+	# (a running Sileo died the moment a tweak was installed). The real path, with the grafted prefix a
+	# directory of the boot volume, is only the fallback.
+	real=$(/var/jb/usr/bin/readlink "$app/Info.plist" 2>/dev/null)
+	real=${real%/Info.plist}
 	(
 		for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
-			case "$(/var/jb/usr/bin/uicache -p "$app" 2>&1)" in
-			*Error*) sleep 5 ;;
-			*) echo "prep.sh: ${app##*/} registered (try $try)"; exit 0 ;;
-			esac
+			for path in "$app" ${real:+"$real"}; do
+				case "$(/var/jb/usr/bin/uicache -p "$path" 2>&1)" in
+				*Error*) ;;
+				*) echo "prep.sh: ${app##*/} registered from $path (try $try)"; exit 0 ;;
+				esac
+			done
+			sleep 5
 		done
 		echo "prep.sh: ${app##*/} could not be registered"
 	) &
