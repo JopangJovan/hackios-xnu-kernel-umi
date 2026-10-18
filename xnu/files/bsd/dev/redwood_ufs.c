@@ -90,6 +90,9 @@ static bool ufs_ready, ufs_dead;
 static uint64_t ufs_requests, ufs_errors, ufs_bytes, ufs_wait_us;
 static uint64_t ufs_copy_us;                    /* copying out of the loader's buffer */
 static uint64_t ufs_small, ufs_medium, ufs_large; /* requests of <= 4 KB, <= 64 KB, more */
+static uint64_t ufs_sequential;                 /* requests that start where the one before ended */
+static uint32_t ufs_last_part = ~0u;
+static uint64_t ufs_last_end;
 
 static LCK_GRP_DECLARE(ufs_lck_grp, "redwood-ufs");
 static LCK_MTX_DECLARE(ufs_lock, &ufs_lck_grp);
@@ -120,6 +123,11 @@ ufs_request(uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst)
 	if (ufs_dead) {
 		return EIO;
 	}
+	if (part == ufs_last_part && lba == ufs_last_end) {
+		ufs_sequential++;
+	}
+	ufs_last_part = part;
+	ufs_last_end = lba + count;
 	ufs_page->ask.part = part;
 	ufs_page->ask.lba = lba;
 	ufs_page->ask.count = count;
@@ -211,10 +219,10 @@ redwood_ufs_report(const char *when)
 		return;
 	}
 	absolutetime_to_nanoseconds(ufs_page->answer.ticks, &loader_ns);
-	printf("ufs: %s: %llu requests (%llu of 4 KB or less, %llu to 64 KB, %llu more), %llu errors, "
-	    "%llu bytes; waiting %llu ms, of it in ReadBlocks %llu ms; copying %llu ms\n", when,
-	    ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_errors, ufs_bytes, ufs_wait_us / 1000,
-	    loader_ns / 1000000, ufs_copy_us / 1000);
+	printf("ufs: %s: %llu requests (%llu of 4 KB or less, %llu to 64 KB, %llu more; %llu right after "
+	    "the one before), %llu errors, %llu bytes; waiting %llu ms, of it in ReadBlocks %llu ms; "
+	    "copying %llu ms\n", when, ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_sequential,
+	    ufs_errors, ufs_bytes, ufs_wait_us / 1000, loader_ns / 1000000, ufs_copy_us / 1000);
 }
 
 /*

@@ -165,6 +165,20 @@ typedef struct efi_block_io {
 	efi_status (EFIAPI *flush_blocks)(struct efi_block_io *self);
 } efi_block_io;
 
+/* Block I/O 2: the same reads, asynchronous -- a token's event is signalled when one is done */
+typedef struct {
+	void *event;
+	efi_status transaction_status;
+} efi_block_io2_token;
+
+typedef struct efi_block_io2 {
+	efi_block_media *media;
+	void *reset;
+	efi_status (EFIAPI *read_blocks_ex)(struct efi_block_io2 *self, uint32_t media_id, uint64_t lba,
+	    efi_block_io2_token *token, uint64_t size, void *buf);
+	void *write_blocks_ex, *flush_blocks_ex;
+} efi_block_io2;
+
 #pragma pack(push, 1)
 typedef struct {
 	uint32_t revision; uint32_t type; uint8_t system;
@@ -231,6 +245,7 @@ typedef struct {
 #define QCOM_USB_INIT_EVENT_GUID { 0x1c0cffce, 0xfc8d, 0x4e44, { 0x8c, 0x78, 0x9c, 0x9e, 0x5b, 0x53, 0x0d, 0x36 } }
 #define EFI_GOP_GUID            { 0x9042a9de, 0x23dc, 0x4a38, { 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a } }
 #define EFI_BLOCK_IO_GUID       { 0x964e5b21, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
+#define EFI_BLOCK_IO2_GUID      { 0xa77b2472, 0xe282, 0x4e9f, { 0xa2, 0x45, 0xc2, 0xc0, 0xe2, 0x7b, 0xbc, 0xc1 } }
 #define EFI_PARTITION_INFO_GUID { 0x8cf2f62c, 0xbc9b, 0x4821, { 0x80, 0x8d, 0xec, 0x9e, 0xc4, 0x21, 0xa1, 0xa0 } }
 #define QCOM_CHARGER_EX_GUID     { 0x6edc8a6d, 0x2663, 0x43cd, { 0x90, 0xff, 0x46, 0x21, 0xff, 0xd1, 0x0d, 0xf5 } }
 #define QCOM_CHARGER_GUID        { 0x21bfb78b, 0x02ea, 0x4ab7, { 0x99, 0x40, 0xb5, 0x8a, 0x2a, 0xd6, 0x58, 0x29 } }

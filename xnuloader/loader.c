@@ -1444,6 +1444,8 @@ struct loader_block {
 
 /* (8 KB is as far as this target aligns; the kernel maps whole 16 KB pages around both) */
 static struct loader_block block_shared __attribute__((aligned(0x2000)));
+static void block_io2_probe(efi_handle h, efi_block_io *bio);
+static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at block_start() */
 static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
 static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
@@ -1475,6 +1477,10 @@ block_start(void)
 		bp->block_size = bio->media->block_size;
 		bp->blocks = bio->media->last_block + 1;
 		block_bios[block_shared.parts++] = bio;
+		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
+		    bp->name[3] == 'w' && bp->name[4] == 'i' && bp->name[5] == 'n' && bp->name[6] == 0) {
+			block_io2_probe(handles[i], bio);
+		}
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -1485,6 +1491,85 @@ block_start(void)
 	block_enabled = 1;
 	print("ufs: block service: %d partitions, page %x, buffer %x of %d KB\n", (uint64_t)block_shared.parts,
 	    (uint64_t)(uintptr_t)&block_shared, block_shared.buffer_pa, (uint64_t)(BLOCK_BUFFER_SIZE >> 10));
+}
+
+/*
+ * Whether the storage could have more than one request in flight (ufs_probe=1): Block I/O 2
+ * on the partitions, and whether its reads come back before they are done.  Eight 4 KB
+ * reads at places 64 MB apart in "darwin", one after another through Block I/O and then all
+ * eight at once through Block I/O 2, each into its own part of the buffer.  Before the kernel
+ * runs (the UEFI timer still ticks), and only to say what there is.
+ *
+ * What it says on this phone: Block I/O 2 is there and the calls come back at once (eight in
+ * 160 us, none done), but the eight are done only after 61.5 ms, against 1.0 ms one at a time
+ * through Block I/O -- Qualcomm's driver finishes them from the UEFI timer, which besides does
+ * not tick on core 0 while the kernel runs.  So one request at a time, synchronously.
+ */
+static void
+block_io2_probe(efi_handle h, efi_block_io *bio)
+{
+	static const efi_guid blk2_guid = EFI_BLOCK_IO2_GUID;
+	efi_status (EFIAPI *create_event)(uint32_t, uint64_t, void *, void *, void **) =
+	    (efi_status (EFIAPI *)(uint32_t, uint64_t, void *, void *, void **))BS->create_event;
+	efi_status (EFIAPI *check_event)(void *) = (efi_status (EFIAPI *)(void *))BS->check_event;
+	static efi_block_io2_token tokens[8];
+	efi_block_io2 *bio2 = NULL;
+	uint64_t bs = bio->media->block_size, t0, t_sync, t_issue = 0, t_all, freq = READ_SYSREG(CNTFRQ_EL0);
+	uint64_t returned_done = 0, pending, polls = 0;
+	efi_status s;
+
+	if (EFI_ERROR(BS->handle_protocol(h, &blk2_guid, (void **)&bio2)) || bio2 == NULL) {
+		print("ufs: darwin: no Block I/O 2: one request at a time it is\n");
+		return;
+	}
+	t0 = READ_SYSREG(CNTVCT_EL0);
+	for (int i = 0; i < 8; i++) {
+		s = bio->read_blocks(bio, bio->media->media_id, (uint64_t)i * (64ULL << 20) / bs + 7, bs,
+		    block_buffer + i * 65536);
+		if (EFI_ERROR(s)) {
+			print("ufs: probe: Block I/O read failed %x\n", s);
+			return;
+		}
+	}
+	t_sync = READ_SYSREG(CNTVCT_EL0) - t0;
+	for (int i = 0; i < 8; i++) {
+		tokens[i].transaction_status = 0;
+		if (EFI_ERROR(create_event(0, 8 /* TPL_CALLBACK */, NULL, NULL, &tokens[i].event))) {
+			print("ufs: probe: no event\n");
+			return;
+		}
+	}
+	t0 = READ_SYSREG(CNTVCT_EL0);
+	for (int i = 0; i < 8; i++) {
+		/* other places than the synchronous reads, so that nothing the storage kept is read again */
+		s = bio2->read_blocks_ex(bio2, bio2->media->media_id, (uint64_t)i * (64ULL << 20) / bs + 1031,
+		    &tokens[i], bs, block_buffer + 1048576 + i * 65536);
+		if (EFI_ERROR(s)) {
+			print("ufs: probe: ReadBlocksEx %d failed %x\n", (uint64_t)i, s);
+			return;
+		}
+		if (check_event(tokens[i].event) == 0) {
+			returned_done++;        /* already signalled when the call came back */
+		}
+	}
+	t_issue = READ_SYSREG(CNTVCT_EL0) - t0;
+	pending = 8 - returned_done;
+	while (pending > 0 && polls < 50000000) {
+		pending = 0;
+		for (int i = 0; i < 8; i++) {
+			if (tokens[i].event != NULL && check_event(tokens[i].event) != 0) {
+				pending++;
+			} else if (tokens[i].event != NULL) {
+				BS->close_event(tokens[i].event);
+				tokens[i].event = NULL;
+			}
+		}
+		polls++;
+	}
+	t_all = READ_SYSREG(CNTVCT_EL0) - t0;
+	print("ufs: darwin: Block I/O 2 there. 8 random 4 KB reads: one at a time %d us; at once: the calls came back "
+	    "after %d us (%d of them done by then), all done after %d us, %d still pending\n",
+	    t_sync * 1000000 / freq, t_issue * 1000000 / freq, returned_done, t_all * 1000000 / freq, pending);
 }
 
 /* one request, if there is one: called from core 0's watch loop while the kernel runs */
@@ -2228,6 +2313,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (c[5] == 0 || c[5] == ' ')) {
 			ufs_requested = c[4] - '0';
 		}
+		block_probe_requested |= starts_with(c, "ufs_probe=1") && (c == pi.cmdline || c[-1] == ' ');
 	}
 	if (battery_requested) {
 		charger_start();
