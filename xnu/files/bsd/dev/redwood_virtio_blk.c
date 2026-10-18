@@ -138,6 +138,14 @@ static struct blk_device blk_dev;
 static bool blk_ready;
 static int blk_bmajor = -1, blk_cmajor = -1;
 
+/* One of this driver's devices: every request is a trip through the hypervisor */
+bool
+redwood_virtio_blk_dev(dev_t dev)
+{
+	return (blk_bmajor >= 0 && major(dev) == blk_bmajor) ||
+	       (blk_cmajor >= 0 && major(dev) == blk_cmajor);
+}
+
 static inline uint32_t
 reg_read(struct blk_device *d, uint32_t reg)
 {

@@ -106,14 +106,94 @@ apfs_mode_to_dtype(uint16_t mode)
 
 /*
  * A block of metadata, from the cache or from the device.  The returned pointer stays
- * good until APFS_CACHE_BLOCKS further blocks have been fetched, which is why a B-tree
- * descent holds block addresses and not pointers.
+ * good while fewer than APFS_CACHE_RECENT further blocks have been fetched -- the clock
+ * hand passes over a block used that recently -- which is why a B-tree descent holds
+ * block addresses and not pointers.
  */
+static inline uint32_t
+cache_bucket(uint64_t addr)
+{
+	return (uint32_t)((addr * 0x9E3779B97F4A7C15ULL) >> 40) & (APFS_CACHE_HASH - 1);
+}
+
+/* A free slot, or the first the clock hand finds neither used since it last passed nor recent. */
+static struct apfs_buf *
+cache_victim(struct apfs_nx *nx)
+{
+	struct apfs_buf *victim;
+	uint32_t steps = 0;
+	int32_t *pp;
+
+	for (;;) {
+		victim = &nx->cache[nx->hand];
+		nx->hand = (nx->hand + 1) % APFS_CACHE_BLOCKS;
+		if (victim->data == NULL) {
+			victim->data = apfs_alloc(nx->block_size);
+			if (victim->data == NULL) {
+				return NULL;
+			}
+			break;
+		}
+		if (!victim->ref && nx->fetches - victim->used >= APFS_CACHE_RECENT) {
+			break;
+		}
+		victim->ref = false;
+		if (++steps >= 2 * APFS_CACHE_BLOCKS) {
+			/* every block used that recently: the one used longest ago, then */
+			uint32_t k, best = 0;
+
+			for (k = 1; k < APFS_CACHE_BLOCKS; k++) {
+				if (nx->fetches - nx->cache[k].used > nx->fetches - nx->cache[best].used) {
+					best = k;
+				}
+			}
+			victim = &nx->cache[best];
+			break;
+		}
+	}
+	if (victim->addr != APFS_BUF_EMPTY) {
+		/* out of its old chain */
+		for (pp = &nx->cache_hash[cache_bucket(victim->addr)]; *pp >= 0;
+		    pp = &nx->cache[*pp].next) {
+			if (&nx->cache[*pp] == victim) {
+				*pp = victim->next;
+				break;
+			}
+		}
+		victim->addr = APFS_BUF_EMPTY;
+	}
+	victim->next = -1;
+	return victim;
+}
+
+static void
+cache_link(struct apfs_nx *nx, struct apfs_buf *b, uint64_t addr)
+{
+	uint32_t bucket = cache_bucket(addr);
+
+	b->addr = addr;
+	b->next = nx->cache_hash[bucket];
+	nx->cache_hash[bucket] = (int32_t)(b - nx->cache);
+}
+
+static struct apfs_buf *
+cache_find(struct apfs_nx *nx, uint64_t addr)
+{
+	int32_t i;
+
+	for (i = nx->cache_hash[cache_bucket(addr)]; i >= 0; i = nx->cache[i].next) {
+		if (nx->cache[i].addr == addr) {
+			return &nx->cache[i];
+		}
+	}
+	return NULL;
+}
+
 static int
 nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 {
-	struct apfs_buf *victim = NULL;
-	uint32_t i, oldest = 0xFFFFFFFFu;
+	struct apfs_buf *victim, *b;
+	uint64_t first = 0, count = 0, i;
 	int error;
 
 	if (addr == 0 || addr >= nx->block_count) {
@@ -122,41 +202,58 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 	if (addr > nx->max_addr) {
 		nx->max_addr = addr;
 	}
-	for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
-		if (nx->cache[i].addr == addr && nx->cache[i].data != NULL) {
-			nx->cache[i].age = ++nx->clock;
-			nx->hits++;
-			*out = nx->cache[i].data;
-			return 0;
-		}
-	}
-	/* not cached: take an unused slot, else the one used longest ago */
-	for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
-		if (nx->cache[i].data == NULL) {
-			nx->cache[i].data = apfs_alloc(nx->block_size);
-			if (nx->cache[i].data == NULL) {
-				return ENOMEM;
+	b = cache_find(nx, addr);
+	if (b != NULL) {
+		if (verify && !b->checked) {
+			/* brought in as a neighbour, asked for now */
+			if (!apfs_checksum_ok(b->data, nx->block_size)) {
+				apfs_log("block %llu: bad checksum\n", (unsigned long long)addr);
+				return EIO;
 			}
-			victim = &nx->cache[i];
-			break;
+			b->checked = true;
 		}
-		if (nx->cache[i].age < oldest) {
-			oldest = nx->cache[i].age;
-			victim = &nx->cache[i];
+		if (!b->ref && nx->fetches - b->used >= APFS_CACHE_RECENT) {
+			nx->prefetch_used++;    /* (or one used long ago; near enough) */
 		}
+		b->ref = true;
+		b->used = nx->fetches;
+		nx->hits++;
+		*out = b->data;
+		return 0;
 	}
+	victim = cache_victim(nx);
 	if (victim == NULL) {
 		return ENOMEM;
 	}
-	victim->addr = APFS_BUF_EMPTY;
+	nx->fetches++;
+	if (nx->cluster == NULL && nx->dev.read_data != NULL) {
+		nx->cluster = apfs_alloc((size_t)APFS_META_CLUSTER * nx->block_size);
+	}
 	{
 		uint64_t t0 = apfs_ticks();
 
-		error = nx->dev.read(nx->dev.ctx, addr * (uint64_t)nx->block_size,
-		    victim->data, nx->block_size);
+		uint32_t k = nx->meta_cluster != 0 ?
+		    (nx->meta_cluster > APFS_META_CLUSTER ? APFS_META_CLUSTER : nx->meta_cluster) :
+		    nx->cheap_requests ? 1 : APFS_META_CLUSTER_DEFAULT;
+
+		if (nx->cluster != NULL && k > 1) {
+			/* the block and its aligned neighbours, in one request */
+			first = addr - addr % k;
+			count = nx->block_count - first < k ? nx->block_count - first : k;
+			error = nx->dev.read_data(nx->dev.ctx, first * (uint64_t)nx->block_size,
+			    nx->cluster, (size_t)count * nx->block_size);
+			if (error == 0) {
+				memcpy(victim->data, nx->cluster + (addr - first) * nx->block_size,
+				    nx->block_size);
+			}
+			nx->dev_bytes += count * nx->block_size;
+		} else {
+			error = nx->dev.read(nx->dev.ctx, addr * (uint64_t)nx->block_size,
+			    victim->data, nx->block_size);
+			nx->dev_bytes += nx->block_size;
+		}
 		nx->dev_ticks += apfs_ticks() - t0;
 		nx->dev_calls++;
-		nx->dev_bytes += nx->block_size;
 	}
 	if (error) {
 		return error;
@@ -166,8 +263,31 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 		apfs_log("block %llu: bad checksum\n", (unsigned long long)addr);
 		return EIO;
 	}
-	victim->addr = addr;
-	victim->age = ++nx->clock;
+	victim->checked = verify;
+	victim->ref = true;
+	victim->used = nx->fetches;
+	cache_link(nx, victim, addr);
+	/*
+	 * The neighbours: kept as if long unused, so that they are the first to go if nobody
+	 * asks for them, and checked when somebody does.
+	 */
+	for (i = first; i < first + count; i++) {
+		struct apfs_buf *nb;
+
+		if (i == addr || i == 0 || cache_find(nx, i) != NULL) {
+			continue;
+		}
+		nb = cache_victim(nx);
+		if (nb == NULL) {
+			break;
+		}
+		memcpy(nb->data, nx->cluster + (i - first) * nx->block_size, nx->block_size);
+		nb->checked = false;
+		nb->ref = false;
+		nb->used = nx->fetches - APFS_CACHE_RECENT;
+		cache_link(nx, nb, i);
+		nx->prefetched++;
+	}
 	*out = victim->data;
 	return 0;
 }
@@ -603,8 +723,17 @@ apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev)
 
 	memset(nx, 0, sizeof(*nx));
 	nx->dev = *dev;
+	nx->cache = apfs_alloc(APFS_CACHE_BLOCKS * sizeof(*nx->cache));
+	nx->cache_hash = apfs_alloc(APFS_CACHE_HASH * sizeof(*nx->cache_hash));
+	if (nx->cache == NULL || nx->cache_hash == NULL) {
+		return ENOMEM;                  /* apfs_nx_close() frees what there is */
+	}
 	for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
 		nx->cache[i].addr = APFS_BUF_EMPTY;
+		nx->cache[i].next = -1;
+	}
+	for (i = 0; i < APFS_CACHE_HASH; i++) {
+		nx->cache_hash[i] = -1;
 	}
 	/* zeroed, so every slot is empty; without it the object maps are simply walked */
 	nx->omap_cache = apfs_alloc(APFS_OMAP_CACHE * sizeof(*nx->omap_cache));
@@ -726,12 +855,22 @@ apfs_nx_close(struct apfs_nx *nx)
 		nx->omap_cache = NULL;
 	}
 
-	for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
-		if (nx->cache[i].data != NULL) {
-			apfs_free(nx->cache[i].data, nx->block_size);
-			nx->cache[i].data = NULL;
+	if (nx->cache != NULL) {
+		for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
+			if (nx->cache[i].data != NULL) {
+				apfs_free(nx->cache[i].data, nx->block_size);
+			}
 		}
-		nx->cache[i].addr = APFS_BUF_EMPTY;
+		apfs_free(nx->cache, APFS_CACHE_BLOCKS * sizeof(*nx->cache));
+		nx->cache = NULL;
+	}
+	if (nx->cache_hash != NULL) {
+		apfs_free(nx->cache_hash, APFS_CACHE_HASH * sizeof(*nx->cache_hash));
+		nx->cache_hash = NULL;
+	}
+	if (nx->cluster != NULL) {
+		apfs_free(nx->cluster, (size_t)APFS_META_CLUSTER * nx->block_size);
+		nx->cluster = NULL;
 	}
 }
 
@@ -2422,10 +2561,12 @@ struct apfs_piece_job {
 	size_t   want;
 	bool     ra;                    /* read ahead, not asked for: its failure fails nothing */
 	int      error;
+	const uint8_t *src;             /* its compressed bytes, already read with its neighbours; or NULL */
 };
 
 #define APFS_BATCH   32
 #define APFS_PAR_MAX 8
+#define APFS_GROUP_CAP (1024 * 1024)
 
 struct apfs_scratch {
 	struct apfs_scratch            *next;
@@ -2439,6 +2580,7 @@ struct apfs_scratch {
 	uint8_t                        *raw;
 	size_t                          raw_cap;
 	struct apfs_piece_job          *jobs;   /* APFS_BATCH, made when first wanted */
+	uint8_t                        *group;  /* APFS_GROUP_CAP: neighbouring pieces read together */
 };
 
 static void
@@ -2458,6 +2600,9 @@ scratch_free(struct apfs_scratch *sc)
 	}
 	if (sc->jobs != NULL) {
 		apfs_free(sc->jobs, APFS_BATCH * sizeof(*sc->jobs));
+	}
+	if (sc->group != NULL) {
+		apfs_free(sc->group, APFS_GROUP_CAP);
 	}
 	apfs_free(sc, sizeof(*sc));
 }
@@ -2535,15 +2680,23 @@ batch_one(void *arg, uint32_t item, uint32_t worker)
 	uint64_t t0, t1;
 	int error;
 
+	const uint8_t *src = j->src;
+
 	t0 = apfs_ticks();
-	error = dev_read_data(b->nx, j->addr, sc->raw, span, &b->w[worker].calls,
-	    &b->w[worker].bytes);
+	if (src == NULL) {
+		error = dev_read_data(b->nx, j->addr, sc->raw, span, &b->w[worker].calls,
+		    &b->w[worker].bytes);
+		src = sc->raw + j->skew;
+	} else {
+		error = 0;
+	}
 	t1 = apfs_ticks();
 	b->w[worker].data_ticks += t1 - t0;
 	if (error) {
-		return error;
+		j->error = error;
+		return j->ra ? 0 : error;
 	}
-	error = apfs_inflate_fast(sc->dec, sc->raw + j->skew, j->plen, j->dst, j->want, &got,
+	error = apfs_inflate_fast(sc->dec, src, j->plen, j->dst, j->want, &got,
 	    &fell_back);
 	b->w[worker].inflate_ticks += apfs_ticks() - t1;
 	b->w[worker].out += got;
@@ -2555,6 +2708,65 @@ batch_one(void *arg, uint32_t item, uint32_t worker)
 	}
 	j->error = error;
 	return j->ra ? 0 : error;
+}
+
+/*
+ * Pieces of a batch that lie one right after the other on the device -- the pieces of one
+ * file, as a rule -- are read in one request, into sc->group, and the jobs decompress from
+ * there.  From the phone's flash a request costs some 25 us besides the bytes (four of
+ * 16 KB took 160 us, one of 64 KB 96), and a batch is up to 32 pieces.  A piece that has
+ * no neighbour, or does not fit, is left to read itself.  Without the lock.
+ */
+static void
+batch_group(struct apfs_nx *nx, struct apfs_scratch *sc, uint32_t n, uint64_t *calls,
+    uint64_t *bytes, uint64_t *ticks)
+{
+	uint32_t bs = nx->block_size, k = 0;
+	size_t used = 0;
+	uint64_t t0 = apfs_ticks();
+
+	for (k = 0; k < n; k++) {
+		sc->jobs[k].src = NULL;
+	}
+	if (nx->cheap_requests) {
+		return;                 /* each piece reads itself, on its own thread */
+	}
+	if (sc->group == NULL) {
+		sc->group = apfs_alloc(APFS_GROUP_CAP);
+		if (sc->group == NULL) {
+			return;
+		}
+	}
+	for (k = 0; k < n;) {
+		uint64_t start = sc->jobs[k].addr * bs + sc->jobs[k].skew;
+		uint64_t end = start + sc->jobs[k].plen, first_block = start / bs, span;
+		uint32_t last = k;
+
+		/* as far as the next piece starts where this one ends, and it all fits */
+		while (last + 1 < n) {
+			uint64_t s2 = sc->jobs[last + 1].addr * bs + sc->jobs[last + 1].skew;
+			uint64_t e2 = s2 + sc->jobs[last + 1].plen;
+
+			if (s2 != end || (e2 + bs - 1) / bs * bs - first_block * bs > APFS_GROUP_CAP - used) {
+				break;
+			}
+			end = e2;
+			last++;
+		}
+		span = (end + bs - 1) / bs * bs - first_block * bs;
+		if (last > k && span <= APFS_GROUP_CAP - used &&
+		    dev_read_data(nx, first_block, sc->group + used, (size_t)span, calls, bytes) == 0) {
+			uint32_t m;
+
+			for (m = k; m <= last; m++) {
+				sc->jobs[m].src = sc->group + used +
+				    (sc->jobs[m].addr * bs + sc->jobs[m].skew - first_block * bs);
+			}
+			used += (size_t)span;
+		}
+		k = last + 1;
+	}
+	*ticks += apfs_ticks() - t0;
 }
 
 /*
@@ -2596,6 +2808,7 @@ batch_run(struct apfs_vol *vol, struct apfs_scratch *sc, uint32_t n)
 		workers = w;
 	}
 	nx_unlock(nx);
+	batch_group(nx, sc, n, &b.w[0].calls, &b.w[0].bytes, &b.w[0].data_ticks);
 	if (workers > 1) {
 		error = nx->parallel(nx->parallel_ctx, n, workers, batch_one, &b);
 	} else {

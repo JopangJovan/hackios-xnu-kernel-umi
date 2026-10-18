@@ -19,6 +19,8 @@
 #include <sys/sysctl.h>
 #include <sys/vnode_internal.h>
 #include <sys/fcntl.h>
+#include <sys/redwood_input.h>
+#include <sys/redwood_virtio_blk.h>
 #include <sys/proc.h>
 #include <kern/thread.h>
 #include <libkern/OSAtomic.h>
@@ -642,6 +644,25 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 		    round >= 64 * 1024 && round <= APFS_IOBUF_MAX && (round % (64 * 1024)) == 0) {
 			am->am_iobuf_size = round;
 		}
+	}
+	(void)PE_parse_boot_argn("apfs_meta_cluster", &am->am_nx.meta_cluster,
+	    sizeof(am->am_nx.meta_cluster));
+	/*
+	 * The phone's flash and QEMU's virtio disk cost tens of microseconds a request; this
+	 * port's other disks (md, the resident image; rsp, part of an image) answer with a
+	 * memory copy.  Boot-arg apfs_cheap=0/1 says otherwise.
+	 */
+	{
+		dev_t rdev = vnode_specrdev(devvp);
+		uint32_t cheap;
+
+		am->am_nx.cheap_requests = !redwood_ufs_dev(rdev) && !redwood_virtio_blk_dev(rdev);
+		if (PE_parse_boot_argn("apfs_cheap", &cheap, sizeof(cheap))) {
+			am->am_nx.cheap_requests = (cheap != 0);
+		}
+		printf("apfs: device %d,%d: requests to it %s\n", major(rdev), minor(rdev),
+		    am->am_nx.cheap_requests ? "cost next to nothing (a disk in memory)" :
+		    "are worth putting together");
 	}
 	apfs_pool_start();
 	if (apfs_pool_threads > 0) {

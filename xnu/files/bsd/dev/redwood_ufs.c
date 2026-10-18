@@ -190,6 +190,14 @@ ufs_request(uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst)
 	return 0;
 }
 
+/* One of this driver's devices (block or character): a request to it costs tens of microseconds */
+bool
+redwood_ufs_dev(dev_t dev)
+{
+	return ufs_ready && ((ufs_bmajor >= 0 && major(dev) == ufs_bmajor) ||
+	       (ufs_cmajor >= 0 && major(dev) == ufs_cmajor));
+}
+
 /*
  * Where the time of reading the storage went, so far: waiting for core 0's answer (of which
  * the loader's own clock says how long ReadBlocks itself took) and copying out of its buffer.

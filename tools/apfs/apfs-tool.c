@@ -156,6 +156,7 @@ open_image(const char *path, struct apfs_nx *nx, struct apfs_vol *vol)
 	dev.ctx = (void *)(intptr_t)fd;
 	dev.size = (uint64_t)lseek(fd, 0, SEEK_END);
 	dev.read = file_read;
+	dev.read_data = file_read;      /* pread is as good without a lock as with one */
 
 	error = apfs_nx_open(nx, &dev);
 	if (error) {
@@ -582,7 +583,8 @@ cmd_census(const char *path, const char *where, bool meta_only)
 		return 1;
 	}
 	fprintf(stderr, "apfs-tool: %ld entries, %" PRIu64 " blocks read, %" PRIu64
-	    " cache hits\n", cs.seen, nx.reads, nx.hits);
+	    " cache hits; %" PRIu64 " neighbours brought in, %" PRIu64 " of them asked for\n",
+	    cs.seen, nx.reads, nx.hits, nx.prefetched, nx.prefetch_used);
 	fprintf(stderr, "apfs-tool: inflate %" PRIu64 " calls, %" PRIu64 " bytes in, %" PRIu64
 	    " bytes out, %" PRIu64 " by zlib\n", nx.inflate_calls, nx.inflate_in, nx.inflate_out,
 	    nx.inflate_fallbacks);

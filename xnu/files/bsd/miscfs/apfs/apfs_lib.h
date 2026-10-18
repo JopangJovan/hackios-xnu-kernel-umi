@@ -69,8 +69,15 @@ apfs_ticks(void)
 #define apfs_log(...)        fprintf(stderr, "apfs: " __VA_ARGS__)
 #endif
 
-/* How many blocks of metadata to keep; a B-tree descent touches one per level. */
-#define APFS_CACHE_BLOCKS 64
+/*
+ * How many blocks of metadata to keep (8 MB at 4096 bytes a block).  64 was plenty from a
+ * disk in memory; from the phone's flash a block not kept is a random 4 KB read of 113 us.
+ * A walk of the whole root volume read 123940 blocks with 64 kept, 83841 with 512, 63789
+ * with 2048 and 61831 with 8192.  Found through a hash of the address, the one to give up
+ * picked by a clock hand (a block used since the hand last passed gets another round).
+ */
+#define APFS_CACHE_BLOCKS 2048
+#define APFS_CACHE_HASH   4096          /* a power of two */
 
 /* Room for a symbolic link's target (Darwin's own limit is 1024 bytes; it is kept in an xattr) */
 #define APFS_LINK_MAX 4096
@@ -98,9 +105,26 @@ struct apfs_dev {
 /* One cached block of metadata. */
 struct apfs_buf {
 	uint64_t  addr;                 /* block address, APFS_BUF_EMPTY if unused */
-	uint32_t  age;
+	int32_t   next;                 /* the next in its hash chain, or -1 */
+	bool      ref;                  /* used since the clock hand last passed it */
+	uint32_t  used;                 /* nx->fetches when it was last used */
+	bool      checked;              /* its checksum has been verified */
 	uint8_t  *data;
 };
+
+/*
+ * Blocks of metadata are read a few at a time, aligned: the one asked for and its
+ * neighbours, which a walk mostly wants next (meta_cluster, boot-arg apfs_meta_cluster,
+ * up to APFS_META_CLUSTER).  From the phone's flash, walking the whole root volume: one
+ * block a read, 64459 reads and 7294 ms; four, 36086 and 5680 ms; eight, 27918 and
+ * 5673 ms; sixteen, 26214 and 6937 ms -- a random read costs about 100 us whatever its
+ * size, and then the bytes.  The walk: 46328 / 44701 / 44823 / 45439 ms.
+ */
+#define APFS_META_CLUSTER         16
+#define APFS_META_CLUSTER_DEFAULT 4
+
+/* A block used fewer than this many fetches ago is never given up (see nx_block) */
+#define APFS_CACHE_RECENT 64
 
 #define APFS_BUF_EMPTY ((uint64_t)~0ULL)
 
@@ -161,8 +185,20 @@ struct apfs_nx {
 	void            (*unlock)(void *ctx);
 	void            (*relock)(void *ctx);
 	void             *lock_ctx;
-	struct apfs_buf   cache[APFS_CACHE_BLOCKS];
-	uint32_t          clock;
+	struct apfs_buf  *cache;        /* APFS_CACHE_BLOCKS of them, made at apfs_nx_open */
+	int32_t          *cache_hash;   /* APFS_CACHE_HASH chain heads, -1 for none */
+	uint32_t          hand;
+	uint32_t          fetches;      /* blocks read into the cache, ever (wraps) */
+	uint8_t          *cluster;      /* APFS_META_CLUSTER blocks, made at the first miss */
+	uint32_t          meta_cluster; /* blocks a metadata read brings in, 1..APFS_META_CLUSTER (0: the default) */
+	/*
+	 * A request to the device costs next to nothing (a disk in memory): no reading pieces
+	 * together in batch_group, one block a metadata read.  Set by the caller; from the
+	 * phone's memory disk batch_group cost one reader 612 -> 663 ms over the restore
+	 * ramdisk, from its flash it saved 52.9 -> 46.3 s over the root volume.
+	 */
+	bool              cheap_requests;
+	uint64_t          prefetched, prefetch_used;   /* neighbours brought in, and later asked for */
 	uint64_t          reads;
 	uint64_t          hits;
 	/*
