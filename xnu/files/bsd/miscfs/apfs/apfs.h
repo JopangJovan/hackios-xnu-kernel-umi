@@ -43,6 +43,21 @@ struct apfs_node;
 #define APFS_ROUND_SHARED  (128 * 1024)
 #define APFS_IOBUF_KEEP    8
 
+#define APFS_SYNTH_MAX     64
+#define APFS_SYNTH_NAMELEN 96
+/*
+ * Object ids from here up are synthetic: the last few of the 60 bits an id has.  (Not
+ * 0x0FFFFFFF00000000: the iOS root volume numbers its own objects from there.)
+ */
+#define APFS_SYNTH_BASE    0x0FFFFFFFFFFFF000ULL
+
+struct apfs_synth {
+	uint64_t parent;                /* the directory it is in (a real one, or synthetic) */
+	uint64_t id;                    /* its own, or the directory it is another name for */
+	bool     alias;                 /* another name for a directory of the volume */
+	char     name[APFS_SYNTH_NAMELEN];
+};
+
 struct apfs_mount {
 	mount_t            am_mp;
 	vnode_t            am_devvp;
@@ -75,6 +90,16 @@ struct apfs_mount {
 	void              *am_iobuf[APFS_IOBUF_KEEP];
 	uint32_t           am_iobuf_kept;
 	uint32_t           am_iobuf_size;
+	/*
+	 * Synthetic directories: empty directories that are not on the volume, for mount
+	 * points on a volume nobody can add a directory to -- what macOS's synthetic.conf is
+	 * for its sealed system volume.  Added through sysctl kern.apfs_synthetic; seen by
+	 * lookup and readdir of their parent, empty, owned by root.  Or another name for a
+	 * directory of the same volume ("PATH=TARGET"): the directory itself, with PATH's
+	 * parent for its "..".  Under am_lock.
+	 */
+	struct apfs_synth *am_synth;        /* APFS_SYNTH_MAX of them, made at the first */
+	uint32_t           am_nsynth;
 };
 
 /* The private part of a vnode: which object it is. */
@@ -104,6 +129,9 @@ struct apfs_node {
 };
 
 #define APFS_MP(mp)       ((struct apfs_mount *)vfs_fsprivate(mp))
+const struct apfs_synth *apfs_synth_find(struct apfs_mount *am, uint64_t parent,
+    const char *name, size_t len);      /* with am_lock held */
+
 #define APFS_VP(vp)       ((struct apfs_node *)vnode_fsnode(vp))
 #define APFS_VP_MOUNT(vp) (APFS_VP(vp)->an_mount)
 

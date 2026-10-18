@@ -264,7 +264,41 @@ if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
 fi
+# When the iOS volume on the phone's flash is to become the root (boot-arg root_apfs=ufs_darwin,
+# with flashboot.packfs resident; src/init.c, flash_root): an empty directory to hide iOS's
+# NanoLaunchDaemons and LaunchAngels with,
+# xpc without launchd.plist (launchd would read that list of all of iOS's jobs instead of
+# LaunchDaemons) and the audio server's plug-in directory with only our device in it.
+mkdir -p root/empty root/xpc root/hal
+for f in extensions.plist extensions.plist.sig; do
+	[ -f $IOS/rootfs/System/Library/xpc/$f ] && cp $IOS/rootfs/System/Library/xpc/$f root/xpc/
+done
+[ -d root/lib/RedwoodAudio.driver ] && ln -s /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
 ../mkpackfs.py -o root.packfs root
+
+# --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.packfs ------------------------------
+# With the iOS volume on the phone's flash as the root, all that has to come from RAM is what is not
+# on it -- the OS cryptex with the dyld shared cache -- and what starts the boot. This image is the
+# root the kernel starts from (rd=md0, the resident image): stage0 as /sbin/launchd mounts the small
+# image on /redwood and runs its init, which with boot-arg root_apfs=DEV mounts the volume on /flash,
+# makes it the root and moves this image to the volume's /private/preboot -- where the volume's own
+# /System/Cryptexes/OS points, and where the kernel lets a shared cache come from (src/init.c,
+# flash_root). Upload it with `xl ramdisk userland/flashboot.packfs`.
+if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
+	rm -rf flashboot
+	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes
+	cp obj/stage0 flashboot/sbin/launchd
+	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot/Cryptexes/OS; else mkdir -p flashboot/Cryptexes/OS; fi
+	D=flashboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld
+	mkdir -p $D
+	for f in $CACHE/dyld_shared_cache_arm64*; do
+		case "$f" in *.symbols) continue ;; esac
+		ln "$f" $D/
+	done
+	if [ -n "$PLAIN" ]; then pack="-b 4096 -a 16384"; elif [ -n "$ZSTD" ]; then pack="--zstd"; else pack="-z"; fi
+	../mkpackfs.py $pack -o flashboot.packfs flashboot
+	rm -rf flashboot
+fi
 
 # --- the system image -----------------------------------------------------------------------------
 if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&

@@ -309,12 +309,41 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 		}
 	}
 
-	error = apfs_inode_get(&am->am_vol, obj_id, &ino);
-	if (error == 0) {
-		error = apfs_inode_size(&am->am_vol, &ino, &size);
-		if (error) {
-			size = ino.size;       /* the stream's size is still better than nothing */
+	if (obj_id >= APFS_SYNTH_BASE) {
+		/* a synthetic directory: an empty one, root's, made up here */
+		const struct apfs_synth *sy = NULL;
+		uint32_t i;
+
+		for (i = 0; i < am->am_nsynth; i++) {
+			if (am->am_synth[i].id == obj_id) {
+				sy = &am->am_synth[i];
+			}
+		}
+		bzero(&ino, sizeof(ino));
+		if (sy == NULL) {
+			error = ENOENT;
+		} else {
+			ino.obj_id = obj_id;
+			ino.parent_id = sy->parent;
+			ino.mode = APFS_S_IFDIR | 0755;
 			error = 0;
+		}
+	} else {
+		error = apfs_inode_get(&am->am_vol, obj_id, &ino);
+		if (error == 0) {
+			uint32_t i;
+
+			error = apfs_inode_size(&am->am_vol, &ino, &size);
+			if (error) {
+				size = ino.size;       /* the stream's size is still better than nothing */
+				error = 0;
+			}
+			/* a directory with another name: ".." is where that name is */
+			for (i = 0; i < am->am_nsynth; i++) {
+				if (am->am_synth[i].alias && am->am_synth[i].id == obj_id) {
+					ino.parent_id = am->am_synth[i].parent;
+				}
+			}
 		}
 	}
 	lck_mtx_unlock(&am->am_lock);
@@ -376,6 +405,146 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	*vpp = an->an_vp;
 	return 0;
 }
+
+/* A synthetic directory by where it is and its name; with am_lock held. */
+const struct apfs_synth *
+apfs_synth_find(struct apfs_mount *am, uint64_t parent, const char *name, size_t len)
+{
+	uint32_t i;
+
+	for (i = 0; i < am->am_nsynth; i++) {
+		if (am->am_synth[i].parent == parent && strlen(am->am_synth[i].name) == len &&
+		    memcmp(am->am_synth[i].name, name, len) == 0) {
+			return &am->am_synth[i];
+		}
+	}
+	return NULL;
+}
+
+/*
+ * sysctl kern.apfs_synthetic=PATH: a synthetic directory at PATH, whose parent must be a
+ * directory of an APFS volume (real or synthetic) and which must not exist yet.
+ * PATH=TARGET: at PATH, another name for the directory TARGET of the same volume.  Root
+ * only; nothing ever takes one away again but unmounting.
+ */
+static int
+apfs_sysctl_synthetic SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	char path[MAXPATHLEN], name[APFS_SYNTH_NAMELEN], *target;
+	vnode_t dvp = NULLVP, vp = NULLVP, tvp = NULLVP;
+	struct apfs_mount *am;
+	struct apfs_node *dn;
+	uint64_t target_id = 0;
+	const char *slash;
+	size_t len;
+	int error;
+
+	if (req->newptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, "", 1);          /* reading it says nothing */
+	}
+	if ((error = suser(kauth_cred_get(), NULL)) != 0) {
+		return error;
+	}
+	if (req->newlen == 0 || req->newlen >= sizeof(path)) {
+		return EINVAL;
+	}
+	error = SYSCTL_IN(req, path, req->newlen);
+	if (error) {
+		return error;
+	}
+	path[req->newlen] = '\0';
+	target = strchr(path, '=');
+	if (target != NULL) {
+		*target++ = '\0';
+		error = vnode_lookup(target, 0, &tvp, vfs_context_current());
+		if (error) {
+			return error;
+		}
+		if (vnode_vtype(tvp) != VDIR || vnode_mount(tvp) == NULL ||
+		    strcmp(vfs_statfs(vnode_mount(tvp))->f_fstypename, "apfs") != 0) {
+			vnode_put(tvp);
+			return ENOTDIR;
+		}
+		target_id = APFS_VP(tvp)->an_id;
+	}
+	while ((len = strlen(path)) > 1 && path[len - 1] == '/') {
+		path[len - 1] = '\0';
+	}
+	slash = strrchr(path, '/');
+	if (slash == NULL || slash[1] == '\0') {
+		error = EINVAL;
+		goto out;
+	}
+	len = strlen(slash + 1);
+	if (len >= sizeof(name)) {
+		error = EINVAL;
+		goto out;
+	}
+	strlcpy(name, slash + 1, sizeof(name));        /* before the path is cut to its parent */
+	if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+		error = EINVAL;
+		goto out;
+	}
+	if (vnode_lookup(path, 0, &vp, vfs_context_current()) == 0) {
+		vnode_put(vp);
+		error = EEXIST;
+		goto out;
+	}
+	path[slash - path == 0 ? 1 : slash - path] = '\0';     /* the parent ("/" for "/name") */
+	error = vnode_lookup(path, 0, &dvp, vfs_context_current());
+	if (error) {
+		goto out;
+	}
+	if (vnode_vtype(dvp) != VDIR || vnode_mount(dvp) == NULL ||
+	    strcmp(vfs_statfs(vnode_mount(dvp))->f_fstypename, "apfs") != 0 ||
+	    (tvp != NULLVP && vnode_mount(tvp) != vnode_mount(dvp))) {
+		vnode_put(dvp);
+		error = ENOTSUP;
+		goto out;
+	}
+	dn = APFS_VP(dvp);
+	am = dn->an_mount;
+	lck_mtx_lock(&am->am_lock);
+	if (am->am_synth == NULL) {
+		am->am_synth = kalloc_data(APFS_SYNTH_MAX * sizeof(*am->am_synth), Z_WAITOK | Z_ZERO);
+	}
+	if (am->am_synth == NULL) {
+		error = ENOMEM;
+	} else if (apfs_synth_find(am, dn->an_id, name, len) != NULL) {
+		error = EEXIST;
+	} else if (am->am_nsynth >= APFS_SYNTH_MAX) {
+		error = ENOSPC;
+	} else {
+		struct apfs_synth *sy = &am->am_synth[am->am_nsynth];
+		struct apfs_inode ino;
+
+		sy->parent = dn->an_id;
+		sy->alias = (tvp != NULLVP);
+		sy->id = sy->alias ? target_id : APFS_SYNTH_BASE + am->am_nsynth;
+		strlcpy(sy->name, name, sizeof(sy->name));
+		/* an id the volume does not use itself, or nothing */
+		if (!sy->alias && apfs_inode_get(&am->am_vol, sy->id, &ino) != ENOENT) {
+			error = EEXIST;
+		} else {
+			am->am_nsynth++;
+			error = 0;
+		}
+	}
+	lck_mtx_unlock(&am->am_lock);
+	/* the parent's entries changed: what the name cache has of it is stale */
+	cache_purge(dvp);
+	vnode_put(dvp);
+out:
+	if (tvp != NULLVP) {
+		vnode_put(tvp);
+	}
+	return error;
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, apfs_synthetic, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 0, apfs_sysctl_synthetic, "A",
+    "write PATH: an empty synthetic directory on an APFS volume (a mount point)");
 
 /* Take a node out of the hash; called from vnop_reclaim. */
 void
@@ -569,6 +738,9 @@ apfs_pool_start(void)
 static void
 apfs_free_mount(struct apfs_mount *am)
 {
+	if (am->am_synth != NULL) {
+		kfree_data(am->am_synth, APFS_SYNTH_MAX * sizeof(*am->am_synth));
+	}
 	while (am->am_iobuf_kept > 0) {
 		kfree_data(am->am_iobuf[--am->am_iobuf_kept], am->am_iobuf_size);
 	}

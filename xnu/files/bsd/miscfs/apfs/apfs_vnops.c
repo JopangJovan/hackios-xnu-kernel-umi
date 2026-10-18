@@ -69,10 +69,6 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 	if (!vnode_isdir(dvp)) {
 		return ENOTDIR;
 	}
-	/* read only: anything that would change the directory is refused up front */
-	if (cnp->cn_nameiop != LOOKUP) {
-		return EROFS;
-	}
 	if (cnp->cn_namelen == 1 && cnp->cn_nameptr[0] == '.') {
 		error = vnode_get(dvp);
 		if (error == 0) {
@@ -85,9 +81,32 @@ apfs_vnop_lookup(struct vnop_lookup_args *ap)
 	}
 
 	apfs_lock(am);
-	error = apfs_lookup(&am->am_vol, dn->an_id, cnp->cn_nameptr,
-	    (size_t)cnp->cn_namelen, &id, &dt);
+	if (dn->an_id >= APFS_SYNTH_BASE) {
+		error = ENOENT;                 /* nothing of a synthetic directory is on the volume */
+	} else {
+		error = apfs_lookup(&am->am_vol, dn->an_id, cnp->cn_nameptr,
+		    (size_t)cnp->cn_namelen, &id, &dt);
+	}
+	if (error == ENOENT && am->am_nsynth > 0) {
+		const struct apfs_synth *sy = apfs_synth_find(am, dn->an_id, cnp->cn_nameptr,
+		    (size_t)cnp->cn_namelen);
+
+		if (sy != NULL) {
+			id = sy->id;
+			error = 0;
+		}
+	}
 	apfs_unlock(am);
+	/*
+	 * What is there is found whatever the caller means to do with it -- VFS refuses the
+	 * change itself on a read-only mount, and mkdir of a directory that exists is to fail
+	 * with EEXIST, not EROFS (xpcproxy gives up on the latter).  Only a name that is not
+	 * there and is to be made is refused here, as packfs does.
+	 */
+	if (error == ENOENT && (cnp->cn_flags & ISLASTCN) &&
+	    (cnp->cn_nameiop == CREATE || cnp->cn_nameiop == RENAME)) {
+		return EROFS;
+	}
 	if (error) {
 		return error;
 	}
@@ -413,8 +432,19 @@ apfs_vnop_readdir(struct vnop_readdir_args *ap)
 		error = apfs_vnop_readdir_one(&rc, "..", 2, an->an_parent, DT_DIR);
 	}
 	if (error == 0) {
+		uint32_t i;
+
 		apfs_lock(am);
-		error = apfs_readdir(&am->am_vol, an->an_id, apfs_readdir_cb, &rc);
+		if (an->an_id < APFS_SYNTH_BASE) {
+			error = apfs_readdir(&am->am_vol, an->an_id, apfs_readdir_cb, &rc);
+		}
+		/* the synthetic directories in this one, after what is on the volume */
+		for (i = 0; error == 0 && i < am->am_nsynth; i++) {
+			if (am->am_synth[i].parent == an->an_id) {
+				error = apfs_vnop_readdir_one(&rc, am->am_synth[i].name,
+				    strlen(am->am_synth[i].name), am->am_synth[i].id, DT_DIR);
+			}
+		}
 		apfs_unlock(am);
 	}
 	if (error == EEXIST) {
@@ -650,6 +680,17 @@ apfs_vnop_reclaim(struct vnop_reclaim_args *ap)
 	return 0;
 }
 
+/*
+ * No ioctl or fsctl means anything here.  ENOTTY is what callers take for "this filesystem
+ * does not have that"; the default, ENOTSUP, is not -- the iOS dyld, probing the root
+ * volume for APFS features, gives up on it (see packfs_ioctl).
+ */
+static int
+apfs_vnop_ioctl(__unused struct vnop_ioctl_args *ap)
+{
+	return ENOTTY;
+}
+
 static int
 apfs_vnop_pathconf(struct vnop_pathconf_args *ap)
 {
@@ -689,6 +730,7 @@ apfs_vnop_pathconf(struct vnop_pathconf_args *ap)
 int(**apfs_vnodeop_p)(void *);
 const struct vnodeopv_entry_desc apfs_vnodeop_entries[] = {
 	{ .opve_op = &vnop_default_desc, .opve_impl = (VOPFUNC)vn_default_error },
+	{ .opve_op = &vnop_ioctl_desc, .opve_impl = (VOPFUNC)apfs_vnop_ioctl },
 	{ .opve_op = &vnop_lookup_desc, .opve_impl = (VOPFUNC)apfs_vnop_lookup },
 	{ .opve_op = &vnop_open_desc, .opve_impl = (VOPFUNC)apfs_vnop_open },
 	{ .opve_op = &vnop_close_desc, .opve_impl = (VOPFUNC)apfs_vnop_close },

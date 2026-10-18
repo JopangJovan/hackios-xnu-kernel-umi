@@ -34,6 +34,177 @@ in_image(const char *path)
 	return buf;
 }
 
+/* ---- the iOS root volume on the phone's flash as the root (boot-arg root_apfs=DEV) ---- */
+
+/* the root is the iOS volume: its /sbin/launchd is Apple's, there is no launchd.ios */
+static int flash_root_mode;
+
+static void check(int ok, const char *what);
+
+/* dst = a + b + c (each call's result only until the next) */
+static const char *
+join(const char *a, const char *b, const char *c)
+{
+	static char buf[1200];
+	size_t la = strlen(a), lb = strlen(b), lc = strlen(c);
+
+	if (la + lb + lc >= sizeof(buf)) {
+		buf[0] = 0;
+		return buf;
+	}
+	memcpy(buf, a, la);
+	memcpy(buf + la, b, lb);
+	memcpy(buf + la + lb, c, lc + 1);
+	return buf;
+}
+
+/* The value of boot-arg NAME on the kernel's command line, or NULL. */
+static const char *
+boot_arg(const char *name)
+{
+	static char args[1024], value[128];
+	size_t len = sizeof(args) - 1, n = strlen(name);
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return NULL;
+	}
+	args[len < sizeof(args) ? len : sizeof(args) - 1] = 0;
+	for (char *p = args; *p;) {
+		while (*p == ' ') {
+			p++;
+		}
+		if (strncmp(p, name, n) == 0 && p[n] == '=') {
+			size_t i = 0;
+
+			for (p += n + 1; *p && *p != ' ' && i < sizeof(value) - 1; p++) {
+				value[i++] = *p;
+			}
+			value[i] = 0;
+			return value;
+		}
+		while (*p && *p != ' ') {
+			p++;
+		}
+	}
+	return NULL;
+}
+
+/* A directory of this image (or anything else) shown in place of one of the volume's: bindfs. */
+static int
+bind_dir(const char *from, const char *to)
+{
+	int ok = mount("bindfs", to, MNT_RDONLY, (void *)from) == 0;
+
+	if (!ok) {
+		printf("  bindfs %s on %s: %s\n", from, to, strerror(errno));
+	}
+	return ok;
+}
+
+/* An empty directory that is not on the volume, for a mount point (sysctl kern.apfs_synthetic). */
+static int
+synthetic_dir(const char *path)
+{
+	int ok = sysctlbyname("kern.apfs_synthetic", NULL, NULL, (void *)path, strlen(path)) == 0;
+
+	if (!ok) {
+		printf("  synthetic directory %s: %s\n", path, strerror(errno));
+	}
+	return ok;
+}
+
+/*
+ * root_apfs=DEV: the root is to be the iOS root volume on /dev/DEV -- the phone's flash, read
+ * only.  The kernel has started off flashboot.packfs (the resident image, md0: stage0, the OS
+ * cryptex with the dyld shared cache, mount points) and stage0 has mounted this image on
+ * /redwood.  What the big system image changes in iOS (userland/build.sh) is put in place on
+ * the volume instead, without writing to it:
+ *   - our choice of launchd jobs instead of iOS's 500 (this image's LaunchDaemons, and
+ *     nothing for NanoLaunchDaemons, LaunchAngels, nor xpc's launchd.plist, which launchd
+ *     would read instead of the directory);
+ *   - only our audio device among the audio server's plug-ins;
+ *   - the applications iOS installs on its first boot (private/var/staged_system_apps)
+ *     among the system's own in /Applications: another name for each there (a synthetic
+ *     entry of the volume -- not a mount, which whatever registers the system's
+ *     applications passed over), made before /private/var is covered by a memory
+ *     filesystem.
+ * Then the volume becomes the root (sysctl kern.redwood_switch_root) and flashboot.packfs
+ * goes to its /private/preboot: the volume's /System/Cryptexes/OS points to
+ * /private/preboot/Cryptexes/OS, and the kernel takes a shared cache from there.  This
+ * image goes along with it, to /private/preboot/redwood, and is bound back on /redwood, a
+ * synthetic directory of the volume.  The boot-args stay those of a RAM disk (rd=md0),
+ * which is what launchd reads to leave out the boot tasks of a real device.
+ */
+static void
+flash_root(const char *dev)
+{
+	static char buf[8192];
+	char devpath[96], name[256], from[800], to[400];
+	off_t pos = 0;
+	ssize_t n;
+	int fd, ok, apps = 0, bound = 0;
+
+	printf("\n-- the iOS root volume on /dev/%s as the root --\n", dev);
+	strcpy(devpath, join("/dev/", dev, ""));
+	ok = mount("apfs", "/flash", MNT_RDONLY, devpath) == 0;
+	if (!ok) {
+		printf("  mount %s: %s\n", devpath, strerror(errno));
+	}
+	check(ok, "mount the iOS volume read only");
+	if (!ok) {
+		return;
+	}
+	check(synthetic_dir("/flash/redwood"), "a synthetic /redwood on it, for this image");
+	check(bind_dir(in_image("/LaunchDaemons"), "/flash/System/Library/LaunchDaemons") &&
+	    bind_dir(in_image("/empty"), "/flash/System/Library/NanoLaunchDaemons") &&
+	    bind_dir(in_image("/empty"), "/flash/System/Library/LaunchAngels") &&
+	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
+	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
+	    "our audio device, not Apple's plug-ins");
+
+	fd = open("/flash/private/var/staged_system_apps", O_RDONLY | O_DIRECTORY, 0);
+	while (fd >= 0 && (n = getdirentries(fd, buf, sizeof(buf), &pos)) > 0) {
+		for (char *p = buf; p < buf + n;) {
+			struct dirent *de = (struct dirent *)(void *)p;
+			size_t len = de->d_namlen;
+
+			if (de->d_reclen == 0) {
+				break;
+			}
+			p += de->d_reclen;
+			if (len < 5 || len >= sizeof(name) || strncmp(de->d_name + len - 4, ".app", 4) != 0) {
+				continue;
+			}
+			memcpy(name, de->d_name, len);
+			name[len] = 0;
+			apps++;
+			/* another name for it in /Applications, on the same volume: no mount point to skip */
+			strcpy(to, join("/flash/Applications/", name, "="));
+			strcpy(from, join(to, "/flash/private/var/staged_system_apps/", name));
+			if (synthetic_dir(from)) {
+				bound++;
+			}
+		}
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	printf("  %d applications waiting to be installed, %d of them in /Applications\n", apps, bound);
+	check(apps > 0 && bound == apps, "the first boot's applications in /Applications");
+
+	ok = sysctlbyname("kern.redwood_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
+	if (!ok) {
+		printf("  switching the root: %s\n", strerror(errno));
+	}
+	check(ok, "the iOS volume is the root, the RAM part of the boot on /private/preboot");
+	if (!ok) {
+		return;
+	}
+	chdir("/");
+	check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
+	flash_root_mode = 1;
+}
+
 static void
 check(int ok, const char *what)
 {
@@ -606,6 +777,9 @@ run_command(char *line)
 
 	/* "exec program args": become that program, keeping process number 1 */
 	if (strcmp(argv[0], "exec") == 0 && argc > 1) {
+		if (flash_root_mode && strcmp(argv[1], "/sbin/launchd.ios") == 0) {
+			argv[1] = "/sbin/launchd";      /* the root is iOS's own volume: its launchd is that */
+		}
 		execve(argv[1], argv + 1, envp);
 		printf("%s: %s\n", argv[1], strerror(errno));
 		return;
@@ -799,6 +973,13 @@ main(int argc, char **argv, char **envp)
 	}
 
 	printf("\n=== init: process %d, started as %s ===\n", getpid(), argc > 0 ? argv[0] : "?");
+	{
+		const char *dev = boot_arg("root_apfs");
+
+		if (dev != NULL) {
+			flash_root(dev);
+		}
+	}
 
 	show_system();
 	mount_writable();

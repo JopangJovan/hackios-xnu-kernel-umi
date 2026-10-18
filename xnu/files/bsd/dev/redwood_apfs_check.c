@@ -77,6 +77,7 @@
 #include <sys/vnode_if.h>
 #include <sys/vnode_internal.h>
 #include <sys/redwood_input.h>
+#include <sys/sysctl.h>
 #include <pexpert/pexpert.h>
 #include <libkern/OSAtomic.h>
 #include <sys/redwood_apfs_check.h>
@@ -944,6 +945,58 @@ apfs_check_runner(void *arg, wait_result_t wr)
 	apfs_check_thread(arg, wr);
 	apfs_check_finished = 1;
 }
+
+/*
+ * sysctl kern.redwood_switch_root="INCOMING OUTGOING": the volume mounted on INCOMING
+ * becomes the root, and what was the root until now is mounted on OUTGOING inside it (a
+ * path without a leading slash, which must be a directory there -- on the iOS volume, a
+ * synthetic one).  devfs stays on /dev (vfs_switch_root() keeps it there).  This is how
+ * the iOS root volume on the phone's flash becomes the root: the kernel starts from the
+ * small image, whose init mounts the volume, puts in place what the system needs on it
+ * and then asks for this (userland/src/init.c, boot-arg root_apfs=).  Process 1 only, once.
+ */
+static int redwood_root_switched;
+
+static int
+redwood_sysctl_switch_root SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	char buf[512], *outgoing;
+	int error;
+
+	if (req->newptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, redwood_root_switched ? "1" : "0", 2);
+	}
+	if (proc_getpid(current_proc()) != 1 || suser(kauth_cred_get(), NULL) != 0) {
+		return EPERM;
+	}
+	if (redwood_root_switched) {
+		return EBUSY;
+	}
+	if (req->newlen == 0 || req->newlen >= sizeof(buf)) {
+		return EINVAL;
+	}
+	error = SYSCTL_IN(req, buf, req->newlen);
+	if (error) {
+		return error;
+	}
+	buf[req->newlen] = '\0';
+	outgoing = strchr(buf, ' ');
+	if (outgoing == NULL || buf[0] != '/') {
+		return EINVAL;
+	}
+	*outgoing++ = '\0';
+	error = vfs_switch_root(buf, outgoing, 0);
+	printf("redwood: %s is the root now, the one before it on /%s: %d\n", buf, outgoing, error);
+	if (error == 0) {
+		redwood_root_switched = 1;
+	}
+	return error;
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, redwood_switch_root, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 0, redwood_sysctl_switch_root, "A",
+    "write \"INCOMING OUTGOING\": the volume on INCOMING becomes the root (process 1, once)");
 
 /*
  * apfs_volume=DEV: a volume for user space in an ordinary boot.  Mounted read only (and
