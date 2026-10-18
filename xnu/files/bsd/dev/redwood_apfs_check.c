@@ -179,7 +179,24 @@ struct census {
 	 */
 	bool      no_hash;
 	uint64_t  hash_ticks;
+	/*
+	 * Boot-arg apfs_contents=0: no file is read at all, only looked up and stat'ed --
+	 * how long the walk itself takes, the directories and the inodes.
+	 */
+	bool      no_contents;
 };
+
+/* The boot-args both kinds of walk take the same way. */
+static void
+census_options(struct census *cs)
+{
+	uint32_t hash = 1, contents = 1;
+
+	PE_parse_boot_argn("apfs_hash", &hash, sizeof(hash));
+	PE_parse_boot_argn("apfs_contents", &contents, sizeof(contents));
+	cs->no_hash = (hash == 0);
+	cs->no_contents = (contents == 0);
+}
 
 /* The format bits of a mode, which vnode_getattr does not report in va_mode. */
 static uint16_t
@@ -301,11 +318,15 @@ census_entry(struct census *cs, uint8_t d_type)
 	if (vnode_vtype(vp) == VREG) {
 		cs->files++;
 		PHASE("read");
-		error = hash_file(cs, vp, size, &h);
+		if (!cs->no_contents) {
+			error = hash_file(cs, vp, size, &h);
+		}
 	} else if (vnode_vtype(vp) == VLNK) {
 		cs->links++;
 		PHASE("readlink");
-		error = hash_link(cs, vp, &h);
+		if (!cs->no_contents) {
+			error = hash_link(cs, vp, &h);
+		}
 	} else if (vnode_vtype(vp) == VDIR) {
 		cs->dirs++;
 	} else {
@@ -610,12 +631,10 @@ apfs_walk_one(void *arg, __unused wait_result_t wr)
 	struct walk_job *job = arg;
 	struct census cs;
 	uint64_t start, end, ns = 0, hash_ns = 0;
-	uint32_t hash = 1;
 
 	bzero(&cs, sizeof(cs));
 	cs.ctx = vfs_context_kernel();
-	PE_parse_boot_argn("apfs_hash", &hash, sizeof(hash));
-	cs.no_hash = (hash == 0);
+	census_options(&cs);
 	PE_parse_boot_argn("apfs_depth", &cs.max_depth, sizeof(cs.max_depth));
 	PE_parse_boot_argn("apfs_max", &cs.max_entries, sizeof(cs.max_entries));
 	{
@@ -725,6 +744,7 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 
 	bzero(&cs, sizeof(cs));
 	cs.ctx = ctx;
+	census_options(&cs);
 	cs.print_lines = (mode == 2);
 	/*
 	 * NOCROSSMOUNT only where the volume is the root (modes 4 and 5).  In mode 6 the

@@ -474,8 +474,22 @@ omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *a
 	const uint8_t *blk;
 	int level, error;
 
+	struct apfs_omap_hit *hit = NULL;
+
 	if (!omap->ready) {
 		return EIO;
+	}
+	if (tree->nx->omap_cache != NULL) {
+		uint64_t h = (oid ^ (tree->root * 0xff51afd7ed558ccdULL)) * 0x9E3779B97F4A7C15ULL;
+
+		hit = &tree->nx->omap_cache[h >> 53 & (APFS_OMAP_CACHE - 1)];
+		if (hit->oid == oid && oid != 0 && hit->xid == want_xid &&
+		    hit->map == tree->root) {
+			tree->nx->omap_hits++;
+			*addr = hit->addr;
+			return 0;
+		}
+		tree->nx->omap_misses++;
 	}
 	error = nx_block(tree->nx, node_oid, &blk, true);
 	if (error) {
@@ -486,19 +500,20 @@ omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *a
 		return error;
 	}
 	for (level = 0; level < APFS_MAX_LEVELS; level++) {
-		uint32_t i, best = 0;
-		bool found = false;
+		uint32_t lo = 0, hi, best;
 
 		if (n.nkeys == 0) {
 			return ENOENT;
 		}
-		/* the last entry whose key is at or before what we are looking for */
-		for (i = 0; i < n.nkeys; i++) {
+		/* the last entry whose key is at or before what we are looking for: halving */
+		hi = n.nkeys;
+		while (lo < hi) {
+			uint32_t mid = lo + (hi - lo) / 2;
 			const uint8_t *k, *v;
 			uint16_t kl, vl;
 			uint64_t o, x;
 
-			error = node_entry(tree, &n, i, &k, &kl, &v, &vl);
+			error = node_entry(tree, &n, mid, &k, &kl, &v, &vl);
 			if (error) {
 				return error;
 			}
@@ -508,15 +523,15 @@ omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *a
 			o = le64(k);
 			x = le64(k + 8);
 			if (o < oid || (o == oid && x <= want_xid)) {
-				best = i;
-				found = true;
+				lo = mid + 1;
 			} else {
-				break;
+				hi = mid;
 			}
 		}
-		if (!found) {
+		if (lo == 0) {
 			return ENOENT;
 		}
+		best = lo - 1;
 		if (n.leaf) {
 			const uint8_t *k, *v;
 			uint16_t kl, vl;
@@ -535,6 +550,12 @@ omap_find(struct apfs_omap *omap, uint64_t oid, apfs_xid_t want_xid, uint64_t *a
 			*addr = le64(v + 8);
 			if (*addr == 0 || *addr >= tree->nx->block_count) {
 				return EIO;
+			}
+			if (hit != NULL) {
+				hit->map = tree->root;
+				hit->oid = oid;
+				hit->xid = want_xid;
+				hit->addr = *addr;
 			}
 			return 0;
 		}
@@ -585,6 +606,8 @@ apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev)
 	for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
 		nx->cache[i].addr = APFS_BUF_EMPTY;
 	}
+	/* zeroed, so every slot is empty; without it the object maps are simply walked */
+	nx->omap_cache = apfs_alloc(APFS_OMAP_CACHE * sizeof(*nx->omap_cache));
 
 	/*
 	 * Block zero holds a container superblock, but it can be behind: the live one is
@@ -698,6 +721,10 @@ apfs_nx_close(struct apfs_nx *nx)
 	uint32_t i;
 
 	scratch_drain(nx);
+	if (nx->omap_cache != NULL) {
+		apfs_free(nx->omap_cache, APFS_OMAP_CACHE * sizeof(*nx->omap_cache));
+		nx->omap_cache = NULL;
+	}
 
 	for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
 		if (nx->cache[i].data != NULL) {
@@ -770,9 +797,39 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 
 /* ------------------------------------------------------------------ records */
 
-int
-apfs_seek(struct apfs_btree *tree, uint64_t obj_id, uint8_t type,
-    struct apfs_cursor *cur)
+/*
+ * Where a seek is going: (obj_id, type), and for a directory record also the word that
+ * holds its name's hash and length (with_nlh) -- the records of one directory sort by
+ * that word, then by name.
+ */
+struct seek_target {
+	uint64_t obj_id;
+	uint8_t  type;
+	bool     with_nlh;
+	uint32_t nlh;
+};
+
+/* Below 0: the key sorts before the target; 0 or more: at it or after. */
+static int
+seek_cmp(const uint8_t *k, uint16_t kl, const struct seek_target *t)
+{
+	uint64_t id = jkey_id(k);
+	uint8_t type = jkey_type(k);
+
+	if (id != t->obj_id) {
+		return id < t->obj_id ? -1 : 1;
+	}
+	if (type != t->type) {
+		return type < t->type ? -1 : 1;
+	}
+	if (t->with_nlh && kl >= 12 && le32(k + 8) < t->nlh) {
+		return -1;
+	}
+	return 0;
+}
+
+static int
+seek_to(struct apfs_btree *tree, const struct seek_target *t, struct apfs_cursor *cur)
 {
 	const uint8_t *blk;
 	struct node n;
@@ -797,24 +854,31 @@ apfs_seek(struct apfs_btree *tree, uint64_t obj_id, uint8_t type,
 			cur->done = true;
 			return 0;
 		}
-		if (n.leaf) {
-			/* the first record at or after (obj_id, type) */
-			for (i = 0; i < n.nkeys; i++) {
+		/* the first key at or after the target, by halving: keys sort the way seek_cmp does */
+		{
+			uint32_t lo = 0, hi = n.nkeys;
+
+			while (lo < hi) {
+				uint32_t mid = lo + (hi - lo) / 2;
 				const uint8_t *k, *v;
 				uint16_t kl, vl;
 
-				error = node_entry(tree, &n, i, &k, &kl, &v, &vl);
+				error = node_entry(tree, &n, mid, &k, &kl, &v, &vl);
 				if (error) {
 					return error;
 				}
 				if (kl < 8) {
 					return EIO;
 				}
-				if (jkey_id(k) > obj_id ||
-				    (jkey_id(k) == obj_id && jkey_type(k) >= type)) {
-					break;
+				if (seek_cmp(k, kl, t) < 0) {
+					lo = mid + 1;
+				} else {
+					hi = mid;
 				}
 			}
+			i = lo;
+		}
+		if (n.leaf) {
 			cur->index[cur->depth] = i;
 			return 0;
 		}
@@ -823,24 +887,7 @@ apfs_seek(struct apfs_btree *tree, uint64_t obj_id, uint8_t type,
 		 * smallest key in it, so going left on a tie cannot skip a record: the walk
 		 * forward will reach it.
 		 */
-		for (i = 0; i < n.nkeys; i++) {
-			const uint8_t *k, *v;
-			uint16_t kl, vl;
-
-			error = node_entry(tree, &n, i, &k, &kl, &v, &vl);
-			if (error) {
-				return error;
-			}
-			if (kl < 8) {
-				return EIO;
-			}
-			if (jkey_id(k) < obj_id ||
-			    (jkey_id(k) == obj_id && jkey_type(k) < type)) {
-				pick = i;
-			} else {
-				break;
-			}
-		}
+		pick = (i > 0) ? i - 1 : 0;
 		cur->index[cur->depth] = pick;
 		error = node_child_addr(tree, &n, pick, &addr);
 		if (error) {
@@ -852,6 +899,15 @@ apfs_seek(struct apfs_btree *tree, uint64_t obj_id, uint8_t type,
 			return error;
 		}
 	}
+}
+
+int
+apfs_seek(struct apfs_btree *tree, uint64_t obj_id, uint8_t type,
+    struct apfs_cursor *cur)
+{
+	struct seek_target t = { .obj_id = obj_id, .type = type };
+
+	return seek_to(tree, &t, cur);
 }
 
 /*
@@ -1184,6 +1240,104 @@ lookup_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_
 	return EEXIST;                          /* stop the walk; not an error */
 }
 
+/*
+ * The hash in a directory record's key, for a name of ASCII characters: CRC-32C over the
+ * name as little-endian 32-bit code points, started at all ones and not inverted at the
+ * end, low 22 bits.  For other names APFS hashes the name after Unicode canonical
+ * decomposition (and case folding, on a case-insensitive volume), which is not done
+ * here.  Checked against the hash stored with every ASCII name of the iOS 16.5 root
+ * volume: 317749 of 317749 (tools/apfs/test_namehash.py).
+ */
+static const uint32_t crc32c_nibble[16] = {
+	0x00000000, 0x105ec76f, 0x20bd8ede, 0x30e349b1,
+	0x417b1dbc, 0x5125dad3, 0x61c69362, 0x7198540d,
+	0x82f63b78, 0x92a8fc17, 0xa24bb5a6, 0xb21572c9,
+	0xc38d26c4, 0xd3d3e1ab, 0xe330a81a, 0xf36e6f75,
+};
+
+static bool
+ascii_name_hash(const char *name, size_t name_len, uint32_t *hash)
+{
+	uint32_t crc = 0xffffffffu;
+	size_t i;
+
+	for (i = 0; i < name_len; i++) {
+		uint8_t c = (uint8_t)name[i];
+		uint8_t b[4] = { c, 0, 0, 0 };  /* the code point, little-endian */
+		int j;
+
+		if (c == 0 || c >= 0x80) {
+			return false;
+		}
+		for (j = 0; j < 4; j++) {
+			crc ^= b[j];
+			crc = (crc >> 4) ^ crc32c_nibble[crc & 15];
+			crc = (crc >> 4) ^ crc32c_nibble[crc & 15];
+		}
+	}
+	*hash = crc & 0x3fffff;
+	return true;
+}
+
+/*
+ * A name in a directory by its hash: straight to the records with that hash and compare
+ * only those, instead of reading the directory from its start.  Gives ENOENT for a name
+ * that is not there, EAGAIN when this way does not apply (not hashed keys, a case-
+ * insensitive volume, a name that is not plain ASCII) and the caller goes through the
+ * directory instead.  Either way the match is the same: the name byte for byte.
+ */
+static int
+lookup_hashed(struct apfs_vol *vol, uint64_t dir_id, const char *name, size_t name_len,
+    uint64_t *file_id, uint8_t *d_type)
+{
+	struct seek_target t = { .obj_id = dir_id, .type = APFS_TYPE_DIR_REC,
+		                 .with_nlh = true };
+	struct apfs_cursor cur;
+	struct apfs_rec rec;
+	uint32_t hash;
+	int error;
+
+	if (!vol->hashed_names || (vol->incompat & APFS_INCOMPAT_CASE_INSENSITIVE) != 0 ||
+	    name_len == 0 || name_len >= APFS_J_DREC_LEN_MASK ||
+	    !ascii_name_hash(name, name_len, &hash)) {
+		return EAGAIN;
+	}
+	t.nlh = hash << APFS_J_DREC_HASH_SHIFT;
+	error = seek_to(&vol->tree, &t, &cur);
+	if (error) {
+		return error;
+	}
+	for (;;) {
+		uint32_t nlh, len;
+
+		error = apfs_cursor_next(&cur, &rec);
+		if (error) {
+			return error;   /* ENOENT at the end of the tree */
+		}
+		if (rec.obj_id != dir_id || rec.type != APFS_TYPE_DIR_REC || rec.key_len < 12) {
+			return ENOENT;
+		}
+		nlh = le32(rec.key + 8);
+		if ((nlh >> APFS_J_DREC_HASH_SHIFT) != hash) {
+			return ENOENT;  /* past the records with this hash */
+		}
+		len = nlh & APFS_J_DREC_LEN_MASK;
+		if (len == name_len + 1 && 12 + len <= rec.key_len &&
+		    memcmp(rec.key + 12, name, name_len) == 0) {
+			if (rec.val == NULL || rec.val_len < 18) {
+				return EIO;
+			}
+			if (file_id != NULL) {
+				*file_id = le64(rec.val);
+			}
+			if (d_type != NULL) {
+				*d_type = (uint8_t)(le16(rec.val + 16) & APFS_DREC_TYPE_MASK);
+			}
+			return 0;
+		}
+	}
+}
+
 int
 apfs_lookup(struct apfs_vol *vol, uint64_t dir_id, const char *name, size_t name_len,
     uint64_t *file_id, uint8_t *d_type)
@@ -1191,6 +1345,10 @@ apfs_lookup(struct apfs_vol *vol, uint64_t dir_id, const char *name, size_t name
 	struct lookup_ctx lc;
 	int error;
 
+	error = lookup_hashed(vol, dir_id, name, name_len, file_id, d_type);
+	if (error != EAGAIN) {
+		return error;
+	}
 	memset(&lc, 0, sizeof(lc));
 	lc.name = name;
 	lc.name_len = name_len;

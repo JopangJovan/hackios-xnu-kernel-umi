@@ -14,6 +14,7 @@
  *        apfs-tool stat   IMAGE PATH
  *        apfs-tool cat    IMAGE PATH
  *        apfs-tool census IMAGE [PATH] [--meta]   (--meta: do not read contents)
+ *        apfs-tool lookups IMAGE    (every name looked up by name; see cmd_lookups)
  */
 
 /* pread(2) and clock_gettime(2) come with -D_DEFAULT_SOURCE, set by build-tool.sh */
@@ -599,6 +600,162 @@ cmd_census(const char *path, const char *where, bool meta_only)
 	return cs.error ? 1 : 0;
 }
 
+/*
+ * Every name in the volume looked up by name, the way the kernel's vnop_lookup does it,
+ * against what reading its directory gave; and each name with "#" after it, which must
+ * not be found.  Also how long that took against finding each name by reading its
+ * directory from the start, which is what apfs_lookup did before it went by the hash.
+ */
+struct lk_entry {
+	char     name[256];
+	size_t   len;
+	uint64_t id;
+	uint8_t  type;
+};
+
+struct lk_dir {
+	struct lk_entry *e;
+	size_t n, cap;
+};
+
+static int
+lk_collect(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_t d_type)
+{
+	struct lk_dir *d = ctx;
+
+	if (d->n == d->cap) {
+		size_t cap = d->cap ? d->cap * 2 : 64;
+		struct lk_entry *e = realloc(d->e, cap * sizeof(*e));
+
+		if (e == NULL) {
+			return ENOMEM;
+		}
+		d->e = e;
+		d->cap = cap;
+	}
+	if (name_len >= sizeof(d->e[0].name)) {
+		return EIO;
+	}
+	memcpy(d->e[d->n].name, name, name_len);
+	d->e[d->n].name[name_len] = '\0';
+	d->e[d->n].len = name_len;
+	d->e[d->n].id = file_id;
+	d->e[d->n].type = d_type;
+	d->n++;
+	return 0;
+}
+
+struct lk_scan {
+	const char *name;
+	size_t      len;
+	bool        found;
+};
+
+static int
+lk_scan_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_t d_type)
+{
+	struct lk_scan *sc = ctx;
+
+	(void)file_id;
+	(void)d_type;
+	if (name_len == sc->len && memcmp(name, sc->name, name_len) == 0) {
+		sc->found = true;
+		return EEXIST;
+	}
+	return 0;
+}
+
+static double
+lk_now(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static int
+cmd_lookups(const char *path)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	uint64_t *stack = NULL;
+	size_t depth = 0, cap = 0;
+	uint64_t dirs = 0, names = 0, good = 0, bad = 0, absent_good = 0, absent_bad = 0;
+	double t_hash = 0, t_scan = 0;
+
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	stack = malloc(sizeof(*stack) * 64);
+	cap = 64;
+	stack[depth++] = APFS_ROOT_DIR_INO_NUM;
+	while (depth > 0) {
+		uint64_t dir = stack[--depth];
+		struct lk_dir d = { 0 };
+		size_t i;
+		int error = apfs_readdir(&vol, dir, lk_collect, &d);
+
+		if (error) {
+			fprintf(stderr, "apfs-tool: readdir %" PRIu64 ": %s\n", dir, strerror(error));
+			bad++;
+			continue;
+		}
+		dirs++;
+		for (i = 0; i < d.n; i++) {
+			struct lk_entry *e = &d.e[i];
+			struct lk_scan sc = { e->name, e->len, false };
+			char absent[260];
+			uint64_t id = 0;
+			uint8_t type = 0;
+			double t0;
+
+			names++;
+			t0 = lk_now();
+			error = apfs_lookup(&vol, dir, e->name, e->len, &id, &type);
+			t_hash += lk_now() - t0;
+			if (error == 0 && id == e->id && type == e->type) {
+				good++;
+			} else {
+				bad++;
+				if (bad <= 10) {
+					fprintf(stderr, "apfs-tool: lookup %s in %" PRIu64 ": %d, %" PRIu64
+					    " (readdir: %" PRIu64 ")\n", e->name, dir, error, id, e->id);
+				}
+			}
+			t0 = lk_now();
+			error = apfs_readdir(&vol, dir, lk_scan_cb, &sc);
+			t_scan += lk_now() - t0;
+			if (!sc.found) {
+				bad++;
+			}
+			snprintf(absent, sizeof(absent), "%s#", e->name);
+			error = apfs_lookup(&vol, dir, absent, e->len + 1, NULL, NULL);
+			if (error == ENOENT) {
+				absent_good++;
+			} else {
+				absent_bad++;
+			}
+			if (e->type == APFS_DT_DIR) {
+				if (depth == cap) {
+					cap *= 2;
+					stack = realloc(stack, sizeof(*stack) * cap);
+				}
+				stack[depth++] = e->id;
+			}
+		}
+		free(d.e);
+	}
+	printf("directories %" PRIu64 ", names %" PRIu64 ": found as readdir has them %" PRIu64
+	    ", not %" PRIu64 "; with \"#\" after them not found %" PRIu64 ", found %" PRIu64 "\n",
+	    dirs, names, good, bad, absent_good, absent_bad);
+	printf("time for all of them: apfs_lookup %.0f ms, reading the directory from its start "
+	    "%.0f ms\n", t_hash * 1000, t_scan * 1000);
+	free(stack);
+	apfs_nx_close(&nx);
+	return (bad == 0 && absent_bad == 0) ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -608,7 +765,8 @@ main(int argc, char **argv)
 		    "       apfs-tool ls     IMAGE [PATH]\n"
 		    "       apfs-tool stat   IMAGE PATH\n"
 		    "       apfs-tool cat    IMAGE PATH\n"
-		    "       apfs-tool census IMAGE [PATH] [--meta]\n");
+		    "       apfs-tool census IMAGE [PATH] [--meta]\n"
+		    "       apfs-tool lookups IMAGE\n");
 		return 2;
 	}
 	if (strcmp(argv[1], "info") == 0) {
@@ -626,6 +784,9 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "census") == 0) {
 		return cmd_census(argv[2], (argc > 3 && argv[3][0] == '/') ? argv[3] : NULL,
 		    (argc > 3 && strcmp(argv[argc - 1], "--meta") == 0));
+	}
+	if (strcmp(argv[1], "lookups") == 0) {
+		return cmd_lookups(argv[2]);
 	}
 	fprintf(stderr, "apfs-tool: unknown command %s\n", argv[1]);
 	return 2;

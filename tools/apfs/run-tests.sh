@@ -6,8 +6,10 @@
 #   3. the APFS reader against 7-Zip's, over every entry in the volume (needs ios165/)
 #   4. file contents against the files 7-Zip extracted, byte for byte (needs ios165/)
 #   5. the C the kernel is built from against apfs.py, over the whole volume
+#   6. the hash in directory records, worked out as the C lookup does (needs the image)
+#   7. every name looked up by name through the C, against its directory (needs the image)
 #
-# Steps 3, 4 and 5 need the APFS partition unpacked out of ios165/rootfs.dmg; pass it as
+# Steps 3 to 7 need the APFS partition unpacked out of ios165/rootfs.dmg; pass it as
 # $1, or set APFS_IMAGE.  Without it only the first two steps run.
 #
 # APFS_SUBTREE=/some/path keeps step 5 to one subtree, which is the quick way to run it;
@@ -42,6 +44,17 @@ echo
 
 echo "== 1b. hole handling, on made-up extent lists (the image has no sparse file)"
 python3 "$HERE/test_sparse.py" || fail=1
+echo
+
+echo "== 1c. the C that reads file contents without the lock, on made-up runs (holes, ends inside blocks)"
+if cc -std=c11 -O2 -w -I"$HERE/host-shim" -c -o "$TMP/deflate.o" "$HDR_DIR/apfs_deflate.c" &&
+	cc -std=c11 -D_DEFAULT_SOURCE -O1 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+	-I"$HDR_DIR" -o "$TMP/test_fetch" "$HERE/test_fetch.c" "$TMP/deflate.o" -lz -pthread; then
+	"$TMP/test_fetch" || fail=1
+else
+	echo "   would not build"
+	fail=1
+fi
 echo
 
 echo "== 2. the UDIF reader on ios165/rootfs.dmg"
@@ -92,6 +105,19 @@ if "$HERE/build-tool.sh" "$TMP/apfs-tool" > /dev/null; then
 		head -10 "$TMP/d.txt"
 		fail=1
 	fi
+else
+	echo "   skipped: the tool would not build"
+	fail=1
+fi
+echo
+
+echo "== 6. the hash in directory records, as the lookup works it out"
+python3 "$HERE/test_namehash.py" "$IMAGE" || fail=1
+echo
+
+echo "== 7. every name in the volume looked up by name (and with \"#\" after it, not found)"
+if [ -x "$TMP/apfs-tool" ]; then
+	"$TMP/apfs-tool" lookups "$IMAGE" || fail=1
 else
 	echo "   skipped: the tool would not build"
 	fail=1

@@ -122,6 +122,21 @@ struct apfs_omap {
 	bool              ready;
 };
 
+/*
+ * What the object maps have answered: a B-tree node of the file-system tree is named by
+ * a virtual id, and every step down that tree used to be a walk down an object map too.
+ * The mount is read-only at one checkpoint, so an answer never goes stale.  One cache
+ * for the container's map and its volumes', direct-mapped, made at apfs_nx_open.
+ */
+#define APFS_OMAP_CACHE 2048            /* a power of two */
+
+struct apfs_omap_hit {
+	uint64_t map;                   /* which object map: the root of its tree */
+	uint64_t oid;                   /* 0: empty */
+	uint64_t xid;
+	uint64_t addr;
+};
+
 struct apfs_scratch;            /* apfs_lib.c's own */
 
 /* A mounted container. */
@@ -193,6 +208,8 @@ struct apfs_nx {
 	uint32_t          requests;
 	uint64_t          batch_calls, batch_pieces;   /* how many requests used it, for how much */
 	uint64_t          ra_batches, ra_pieces, ra_hits;  /* read-ahead: filled, and used */
+	struct apfs_omap_hit *omap_cache;       /* APFS_OMAP_CACHE of them, or NULL */
+	uint64_t          omap_hits, omap_misses;
 };
 
 /* A volume inside the container. */
