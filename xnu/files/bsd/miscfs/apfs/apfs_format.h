@@ -748,6 +748,9 @@ struct apfs_decmpfs_disk_header {
 #define APFS_DECMPFS_TYPE_RAW_RSRC   10  /* uncompressed, bytes in the resource fork */
 #define APFS_DECMPFS_TYPE_LZFSE_ATTR 11
 #define APFS_DECMPFS_TYPE_LZFSE_RSRC 12
+#define APFS_DECMPFS_TYPE_LZBITMAP_ATTR 13  /* LZBITMAP, bytes in the attribute */
+#define APFS_DECMPFS_TYPE_LZBITMAP_RSRC 14  /* LZBITMAP, 64 KB pieces in the resource fork behind
+                                               a table of n+1 little-endian offsets */
 
 /* the pieces a resource-fork-compressed file is cut into */
 #define APFS_DECMPFS_BLOCK_SIZE 65536

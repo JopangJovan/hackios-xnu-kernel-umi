@@ -26,6 +26,12 @@
 #include <zlib.h>
 #endif
 #include "libdeflate/libdeflate.h"
+#include "libzbitmap/libzbitmap.h"
+#ifdef KERNEL
+#include <libkern/crypto/sha2.h>
+#else
+#include <openssl/sha.h>
+#endif
 
 /* The pieces a resource-fork-compressed file is cut into. */
 #define APFS_RSRC_PIECE APFS_DECMPFS_BLOCK_SIZE
@@ -640,32 +646,139 @@ tree_node_addr(struct apfs_btree *tree, uint64_t oid, uint64_t *addr);
  * ENOENT, which a caller scanning for records reads as "there are no more" -- the records
  * of the object quietly go missing instead of the read failing.
  */
-static int
-node_at(struct apfs_btree *tree, uint64_t addr, const uint8_t **blk, struct node *n)
+/*
+ * A sealed volume (the iOS cryptexes) keeps its file-system tree in nodes without an object
+ * header -- no Fletcher checksum -- and each parent keeps the SHA-256 of each child's whole
+ * block instead.  Checked once per block the cache brings in (b->checked, which for such a
+ * block means "its hash was right"); `len` is 32 on the way down, 8 when a cursor comes back
+ * to a node it had left (apfs_cursor.hash8).  The root has no parent: Apple checks it against
+ * the volume's root hash, which is kept outside the image (the IPSW's .root_hash), and
+ * nothing here has that.
+ */
+static void
+apfs_sha256(const uint8_t *data, size_t len, uint8_t out[32])
 {
-	int error = nx_block(tree->nx, addr, blk, true);
+#ifdef KERNEL
+	SHA256_CTX c;
+
+	SHA256_Init(&c);
+	SHA256_Update(&c, data, len);
+	SHA256_Final(out, &c);
+#else
+	SHA256(data, len, out);
+#endif
+}
+
+static int
+node_hash_check(struct apfs_nx *nx, uint64_t addr, const uint8_t *blk, const uint8_t *hash, size_t len)
+{
+	struct apfs_buf *b = cache_find(nx, addr);
+	uint8_t d[32];
+
+	if (b != NULL && b->checked) {
+		return 0;
+	}
+	apfs_sha256(blk, nx->block_size, d);
+	if (memcmp(d, hash, len) != 0) {
+		apfs_log("block %llu: not the node its parent names (SHA-256)\n", (unsigned long long)addr);
+		return EIO;
+	}
+	if (b != NULL) {
+		b->checked = true;
+	}
+	return 0;
+}
+
+/* hash8: for a sealed tree's node, the first 8 bytes of its SHA-256 (0 for the root: none) */
+static int
+node_at_h(struct apfs_btree *tree, uint64_t addr, uint64_t hash8, const uint8_t **blk, struct node *n)
+{
+	bool noheader = (tree->flags & APFS_BTREE_NOHEADER) != 0;
+	int error = nx_block(tree->nx, addr, blk, !noheader);
 
 	if (error) {
 		return error;
 	}
-	if (obj_type(*blk) != APFS_OBJECT_TYPE_BTREE &&
+	if (noheader) {
+		uint8_t h[8];
+
+		if ((le16(*blk + 32) & APFS_BTNODE_NOHEADER) == 0) {
+			return EIO;
+		}
+		if (addr != tree->root) {
+			if (hash8 == 0) {
+				return EIO;     /* (a node below the root always comes with its parent's hash) */
+			}
+			memcpy(h, &hash8, 8);
+			error = node_hash_check(tree->nx, addr, *blk, h, 8);
+			if (error) {
+				return error;
+			}
+		}
+	} else if (obj_type(*blk) != APFS_OBJECT_TYPE_BTREE &&
 	    obj_type(*blk) != APFS_OBJECT_TYPE_BTREE_NODE) {
 		return EIO;
 	}
 	return node_parse(tree, *blk, n);
 }
 
-/* The block address of child i of a non-leaf node. */
 static int
-node_child_addr(struct apfs_btree *tree, const struct node *n, uint32_t i, uint64_t *addr)
+node_at(struct apfs_btree *tree, uint64_t addr, const uint8_t **blk, struct node *n)
 {
-	uint64_t oid;
-	int error = node_child(tree, n, i, &oid);
+	return node_at_h(tree, addr, 0, blk, n);
+}
 
+/*
+ * The block address of child i of a non-leaf node.  In a sealed (hashed) tree the value also
+ * holds the child's SHA-256, and the id in it is an offset from the root's id -- apfsck says
+ * so as well; Apple's reference does not.  The child's block is checked against the hash
+ * here, and the first 8 bytes of it given back for a cursor to keep (hash8, may be NULL).
+ */
+static int
+node_child_addr(struct apfs_btree *tree, const struct node *n, uint32_t i, uint64_t *addr,
+    uint64_t *hash8)
+{
+	const uint8_t *k, *v, *blk;
+	uint16_t kl, vl;
+	uint8_t hash[32];
+	uint64_t oid;
+	int error;
+
+	if ((tree->flags & APFS_BTREE_HASHED) == 0) {
+		error = node_child(tree, n, i, &oid);
+		if (error) {
+			return error;
+		}
+		if (hash8 != NULL) {
+			*hash8 = 0;
+		}
+		return tree_node_addr(tree, oid, addr);
+	}
+	error = node_entry(tree, n, i, &k, &kl, &v, &vl);
 	if (error) {
 		return error;
 	}
-	return tree_node_addr(tree, oid, addr);
+	if (v == NULL || vl != 8 + sizeof(hash)) {
+		apfs_log("a sealed tree's node with a %u-byte child entry (only SHA-256 is known here)\n", vl);
+		return ENOTSUP;
+	}
+	oid = le64(v) + tree->root_oid;
+	memcpy(hash, v + 8, sizeof(hash));
+	error = tree_node_addr(tree, oid, addr);
+	if (error) {
+		return error;
+	}
+	error = nx_block(tree->nx, *addr, &blk, (tree->flags & APFS_BTREE_NOHEADER) == 0);
+	if (error) {
+		return error;
+	}
+	if (tree->flags & APFS_BTREE_NOHEADER) {
+		error = node_hash_check(tree->nx, *addr, blk, hash, sizeof(hash));
+	}
+	if (error == 0 && hash8 != NULL) {
+		memcpy(hash8, hash, 8);
+	}
+	return error;
 }
 
 /* ------------------------------------------------------------------ object maps */
@@ -706,19 +819,29 @@ btree_open(struct apfs_nx *nx, struct apfs_omap *omap, uint64_t root_oid,
 			return error;
 		}
 	}
-	error = nx_block(nx, addr, &blk, true);
-	if (error) {
-		return error;
-	}
-	if (obj_type(blk) != APFS_OBJECT_TYPE_BTREE) {
-		apfs_log("block %llu is not a b-tree root\n", (unsigned long long)addr);
-		return EIO;
-	}
 	if (bs < 56 + sizeof(struct apfs_btree_info)) {
 		return EIO;
 	}
+	error = nx_block(nx, addr, &blk, false);
+	if (error) {
+		return error;
+	}
 	info = blk + bs - sizeof(struct apfs_btree_info);
+	if (le64(blk) == 0 && le64(blk + 8) == 0 && le32(blk + 24) == 0 &&
+	    (le16(blk + 32) & APFS_BTNODE_NOHEADER) && (le32(info) & APFS_BTREE_NOHEADER)) {
+		/* a sealed tree's root: no header, no checksum (see node_hash_check) */
+	} else {
+		error = nx_block(nx, addr, &blk, true);
+		if (error) {
+			return error;
+		}
+		if (obj_type(blk) != APFS_OBJECT_TYPE_BTREE) {
+			apfs_log("block %llu is not a b-tree root\n", (unsigned long long)addr);
+			return EIO;
+		}
+	}
 	tree->root = addr;
+	tree->root_oid = root_oid;
 	tree->flags = le32(info);
 	tree->key_size = le32(info + 8);
 	tree->val_size = le32(info + 12);
@@ -1050,7 +1173,8 @@ int
 apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 {
 	const uint8_t *blk;
-	uint64_t addr, omap_oid, root_oid;
+	uint64_t addr, omap_oid, root_oid, fext_oid;
+	uint32_t fext_type;
 	int error;
 
 	if (index >= APFS_NX_MAX_FILE_SYSTEMS || nx->fs_oid[index] == 0) {
@@ -1084,6 +1208,8 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 	memcpy(vol->name, blk + 704, APFS_VOLNAME_LEN);
 	vol->name[APFS_VOLNAME_LEN - 1] = '\0';
 	vol->role = le16(blk + 964);
+	fext_oid = le64(blk + 0x408);           /* apfs_fext_tree_oid, apfs_fext_tree_type */
+	fext_type = le32(blk + 0x410);
 	vol->hashed_names = (vol->incompat & (APFS_INCOMPAT_CASE_INSENSITIVE |
 	    APFS_INCOMPAT_NORMALIZATION_INSENSITIVE)) != 0;
 
@@ -1103,7 +1229,23 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 	if (error) {
 		return error;
 	}
-	return btree_open(nx, &vol->omap, root_oid, &vol->tree);
+	error = btree_open(nx, &vol->omap, root_oid, &vol->tree);
+	if (error) {
+		return error;
+	}
+	if (fext_oid != 0) {
+		if ((fext_type & APFS_OBJ_STORAGETYPE_MASK) != APFS_OBJ_PHYSICAL) {
+			apfs_log("volume %u (%s): an extent tree that is not physical (0x%x)\n", index, vol->name,
+			    fext_type);
+			return ENOTSUP;
+		}
+		error = btree_open(nx, NULL, fext_oid, &vol->fext);
+		if (error) {
+			return error;
+		}
+		vol->has_fext = true;
+	}
+	return 0;
 }
 
 /* ------------------------------------------------------------------ records */
@@ -1200,12 +1342,20 @@ seek_to(struct apfs_btree *tree, const struct seek_target *t, struct apfs_cursor
 		 */
 		pick = (i > 0) ? i - 1 : 0;
 		cur->index[cur->depth] = pick;
-		error = node_child_addr(tree, &n, pick, &addr);
-		if (error) {
-			return error;
+		{
+			uint64_t h8 = 0;
+
+			error = node_child_addr(tree, &n, pick, &addr, &h8);
+			if (error) {
+				return error;
+			}
+			if (cur->depth + 1 >= APFS_MAX_LEVELS) {
+				return EIO;
+			}
+			cur->depth++;
+			cur->hash8[cur->depth] = h8;
+			error = node_at_h(tree, addr, h8, &blk, &n);
 		}
-		cur->depth++;
-		error = node_at(tree, addr, &blk, &n);
 		if (error) {
 			return error;
 		}
@@ -1237,7 +1387,7 @@ apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec)
 		return ENOENT;
 	}
 	for (;;) {
-		error = node_at(tree, cur->node[cur->depth], &blk, &n);
+		error = node_at_h(tree, cur->node[cur->depth], cur->hash8[cur->depth], &blk, &n);
 		if (error) {
 			return error;
 		}
@@ -1271,7 +1421,7 @@ apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec)
 				return ENOENT;
 			}
 			cur->depth--;
-			error = node_at(tree, cur->node[cur->depth], &blk, &n);
+			error = node_at_h(tree, cur->node[cur->depth], cur->hash8[cur->depth], &blk, &n);
 			if (error) {
 				return error;
 			}
@@ -1287,7 +1437,9 @@ apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec)
 		for (;;) {
 			uint64_t child;
 
-			error = node_child_addr(tree, &n, cur->index[cur->depth], &child);
+			uint64_t h8 = 0;
+
+			error = node_child_addr(tree, &n, cur->index[cur->depth], &child, &h8);
 			if (error) {
 				return error;
 			}
@@ -1297,7 +1449,8 @@ apfs_cursor_next(struct apfs_cursor *cur, struct apfs_rec *rec)
 			cur->depth++;
 			cur->node[cur->depth] = child;
 			cur->index[cur->depth] = 0;
-			error = node_at(tree, child, &blk, &n);
+			cur->hash8[cur->depth] = h8;
+			error = node_at_h(tree, child, h8, &blk, &n);
 			if (error) {
 				return error;
 			}
@@ -2018,12 +2171,138 @@ apfs_xattr_read(struct apfs_vol *vol, uint64_t obj_id, const char *name, void *b
 
 /* ------------------------------------------------------------------ contents */
 
+/*
+ * The extents of one stream, in order: the file-system tree's records of it, or on a sealed
+ * volume its entries in the extent tree (key: stream id and logical offset; value: length
+ * with flags, and the first block).  ext_begin(..., off, ...) starts at the extent that may
+ * reach `off`, or earlier.
+ */
+struct ext_iter {
+	struct apfs_cursor cur;
+	uint64_t           id;
+	bool               fext;
+};
+
+static int
+fext_seek(struct apfs_btree *tree, uint64_t id, uint64_t off, struct apfs_cursor *cur)
+{
+	const uint8_t *blk;
+	struct node n;
+	uint64_t addr = tree->root;
+	int error;
+
+	memset(cur, 0, sizeof(*cur));
+	cur->tree = tree;
+	error = node_at(tree, addr, &blk, &n);
+	if (error) {
+		return error;
+	}
+	for (;;) {
+		uint32_t lo = 0, hi = n.nkeys, pick;
+
+		if (cur->depth >= APFS_MAX_LEVELS) {
+			return EIO;
+		}
+		cur->node[cur->depth] = addr;
+		if (n.nkeys == 0) {
+			cur->done = true;
+			return 0;
+		}
+		/* the last entry at or before (id, off), by halving */
+		while (lo < hi) {
+			uint32_t mid = lo + (hi - lo) / 2;
+			const uint8_t *k, *v;
+			uint16_t kl, vl;
+
+			error = node_entry(tree, &n, mid, &k, &kl, &v, &vl);
+			if (error) {
+				return error;
+			}
+			if (kl < 16) {
+				return EIO;
+			}
+			if (le64(k) < id || (le64(k) == id && le64(k + 8) <= off)) {
+				lo = mid + 1;
+			} else {
+				hi = mid;
+			}
+		}
+		pick = lo > 0 ? lo - 1 : 0;
+		cur->index[cur->depth] = pick;
+		if (n.leaf) {
+			return 0;
+		}
+		error = node_child_addr(tree, &n, pick, &addr, NULL);
+		if (error) {
+			return error;
+		}
+		if (cur->depth + 1 >= APFS_MAX_LEVELS) {
+			return EIO;
+		}
+		cur->depth++;
+		error = node_at(tree, addr, &blk, &n);
+		if (error) {
+			return error;
+		}
+	}
+}
+
+static int
+ext_begin(struct apfs_vol *vol, uint64_t id, uint64_t off, struct ext_iter *it)
+{
+	it->id = id;
+	it->fext = vol->has_fext;
+	if (it->fext) {
+		return fext_seek(&vol->fext, id, off, &it->cur);
+	}
+	return apfs_seek(&vol->tree, id, APFS_TYPE_FILE_EXTENT, &it->cur);
+}
+
+/* The next extent; ENOENT after the last. */
+static int
+ext_next(struct ext_iter *it, uint64_t *logical, uint64_t *length, uint64_t *phys)
+{
+	struct apfs_rec rec;
+	int error;
+
+	for (;;) {
+		error = apfs_cursor_next(&it->cur, &rec);
+		if (error) {
+			return error;
+		}
+		if (it->fext) {
+			uint64_t id;
+
+			if (rec.key_len < 16 || rec.val == NULL || rec.val_len < 16) {
+				return EIO;
+			}
+			id = le64(rec.key);
+			if (id < it->id) {
+				continue;       /* (the seek may land on the stream before) */
+			}
+			if (id > it->id) {
+				return ENOENT;
+			}
+		} else {
+			if (rec.obj_id != it->id || rec.type != APFS_TYPE_FILE_EXTENT) {
+				return ENOENT;
+			}
+			if (rec.key_len < 16 || rec.val == NULL || rec.val_len < 24) {
+				return EIO;
+			}
+		}
+		*logical = le64(rec.key + 8);
+		*length = le64(rec.val) & APFS_J_FILE_EXTENT_LEN_MASK;
+		*phys = le64(rec.val + 8);
+		return 0;
+	}
+}
+
 int
 apfs_read_stream(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_size,
     uint64_t off, void *buf, size_t len, size_t *out)
 {
-	struct apfs_cursor cur;
-	struct apfs_rec rec;
+	struct ext_iter it;
 	uint8_t *dst = buf;
 	uint32_t bs = vol->nx->block_size;
 	uint64_t end;
@@ -2040,29 +2319,20 @@ apfs_read_stream(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_size,
 	/* holes read as zeros, so start from zeros and fill in what the extents cover */
 	memset(dst, 0, len);
 
-	error = apfs_seek(&vol->tree, stream_id, APFS_TYPE_FILE_EXTENT, &cur);
+	error = ext_begin(vol, stream_id, off, &it);
 	if (error) {
 		return error;
 	}
 	for (;;) {
 		uint64_t logical, length, phys;
 
-		error = apfs_cursor_next(&cur, &rec);
+		error = ext_next(&it, &logical, &length, &phys);
 		if (error == ENOENT) {
 			break;
 		}
 		if (error) {
 			return error;
 		}
-		if (rec.obj_id != stream_id || rec.type != APFS_TYPE_FILE_EXTENT) {
-			break;
-		}
-		if (rec.key_len < 16 || rec.val == NULL || rec.val_len < 24) {
-			return EIO;
-		}
-		logical = le64(rec.key + 8);
-		length = le64(rec.val) & APFS_J_FILE_EXTENT_LEN_MASK;
-		phys = le64(rec.val + 8);
 		if (length == 0 || (length % bs) != 0) {
 			return EIO;
 		}
@@ -2140,37 +2410,27 @@ static int
 stream_plan(struct apfs_vol *vol, uint64_t stream_id, uint64_t off, uint64_t len,
     struct apfs_run *runs, uint32_t max, uint32_t *nruns, uint64_t *covered)
 {
-	struct apfs_cursor cur;
-	struct apfs_rec rec;
+	struct ext_iter it;
 	uint32_t bs = vol->nx->block_size;
 	uint64_t end = off + len;
 	int error;
 
 	*nruns = 0;
 	*covered = len;
-	error = apfs_seek(&vol->tree, stream_id, APFS_TYPE_FILE_EXTENT, &cur);
+	error = ext_begin(vol, stream_id, off, &it);
 	if (error) {
 		return error;
 	}
 	for (;;) {
 		uint64_t logical, length, phys, from, to, inner;
 
-		error = apfs_cursor_next(&cur, &rec);
+		error = ext_next(&it, &logical, &length, &phys);
 		if (error == ENOENT) {
 			break;
 		}
 		if (error) {
 			return error;
 		}
-		if (rec.obj_id != stream_id || rec.type != APFS_TYPE_FILE_EXTENT) {
-			break;
-		}
-		if (rec.key_len < 16 || rec.val == NULL || rec.val_len < 24) {
-			return EIO;
-		}
-		logical = le64(rec.key + 8);
-		length = le64(rec.val) & APFS_J_FILE_EXTENT_LEN_MASK;
-		phys = le64(rec.val + 8);
 		if (length == 0 || (length % bs) != 0) {
 			return EIO;
 		}
@@ -2324,10 +2584,12 @@ cfile_header(struct apfs_vol *vol, const struct apfs_inode *ino, bool *compresse
 	switch (*type) {
 	case APFS_DECMPFS_TYPE_ZLIB_ATTR:
 	case APFS_DECMPFS_TYPE_RAW_ATTR:
+	case APFS_DECMPFS_TYPE_LZBITMAP_ATTR:
 		*in_rsrc = false;
 		return 0;
 	case APFS_DECMPFS_TYPE_ZLIB_RSRC:
 	case APFS_DECMPFS_TYPE_RAW_RSRC:
+	case APFS_DECMPFS_TYPE_LZBITMAP_RSRC:
 		*in_rsrc = true;
 		return 0;
 	default:
@@ -2368,6 +2630,57 @@ apfs_cfile_fini(struct apfs_cfile *cf)
  * the data offset is 256 in every file here, so the table lands at 260, but it has to be
  * read rather than assumed.
  */
+/*
+ * The table of an LZBITMAP resource fork (type 14): no resource-fork header, but straight
+ * from its start n+1 little-endian offsets, piece i lying between the i-th and the next.
+ */
+static int
+cfile_read_offsets(struct apfs_vol *vol, const struct apfs_inode *ino, struct apfs_cfile *cf)
+{
+	uint32_t count = (uint32_t)((cf->size + APFS_DECMPFS_BLOCK_SIZE - 1) / APFS_DECMPFS_BLOCK_SIZE);
+	size_t tbl_len = ((size_t)count + 1) * 4, got = 0;
+	uint8_t *tbl;
+	uint32_t i;
+	int error;
+
+	if (count == 0 || tbl_len > cf->rsrc_size) {
+		apfs_log("inode %llu: an LZBITMAP resource fork of %llu bytes for %llu bytes of file\n",
+		    (unsigned long long)ino->obj_id, (unsigned long long)cf->rsrc_size,
+		    (unsigned long long)cf->size);
+		return EIO;
+	}
+	tbl = apfs_alloc(tbl_len);
+	cf->piece_off = apfs_alloc((size_t)count * sizeof(uint32_t));
+	cf->piece_len = apfs_alloc((size_t)count * sizeof(uint32_t));
+	if (tbl == NULL || cf->piece_off == NULL || cf->piece_len == NULL) {
+		error = ENOMEM;
+		goto out;
+	}
+	cf->piece_count = count;
+	cf->table_base = 0;
+	error = apfs_read_stream(vol, cf->rsrc_id, cf->rsrc_size, 0, tbl, tbl_len, &got);
+	if (error == 0 && got < tbl_len) {
+		error = EIO;
+	}
+	for (i = 0; error == 0 && i < count; i++) {
+		uint32_t a = le32(tbl + 4 * i), b = le32(tbl + 4 * (i + 1));
+
+		if (b <= a || b > cf->rsrc_size) {
+			apfs_log("inode %llu: LZBITMAP piece %u from %u to %u of a %llu-byte resource fork\n",
+			    (unsigned long long)ino->obj_id, i, a, b, (unsigned long long)cf->rsrc_size);
+			error = EIO;
+			break;
+		}
+		cf->piece_off[i] = a;
+		cf->piece_len[i] = b - a;
+	}
+out:
+	if (tbl != NULL) {
+		apfs_free(tbl, tbl_len);
+	}
+	return error;
+}
+
 static int
 cfile_read_table(struct apfs_vol *vol, const struct apfs_inode *ino,
     struct apfs_cfile *cf)
@@ -2388,6 +2701,9 @@ cfile_read_table(struct apfs_vol *vol, const struct apfs_inode *ino,
 	}
 	cf->rsrc_id = xa.stream_id;
 	cf->rsrc_size = xa.stream_size;
+	if (cf->type == APFS_DECMPFS_TYPE_LZBITMAP_RSRC) {
+		return cfile_read_offsets(vol, ino, cf);
+	}
 
 	error = apfs_read_stream(vol, cf->rsrc_id, cf->rsrc_size, 0, head, sizeof(head),
 	    &got);
@@ -2717,6 +3033,44 @@ apfs_inflate_counted(struct apfs_nx *nx, const uint8_t *src, size_t src_len, uin
  * after it, which is how the marker's length was settled; a payload that is already
  * exactly the right length is taken whole.
  */
+/*
+ * One piece of a compressed file by the file's method: zlib (types 3 and 4) as above;
+ * LZBITMAP (13 and 14) -- what the iOS 16 cryptexes use -- by libzbitmap (apfs_zbitmap.c):
+ * a piece that starts with 'Z' is a stream of it, one whose first byte has its low four bits
+ * set is stored after that byte.
+ */
+static int
+apfs_decode_piece(uint32_t type, struct libdeflate_decompressor *d, const uint8_t *src,
+    size_t src_len, uint8_t *dst, size_t dst_len, size_t *out, bool *fell_back)
+{
+	if (type != APFS_DECMPFS_TYPE_LZBITMAP_ATTR && type != APFS_DECMPFS_TYPE_LZBITMAP_RSRC) {
+		return apfs_inflate_fast(d, src, src_len, dst, dst_len, out, fell_back);
+	}
+	if (src_len == 0) {
+		return EIO;
+	}
+	if (src[0] == 'Z') {
+		size_t n = 0;
+		int r = zbm_decompress(dst, dst_len, src, src_len, &n);
+
+		if (r < 0 || n > dst_len) {
+			apfs_log("an LZBITMAP piece of %zu bytes for %zu: %d (%zu out)\n", src_len, dst_len, r, n);
+			return EIO;
+		}
+		*out = n;
+		return 0;
+	}
+	if ((src[0] & 0x0F) == 0x0F) {
+		size_t n = src_len - 1 < dst_len ? src_len - 1 : dst_len;
+
+		memcpy(dst, src + 1, n);
+		*out = n;
+		return 0;
+	}
+	apfs_log("an LZBITMAP piece of %zu bytes that starts with %02x\n", src_len, src[0]);
+	return EIO;
+}
+
 static int
 decmpfs_attr(struct apfs_nx *nx, uint32_t type, const uint8_t *src, size_t src_len,
     size_t want, uint8_t *dst, size_t *out)
@@ -2740,9 +3094,10 @@ decmpfs_attr(struct apfs_nx *nx, uint32_t type, const uint8_t *src, size_t src_l
 		*out = n;
 		return 0;
 	}
-	case APFS_DECMPFS_TYPE_ZLIB_ATTR: {
+	case APFS_DECMPFS_TYPE_ZLIB_ATTR:
+	case APFS_DECMPFS_TYPE_LZBITMAP_ATTR: {
 		bool fb = false;
-		int error = apfs_inflate_fast(NULL, src, src_len, dst, want, out, &fb);
+		int error = apfs_decode_piece(type, NULL, src, src_len, dst, want, out, &fb);
 
 		if (fb && nx != NULL) {
 			nx->inflate_fallbacks++;
@@ -2876,6 +3231,7 @@ struct apfs_piece_job {
 	uint8_t *dst;                   /* the caller's, `want` bytes */
 	size_t   want;
 	bool     ra;                    /* read ahead, not asked for: its failure fails nothing */
+	uint32_t type;                  /* the file's decmpfs type: how the piece is decoded */
 	int      error;
 	const uint8_t *src;             /* its compressed bytes, already read with its neighbours; or NULL */
 };
@@ -3012,7 +3368,7 @@ batch_one(void *arg, uint32_t item, uint32_t worker)
 		j->error = error;
 		return j->ra ? 0 : error;
 	}
-	error = apfs_inflate_fast(sc->dec, src, j->plen, j->dst, j->want, &got,
+	error = apfs_decode_piece(j->type, sc->dec, src, j->plen, j->dst, j->want, &got,
 	    &fell_back);
 	b->w[worker].inflate_ticks += apfs_ticks() - t1;
 	b->w[worker].out += got;
@@ -3296,6 +3652,7 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 				j->dst = buf + *out;
 				j->want = want;
 				j->ra = false;
+				j->type = cf->type;
 				*out += want;
 				if (nbatch == APFS_BATCH) {
 					error = batch_run(vol, sc, nbatch);
@@ -3354,6 +3711,7 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 						j->dst = cf->ra_data + (size_t)(k - i - 1) * APFS_DECMPFS_BLOCK_SIZE;
 						j->want = kwant;
 						j->ra = true;
+						j->type = cf->type;
 						cf->ra_len[k - i - 1] = (uint32_t)kwant;
 						nra++;
 					}
@@ -3398,7 +3756,7 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 			}
 			t1 = apfs_ticks();
 			if (error == 0 && !raw_type) {
-				error = apfs_inflate_fast(sc->dec, src, plen, dst, want, &got_len,
+				error = apfs_decode_piece(cf->type, sc->dec, src, plen, dst, want, &got_len,
 				    &fell_back);
 			}
 			nx_relock(vol->nx);

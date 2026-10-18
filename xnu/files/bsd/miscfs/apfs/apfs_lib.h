@@ -140,6 +140,7 @@ struct apfs_btree {
 	struct apfs_nx *nx;
 	struct apfs_omap *omap;         /* NULL for a tree whose node ids are block addresses */
 	uint64_t  root;                 /* block address of the root node */
+	uint64_t  root_oid;             /* its object id: a sealed tree names its nodes from it */
 	uint32_t  flags;                /* bt_flags out of the root's btree_info */
 	uint32_t  key_size;             /* nonzero only for fixed-size keys */
 	uint32_t  val_size;
@@ -287,6 +288,12 @@ struct apfs_vol {
 	 * fit the key and the record is refused.
 	 */
 	bool              hashed_names;
+	/*
+	 * A sealed volume (the iOS 16 cryptexes) keeps its files' extents in a tree of their own,
+	 * keyed by stream and offset, rather than among the file-system tree's records.
+	 */
+	struct apfs_btree fext;
+	bool              has_fext;
 	uint64_t          num_files;
 	uint64_t          num_dirs;
 	uint64_t          num_symlinks;
@@ -319,6 +326,8 @@ struct apfs_cursor {
 	uint64_t           node[APFS_MAX_LEVELS];  /* the block address at each level,
 	                                            * never an object identifier */
 	uint32_t           index[APFS_MAX_LEVELS];
+	uint64_t           hash8[APFS_MAX_LEVELS];  /* a sealed tree's nodes: the first 8 bytes of the
+	                                            * SHA-256 the parent keeps of each (0 for the root) */
 	bool               done;
 };
 

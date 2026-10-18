@@ -367,10 +367,13 @@ cmd_stat(const char *path, const char *where)
 	    ino.alloced_size);
 	printf("flags       internal 0x%" PRIx64 "  bsd 0x%x%s\n", ino.internal_flags,
 	    ino.bsd_flags, ino.is_sparse ? "  sparse" : "");
+	memset(&cf, 0, sizeof(cf));
+	cf.held = APFS_NO_PIECE;
 	if (apfs_cfile_init(&vol, &ino, &cf) == 0 && cf.compressed) {
 		printf("decmpfs     type %u  uncompressed %" PRIu64 "  %s\n", cf.type, cf.size,
 		    cf.in_rsrc ? "in the resource fork" : "in the attribute");
 	}
+	apfs_cfile_fini(&cf);
 	apfs_xattr_list(&vol, id, xattr_print_cb, NULL);
 	apfs_nx_close(&nx);
 	return 0;
@@ -407,6 +410,14 @@ cmd_cat(const char *path, const char *where)
 	}
 	memset(&cf, 0, sizeof(cf));
 	cf.held = APFS_NO_PIECE;
+	{
+		uint64_t size = 0;
+
+		/* (a compressed file's size is in its decmpfs header, not its inode) */
+		if (apfs_inode_size(&vol, &ino, &size) == 0) {
+			ino.size = size;
+		}
+	}
 	while (off < ino.size) {
 		size_t got = 0;
 
