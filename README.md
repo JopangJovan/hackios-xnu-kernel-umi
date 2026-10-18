@@ -517,17 +517,18 @@ iOS доходит до домашнего экрана как обычно, а 
 ### iOS с корнем на флеше
 
 С `root_apfs=ufs_darwin` корень системы — сам том iOS на флеше, только для чтения, а в памяти телефона только то,
-чего на нём нет: образ `flashboot.apfs` (~1 ГБ вместо 2,5 ГБ) — три контейнера APFS подряд: загрузочный том
-(`stage0`, прошивки звукового процессора, точки монтирования), криптекс OS с общим кешем dyld и криптекс App
-(образ Apple как есть).
+чего на нём нет: образ `flashboot.apfs` — загрузочный том (`stage0`, прошивки звукового процессора, точки
+монтирования), 21 МБ. Оба криптекса — образы Apple как есть — лежат на флеше, в разделе `darwin` сразу за томом iOS
+(см. «Криптексы на флеше»). Без `CRYPTEXES=flash` образ несёт их сам, тремя контейнерами подряд (994 МБ), — для
+телефона, на флеше которого их нет; `init` берёт криптексы из памяти, если они там есть, иначе с флеша.
 
 ```sh
-FLASHBOOT=1 GL=1 REST=1 RC_JOBS=rc.jobs.flashcheck userland/build.sh
+CRYPTEXES=flash FLASHBOOT=1 GL=1 REST=1 RC_JOBS=rc.jobs.flashcheck userland/build.sh
 ./xl ramdisk userland/flashboot.apfs
 XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1" XL_SECS=180 ./xl run
 ```
 
-iOS доходит до того же домашнего экрана, что и с образа в памяти (SpringBoard готов через 5,9–6,5 с против
+iOS доходит до того же домашнего экрана, что и с образа в памяти (SpringBoard готов через 6,1–6,3 с против
 4,5–4,6 с с образа в памяти; см. «Только APFS, как на iPhone»), и из пространства пользователя видно (`/sbin/mount`):
 
 ```
@@ -541,8 +542,8 @@ root_device on /private/preboot (apfs, local, read-only)
 /redwood/xpc on /System/Library/xpc (bindfs, local, nosuid, read-only, nobrowse)
 /redwood/hal on /System/Library/Audio/Plug-Ins/HAL (bindfs, local, nosuid, read-only, nobrowse)
 /fw on /fw (bindfs, local, nosuid, read-only, nobrowse)
-/dev/md0,c=1 on /private/preboot/Cryptexes/OS (apfs, local, read-only)
-/dev/md0,c=2 on /private/preboot/Cryptexes/App (apfs, local, read-only)
+/dev/ufs_darwin,c=1 on /private/preboot/Cryptexes/OS (apfs, local, read-only)
+/dev/ufs_darwin,c=2 on /private/preboot/Cryptexes/App (apfs, local, read-only)
 /private/preboot/redwood on /redwood (bindfs, local, nosuid, read-only, nobrowse)
 ramfs on /private/var (ramfs, local)
 ```
@@ -558,8 +559,9 @@ ramfs on /private/var (ramfs, local)
   даёт `/Applications` 32 приложения, которые iOS ставит при первом запуске, и просит ядро сделать том корнем
   (`sysctl kern.redwood_switch_root`, внутри — `vfs_switch_root`);
 - загрузочный том из памяти уезжает в `/private/preboot` тома, а `init` монтирует на его пустые `Cryptexes/OS` и
-  `Cryptexes/App` второй и третий контейнеры того же диска (`/dev/md0,c=1`, `c=2`) — туда ведут `/System/Cryptexes/OS`
-  и `App` самого тома, как на iPhone, где их прививает `graftdmg`; кроме корня, ядро принимает общий кеш только
+  `Cryptexes/App` криптексы — контейнеры 1 и 2 раздела `darwin` (`/dev/ufs_darwin,c=1`, `c=2`) или, если образ в
+  памяти их несёт, его (`/dev/md0,c=1`, `c=2`); туда ведут `/System/Cryptexes/OS` и `App` самого тома, как на
+  iPhone, где их прививает `graftdmg`; кроме корня, ядро принимает общий кеш только
   оттуда; маленький образ на загрузочном томе привязывается обратно на `/redwood`.
 
 Для этого в драйвере APFS появились синтетические каталоги (`sysctl kern.apfs_synthetic=ПУТЬ`), как
@@ -864,8 +866,8 @@ APFS, и все их читает тот же драйвер APFS ядра, чт
 | | iPhone, iOS 16.5 | порт |
 |---|---|---|
 | системный том | System: запечатанный том на флеше | он же из раздела `darwin` (`root_apfs=ufs_darwin`, только чтение) или `system.apfs` в памяти — отобранная часть iOS 16.5 |
-| криптекс OS (общий кеш dyld) | образ `Cryptex1,SystemOS` на томе Preboot, привит (`graftdmg`) на `/private/preboot/Cryptexes/OS`, куда ведёт `/System/Cryptexes/OS` | второй контейнер `flashboot.apfs` на том же месте (пересобранный, 1 ГБ; образ Apple как есть — `CRYPTEX_IMAGE=`, 2,6 ГБ); в `system.apfs` — каталог `/System/Cryptexes/OS` |
-| криптекс App (службы Safari) | `Cryptex1,AppOS` на `/private/preboot/Cryptexes/App`, куда ведёт `/System/Cryptexes/App` | образ Apple байт в байт (10 МБ) — третий контейнер `flashboot.apfs`, на том же месте; в `system.apfs` — каталог `/System/Cryptexes/App` |
+| криптекс OS (общий кеш dyld) | образ `Cryptex1,SystemOS` на томе Preboot, привит (`graftdmg`) на `/private/preboot/Cryptexes/OS`, куда ведёт `/System/Cryptexes/OS` | образ Apple как есть (2,5 ГБ) — контейнер 1 раздела `darwin` на флеше, на том же месте (или второй контейнер `flashboot.apfs`: пересобранный, 1 ГБ); в `system.apfs` — каталог `/System/Cryptexes/OS` |
+| криптекс App (службы Safari) | `Cryptex1,AppOS` на `/private/preboot/Cryptexes/App`, куда ведёт `/System/Cryptexes/App` | образ Apple байт в байт (10 МБ) — контейнер 2 раздела `darwin`, на том же месте (или третий контейнер `flashboot.apfs`); в `system.apfs` — каталог `/System/Cryptexes/App` |
 | Preboot | том Preboot | загрузочный том `flashboot.apfs` (`stage0`, прошивки звукового процессора, точки монтирования), после смены корня — на `/private/preboot` |
 | Data (`/private/var`) | том Data | ramfs: каждая загрузка — «новое устройство» |
 | — | — | `root.apfs` на `/redwood`: наш init, программы, библиотеки-вставки, задания launchd, прошивки GPU и Wi-Fi |
@@ -874,7 +876,7 @@ APFS, и все их читает тот же драйвер APFS ядра, чт
 |---|---|---|---|
 | `root.apfs` | 1 | 13,4 МБ | 31,5 МБ |
 | `system.apfs` | 1 | 2372 МБ, 62 299 записей, заливается за 77 с | 2170 МБ (Zstandard) или 2689 МБ (LZ4) |
-| `flashboot.apfs` | 3 | 994 МБ, заливается за 33 с | 881 МБ, без криптекса App |
+| `flashboot.apfs` | 1 (`CRYPTEXES=flash`) или 3 | 21 МБ, заливается за 1 с; с криптексами — 994 МБ, 33 с | 881 МБ, с криптексом OS, без App |
 
 **Сборка.** `tools/apfs/mkapfs.py -o ОБРАЗ [-z [--plain КАТАЛОГ]] ТОМ=КАТАЛОГ[,manifest=ФАЙЛ] …` пишет контейнер
 одной транзакцией; раскладка объектов (контрольная точка, менеджер пространства, карта объектов, деревья тома) — как
@@ -909,8 +911,9 @@ APFS, и все их читает тот же драйвер APFS ядра, чт
 **Что проверено на телефоне** (`gpu=1 adsp=1`, образ `GL=1`; с корнем на флеше `root_apfs=ufs_darwin ufs=2
 ufs_native=1`, `rc.jobs.flashcheck`):
 
-- корень на флеше (прогоны 165449 и 172245): все проверки `init`, том iOS — корень, загрузочный том на
-  `/private/preboot`, оба криптекса на своих местах (`mount` выше); Wi-Fi (`wifi=1`) — адрес по DHCP через 12,4–12,9 с,
+- корень на флеше (прогоны 165449 и 172245 — криптексы в памяти, 175638 и 175933 — на флеше, см. «Криптексы на
+  флеше»): все проверки `init`, том iOS — корень, загрузочный том на `/private/preboot`, оба криптекса на своих
+  местах (`mount` выше); Wi-Fi (`wifi=1`) — адрес по DHCP через 12,4–12,9 с,
   имя, две страницы по HTTPS (200); звук (`sound=4`) — тон, системные звуки, фанфары; батарея — 100 % от звукового
   процессора; домашний экран рисует GPU; **Safari открывает example.com**, а его службы `SafariBookmarksSyncAgent`
   и `com.apple.Safari.History` запускаются из `/System/Cryptexes/App` (раньше этих заданий не было вовсе: их
@@ -943,11 +946,62 @@ Wi-Fi и звука):
 
 Дальше:
 
-- кеш метаданных поменьше для дисков в памяти — вернуть часть памяти;
-- криптексы на флеше, рядом с `rootfs.apfs` в разделе `darwin` (образы Apple как есть, контейнеры подряд): тогда в
-  памяти остаётся только загрузочный том. Это первая запись на флеш — путь записи и его проверки сначала, и
-  только с согласия владельца телефона;
+- кеш метаданных поменьше для дисков в памяти — вернуть часть памяти, когда корень в памяти;
 - префикс Sileo (`/var/jb`) живёт в ветке `camera`; в этой ветке его нет, и с APFS он не проверялся.
+
+### Криптексы на флеше
+
+На iPhone криптексы — файлы-образы на томе Preboot, которые iOS прививает (`graftdmg`) на
+`/private/preboot/Cryptexes/OS` и `App`. У порта те же образы — байт в байт, их SHA-384 те же, что в BuildManifest
+IPSW, — лежат в разделе `darwin` сразу за томом iOS, контейнерами подряд, и ядро монтирует их прямо с раздела тем
+же способом, каким находит второй и третий контейнер образа в памяти (`/dev/ufs_darwin,c=1`, `c=2`). В памяти
+остаётся только загрузочный том.
+
+| блоки `darwin` (по 4 КБ) | с байта | что | sha256 |
+|---|---|---|---|
+| 0–1 374 207 | 0 | том iOS (`rootfs.apfs`), не тронут | `9f430a58…` |
+| 1 374 208–2 039 807 | 5 628 755 968 | криптекс OS: `096-04666-078.dmg` (`Cryptex1,SystemOS`), том `SydneyF20F66.D22D221SystemCryptex` | `2279bf44…` |
+| 2 039 808–2 042 367 | 8 355 053 568 | криптекс App: `096-03536-083.dmg` (`Cryptex1,AppOS`), том `AppCryptex` | `6b9d1f09…` |
+| 2 042 368–5 242 874 | 8 365 539 328 | нули: контейнера 3 нет, ядро отвечает `EINVAL` | |
+
+**Как записано.** Только из Android и только `tools/darwin-write.py`. Перед каждой записью он читает с телефона
+заново и сверяет с константами: GPT логического устройства 0 (CRC заголовка и таблицы, запись 34 «darwin», её GUID
+типа и уникальный, LBA 25374720..30617594, ничья другая запись не заходит на неё); что `sda` — логическое
+устройство 0 контроллера UFS; что `/dev/block/by-name/darwin` — `sda34` с теми же номером, именем, началом и
+размером в sysfs и у `blockdev`. Пишет только `dd` в `/dev/block/by-name/darwin` (имя проверяется ещё раз в той же
+оболочке прямо перед `dd`), только в блоки внутри `darwin` и после тома iOS, с копии образа на телефоне, чья sha256
+проверена, и читает записанное обратно. Без `DARWIN_WRITE=yes` не пишет ничего, `plan` показывает, что было бы
+сделано, `selftest` проверяет отказы (диапазоны, номера, GPT с изменённым полем), каждая попытка — в
+`logs/darwin-write.log`. Порядок был такой: отпечаток флеша; `check` и `selftest`; четыре запроса за пределы (в том
+iOS, на блок за концом раздела, нули в суперблок тома, криптекс OS, не помещающийся до конца) — все отказаны до
+обращения к телефону; пробная запись 1 МБ в середину свободного места, чтение обратно (и после сброса кешей),
+возврат нулей; оба криптекса (2,5 ГБ за 11,3 с) с чтением обратно; отпечаток флеша. Всё за пределами `darwin` —
+как было, том iOS — `9f430a58…`. Ядро на флеш по-прежнему не пишет ничего.
+
+**Что это дало.** Корень на флеше, `gpu=1 adsp=1 sound=4 wifi=1`, `rc.jobs.flashcheck`, тот же `root.apfs`:
+
+| | криптексы в памяти (`flashboot.apfs`, 994 МБ) | криптексы на флеше (21 МБ) |
+|---|---|---|
+| прогоны | 172245, 174603 | 175638, 175933 |
+| SpringBoard готов | 5,89 / 6,50 с | 6,08 / 6,28 с |
+| доступно памяти | 1312–1378 МБ | 2239–2310 МБ |
+| wired | 1855–1899 МБ | 892–959 МБ |
+| Wi-Fi: адрес по DHCP | 12,2–12,4 с | 11,9–12,2 с |
+
+Около 930 МБ памяти вернулось системе; время до SpringBoard — в пределах разброса. В обоих случаях одинаково: все
+проверки `init`, звук (тон, системные звуки), батарея 100 % от звукового процессора, две страницы по HTTPS, Safari
+открывает example.com, а `SafariBookmarksSyncAgent` и `com.apple.Safari.History` работают из `/System/Cryptexes/App`.
+
+Обход ядром прямо с флеша (`apfs_check=6 apfs_dev=ufs_darwin[,c=N] apfs_mnt=/flash apfs_walkers=8`), против того же
+на компьютере (`verify.py sum` для тома iOS, `apfs-tool census` для образов Apple), ошибок 0:
+
+| | записей | сумма с флеша | на компьютере | время |
+|---|---|---|---|---|
+| том iOS (контейнер 0) | 318 098 | `ceb8a53c349a011f` | `ceb8a53c349a011f` | 17,6 с |
+| криптекс OS (контейнер 1) | 2093 | `25a8c994a06a8b7b` | `25a8c994a06a8b7b` | 10,8 с |
+| криптекс App (контейнер 2) | 1047 | `df01e45a334513ee` | `df01e45a334513ee` | 0,05 с |
+
+Отпечаток флеша после всех этих загрузок (обзор загрузчика и сторона Android) — тот же, что до записи.
 
 ## Снимки экрана
 
@@ -1101,7 +1155,7 @@ fastboot boot ──► UEFI (Mu-Silicium, redwood) ──► xnuloader (EFI-п�
 | `ios165/` | добыча файлов iOS из IPSW и выбор того, что идёт в образ |
 | `qemu/` | запуск в QEMU, касания, снимки экрана, разбор стеков |
 | `uefi/`, `mkxnuimg.py` | порт UEFI на redwood и упаковка загрузочного образа для `fastboot boot` |
-| `tools/` | `recording.py` (запись экрана → mp4), `sound.py` (запись звука → wav), `update-prebuilt.sh`, `new-workspace.sh` (вторая рабочая копия со своим ядром и QEMU), `mk-mesa.sh` (Mesa для `GL=1`), `mk-ath11k.sh` (драйвер Wi-Fi для ядра), `apfs/` (APFS на компьютере: чтение — «Чтение APFS», сборка образов `mkapfs.py` и их проверка `check-image.sh` — «Только APFS, как на iPhone»), `qmi-test/` и `wpa-test/` (проверки на компьютере) |
+| `tools/` | `recording.py` (запись экрана → mp4), `sound.py` (запись звука → wav), `update-prebuilt.sh`, `new-workspace.sh` (вторая рабочая копия со своим ядром и QEMU), `mk-mesa.sh` (Mesa для `GL=1`), `mk-ath11k.sh` (драйвер Wi-Fi для ядра), `apfs/` (APFS на компьютере: чтение — «Чтение APFS», сборка образов `mkapfs.py` и их проверка `check-image.sh` — «Только APFS, как на iPhone»), `darwin-write.py` (запись в раздел `darwin` и только в него — «Криптексы на флеше»), `qmi-test/` и `wpa-test/` (проверки на компьютере) |
 | `wifi/lx/` | прослойка, на которой драйвер Wi-Fi из Linux собирается для нашего ядра (см. «Драйвер Wi-Fi») |
 | `prebuilt/` | собранные ядро, загрузчик, наши программы и куски UEFI |
 
