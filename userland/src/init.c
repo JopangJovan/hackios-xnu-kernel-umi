@@ -136,6 +136,41 @@ synthetic_dir(const char *path)
  * synthetic directory of the volume.  The boot-args stay those of a RAM disk (rd=md0),
  * which is what launchd reads to leave out the boot tasks of a real device.
  */
+#ifndef EINVAL
+#define EINVAL 22
+#endif
+/*
+ * Mount a cryptex on /private/preboot/Cryptexes/NAME: container C (",c=N") of md0, or, when md0 has
+ * no such container (EINVAL: the RAM part of the boot is the boot volume alone), the same container
+ * of the device the iOS volume came from.  Neither: said, and a check fails.
+ */
+static void
+mount_cryptex(const char *name, const char *container, const char *flashdev)
+{
+	char at[64], spec[128], what[200];
+	int err;
+
+	strcpy(at, join("/private/preboot/Cryptexes/", name, ""));
+	strcpy(spec, join("/dev/md0", container, ""));
+	if (mount("apfs", at, MNT_RDONLY, (void *)spec) != 0) {
+		err = errno;
+		if (err != EINVAL) {
+			printf("  the %s cryptex from %s: %s\n", name, spec, strerror(err));
+		}
+		strcpy(spec, join(flashdev, container, ""));
+		if (mount("apfs", at, MNT_RDONLY, (void *)spec) != 0) {
+			printf("  the %s cryptex from %s: %s\n", name, spec, strerror(errno));
+			strcpy(what, join("the ", name, " cryptex: in neither md0 nor the flash"));
+			check(0, what);
+			return;
+		}
+	}
+	strcpy(what, join("the ", name, " cryptex ("));
+	strcpy(what, join(what, spec, ") on "));
+	strcpy(what, join(what, at, ""));
+	check(1, what);
+}
+
 static void
 flash_root(const char *dev)
 {
@@ -208,31 +243,15 @@ flash_root(const char *dev)
 	}
 	chdir("/");
 	/*
-	 * When the RAM part of the boot is APFS (flashboot.apfs), the OS cryptex is not inside it
-	 * but its own container right after it in md0: mounted where iOS grafts it, the empty
-	 * Cryptexes/OS of the boot volume -- now /private/preboot/Cryptexes/OS -- where the
-	 * kernel takes a shared cache from (bsd/vm/vm_unix.c).  No second container (a boot image
-	 * with the cryptex inside): EINVAL, nothing to do.
+	 * The cryptexes, where iOS grafts them: the boot volume's empty Cryptexes/OS and Cryptexes/App,
+	 * now /private/preboot/Cryptexes/OS and App, where the iOS volume's /System/Cryptexes/OS and App
+	 * point (and the kernel takes a shared cache from the first, bsd/vm/vm_unix.c).  Each from md0 when
+	 * the RAM part of the boot has it (flashboot.apfs: the second and third containers), else from
+	 * the flash -- darwin, where Apple's images lie as they are after the iOS volume (containers 1 and 2
+	 * of the root's own device).
 	 */
-#ifndef EINVAL
-#define EINVAL 22
-#endif
-	if (mount("apfs", "/private/preboot/Cryptexes/OS", MNT_RDONLY, (void *)"/dev/md0,c=1") == 0) {
-		check(1, "the OS cryptex (md0, its second container) on /private/preboot/Cryptexes/OS");
-	} else if (errno != EINVAL) {
-		printf("  the OS cryptex: %s\n", strerror(errno));
-		check(0, "the OS cryptex (md0, its second container) on /private/preboot/Cryptexes/OS");
-	}
-	/*
-	 * The third container, when there is one: Apple's App cryptex as it is, on Cryptexes/App, where the
-	 * iOS volume's /System/Cryptexes/App points -- Safari's daemons, its settings, the bundles around it.
-	 */
-	if (mount("apfs", "/private/preboot/Cryptexes/App", MNT_RDONLY, (void *)"/dev/md0,c=2") == 0) {
-		check(1, "the App cryptex (md0, its third container) on /private/preboot/Cryptexes/App");
-	} else if (errno != EINVAL) {
-		printf("  the App cryptex: %s\n", strerror(errno));
-		check(0, "the App cryptex (md0, its third container) on /private/preboot/Cryptexes/App");
-	}
+	mount_cryptex("OS", ",c=1", devpath);
+	mount_cryptex("App", ",c=2", devpath);
 	check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
 	flash_root_mode = 1;
 }

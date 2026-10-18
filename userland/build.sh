@@ -43,7 +43,8 @@
 #                    (stage0, the manifest, the cryptex files) are newer, or with SYSTEM=1 (after
 #                    changing the recipe below).
 #   flashboot.apfs   FLASHBOOT=1: the RAM part of a boot whose root is the iOS volume on the phone's
-#                    flash (see below)
+#                    flash (see below); with CRYPTEXES=flash the boot volume alone, the cryptexes being
+#                    on the flash
 #
 #   PREBUILT=1       do not compile anything: take our programs from ../prebuilt/userland (this is also
 #                    what happens when the cross toolchain is not set up, see ../xnu-deps/setup.sh);
@@ -298,6 +299,9 @@ python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -
 # "c=2", and bsd/vm/vm_unix.c takes a shared cache from Cryptexes/OS). CRYPTEX_IMAGE=FILE:
 # Apple's own image of the cryptex as it is instead of this one remade (2.6 GB against 1 GB: too much
 # for the phone's memory beside iOS, not for QEMU's). Upload it with `xl ramdisk userland/flashboot.apfs`.
+# CRYPTEXES=flash: the boot volume alone (20 MB) -- the cryptexes are Apple's images as they are on the
+# flash, in darwin right after the iOS volume (../tools/darwin-write.py put them there), and init mounts
+# them from there, the same containers 1 and 2 of the root's own device.
 if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	rm -rf flashboot flashboot.os
 	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
@@ -325,7 +329,9 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	# the third container: Apple's App cryptex as it is (10 MB; fetch.sh), for the boot volume's Cryptexes/App
 	APP=""
 	[ -f $IOS/cryptex-app.dmg ] && APP=$IOS/cryptex-app.dmg
-	if [ -n "$CRYPTEX_IMAGE" ]; then
+	if [ "$CRYPTEXES" = flash ]; then
+		mv flashboot.boot.apfs flashboot.apfs
+	elif [ -n "$CRYPTEX_IMAGE" ]; then
 		cat flashboot.boot.apfs "$CRYPTEX_IMAGE" $APP > flashboot.apfs
 	else
 		python3 ../tools/apfs/mkapfs.py -z -o flashboot.os.apfs OS=flashboot.os | tail -1
