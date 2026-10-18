@@ -8,9 +8,9 @@ normalization-insensitive like the iOS volumes, unencrypted, read-only content l
 Permission bits and symbolic links are taken from DIR; everything is owned by root:wheel
 unless a manifest says otherwise (the same lines as mkpackfs.py -m: mode in octal with the
 type bits, uid, gid, path, [link target]; a directory or symbolic link that is only in the
-manifest is made). With -z a regular file is stored compressed when that makes it smaller:
-zlib in 64 KB pieces in its resource fork (decmpfs type 4), as Apple stores most of the iOS
-root volume; but not what is under a --plain DIR (relative to the volume's root), which stays as
+manifest is made). With -z a regular file is stored compressed when that makes it smaller,
+as Apple stores most of the iOS root volume: a small one whole in its decmpfs attribute (type
+3, no block of its own at all), a bigger one in 64 KB zlib pieces in its resource fork (type 4); but not what is under a --plain DIR (relative to the volume's root), which stays as
 it is and in one piece -- the firmware a driver uses where it lies in memory.  Times are all --time (default: 2023-05-12, the iOS 16.5 images'), so the same
 input gives the same image byte for byte.
 
@@ -61,7 +61,8 @@ XATTR_DATA_STREAM, XATTR_DATA_EMBEDDED, XATTR_FS_OWNED = 0x1, 0x2, 0x4
 KIND_NEW = 1
 
 DECMPFS_MAGIC = 0x636d7066              # 'cmpf'
-DECMPFS_ZLIB_RSRC = 4
+DECMPFS_ZLIB_ATTR, DECMPFS_ZLIB_RSRC = 3, 4
+XATTR_MAX_EMBEDDED = 3804               # the most an attribute's value can hold in its record
 PIECE = 65536
 
 SM_BITMAP_XID_OFF = 0x150               # (apfsprogs' mkapfs: from a test image)
@@ -324,6 +325,7 @@ class Volume:
         # private id -> where its bytes are: ('file', path, size) or ('spool', offset, size); never in memory
         self.data = {}
         self.decmpfs = {}               # file oid -> (header, rsrc stream id)
+        self.inline = {}                # file oid -> its decmpfs attribute: header and the zlib stream
         files = [node for node, parent in self.items if stat.S_ISREG(node.mode)]
         for node in files:
             node.size = os.path.getsize(node.source)
@@ -337,8 +339,11 @@ class Volume:
             if node.size == 0:
                 continue
             if self.compress and not self.is_plain(node):
-                rsrc = next(forks)
-                if rsrc is not None:
+                kind, rsrc = next(forks)
+                if kind == 'inline':
+                    self.inline[node.oid] = struct.pack('<IIQ', DECMPFS_MAGIC, DECMPFS_ZLIB_ATTR, node.size) + rsrc
+                    continue
+                if kind == 'rsrc':
                     sid = self.new_oid()
                     self.spool.seek(0, 2)
                     self.data[sid] = ('spool', self.spool.tell(), len(rsrc))
@@ -430,7 +435,12 @@ class Volume:
                 dtype = DT_LNK
             else:
                 self.counts['files'] += 1
-                if oid in self.decmpfs:
+                if oid in self.inline:
+                    mine.append(inode(oid, parent, node.mode, node.uid, node.gid, node.name, 1,
+                                      INODE_NO_RSRC_FORK | INODE_HAS_UNCOMPRESSED_SIZE, UF_COMPRESSED,
+                                      uncompressed=node.size))
+                    mine.append(xattr(oid, 'com.apple.decmpfs', XATTR_DATA_EMBEDDED, self.inline[oid]))
+                elif oid in self.decmpfs:
                     header, sid = self.decmpfs[oid]
                     rsrc_len = self.data[sid][2]
                     mine.append(inode(oid, parent, node.mode, node.uid, node.gid, node.name, 1,
@@ -473,10 +483,15 @@ class Volume:
 
 
 def compressed_fork(path):
-    """A file's resource fork compressed, or None when that would not take fewer blocks."""
+    """How a file is best kept: ('inline', its zlib stream) when that fits the decmpfs attribute,
+    ('rsrc', its resource fork) when that takes fewer blocks, else (None, None)."""
     content = open(path, 'rb').read()
+    if len(content) <= PIECE:
+        z = zlib.compress(content, 9)
+        if 16 + len(z) <= XATTR_MAX_EMBEDDED:
+            return 'inline', z
     rsrc = zlib_rsrc(content)
-    return rsrc if div_up(len(rsrc), BS) < div_up(len(content), BS) else None
+    return ('rsrc', rsrc) if div_up(len(rsrc), BS) < div_up(len(content), BS) else (None, None)
 
 
 def zlib_rsrc(content):
@@ -914,7 +929,8 @@ def main():
     for v in vols:
         print('mkapfs.py: volume %d "%s": %d files, %d directories, %d symbolic links, %d blocks of data%s' % (
             v.index, v.name, v.counts['files'], v.counts['dirs'], v.counts['symlinks'], v.data_blocks,
-            ' (%d compressed)' % len(v.decmpfs) if v.decmpfs else ''))
+            ' (%d compressed in their resource fork, %d whole in their attribute)' % (len(v.decmpfs), len(v.inline))
+            if v.compress else ''))
     print('mkapfs.py: %s: %d blocks of %d bytes, %d free' % (args.output, c.block_count, BS, free))
 
 
