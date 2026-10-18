@@ -32,9 +32,12 @@ done
 echo "userdata ($(readlink /dev/block/by-name/userdata)) first MB: $(dd if=/dev/block/by-name/userdata bs=1048576 count=1 2>/dev/null | sha256sum | cut -d' ' -f1)"
 echo "darwin ($(readlink /dev/block/by-name/darwin)) first 5628755968 bytes: $(dd if=/dev/block/by-name/darwin bs=4194304 count=1342 2>/dev/null | sha256sum | cut -d' ' -f1)"
 echo "files under /sdcard: $(find /sdcard/ -type f 2>/dev/null | wc -l)"
+find /sdcard/ -type f 2>/dev/null | sort | sed 's/^/sdcard file: /'
 echo "android: boot_completed=$(getprop sys.boot_completed), /data: $(mount | grep ' /data ' | cut -d' ' -f1,5)"
 PHONE
-	mv "$2/android.txt.new" "$2/android.txt"
+	grep '^sdcard file: ' "$2/android.txt.new" > "$2/sdcard-files.txt" || true
+	grep -v '^sdcard file: ' "$2/android.txt.new" > "$2/android.txt"
+	rm -f "$2/android.txt.new"
 	grep -E '^(sd[a-f]:|userdata|darwin|files|android)' "$2/android.txt"
 	;;
 survey)

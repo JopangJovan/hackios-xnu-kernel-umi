@@ -50,6 +50,7 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+#include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <stdarg.h>
 #include <mach/mach_types.h>
@@ -127,7 +128,6 @@ extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 #define SLOT_BUFFER_DEFAULT (256u << 10)
 #define BLOCK               4096u               /* the logical block size of every unit here */
 
-#define SPIN_US             5000                /* look without sleeping this long, then a millisecond at a time */
 #define TIMEOUT_MS          10000
 
 struct hc_cmd {
@@ -162,6 +162,8 @@ static uint32_t hc_is_in, hc_cnr_in;            /* IS and UTRLCNR when this kern
 static uint64_t hc_requests, hc_errors, hc_bytes, hc_wait_us, hc_refused, hc_most_in_flight, hc_proofs;
 static uint64_t hc_switch_in_count, hc_switch_out_count;
 static uint32_t hc_in_flight;
+/* where the time goes: doorbell reads while waiting, waits for a free slot, taking hc_lock, how many in flight */
+static uint64_t hc_polls, hc_slot_waits, hc_slot_wait_ticks, hc_lock_ticks, hc_flight_hist[6];
 
 static LCK_GRP_DECLARE(hc_lck_grp, "redwood-ufshc");
 static LCK_MTX_DECLARE(hc_lock, &hc_lck_grp);
@@ -535,6 +537,37 @@ hc_ring(struct hc_slot *s)
 	return ok ? 0 : ENXIO;
 }
 
+/*
+ * ufs_native_hang=N (a test of the loader's side): once N reads are done, the thread that has just
+ * rung a doorbell stops the kernel -- every processor spinning with interrupts off, this one
+ * included -- with reads in flight and this kernel's list in. The heartbeat stops, and the
+ * loader (or the watchdog) must take it from there.
+ */
+extern unsigned int cpu_broadcast_xcall(uint32_t *synch, boolean_t self_xcall, void (*func)(void *), void *parm);
+static uint32_t hc_hang_after;
+static volatile uint32_t hc_hanging;
+
+static void
+hc_spin_forever(__unused void *parm)
+{
+	(void)ml_set_interrupts_enabled(FALSE);
+	for (;;) {
+		__builtin_arm_yield();
+	}
+}
+
+static void
+hc_hang(uint32_t slot)
+{
+	static int parm;
+
+	/* (into the loader's log directly as well: a hung kernel's own log never comes back to it) */
+	hc_say_late("ufs: native: ufs_native_hang=%u: the kernel stops HERE, every processor spinning with interrupts "
+	    "off; slot %u just rung, doorbell %08x, %u reads in flight, this kernel's list in\n", hc_hang_after, slot,
+	    hc_read(UFSHC_UTRLDBR), hc_in_flight);
+	cpu_broadcast_xcall(NULL, TRUE, hc_spin_forever, &parm);
+}
+
 /* Nothing more is sent from here on; whoever waits for a slot is told. */
 static void
 hc_off(void)
@@ -545,32 +578,95 @@ hc_off(void)
 	lck_mtx_unlock(&hc_lock);
 }
 
+/*
+ * Waiting for the controller. Its interrupt stays off (UEFI's setting), so completions are seen
+ * by reading UTRLDBR. A waiter looks at its own bit for a short while (hc_spin_us: a small read
+ * is done by then), then sleeps; one poller thread looks for all who sleep and wakes each whose
+ * slot is done. So the processors are not all taken by threads spinning on the doorbell, which
+ * kept others -- one woken because the volume's lock came free, say -- from running.
+ */
+static volatile uint32_t hc_waiting;            /* slots whose waiters sleep (hc_lock) */
+static uint32_t hc_done;                        /* slots the poller has seen done, not yet collected (hc_lock) */
+static bool hc_poller_asleep;
+static uint32_t hc_spin_us = 40;                /* boot-arg ufs_native_spin */
+static uint64_t hc_sleeps, hc_poller_polls, hc_poller_rounds;
+
+static void
+hc_poller(__unused void *arg, __unused wait_result_t wr)
+{
+	for (;;) {
+		uint32_t waiting, db, done;
+
+		lck_mtx_lock(&hc_lock);
+		while (hc_waiting == 0) {
+			hc_poller_asleep = true;
+			msleep((void *)&hc_waiting, &hc_lock, PRIBIO, "ufshc-poll", NULL);
+		}
+		hc_poller_asleep = false;
+		waiting = hc_waiting;
+		lck_mtx_unlock(&hc_lock);
+		hc_poller_rounds++;
+		/* until one of them is done, or another waiter comes */
+		while (((db = hc_read(UFSHC_UTRLDBR)) & waiting) == waiting && hc_waiting == waiting) {
+			hc_poller_polls++;
+			__builtin_arm_yield();
+		}
+		done = waiting & ~db;
+		if (done != 0) {
+			lck_mtx_lock(&hc_lock);
+			hc_done |= done;
+			hc_waiting &= ~done;
+			for (uint32_t m = done; m != 0; m &= m - 1) {
+				wakeup(&hc_slots[__builtin_ctz(m)]);
+			}
+			lck_mtx_unlock(&hc_lock);
+		}
+	}
+}
+
 /* Until the controller is done with the slot's command; then whether it went well. */
 static int
 hc_complete(struct hc_slot *s, const char *what, bool tur)
 {
 	uint64_t started = mach_absolute_time(), us;
 	volatile const uint8_t *r = (volatile const uint8_t *)s->ucd + UCD_RESPONSE;
-	uint32_t ocs;
+	uint32_t ocs, bit = 1u << s->number;
 
-	while (hc_read(UFSHC_UTRLDBR) & (1u << s->number)) {
-		us = hc_us_since(started);
-		if (us < SPIN_US) {
-			__builtin_arm_yield();
-			continue;
+	uint64_t polls = 1;
+
+	while ((hc_read(UFSHC_UTRLDBR) & bit) && hc_us_since(started) < hc_spin_us) {
+		polls++;
+		__builtin_arm_yield();
+	}
+	if (hc_read(UFSHC_UTRLDBR) & bit) {
+		struct timespec second = { 1, 0 };
+
+		lck_mtx_lock(&hc_lock);
+		hc_sleeps++;
+		hc_waiting |= bit;
+		if (hc_poller_asleep) {
+			wakeup((void *)&hc_waiting);
 		}
-		if (us > TIMEOUT_MS * 1000ULL) {
-			hc_say("ufs: native: slot %u (%s) not done in %u s (doorbell %08x, IS %08x, HCS %08x): "
-			    "this path is off from now on\n", s->number, what, TIMEOUT_MS / 1000, hc_read(UFSHC_UTRLDBR),
-			    hc_read(UFSHC_IS), hc_read(UFSHC_HCS));
-			hc_off();
-			return ETIMEDOUT;
+		while ((hc_done & bit) == 0) {
+			(void)msleep(s, &hc_lock, PRIBIO, "ufshc-io", &second);
+			us = hc_us_since(started);
+			if ((hc_done & bit) == 0 && us > TIMEOUT_MS * 1000ULL) {
+				hc_waiting &= ~bit;
+				lck_mtx_unlock(&hc_lock);
+				hc_say("ufs: native: slot %u (%s) not done in %u s (doorbell %08x, IS %08x, HCS %08x): "
+				    "this path is off from now on\n", s->number, what, TIMEOUT_MS / 1000, hc_read(UFSHC_UTRLDBR),
+				    hc_read(UFSHC_IS), hc_read(UFSHC_HCS));
+				hc_off();
+				return ETIMEDOUT;
+			}
 		}
-		IOSleep(1);
+		hc_done &= ~bit;
+		lck_mtx_unlock(&hc_lock);
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
+	os_atomic_add(&hc_polls, polls, relaxed);
 	if (!tur) {
-		hc_wait_us += hc_us_since(started);
+		os_atomic_add(&hc_wait_us, hc_us_since(started), relaxed);
 	}
 	ocs = s->utrd[2] & 0xff;
 	if (ocs != OCS_SUCCESS || (r[0] & 0x3f) != UPIU_RESPONSE || r[3] != s->number || r[6] != 0 ||
@@ -580,7 +676,7 @@ hc_complete(struct hc_slot *s, const char *what, bool tur)
 		    "sense key %x asc %02x ascq %02x\n", s->number, what, ocs, r[0], r[3], r[6], r[7],
 		    r[34 + 2] & 0x0f, r[34 + 12], r[34 + 13]);
 		if (!tur) {
-			hc_errors++;
+			os_atomic_inc(&hc_errors, relaxed);
 		}
 		return EIO;
 	}
@@ -591,19 +687,29 @@ static struct hc_slot *
 hc_take(bool wait)
 {
 	struct hc_slot *s = NULL;
+	uint64_t t0 = mach_absolute_time();
 
 	lck_mtx_lock(&hc_lock);
-	while (hc_free == 0 && wait && !hc_dead && hc_in) {
-		msleep(&hc_free, &hc_lock, PRIBIO, "ufshc", NULL);
+	hc_lock_ticks += mach_absolute_time() - t0;
+	if (hc_free == 0 && wait && !hc_dead && hc_in) {
+		uint64_t w0 = mach_absolute_time();
+
+		hc_slot_waits++;
+		while (hc_free == 0 && wait && !hc_dead && hc_in) {
+			msleep(&hc_free, &hc_lock, PRIBIO, "ufshc", NULL);
+		}
+		hc_slot_wait_ticks += mach_absolute_time() - w0;
 	}
 	if (hc_free != 0 && hc_in && !hc_dead) {
-		uint32_t i = (uint32_t)__builtin_ctz(hc_free);
+		uint32_t i = (uint32_t)__builtin_ctz(hc_free), f;
 
 		hc_free &= ~(1u << i);
 		s = &hc_slots[i];
-		if (++hc_in_flight > hc_most_in_flight) {
-			hc_most_in_flight = hc_in_flight;
+		f = ++hc_in_flight;
+		if (f > hc_most_in_flight) {
+			hc_most_in_flight = f;
 		}
+		hc_flight_hist[f <= 1 ? 0 : f <= 2 ? 1 : f <= 4 ? 2 : f <= 8 ? 3 : f <= 16 ? 4 : 5]++;
 	}
 	lck_mtx_unlock(&hc_lock);
 	return s;
@@ -672,6 +778,10 @@ ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len)
 			if (e == 0) {
 				e = hc_ring(s);
 			}
+			if (e == 0 && hc_hang_after != 0 && hc_requests >= hc_hang_after &&
+			    os_atomic_cmpxchg(&hc_hanging, 0, 1, relaxed)) {
+				hc_hang(s->number);
+			}
 			if (e != 0) {
 				hc_give(s);
 				error = e;
@@ -698,8 +808,8 @@ ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len)
 			r = hc_complete(e->slot, what, false);
 			if (r == 0) {
 				FlushPoC_DcacheRegion((vm_offset_t)e->slot->data, (size_t)e->blocks * BLOCK);
-				hc_requests++;
-				hc_bytes += (uint64_t)e->blocks * BLOCK;
+				os_atomic_inc(&hc_requests, relaxed);
+				os_atomic_add(&hc_bytes, (uint64_t)e->blocks * BLOCK, relaxed);
 				if (error == 0) {
 					memcpy(e->to, e->slot->data + e->skip, e->take);
 				}
@@ -765,7 +875,7 @@ hc_prove(void)
 }
 
 struct hc_put_back_result {
-	uint32_t db_before, db_after_clear, lo, hi, rsr, db, is, cnr;
+	uint32_t db_before, db_after_clear, lo, hi, rsr, db, is, cnr, cnr_ours;
 	bool cleared, ok;
 };
 
@@ -789,6 +899,11 @@ hc_put_back(struct hc_put_back_result *r)
 		for (t = mach_absolute_time(); (r->db_after_clear = hc_read(UFSHC_UTRLDBR)) != 0 && hc_us_since(t) < 1000000;) {
 			__builtin_arm_yield();
 		}
+	}
+	/* the completion notifications this kernel's requests left: exactly those bits, written with ones */
+	r->cnr_ours = hc_read(UFSHC_UTRLCNR) & ~hc_cnr_in;
+	if (r->cnr_ours != 0) {
+		hc_write(UFSHC_UTRLCNR, r->cnr_ours);
 	}
 	hc_write(UFSHC_UTRLRSR, 0);
 	for (t = mach_absolute_time(); (hc_read(UFSHC_UTRLRSR) & 1) && hc_us_since(t) < 5000;) {
@@ -821,8 +936,9 @@ hc_put_back_print(const char *why, const struct hc_put_back_result *r, bool late
 		    "then %08x\n", why, r->db_before, r->db_after_clear);
 	}
 	say("ufs: native: %s: transfer list %s UEFI's %08x:%08x (run %u, doorbell %08x; IS %08x, at the switch %08x; "
-	    "completion %08x, at the switch %08x)\n", why, r->ok ? "back to" : "NOT BACK TO", r->hi, r->lo, r->rsr, r->db,
-	    r->is, hc_is_in, r->cnr, hc_cnr_in);
+	    "completion %08x after clearing this kernel's %08x, at the switch %08x%s)\n", why, r->ok ? "back to" :
+	    "NOT BACK TO", r->hi, r->lo, r->rsr, r->db, r->is, hc_is_in, r->cnr, r->cnr_ours, hc_cnr_in,
+	    r->cnr == hc_cnr_in ? ", as it was" : ", NOT AS IT WAS");
 }
 
 /*
@@ -892,6 +1008,7 @@ ufshc_switch_in(bool prove)
 				undone = true;
 			} else {
 				hc_in = true;
+				*hc_loader.cnr_at_switch = hc_cnr_in;
 				*hc_loader.list_in = 1;
 				(*hc_loader.switched_in)++;
 				hc_switch_in_count++;
@@ -981,6 +1098,19 @@ hc_report(const char *when, bool late)
 	    "in flight, %llu refused, list in %llu times and out %llu times, %llu proofs%s\n", when, hc_requests, hc_errors,
 	    hc_bytes, hc_wait_us / 1000, hc_most_in_flight, hc_refused, hc_switch_in_count, hc_switch_out_count, hc_proofs,
 	    hc_dead ? "; THE PATH IS OFF" : "");
+	{
+		uint64_t wait_ns, lock_ns;
+
+		absolutetime_to_nanoseconds(hc_slot_wait_ticks, &wait_ns);
+		absolutetime_to_nanoseconds(hc_lock_ticks, &lock_ns);
+		(late ? hc_say_late : hc_say)("ufs: native: %s: %llu doorbell reads while waiting (%llu a read), %llu waits for a "
+		    "free slot (%llu ms), %llu ms taking the slots' lock; reads put in with 1 in flight %llu, 2 %llu, 3-4 %llu, "
+		    "5-8 %llu, 9-16 %llu, more %llu\n", when, hc_polls, hc_requests ? hc_polls / hc_requests : 0, hc_slot_waits,
+		    wait_ns / 1000000, lock_ns / 1000000, hc_flight_hist[0], hc_flight_hist[1], hc_flight_hist[2],
+		    hc_flight_hist[3], hc_flight_hist[4], hc_flight_hist[5]);
+		(late ? hc_say_late : hc_say)("ufs: native: %s: waiters spin %u us, then sleep: %llu slept; the poller %llu "
+		    "rounds, %llu doorbell reads\n", when, hc_spin_us, hc_sleeps, hc_poller_rounds, hc_poller_polls);
+	}
 }
 
 void
@@ -1020,6 +1150,7 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 		slots = SLOTS - 1;
 	}
 	PE_parse_boot_argn("ufs_native_leave", &hc_leave, sizeof(hc_leave));
+	PE_parse_boot_argn("ufs_native_hang", &hc_hang_after, sizeof(hc_hang_after));
 	if (loader->hc_pa != UFSHC_PHYS || loader->area_pa == 0 || loader->slots != SLOTS || (loader->area_pa & 0x3ff) ||
 	    loader->ucd_size < UCD_PRDT + 16 * (hc_slot_buffer / PRD_MAX + 1) || (loader->ucd_offset & 0x7f) ||
 	    (loader->ucd_size & 0x7f) || loader->ucd_offset < SLOTS * 32 ||
@@ -1136,10 +1267,23 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 			return false;
 		}
 	}
+	PE_parse_boot_argn("ufs_native_spin", &hc_spin_us, sizeof(hc_spin_us));
+	if (hc_spin_us > 5000) {
+		hc_spin_us = 5000;
+	}
+	{
+		thread_t th;
+
+		if (kernel_thread_start(hc_poller, NULL, &th) != KERN_SUCCESS) {
+			hc_say("ufs: native: not used: no poller thread\n");
+			return false;
+		}
+		thread_deallocate(th);
+	}
 	hc_nslots = slots;
 	hc_free = (uint32_t)(((1ULL << (slots + 1)) - 1) & ~1ULL);       /* slots 1..n */
 	hc_usable = true;
-	hc_say("ufs: native: usable: a list of %u slots at %llx (the loader's), reads in %u of them, %u KB each, LUN 0 only%s\n",
+	hc_say("ufs: native: usable: a list of %u slots at %llx (the loader's), reads in %u of them, %u KB each (the logical units reads may go to are set by redwood_ufs.c)%s\n",
 	    SLOTS, loader->area_pa, slots, hc_slot_buffer >> 10, hc_leave ? "; ufs_native_leave=1: the list is left in "
 	    "at the end, for the loader to take back" : "");
 	return true;

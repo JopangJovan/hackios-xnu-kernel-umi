@@ -1518,7 +1518,8 @@ struct loader_block {
 	/* written by the kernel: its list is in the controller (for the loader's log) */
 	struct {
 		volatile uint32_t list_in;
-		uint32_t switched_in, switched_out, reserved;
+		uint32_t switched_in, switched_out;
+		volatile uint32_t cnr_at_switch;       /* UTRLCNR when the kernel's list went in */
 	} kernel_native __attribute__((aligned(128)));
 };
 
@@ -1691,6 +1692,18 @@ hc_take_back(const char *when)
 			}
 			print("ufs: %s: doorbell %x after the clear\n", when, (uint64_t)db);
 		}
+	}
+	/* the completion notifications the kernel's requests left (it says what there was when its list went in) */
+	flush_dcache((uint64_t)(uintptr_t)&block_shared.kernel_native,
+	    (uint64_t)(uintptr_t)&block_shared.kernel_native + sizeof(block_shared.kernel_native));
+	if (block_shared.kernel_native.switched_in != 0) {
+		uint32_t cnr = hc_rd(HC_UTRLCNR), ours = cnr & ~block_shared.kernel_native.cnr_at_switch;
+
+		if (ours != 0) {
+			hc_wr(HC_UTRLCNR, ours);
+		}
+		print("ufs: %s: completion %x, at the kernel's switch %x: cleared %x, now %x\n", when, (uint64_t)cnr,
+		    (uint64_t)block_shared.kernel_native.cnr_at_switch, (uint64_t)ours, (uint64_t)hc_rd(HC_UTRLCNR));
 	}
 	hc_wr(HC_UTRLRSR, 0);
 	for (t = READ_SYSREG(CNTVCT_EL0); (hc_rd(HC_UTRLRSR) & 1) && hc_ms_since(t) < 100;) {

@@ -29,6 +29,7 @@
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
+#include <os/atomic_private.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -39,6 +40,7 @@
 #include <sys/disk.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/redwood_input.h>
 #include <libkern/crc.h>
@@ -97,7 +99,8 @@ struct loader_block {
 	} loader_native __attribute__((aligned(128)));
 	struct {
 		volatile uint32_t list_in;     /* this kernel's: its list is in */
-		uint32_t switched_in, switched_out, reserved;
+		uint32_t switched_in, switched_out;
+		volatile uint32_t cnr_at_switch;       /* UTRLCNR when its list went in (for the loader's take-back) */
 	} kernel_native __attribute__((aligned(128)));
 };
 
@@ -125,6 +128,7 @@ static uint64_t ufs_last_end;
 static uint8_t ufs_lun[BLOCK_MAX_PARTS];         /* 0xff: not known, read through the loader */
 static uint64_t ufs_lun_offset[BLOCK_MAX_PARTS];
 static bool ufs_native_mapped;
+static uint32_t ufs_native_luns;                /* how many units are mapped (LUN 0..n-1) */
 static volatile bool ufs_native_on;
 static uint64_t ufs_native_fallbacks, ufs_mailbox_refused;
 
@@ -537,17 +541,21 @@ ufs_is_reference(const char *name, const char *ref)
 }
 
 static void
-ufs_check(__unused void *arg, __unused wait_result_t wr)
+ufs_check(void *arg, __unused wait_result_t wr)
 {
 	uint8_t *chunk = kalloc_data(1 << 20, Z_WAITOK);
 
 	/*
 	 * Not at once: what the kernel prints in its first minute or so does not come back with the
 	 * log on the phone (the first line that does is from long after this driver has started), so
-	 * the check waits until it will be read.
+	 * the check waits until it will be read -- unless it runs right at the start (ufs_check=2, then
+	 * back to the loader: the log is short).
 	 */
-	IOSleep(40000);
-	printf("ufs: check: %u partitions of the phone's storage, read through the loader's page\n", ufs_parts);
+	if (arg == NULL) {
+		IOSleep(40000);
+	}
+	printf("ufs: check: %u partitions of the phone's storage, read through %s\n", ufs_parts,
+	    ufs_native_on ? "this kernel's own UFS driver" : "the loader's page");
 	for (uint32_t part = 0; chunk != NULL && part < ufs_parts; part++) {
 		for (unsigned r = 0; r < sizeof(ufs_references) / sizeof(ufs_references[0]); r++) {
 			uint64_t h = 0xcbf29ce484222325ULL, done = 0, started = mach_absolute_time(), ns;
@@ -654,8 +662,8 @@ ufs_entry(const char *name)
 
 /*
  * Which logical unit each unit the loader lists is (their device paths do not say): unit k is
- * taken to be LUN k -- with ufs_native=1 only the unit darwin is on, which must be LUN 0 -- and it
- * is so only if block 1 (the GPT header, with the unit's own GUID in it) read through the loader
+ * taken to be LUN k (ordinary logical units only: never a well-known one), and it is so only if
+ * block 1 (the GPT header, with the unit's own GUID in it) read through the loader
  * is the same as block 1 of that LUN read here; no other LUN is read. The loader's reads are made
  * first, with UEFI's list in; then this kernel's list goes in (with its proof) and stays in.
  */
@@ -684,6 +692,7 @@ ufs_native_map(bool all_units)
 		}
 		units[n++] = i;
 		mask |= 1u << e->unit;
+		ufs_native_luns = n;
 	}
 	if (good && !all_units && (n != 1 || ufs_page->part[units[0]].unit != 0)) {
 		printf("ufs: native: darwin is not on the first unit the loader lists: not LUN 0, not read here\n");
@@ -916,6 +925,89 @@ ufs_native_check(void)
 	ufshc_report("after the check");
 }
 
+/*
+ * ufs_native_bench=1 (with ufs_native=1): what the flash gives with N reads in flight -- N
+ * threads each reading at random places of darwin, a size at a time -- MB/s and microseconds a
+ * read, for 1, 2, 4, 8, 16 and 31 threads. Then back to the loader.
+ */
+struct ufs_nb {
+	uint32_t part, size, per_thread;
+	uint64_t span, seed;
+	volatile uint32_t left;
+	int error;
+};
+
+static void
+ufs_nb_thread(void *arg, __unused wait_result_t wr)
+{
+	struct ufs_nb *nb = arg;
+	uint8_t *buf = kalloc_data(nb->size, Z_WAITOK);
+	uint64_t seed = os_atomic_add(&nb->seed, 0x9e3779b97f4a7c15ULL, relaxed);
+
+	for (uint32_t i = 0; buf != NULL && i < nb->per_thread; i++) {
+		int e;
+
+		seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+		e = ufs_read_native(nb->part, (seed >> 20) % (nb->span / nb->size) * nb->size, buf, nb->size);
+		if (e != 0) {
+			nb->error = e;
+		}
+	}
+	if (buf != NULL) {
+		kfree_data(buf, nb->size);
+	}
+	lck_mtx_lock(&ufs_lock);
+	nb->left--;
+	wakeup(nb);
+	lck_mtx_unlock(&ufs_lock);
+}
+
+static void
+ufs_native_bench(void)
+{
+	static const uint32_t sizes[] = { 4096, 32768, 131072, 524288 };
+	static const uint32_t threads[] = { 1, 2, 4, 8, 16, 31 };
+	uint32_t part = ufs_entry("darwin");
+
+	if (part >= BLOCK_MAX_PARTS || ufs_lun[part] == 0xff) {
+		printf("ufs: native bench: no darwin\n");
+		return;
+	}
+	for (unsigned z = 0; z < sizeof(sizes) / sizeof(sizes[0]); z++) {
+		for (unsigned t = 0; t < sizeof(threads) / sizeof(threads[0]); t++) {
+			struct ufs_nb nb = {
+				.part = part, .size = sizes[z], .span = ufs_part_bytes(part),
+				.per_thread = (sizes[z] <= 32768 ? 8192 : 2048) / threads[t] + 1, .seed = 12345 + z * 100 + t,
+			};
+			uint64_t started = mach_absolute_time(), ns, bytes;
+
+			nb.left = threads[t];
+			for (uint32_t i = 0; i < threads[t]; i++) {
+				thread_t th;
+
+				if (kernel_thread_start(ufs_nb_thread, &nb, &th) == KERN_SUCCESS) {
+					thread_deallocate(th);
+				} else {
+					lck_mtx_lock(&ufs_lock);
+					nb.left--;
+					lck_mtx_unlock(&ufs_lock);
+				}
+			}
+			lck_mtx_lock(&ufs_lock);
+			while (nb.left > 0) {
+				msleep(&nb, &ufs_lock, PRIBIO, "ufsbench", NULL);
+			}
+			lck_mtx_unlock(&ufs_lock);
+			absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
+			bytes = (uint64_t)nb.per_thread * threads[t] * sizes[z];
+			printf("ufs: native bench: %6u bytes, %2u in flight: %4llu MB/s, %6llu reads/s, %5llu us a read%s\n",
+			    sizes[z], threads[t], ns ? bytes * 1000 / ns : 0, ns ? (bytes / sizes[z]) * 1000000000ULL / ns : 0,
+			    ns / 1000 * threads[t] / (bytes / sizes[z]), nb.error ? " (ERRORS)" : "");
+		}
+	}
+	ufshc_report("after the bench");
+}
+
 /* kern.redwood.ufs_native: 1 while reads go through this kernel's own driver; 0 or 1 may be set */
 static int
 ufs_sysctl_native(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
@@ -1013,6 +1105,7 @@ redwood_ufs_init(void)
 			.take_back = &ufs_page->loader_native.take_back, .list_in = &ufs_page->kernel_native.list_in,
 			.switched_in = (uint32_t *)&ufs_page->kernel_native.switched_in,
 			.switched_out = (uint32_t *)&ufs_page->kernel_native.switched_out,
+			.cnr_at_switch = &ufs_page->kernel_native.cnr_at_switch,
 		};
 		uint32_t mode = check, compare = 0;
 
@@ -1030,7 +1123,7 @@ redwood_ufs_init(void)
 				ufs_native_in(false);
 				printf("ufs: native: dry run: the list stays in for the end of the run\n");
 			}
-		} else if (ufs_native_map(compare != 0)) {
+		} else if (ufs_native_map(true)) {
 			ufs_native_mapped = true;
 			if (compare != 0) {
 				/* right here, in bsd_init's thread, and then back to the loader */
@@ -1039,8 +1132,14 @@ redwood_ufs_init(void)
 				loader_return();
 			}
 			ufs_native_on = true;
-			printf("ufs: the partitions on LUN 0 are read by this kernel's own UFS driver, its list in the controller "
-			    "(kern.redwood.ufs_native=0: through the loader)\n");
+			compare = 0;
+			if (PE_parse_boot_argn("ufs_native_bench", &compare, sizeof(compare)) && compare != 0) {
+				ufs_native_bench();
+				redwood_ufs_report("after the bench");
+				loader_return();
+			}
+			printf("ufs: the partitions (LUN 0-%u) are read by this kernel's own UFS driver, its list in the "
+			    "controller (kern.redwood.ufs_native=0: through the loader)\n", ufs_native_luns - 1);
 		} else {
 			printf("ufs: this kernel's own UFS driver is not used: through the loader\n");
 		}
@@ -1052,7 +1151,13 @@ redwood_ufs_init(void)
 		loader_return();
 	}
 	check = 0;
-	if (PE_parse_boot_argn("ufs_check", &check, sizeof(check)) && check != 0) {
+	if (PE_parse_boot_argn("ufs_check", &check, sizeof(check)) && check == 2) {
+		/* right here, whichever way the partitions are read (ufs_native=), and back to the loader */
+		ufs_check((void *)1, THREAD_AWAKENED);
+		redwood_ufs_report("after the check");
+		loader_return();
+	}
+	if (check == 1) {
 		thread_t thread;
 
 		if (kernel_thread_start(ufs_check, NULL, &thread) == KERN_SUCCESS) {

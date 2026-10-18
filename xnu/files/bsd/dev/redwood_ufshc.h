@@ -16,6 +16,7 @@ struct ufshc_loader {
 	volatile uint32_t *take_back;           /* the loader's: it takes the controller back, send nothing more */
 	volatile uint32_t *list_in;             /* this kernel's: its list is in */
 	uint32_t *switched_in, *switched_out;
+	volatile uint32_t *cnr_at_switch;       /* this kernel's: UTRLCNR when its list went in */
 };
 
 bool ufshc_probe(const struct ufshc_loader *loader, bool only);
