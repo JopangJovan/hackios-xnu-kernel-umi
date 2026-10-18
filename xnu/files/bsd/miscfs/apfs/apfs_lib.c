@@ -13,6 +13,13 @@
 
 #include "apfs_lib.h"
 
+#if defined(KERNEL) || defined(APFS_HOST_UNICODE)
+#define APFS_HAVE_UNICODE 1
+#include <sys/unicode.h>                /* utf8_normalizeOptCaseFoldAndHash, ...AndCompare (bsd/vfs/vfs_unicode.c) */
+#else
+#define APFS_HAVE_UNICODE 0
+#endif
+
 #ifdef KERNEL
 #include <libkern/zlib.h>
 #else
@@ -1518,25 +1525,15 @@ ascii_lower(int c)
 	return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
 }
 
+static bool names_equal(const char *a, size_t a_len, const char *b, size_t b_len, bool fold);
+
 static int
 lookup_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_t d_type)
 {
 	struct lookup_ctx *lc = ctx;
-	size_t i;
 
-	if (name_len != lc->name_len) {
+	if (!names_equal(name, name_len, lc->name, lc->name_len, lc->fold)) {
 		return 0;
-	}
-	for (i = 0; i < name_len; i++) {
-		int a = (unsigned char)name[i], b = (unsigned char)lc->name[i];
-
-		if (lc->fold) {
-			a = ascii_lower(a);
-			b = ascii_lower(b);
-		}
-		if (a != b) {
-			return 0;
-		}
 	}
 	lc->file_id = file_id;
 	lc->d_type = d_type;
@@ -1545,12 +1542,14 @@ lookup_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_
 }
 
 /*
- * The hash in a directory record's key, for a name of ASCII characters: CRC-32C over the
- * name as little-endian 32-bit code points, started at all ones and not inverted at the
- * end, low 22 bits.  For other names APFS hashes the name after Unicode canonical
- * decomposition (and case folding, on a case-insensitive volume), which is not done
- * here.  Checked against the hash stored with every ASCII name of the iOS 16.5 root
- * volume: 317749 of 317749 (tools/apfs/test_namehash.py).
+ * The hash in a directory record's key: CRC-32C over the name as little-endian 32-bit code
+ * points, started at all ones and not inverted at the end, low 22 bits -- the name taken after
+ * Unicode canonical decomposition (NFD), and on a case-insensitive volume in its canonical
+ * caseless form (case-folded NFD), Unicode 9.0 as APFS has it. For the decomposition and folding
+ * the kernel's own (bsd/vfs/vfs_unicode.c, utf8_normalizeOptCaseFoldAndHash, which is APFS's);
+ * a name of plain ASCII needs neither and is hashed directly. Checked against the hash stored
+ * with every name of the iOS 16.5 root volume, ASCII and not (tools/apfs/test_namehash.py,
+ * apfs-tool namehash).
  */
 static const uint32_t crc32c_nibble[16] = {
 	0x00000000, 0x105ec76f, 0x20bd8ede, 0x30e349b1,
@@ -1559,36 +1558,119 @@ static const uint32_t crc32c_nibble[16] = {
 	0xc38d26c4, 0xd3d3e1ab, 0xe330a81a, 0xf36e6f75,
 };
 
+static inline uint32_t
+crc32c_code_point(uint32_t crc, uint32_t cp)
+{
+	uint8_t b[4] = { (uint8_t)cp, (uint8_t)(cp >> 8), (uint8_t)(cp >> 16), (uint8_t)(cp >> 24) };
+	int j;
+
+	for (j = 0; j < 4; j++) {
+		crc ^= b[j];
+		crc = (crc >> 4) ^ crc32c_nibble[crc & 15];
+		crc = (crc >> 4) ^ crc32c_nibble[crc & 15];
+	}
+	return crc;
+}
+
 static bool
-ascii_name_hash(const char *name, size_t name_len, uint32_t *hash)
+name_is_ascii(const char *name, size_t name_len)
+{
+	size_t i;
+
+	for (i = 0; i < name_len; i++) {
+		if ((uint8_t)name[i] == 0 || (uint8_t)name[i] >= 0x80) {
+			return false;
+		}
+	}
+	return true;
+}
+
+#if APFS_HAVE_UNICODE
+static void
+name_hash_feed(void *buf, size_t buf_len, void *ctx)
+{
+	const int32_t *u = buf;
+	uint32_t *crc = ctx;
+	size_t i;
+
+	for (i = 0; i < buf_len / sizeof(int32_t); i++) {
+		*crc = crc32c_code_point(*crc, (uint32_t)u[i]);
+	}
+}
+#endif
+
+bool
+apfs_name_hash(const char *name, size_t name_len, bool fold, uint32_t *hash)
 {
 	uint32_t crc = 0xffffffffu;
 	size_t i;
 
-	for (i = 0; i < name_len; i++) {
-		uint8_t c = (uint8_t)name[i];
-		uint8_t b[4] = { c, 0, 0, 0 };  /* the code point, little-endian */
-		int j;
+	if (name_len == 0) {
+		return false;
+	}
+	if (name_is_ascii(name, name_len)) {
+		for (i = 0; i < name_len; i++) {
+			uint32_t c = (uint8_t)name[i];
 
-		if (c == 0 || c >= 0x80) {
-			return false;
+			if (fold && c >= 'A' && c <= 'Z') {
+				c += 'a' - 'A';         /* the caseless form of an ASCII letter */
+			}
+			crc = crc32c_code_point(crc, c);
 		}
-		for (j = 0; j < 4; j++) {
-			crc ^= b[j];
-			crc = (crc >> 4) ^ crc32c_nibble[crc & 15];
-			crc = (crc >> 4) ^ crc32c_nibble[crc & 15];
-		}
+		*hash = crc & 0x3fffff;
+		return true;
+	}
+#if APFS_HAVE_UNICODE
+	if (utf8_normalizeOptCaseFoldAndHash(name, name_len, !fold, name_hash_feed, &crc) != 0) {
+		return false;                   /* not well-formed UTF-8 (or not stream safe) */
 	}
 	*hash = crc & 0x3fffff;
 	return true;
+#else
+	return false;
+#endif
+}
+
+/*
+ * Two names the same, as the volume sees names: byte for byte when both are plain ASCII (folding
+ * the letters on a case-insensitive volume), else the same after decomposition (and folding).
+ */
+static bool
+names_equal(const char *a, size_t a_len, const char *b, size_t b_len, bool fold)
+{
+	if (name_is_ascii(a, a_len) && name_is_ascii(b, b_len)) {
+		size_t i;
+
+		if (a_len != b_len) {
+			return false;
+		}
+		if (!fold) {
+			return memcmp(a, b, a_len) == 0;
+		}
+		for (i = 0; i < a_len; i++) {
+			if (ascii_lower((unsigned char)a[i]) != ascii_lower((unsigned char)b[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+#if APFS_HAVE_UNICODE
+	{
+		bool equal = false;
+
+		if (utf8_normalizeOptCaseFoldAndCompare(a, a_len, b, b_len, !fold, &equal) == 0) {
+			return equal;
+		}
+	}
+#endif
+	return a_len == b_len && memcmp(a, b, a_len) == 0;
 }
 
 /*
  * A name in a directory by its hash: straight to the records with that hash and compare
- * only those, instead of reading the directory from its start.  Gives ENOENT for a name
- * that is not there, EAGAIN when this way does not apply (not hashed keys, a case-
- * insensitive volume, a name that is not plain ASCII) and the caller goes through the
- * directory instead.  Either way the match is the same: the name byte for byte.
+ * only those, instead of reading the directory from its start. Gives ENOENT for a name that
+ * is not there, EAGAIN when this way does not apply (not hashed keys, a name that cannot be
+ * hashed) and the caller goes through the directory instead.
  */
 static int
 lookup_hashed(struct apfs_vol *vol, uint64_t dir_id, const char *name, size_t name_len,
@@ -1596,14 +1678,14 @@ lookup_hashed(struct apfs_vol *vol, uint64_t dir_id, const char *name, size_t na
 {
 	struct seek_target t = { .obj_id = dir_id, .type = APFS_TYPE_DIR_REC,
 		                 .with_nlh = true };
+	bool fold = (vol->incompat & APFS_INCOMPAT_CASE_INSENSITIVE) != 0;
 	struct apfs_cursor cur;
 	struct apfs_rec rec;
 	uint32_t hash;
 	int error;
 
-	if (!vol->hashed_names || (vol->incompat & APFS_INCOMPAT_CASE_INSENSITIVE) != 0 ||
-	    name_len == 0 || name_len >= APFS_J_DREC_LEN_MASK ||
-	    !ascii_name_hash(name, name_len, &hash)) {
+	if (!vol->hashed_names || name_len == 0 || name_len >= APFS_J_DREC_LEN_MASK ||
+	    !apfs_name_hash(name, name_len, fold, &hash)) {
 		return EAGAIN;
 	}
 	t.nlh = hash << APFS_J_DREC_HASH_SHIFT;
@@ -1626,8 +1708,8 @@ lookup_hashed(struct apfs_vol *vol, uint64_t dir_id, const char *name, size_t na
 			return ENOENT;  /* past the records with this hash */
 		}
 		len = nlh & APFS_J_DREC_LEN_MASK;
-		if (len == name_len + 1 && 12 + len <= rec.key_len &&
-		    memcmp(rec.key + 12, name, name_len) == 0) {
+		if (len >= 1 && 12 + len <= rec.key_len &&
+		    names_equal((const char *)rec.key + 12, len - 1, name, name_len, fold)) {
 			if (rec.val == NULL || rec.val_len < 18) {
 				return EIO;
 			}
@@ -1642,6 +1724,46 @@ lookup_hashed(struct apfs_vol *vol, uint64_t dir_id, const char *name, size_t na
 	}
 }
 
+#ifndef KERNEL
+int
+apfs_dirrec_walk(struct apfs_vol *vol, int (*cb)(void *ctx, uint64_t dir_id, const char *name,
+    size_t name_len, uint32_t stored_hash, uint64_t file_id), void *ctx)
+{
+	struct apfs_cursor cur;
+	struct apfs_rec rec;
+	int error;
+
+	if (!vol->hashed_names) {
+		return ENOTSUP;
+	}
+	error = apfs_seek(&vol->tree, 0, 0, &cur);
+	if (error) {
+		return error;
+	}
+	while ((error = apfs_cursor_next(&cur, &rec)) == 0) {
+		uint32_t nlh, len;
+
+		if (rec.type != APFS_TYPE_DIR_REC || rec.key_len < 12) {
+			continue;
+		}
+		nlh = le32(rec.key + 8);
+		len = nlh & APFS_J_DREC_LEN_MASK;
+		if (len < 1 || 12 + len > rec.key_len) {
+			return EIO;
+		}
+		if (rec.val == NULL || rec.val_len < 18) {
+			return EIO;
+		}
+		error = cb(ctx, rec.obj_id, (const char *)rec.key + 12, len - 1, nlh >> APFS_J_DREC_HASH_SHIFT,
+		    le64(rec.val));
+		if (error) {
+			return error;
+		}
+	}
+	return error == ENOENT ? 0 : error;
+}
+#endif
+
 int
 apfs_lookup(struct apfs_vol *vol, uint64_t dir_id, const char *name, size_t name_len,
     uint64_t *file_id, uint8_t *d_type)
@@ -1651,8 +1773,10 @@ apfs_lookup(struct apfs_vol *vol, uint64_t dir_id, const char *name, size_t name
 
 	error = lookup_hashed(vol, dir_id, name, name_len, file_id, d_type);
 	if (error != EAGAIN) {
+		vol->nx->lookups_hashed++;
 		return error;
 	}
+	vol->nx->lookups_scanned++;
 	memset(&lc, 0, sizeof(lc));
 	lc.name = name;
 	lc.name_len = name_len;

@@ -1082,6 +1082,132 @@ cmd_cfrace(const char *path, int n, int rounds)
 }
 
 /*
+ * namehash IMAGE OUT: every directory record's name hashed the way the lookup hashes it,
+ * against the hash APFS stored with it; and into OUT, for tools/apfs/test_namehash.py to work
+ * out independently, a line per record: directory, the name in hex, the stored hash, the hash
+ * as on a case-sensitive volume and as on a case-insensitive one, the file's id.
+ */
+struct nh_ctx {
+	FILE    *out;
+	bool     fold;
+	uint64_t total, ascii, other, same, differ, unhashable;
+};
+
+static int
+namehash_cb(void *ctx, uint64_t dir_id, const char *name, size_t name_len, uint32_t stored, uint64_t file_id)
+{
+	struct nh_ctx *c = ctx;
+	uint32_t cs = 0, ci = 0, mine;
+	bool ok_cs = apfs_name_hash(name, name_len, false, &cs), ok_ci = apfs_name_hash(name, name_len, true, &ci);
+	bool ascii = true;
+
+	for (size_t i = 0; i < name_len; i++) {
+		ascii &= (uint8_t)name[i] < 0x80;
+	}
+	c->total++;
+	if (ascii) {
+		c->ascii++;
+	} else {
+		c->other++;
+	}
+	mine = c->fold ? ci : cs;
+	if (!(c->fold ? ok_ci : ok_cs)) {
+		c->unhashable++;
+	} else if (mine == stored) {
+		c->same++;
+	} else {
+		c->differ++;
+		fprintf(stderr, "apfs-tool: namehash: dir %" PRIu64 ": %.*s: stored %06x, worked out %06x\n", dir_id,
+		    (int)name_len, name, stored, mine);
+	}
+	if (c->out != NULL) {
+		fprintf(c->out, "%" PRIu64 "\t", dir_id);
+		for (size_t i = 0; i < name_len; i++) {
+			fprintf(c->out, "%02x", (uint8_t)name[i]);
+		}
+		fprintf(c->out, "\t%06x\t%06x\t%06x\t%" PRIu64 "\n", stored, ok_cs ? cs : 0xffffffu, ok_ci ? ci : 0xffffffu,
+		    file_id);
+	}
+	return 0;
+}
+
+static int
+cmd_namehash(const char *path, const char *out)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	struct nh_ctx c;
+	int error;
+
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	memset(&c, 0, sizeof(c));
+	c.fold = (vol.incompat & APFS_INCOMPAT_CASE_INSENSITIVE) != 0;
+	c.out = out != NULL ? fopen(out, "w") : NULL;
+	error = apfs_dirrec_walk(&vol, namehash_cb, &c);
+	if (c.out != NULL) {
+		fclose(c.out);
+	}
+	fprintf(stderr, "apfs-tool: namehash: %s volume: %" PRIu64 " directory records (%" PRIu64 " plain ASCII, %" PRIu64
+	    " not): hash as stored %" PRIu64 ", not %" PRIu64 ", cannot be hashed %" PRIu64 "%s\n",
+	    c.fold ? "case-insensitive" : "case-sensitive", c.total, c.ascii, c.other, c.same, c.differ, c.unhashable,
+	    error ? " (WALK FAILED)" : "");
+	return (error || c.differ || c.unhashable) ? 1 : 0;
+}
+
+/*
+ * lookupnames IMAGE LIST: a line of LIST is a directory, a name in hex and what looking it up
+ * must give (an id, or "none"); each looked up the way the kernel's vnop_lookup does it.
+ */
+static int
+cmd_lookupnames(const char *path, const char *list)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	FILE *f = fopen(list, "r");
+	char line[4096];
+	uint64_t total = 0, right = 0, hashed0, scanned0;
+
+	if (f == NULL || open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	hashed0 = nx.lookups_hashed;
+	scanned0 = nx.lookups_scanned;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char hex[2048], want[32], name[1024];
+		uint64_t dir, id = 0;
+		size_t n = 0;
+		uint8_t dt;
+		int error;
+
+		if (sscanf(line, "%" SCNu64 " %2047s %31s", &dir, hex, want) != 3) {
+			continue;
+		}
+		for (size_t i = 0; hex[2 * i] != 0 && hex[2 * i + 1] != 0 && n < sizeof(name); i++) {
+			unsigned v;
+
+			sscanf(hex + 2 * i, "%2x", &v);
+			name[n++] = (char)v;
+		}
+		total++;
+		error = apfs_lookup(&vol, dir, name, n, &id, &dt);
+		if ((strcmp(want, "none") == 0 && error == ENOENT) ||
+		    (strcmp(want, "none") != 0 && error == 0 && id == strtoull(want, NULL, 0))) {
+			right++;
+		} else if (total - right <= 20) {
+			fprintf(stderr, "apfs-tool: lookupnames: dir %" PRIu64 " %s: want %s, got %s %" PRIu64 "\n", dir, hex, want,
+			    error ? strerror(error) : "id", id);
+		}
+	}
+	fclose(f);
+	fprintf(stderr, "apfs-tool: lookupnames: %" PRIu64 " names, %" PRIu64 " as expected, %" PRIu64 " not; %" PRIu64
+	    " found by the hash, %" PRIu64 " by reading the directory\n", total, right, total - right,
+	    nx.lookups_hashed - hashed0, nx.lookups_scanned - scanned0);
+	return right == total ? 0 : 1;
+}
+
+/*
  * Every name in the volume looked up by name, the way the kernel's vnop_lookup does it,
  * against what reading its directory gave; and each name with "#" after it, which must
  * not be found.  Also how long that took against finding each name by reading its
@@ -1248,7 +1374,9 @@ main(int argc, char **argv)
 		    "       apfs-tool cat    IMAGE PATH\n"
 		    "       apfs-tool census IMAGE [PATH] [--meta]\n"
 		    "       apfs-tool lookups IMAGE\n"
-		    "       apfs-tool cfrace IMAGE [THREADS [ROUNDS]]\n");
+		    "       apfs-tool cfrace IMAGE [THREADS [ROUNDS]]\n"
+		    "       apfs-tool namehash IMAGE [OUT]\n"
+		    "       apfs-tool lookupnames IMAGE LIST\n");
 		return 2;
 	}
 	if (strcmp(argv[1], "info") == 0) {
@@ -1269,6 +1397,12 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[1], "lookups") == 0) {
 		return cmd_lookups(argv[2]);
+	}
+	if (strcmp(argv[1], "namehash") == 0) {
+		return cmd_namehash(argv[2], argc > 3 ? argv[3] : NULL);
+	}
+	if (strcmp(argv[1], "lookupnames") == 0 && argc > 3) {
+		return cmd_lookupnames(argv[2], argv[3]);
 	}
 	if (strcmp(argv[1], "cfrace") == 0) {
 		return cmd_cfrace(argv[2], argc > 3 ? atoi(argv[3]) : 4, argc > 4 ? atoi(argv[4]) : 3);

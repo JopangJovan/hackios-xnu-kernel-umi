@@ -206,6 +206,7 @@ struct apfs_nx {
 	 * gets new memory; the caller frees what no operation still running can be looking at
 	 * (apfs_nx_reclaim, with the oldest epoch any of its operations began at).
 	 */
+	uint64_t          lookups_hashed, lookups_scanned;     /* names found by their hash, by reading the directory */
 	uint64_t          epoch;
 	struct apfs_retired *retired;   /* newest first */
 	uint64_t          retired_now, retired_most, unlocked_fills, fill_races;
@@ -420,11 +421,16 @@ struct apfs_cfile {
 
 int apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev);
 void apfs_nx_close(struct apfs_nx *nx);
+/* The hash APFS keeps with a name in its directory record (22 bits); false: the name cannot be hashed */
+bool apfs_name_hash(const char *name, size_t name_len, bool fold, uint32_t *hash);
 /* Free the retired blocks' memory no operation that began at `oldest` or later can see (lock held) */
 void apfs_nx_reclaim(struct apfs_nx *nx, uint64_t oldest);
 #ifndef KERNEL
 /* For tests on the build machine: every cached block out (retired, with a caller's lock), so all is read again */
 void apfs_nx_cache_flush(struct apfs_nx *nx);
+/* Every directory record of the volume, with the hash stored in its key (hashed keys only) */
+int apfs_dirrec_walk(struct apfs_vol *vol, int (*cb)(void *ctx, uint64_t dir_id, const char *name,
+    size_t name_len, uint32_t stored_hash, uint64_t file_id), void *ctx);
 #endif
 int apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol);
 

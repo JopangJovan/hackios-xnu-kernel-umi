@@ -158,7 +158,7 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
 	struct apfs_mount *am = apfs_the_mount;
-	char text[640];
+	char text[1024];
 	int error;
 
 	if (am == NULL) {
@@ -172,7 +172,9 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    "device   %llu calls  %llu ms  %llu bytes\n"
 		    "data     %llu calls  %llu ms  %llu bytes\n"
 		    "inflate  %llu calls  %llu ms  %llu bytes in  %llu bytes out  %llu by zlib\n"
-		    "blocks   %llu read  %llu cache hits\n",
+		    "blocks   %llu read  %llu cache hits\n"
+		    "lookups  %llu by the name's hash  %llu by reading the directory\n"
+		    "lock     %llu takes  %llu ms waiting  %llu ms held; metadata read without it %llu times\n",
 		    (unsigned long long)am->am_pagein_calls,
 		    (unsigned long long)apfs_ticks_ms(am->am_pagein_ticks),
 		    (unsigned long long)am->am_pagein_bytes,
@@ -191,7 +193,13 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		    (unsigned long long)nx->inflate_out,
 		    (unsigned long long)nx->inflate_fallbacks,
 		    (unsigned long long)nx->reads,
-		    (unsigned long long)nx->hits);
+		    (unsigned long long)nx->hits,
+		    (unsigned long long)nx->lookups_hashed,
+		    (unsigned long long)nx->lookups_scanned,
+		    (unsigned long long)am->am_lock_waits,
+		    (unsigned long long)apfs_ticks_ms(am->am_lock_wait_ticks),
+		    (unsigned long long)apfs_ticks_ms(am->am_lock_held_ticks),
+		    (unsigned long long)nx->unlocked_fills);
 	}
 	error = SYSCTL_OUT(req, text, strlen(text) + 1);
 	if (error || req->newptr == USER_ADDR_NULL) {
@@ -280,6 +288,8 @@ apfs_stats_print(void)
 		printf("apfs: lock    holds: %llu under 10 us, %llu to 100 us, %llu to 1 ms, %llu to 10 ms, %llu longer; "
 		    "longest %llu us\n", am->am_lock_hold_hist[0], am->am_lock_hold_hist[1], am->am_lock_hold_hist[2],
 		    am->am_lock_hold_hist[3], am->am_lock_hold_hist[4], max_ns / 1000);
+		printf("apfs: lookups %llu by the name's hash, %llu by reading the directory\n", nx->lookups_hashed,
+		    nx->lookups_scanned);
 		printf("apfs: metadata read without the lock: %llu times, %llu of them already in by another's read; "
 		    "retired blocks %llu now, %llu at most; operations going on now %u\n", nx->unlocked_fills, nx->fill_races,
 		    nx->retired_now, nx->retired_most, am->am_nops);

@@ -25,6 +25,20 @@ trap 'rm -rf "$OBJ"' EXIT
 # (libdeflate as released compares signed with unsigned in a few places; -Wextra says so)
 cc -std=c11 -O2 -Wall -Wextra -Wno-sign-compare -Wno-unused-parameter $TOOL_CFLAGS -I"$HERE/host-shim" -c -o "$OBJ/apfs_deflate.o" \
 	"$SRC/apfs_deflate.c"
+# Names that are not plain ASCII are hashed and compared after Unicode decomposition (and folding):
+# with the kernel's own code for that, bsd/vfs/vfs_unicode.c, when the kernel tree is here.
+UNI=""
+XNUBSD=$(cd "$SRC/../.." && pwd)
+if [ -f "$XNUBSD/vfs/vfs_unicode.c" ] && [ -f "$XNUBSD/sys/unicode.h" ]; then
+	mkdir -p "$OBJ/inc/sys" "$OBJ/inc/libkern"
+	cp "$XNUBSD/sys/unicode.h" "$OBJ/inc/sys/unicode.h"
+	printf '#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n' > "$OBJ/inc/libkern/libkern.h"
+	cc -std=c11 -D_DEFAULT_SOURCE -DKERNEL_PRIVATE -O2 -w $TOOL_CFLAGS -I"$OBJ/inc" -I"$XNUBSD/vfs" -c -o "$OBJ/vfs_unicode.o" \
+		"$XNUBSD/vfs/vfs_unicode.c"
+	UNI="-DAPFS_HOST_UNICODE -DKERNEL_PRIVATE -I$OBJ/inc $OBJ/vfs_unicode.o"
+else
+	echo "build-tool.sh: no bsd/vfs/vfs_unicode.c: names other than plain ASCII are found by reading the directory" >&2
+fi
 cc -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wno-unused-parameter -I"$SRC" -I"$HERE" \
-	$TOOL_CFLAGS -o "$OUT" "$HERE/apfs-tool.c" "$SRC/apfs_lib.c" "$OBJ/apfs_deflate.o" -lz -pthread
+	$TOOL_CFLAGS -o "$OUT" "$HERE/apfs-tool.c" "$SRC/apfs_lib.c" "$OBJ/apfs_deflate.o" $UNI -lz -pthread
 echo "build-tool.sh: $OUT (from $SRC)"
