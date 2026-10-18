@@ -83,6 +83,24 @@ struct apfs_mount {
 	uint64_t           am_lock_wait_ticks;
 	uint64_t           am_lock_held_ticks;
 	uint64_t           am_lock_t0;      /* when the holder took it; only the holder writes */
+	/* how long takes waited: up to 2 us, 10 us, 100 us, 1 ms, more; and the longest (the holder writes) */
+	uint64_t           am_lock_wait_hist[5];
+	uint64_t           am_lock_wait_max;
+	/*
+	 * The operations going on (taken apfs_lock, not yet apfs_unlock; apfs_lib may let go of
+	 * the lock in between), and the container's epoch each began at: retired cache memory
+	 * older than the oldest of them is freed (apfs_nx_reclaim). Under am_lock.
+	 */
+#define APFS_OPS_MAX 128
+	struct {
+		thread_t           th;
+		uint64_t           epoch;
+	}                  am_ops[APFS_OPS_MAX];
+	uint32_t           am_nops;
+	uint32_t           am_untracked;    /* operations the table had no room for: nothing is freed meanwhile */
+	/* how long it was held: up to 10 us, 100 us, 1 ms, 10 ms, more; and the longest */
+	uint64_t           am_lock_hold_hist[5];
+	uint64_t           am_lock_hold_max;
 	/*
 	 * vnop_read's buffers, kept for the next read rather than allocated and freed for
 	 * every one (at that size the kernel goes to the VM).  Under am_lock.
@@ -145,8 +163,10 @@ void apfs_node_detach(struct apfs_node *an);
 /* the breakdown of where the time went, straight to the log (apfs_vfsops.c) */
 void apfs_stats_print(void);
 
-void apfs_lock(struct apfs_mount *am);
-void apfs_unlock(struct apfs_mount *am);
+void apfs_lock(struct apfs_mount *am);           /* an operation begins */
+void apfs_unlock(struct apfs_mount *am);         /* and ends */
+void apfs_lock_inner(struct apfs_mount *am);     /* the lock taken back in the middle of one (apfs_lib) */
+void apfs_unlock_inner(struct apfs_mount *am);   /* let go of in the middle of one */
 
 /* apfs_vnops.c */
 extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;

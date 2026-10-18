@@ -207,6 +207,10 @@ sysctl_apfs_stats SYSCTL_HANDLER_ARGS
 		am->am_nx.inflate_in = am->am_nx.inflate_out = am->am_nx.inflate_fallbacks = 0;
 		am->am_nx.reads = am->am_nx.hits = 0;
 		am->am_lock_waits = am->am_lock_wait_ticks = am->am_lock_held_ticks = 0;
+		memset(am->am_lock_wait_hist, 0, sizeof(am->am_lock_wait_hist));
+		am->am_lock_wait_max = 0;
+		memset(am->am_lock_hold_hist, 0, sizeof(am->am_lock_hold_hist));
+		am->am_lock_hold_max = 0;
 		apfs_unlock(am);
 	}
 	return 0;
@@ -264,6 +268,22 @@ apfs_stats_print(void)
 	    (unsigned long long)am->am_lock_waits,
 	    (unsigned long long)apfs_ticks_ms(am->am_lock_wait_ticks),
 	    (unsigned long long)apfs_ticks_ms(am->am_lock_held_ticks));
+	{
+		uint64_t max_ns;
+
+		absolutetime_to_nanoseconds(am->am_lock_wait_max, &max_ns);
+		printf("apfs: lock    waits: %llu under 2 us, %llu to 10 us, %llu to 100 us, %llu to 1 ms, %llu longer; "
+		    "longest %llu us; metadata read from the device %llu ms\n",
+		    am->am_lock_wait_hist[0], am->am_lock_wait_hist[1], am->am_lock_wait_hist[2], am->am_lock_wait_hist[3],
+		    am->am_lock_wait_hist[4], max_ns / 1000, (unsigned long long)apfs_ticks_ms(nx->dev_ticks));
+		absolutetime_to_nanoseconds(am->am_lock_hold_max, &max_ns);
+		printf("apfs: lock    holds: %llu under 10 us, %llu to 100 us, %llu to 1 ms, %llu to 10 ms, %llu longer; "
+		    "longest %llu us\n", am->am_lock_hold_hist[0], am->am_lock_hold_hist[1], am->am_lock_hold_hist[2],
+		    am->am_lock_hold_hist[3], am->am_lock_hold_hist[4], max_ns / 1000);
+		printf("apfs: metadata read without the lock: %llu times, %llu of them already in by another's read; "
+		    "retired blocks %llu now, %llu at most; operations going on now %u\n", nx->unlocked_fills, nx->fill_races,
+		    nx->retired_now, nx->retired_most, am->am_nops);
+	}
 }
 
 SYSCTL_PROC(_kern, OID_AUTO, apfs_stats, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -292,19 +312,19 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	int error;
 
 	/* already have one? */
-	lck_mtx_lock(&am->am_lock);
+	apfs_lock(am);
 	for (an = am->am_hash[b]; an != NULL; an = an->an_next) {
 		if (an->an_id == obj_id && an->an_attached) {
 			vnode_t vp = an->an_vp;
 			uint32_t vid = vnode_vid(vp);
 
-			lck_mtx_unlock(&am->am_lock);
+			apfs_unlock(am);
 			if (vnode_getwithvid(vp, vid) == 0) {
 				*vpp = vp;
 				return 0;
 			}
 			/* it was going away under us: fall through and make a new one */
-			lck_mtx_lock(&am->am_lock);
+			apfs_lock(am);
 			break;
 		}
 	}
@@ -346,7 +366,7 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 			}
 		}
 	}
-	lck_mtx_unlock(&am->am_lock);
+	apfs_unlock(am);
 	if (error) {
 		return error;
 	}
@@ -396,11 +416,11 @@ apfs_node_vnode(struct apfs_mount *am, uint64_t obj_id, vnode_t dvp,
 	}
 	vnode_settag(an->an_vp, VT_OTHER);
 
-	lck_mtx_lock(&am->am_lock);
+	apfs_lock(am);
 	an->an_next = am->am_hash[b];
 	am->am_hash[b] = an;
 	an->an_attached = true;
-	lck_mtx_unlock(&am->am_lock);
+	apfs_unlock(am);
 
 	*vpp = an->an_vp;
 	return 0;
@@ -505,7 +525,7 @@ apfs_sysctl_synthetic SYSCTL_HANDLER_ARGS
 	}
 	dn = APFS_VP(dvp);
 	am = dn->an_mount;
-	lck_mtx_lock(&am->am_lock);
+	apfs_lock(am);
 	if (am->am_synth == NULL) {
 		am->am_synth = kalloc_data(APFS_SYNTH_MAX * sizeof(*am->am_synth), Z_WAITOK | Z_ZERO);
 	}
@@ -516,22 +536,27 @@ apfs_sysctl_synthetic SYSCTL_HANDLER_ARGS
 	} else if (am->am_nsynth >= APFS_SYNTH_MAX) {
 		error = ENOSPC;
 	} else {
-		struct apfs_synth *sy = &am->am_synth[am->am_nsynth];
+		uint32_t n0 = am->am_nsynth;
+		uint64_t id = (tvp != NULLVP) ? target_id : APFS_SYNTH_BASE + n0;
 		struct apfs_inode ino;
 
-		sy->parent = dn->an_id;
-		sy->alias = (tvp != NULLVP);
-		sy->id = sy->alias ? target_id : APFS_SYNTH_BASE + am->am_nsynth;
-		strlcpy(sy->name, name, sizeof(sy->name));
-		/* an id the volume does not use itself, or nothing */
-		if (!sy->alias && apfs_inode_get(&am->am_vol, sy->id, &ino) != ENOENT) {
+		/* an id the volume does not use itself, or nothing (reading the tree may let go of the lock) */
+		if (tvp == NULLVP && apfs_inode_get(&am->am_vol, id, &ino) != ENOENT) {
 			error = EEXIST;
+		} else if (am->am_nsynth != n0 || apfs_synth_find(am, dn->an_id, name, len) != NULL) {
+			error = EBUSY;          /* another was made meanwhile: try again */
 		} else {
+			struct apfs_synth *sy = &am->am_synth[am->am_nsynth];
+
+			sy->parent = dn->an_id;
+			sy->alias = (tvp != NULLVP);
+			sy->id = id;
+			strlcpy(sy->name, name, sizeof(sy->name));
 			am->am_nsynth++;
 			error = 0;
 		}
 	}
-	lck_mtx_unlock(&am->am_lock);
+	apfs_unlock(am);
 	/* the parent's entries changed: what the name cache has of it is stale */
 	cache_purge(dvp);
 	vnode_put(dvp);
@@ -554,7 +579,7 @@ apfs_node_detach(struct apfs_node *an)
 	uint32_t b = apfs_hash_index(an->an_id);
 	struct apfs_node **pp;
 
-	lck_mtx_lock(&am->am_lock);
+	apfs_lock(am);
 	for (pp = &am->am_hash[b]; *pp != NULL; pp = &(*pp)->an_next) {
 		if (*pp == an) {
 			*pp = an->an_next;
@@ -562,20 +587,20 @@ apfs_node_detach(struct apfs_node *an)
 		}
 	}
 	an->an_attached = false;
-	lck_mtx_unlock(&am->am_lock);
+	apfs_unlock(am);
 }
 
 /* apfs_lib lets go of the mount's lock round decompression, through these */
 static void
 apfs_lib_unlock(void *ctx)
 {
-	apfs_unlock((struct apfs_mount *)ctx);
+	apfs_unlock_inner((struct apfs_mount *)ctx);     /* the operation goes on */
 }
 
 static void
 apfs_lib_relock(void *ctx)
 {
-	apfs_lock((struct apfs_mount *)ctx);
+	apfs_lock_inner((struct apfs_mount *)ctx);
 }
 
 /* ------------------------------------------------------- threads for one request */
@@ -847,6 +872,8 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 		uint32_t i;
 		bool got = false;
 
+		/* with the lock, as every call into apfs_lib from now on (it may let go of it) */
+		apfs_lock(am);
 		for (i = 0; i < APFS_NX_MAX_FILE_SYSTEMS && !got; i++) {
 			struct apfs_inode ino;
 
@@ -860,6 +887,7 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 				got = true;
 			}
 		}
+		apfs_unlock(am);
 		if (!got) {
 			printf("apfs: no readable volume with a root directory\n");
 			kfree_type(struct apfs_devctx, dc);

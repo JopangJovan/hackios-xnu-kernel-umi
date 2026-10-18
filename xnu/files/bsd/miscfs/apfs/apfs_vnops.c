@@ -26,21 +26,97 @@
 /* How much is read out of a file at a time when copying into a uio. */
 
 void
-apfs_lock(struct apfs_mount *am)
+apfs_lock_inner(struct apfs_mount *am)
 {
-	uint64_t t0 = apfs_ticks();
+	static uint64_t limits[4];
+	uint64_t t0 = apfs_ticks(), waited;
+	unsigned k;
 
+	if (limits[3] == 0) {
+		nanoseconds_to_absolutetime(2000, &limits[0]);
+		nanoseconds_to_absolutetime(10000, &limits[1]);
+		nanoseconds_to_absolutetime(100000, &limits[2]);
+		nanoseconds_to_absolutetime(1000000, &limits[3]);
+	}
 	lck_mtx_lock(&am->am_lock);
-	OSAddAtomic64((int64_t)(apfs_ticks() - t0), (volatile int64_t *)&am->am_lock_wait_ticks);
-	OSAddAtomic64(1, (volatile int64_t *)&am->am_lock_waits);
+	waited = apfs_ticks() - t0;
+	/* (the holder's own: no atomics needed) */
+	am->am_lock_wait_ticks += waited;
+	am->am_lock_waits++;
+	for (k = 0; k < 4 && waited >= limits[k]; k++) {
+	}
+	am->am_lock_wait_hist[k]++;
+	if (waited > am->am_lock_wait_max) {
+		am->am_lock_wait_max = waited;
+	}
 	am->am_lock_t0 = apfs_ticks();
 }
 
 void
+apfs_unlock_inner(struct apfs_mount *am)
+{
+	static uint64_t limits[4];
+	uint64_t held = apfs_ticks() - am->am_lock_t0;
+	unsigned k;
+
+	if (limits[3] == 0) {
+		nanoseconds_to_absolutetime(10000, &limits[0]);
+		nanoseconds_to_absolutetime(100000, &limits[1]);
+		nanoseconds_to_absolutetime(1000000, &limits[2]);
+		nanoseconds_to_absolutetime(10000000, &limits[3]);
+	}
+	am->am_lock_held_ticks += held;
+	for (k = 0; k < 4 && held >= limits[k]; k++) {
+	}
+	am->am_lock_hold_hist[k]++;
+	if (held > am->am_lock_hold_max) {
+		am->am_lock_hold_max = held;
+	}
+	lck_mtx_unlock(&am->am_lock);
+}
+
+/* An operation begins: the lock, and the epoch it began at noted */
+void
+apfs_lock(struct apfs_mount *am)
+{
+	apfs_lock_inner(am);
+	if (am->am_nops < APFS_OPS_MAX) {
+		am->am_ops[am->am_nops].th = current_thread();
+		am->am_ops[am->am_nops].epoch = am->am_nx.epoch;
+		am->am_nops++;
+	} else {
+		am->am_untracked++;
+	}
+}
+
+/* An operation ends: what nobody still going can be reading is freed, and the lock let go of */
+void
 apfs_unlock(struct apfs_mount *am)
 {
-	am->am_lock_held_ticks += apfs_ticks() - am->am_lock_t0;
-	lck_mtx_unlock(&am->am_lock);
+	thread_t self = current_thread();
+	uint64_t oldest = am->am_nx.epoch;
+	uint32_t i;
+	bool found = false;
+
+	for (i = 0; i < am->am_nops; i++) {
+		if (!found && am->am_ops[i].th == self) {
+			am->am_ops[i] = am->am_ops[--am->am_nops];
+			found = true;
+			if (i == am->am_nops) {
+				break;
+			}
+		}
+		if (am->am_ops[i].epoch < oldest) {
+			oldest = am->am_ops[i].epoch;
+		}
+	}
+	if (!found && am->am_untracked > 0) {
+		am->am_untracked--;
+	}
+	if (am->am_untracked == 0 && am->am_nx.retired != NULL) {
+		apfs_nx_reclaim(&am->am_nx, oldest);
+	}
+	apfs_unlock_inner(am);
 }
 
 /* The inode record of the object a vnode stands for. */

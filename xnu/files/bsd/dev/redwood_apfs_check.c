@@ -190,6 +190,9 @@ struct census {
 	bool      no_contents;
 	/* apfs_walkers=N: one of N walkers; a subdirectory is left on the shared stack (par_push) */
 	bool      par;
+	/* where a walker's time goes (mach ticks): lookups, getattr, reading files and links
+	 * (hashing included), readdir, waiting for a directory to walk (par); on a processor */
+	uint64_t  t_lookup, t_attr, t_read, t_readdir, t_idle, t_cpu, t_wall;
 };
 
 /* The boot-args both kinds of walk take the same way. */
@@ -295,7 +298,12 @@ census_entry(struct census *cs, uint8_t d_type)
 	 * path leads from the ramfs that holds the mount point into the volume itself.
 	 */
 	PHASE("lookup");
-	error = vnode_lookup(cs->path, cs->lookup_flags, &vp, cs->ctx);
+	{
+		uint64_t t0 = mach_absolute_time();
+
+		error = vnode_lookup(cs->path, cs->lookup_flags, &vp, cs->ctx);
+		cs->t_lookup += mach_absolute_time() - t0;
+	}
 	if (error) {
 		printf("apfs-check: %s: lookup failed: %d\n", cs->path + cs->rel, error);
 		cs->errors++;
@@ -311,7 +319,12 @@ census_entry(struct census *cs, uint8_t d_type)
 	VATTR_WANTED(&va, va_gid);
 	VATTR_WANTED(&va, va_data_size);
 	PHASE("getattr");
-	error = vnode_getattr(vp, &va, cs->ctx);
+	{
+		uint64_t t0 = mach_absolute_time();
+
+		error = vnode_getattr(vp, &va, cs->ctx);
+		cs->t_attr += mach_absolute_time() - t0;
+	}
 	if (error) {
 		printf("apfs-check: %s: getattr failed: %d\n", cs->path + cs->rel, error);
 		cs->errors++;
@@ -325,13 +338,19 @@ census_entry(struct census *cs, uint8_t d_type)
 		cs->files++;
 		PHASE("read");
 		if (!cs->no_contents) {
+			uint64_t t0 = mach_absolute_time();
+
 			error = hash_file(cs, vp, size, &h);
+			cs->t_read += mach_absolute_time() - t0;
 		}
 	} else if (vnode_vtype(vp) == VLNK) {
 		cs->links++;
 		PHASE("readlink");
 		if (!cs->no_contents) {
+			uint64_t t0 = mach_absolute_time();
+
 			error = hash_link(cs, vp, &h);
+			cs->t_read += mach_absolute_time() - t0;
 		}
 	} else if (vnode_vtype(vp) == VDIR) {
 		cs->dirs++;
@@ -520,8 +539,13 @@ census_dir(struct census *cs)
 	off_t offset = 0;
 	int error;
 
-	error = vnode_lookup(cs->len != 0 ? cs->path : "/", cs->lookup_flags, &dvp,
-	    cs->ctx);
+	{
+		uint64_t t0 = mach_absolute_time();
+
+		error = vnode_lookup(cs->len != 0 ? cs->path : "/", cs->lookup_flags, &dvp,
+		    cs->ctx);
+		cs->t_lookup += mach_absolute_time() - t0;
+	}
 	if (error == 0 && cs->mp == NULL) {
 		cs->mp = vnode_mount(dvp);
 	}
@@ -552,7 +576,12 @@ census_dir(struct census *cs)
 		}
 		uio_addiov(uio, CAST_USER_ADDR_T(dbuf), DIR_CHUNK);
 		PHASE("readdir");
-		error = VNOP_READDIR(dvp, uio, 0, &eof, &items, cs->ctx);
+		{
+			uint64_t t0 = mach_absolute_time();
+
+			error = VNOP_READDIR(dvp, uio, 0, &eof, &items, cs->ctx);
+			cs->t_readdir += mach_absolute_time() - t0;
+		}
 		if (error) {
 			printf("apfs-check: %s: readdir failed: %d\n", cs->path + cs->rel, error);
 			cs->errors++;
@@ -651,16 +680,21 @@ static void
 par_walker(void *arg, __unused wait_result_t wr)
 {
 	struct census *cs = arg;
+	uint64_t cpu0 = thread_get_runtime_self(), wall0 = mach_absolute_time();
 
 	for (;;) {
 		struct par_dir d;
+		uint64_t t0 = mach_absolute_time();
 
 		lck_mtx_lock(&par_lock);
 		while (par_count == 0 && par_busy > 0) {
 			msleep(&par_stack, &par_lock, PRIBIO, "apfs-walkers", NULL);
 		}
+		cs->t_idle += mach_absolute_time() - t0;
 		if (par_count == 0) {
 			/* nothing left, and no walker that could leave more */
+			cs->t_cpu = thread_get_runtime_self() - cpu0;
+			cs->t_wall = mach_absolute_time() - wall0;
 			par_finished++;
 			wakeup(&par_stack);
 			lck_mtx_unlock(&par_lock);
@@ -683,6 +717,29 @@ par_walker(void *arg, __unused wait_result_t wr)
 		wakeup(&par_stack);
 		lck_mtx_unlock(&par_lock);
 	}
+}
+
+/* where a walker's (or, summed, all walkers') time went */
+static void
+census_times(const struct census *cs, int who)
+{
+	uint64_t v[8] = { cs->t_wall, cs->t_cpu, cs->t_lookup, cs->t_attr, cs->t_read, cs->hash_ticks, cs->t_readdir,
+		              cs->t_idle };
+
+	for (int i = 0; i < 8; i++) {
+		absolutetime_to_nanoseconds(v[i], &v[i]);
+		v[i] /= 1000000;
+	}
+	char name[24];
+
+	if (who < 0) {
+		strlcpy(name, "all walkers", sizeof(name));
+	} else {
+		snprintf(name, sizeof(name), "walker %d", who);
+	}
+	printf("apfs-check: %s: %llu entries, %llu bytes: %llu ms, on a processor %llu; lookups %llu, getattr %llu, "
+	    "reading %llu (of it hashing %llu), readdir %llu, waiting for a directory %llu\n",
+	    name, cs->entries, cs->bytes, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
 }
 
 /* The whole walk on n threads, its totals into cs */
@@ -743,7 +800,14 @@ par_walk(struct census *cs, uint32_t n)
 		cs->bytes += w[i]->bytes;
 		cs->errors += w[i]->errors;
 		cs->hash_ticks += w[i]->hash_ticks;
-		printf("apfs-check: walker %u: %llu entries, %llu bytes\n", i, w[i]->entries, w[i]->bytes);
+		census_times(w[i], i);
+		cs->t_lookup += w[i]->t_lookup;
+		cs->t_attr += w[i]->t_attr;
+		cs->t_read += w[i]->t_read;
+		cs->t_readdir += w[i]->t_readdir;
+		cs->t_idle += w[i]->t_idle;
+		cs->t_cpu += w[i]->t_cpu;
+		cs->t_wall += w[i]->t_wall;
 		kfree_data(w[i]->path, PATH_CAP);
 		kfree_data(w[i]->buf, READ_CHUNK);
 		kfree_type(struct census, w[i]);
@@ -752,6 +816,7 @@ par_walk(struct census *cs, uint32_t n)
 		printf("apfs-check: the walkers ran out of memory for their stack: the walk is NOT whole\n");
 		cs->errors++;
 	}
+	census_times(cs, -1);
 	printf("apfs-check: at most %u directories waited on the walkers' stack\n", par_most);
 	if (par_stack != NULL) {
 		kfree_data(par_stack, par_cap * sizeof(*par_stack));
@@ -1101,7 +1166,12 @@ walk:
 		if (mode == 6 && walkers > 1) {
 			par_walk(&cs, walkers > PAR_MAX ? PAR_MAX : walkers);
 		} else {
+			uint64_t cpu0 = thread_get_runtime_self(), wall0 = mach_absolute_time();
+
 			census_dir(&cs);
+			cs.t_cpu = thread_get_runtime_self() - cpu0;
+			cs.t_wall = mach_absolute_time() - wall0;
+			census_times(&cs, 0);
 		}
 	}
 	watch_stop();

@@ -140,6 +140,11 @@ host_parallel(void *ctx, uint32_t items, uint32_t workers,
 	return atomic_load(&hp.error);
 }
 
+static bool want_lock;                 /* the library under a lock, as in the kernel (walkers, cfrace) */
+static void host_locking(struct apfs_nx *nx);
+static void op_begin(void);
+static void op_end(void);
+
 static int
 open_image(const char *path, struct apfs_nx *nx, struct apfs_vol *vol)
 {
@@ -171,6 +176,14 @@ open_image(const char *path, struct apfs_nx *nx, struct apfs_vol *vol)
 			nx->parallel_max = (uint32_t)(t < 16 ? t : 16);
 		}
 	}
+	if (getenv("APFS_TOOL_WALKERS") != NULL && strtol(getenv("APFS_TOOL_WALKERS"), NULL, 0) > 1) {
+		want_lock = true;
+	}
+	if (want_lock) {
+		/* handed over now, as the kernel's mount does; from here on every call is with the lock */
+		host_locking(nx);
+		op_begin();
+	}
 	/* the first volume that has a root directory, like apfs.py picks it */
 	for (i = 0; i < APFS_NX_MAX_FILE_SYSTEMS; i++) {
 		struct apfs_inode ino;
@@ -182,8 +195,14 @@ open_image(const char *path, struct apfs_nx *nx, struct apfs_vol *vol)
 			continue;
 		}
 		if (apfs_inode_get(vol, APFS_ROOT_DIR_INO_NUM, &ino) == 0) {
+			if (want_lock) {
+				op_end();
+			}
 			return 0;
 		}
+	}
+	if (want_lock) {
+		op_end();
 	}
 	fprintf(stderr, "apfs-tool: no readable volume with a root directory\n");
 	return 1;
@@ -413,6 +432,93 @@ cmd_cat(const char *path, const char *where)
 	return 0;
 }
 
+/*
+ * ---- several threads on the library at once, as in the kernel ----
+ *
+ * The kernel holds one lock round apfs_lib for each operation and lets apfs_lib let go of it
+ * in the middle (reading file contents, and a block of metadata not in the cache); a block
+ * leaving the cache keeps its memory until no operation that began before can be reading it
+ * (apfs_nx_reclaim). The same here, with a pthread mutex, so that it can be run under
+ * ThreadSanitizer: op_begin/op_end are the kernel's apfs_lock/apfs_unlock.
+ */
+static pthread_mutex_t host_lock;      /* error checking: unlocking one not held aborts, as the kernel panics */
+static struct apfs_nx *host_nx;
+
+static void
+host_lock_check(int error, const char *what)
+{
+	if (error != 0) {
+		fprintf(stderr, "apfs-tool: %s the library's lock: %s\n", what, strerror(error));
+		abort();
+	}
+}
+#define HOST_OPS 64
+static struct {
+	pthread_t th;
+	uint64_t  epoch;
+	bool      used;
+} host_ops[HOST_OPS];
+
+static void
+host_unlock(void *ctx)
+{
+	(void)ctx;
+	host_lock_check(pthread_mutex_unlock(&host_lock), "letting go of");
+}
+
+static void
+host_relock(void *ctx)
+{
+	(void)ctx;
+	host_lock_check(pthread_mutex_lock(&host_lock), "taking");
+}
+
+static void
+op_begin(void)
+{
+	host_lock_check(pthread_mutex_lock(&host_lock), "taking");
+	for (int i = 0; i < HOST_OPS; i++) {
+		if (!host_ops[i].used) {
+			host_ops[i].used = true;
+			host_ops[i].th = pthread_self();
+			host_ops[i].epoch = host_nx->epoch;
+			return;
+		}
+	}
+	fprintf(stderr, "apfs-tool: more operations at once than %d\n", HOST_OPS);
+	abort();
+}
+
+static void
+op_end(void)
+{
+	uint64_t oldest = host_nx->epoch;
+
+	for (int i = 0; i < HOST_OPS; i++) {
+		if (host_ops[i].used && pthread_equal(host_ops[i].th, pthread_self())) {
+			host_ops[i].used = false;
+		} else if (host_ops[i].used && host_ops[i].epoch < oldest) {
+			oldest = host_ops[i].epoch;
+		}
+	}
+	apfs_nx_reclaim(host_nx, oldest);
+	host_lock_check(pthread_mutex_unlock(&host_lock), "letting go of");
+}
+
+static void
+host_locking(struct apfs_nx *nx)
+{
+	pthread_mutexattr_t a;
+
+	pthread_mutexattr_init(&a);
+	pthread_mutexattr_settype(&a, PTHREAD_MUTEX_ERRORCHECK);
+	pthread_mutex_init(&host_lock, &a);
+	host_nx = nx;
+	nx->unlock = host_unlock;
+	nx->relock = host_relock;
+	nx->lock_ctx = NULL;
+}
+
 /* ---- census: one line per entry, for diffing against apfs.py ---- */
 
 struct census {
@@ -429,6 +535,8 @@ struct census {
 };
 
 static int census_dir(struct census *cs, uint64_t dir_id);
+static int census_parallel(struct apfs_nx *nx, struct apfs_vol *vol, uint64_t start, const char *where,
+    size_t chunk, bool meta_only, int n);
 
 static uint64_t
 file_hash(struct census *cs, const struct apfs_inode *ino, uint64_t size)
@@ -537,9 +645,20 @@ cmd_census(const char *path, const char *where, bool meta_only)
 	if (open_image(path, &nx, &vol) != 0) {
 		return 1;
 	}
-	if (where != NULL && apfs_path_lookup(&vol, where, &start, &dt) != 0) {
-		fprintf(stderr, "apfs-tool: %s: not found\n", where);
-		return 1;
+	if (where != NULL) {
+		int e;
+
+		if (want_lock) {
+			op_begin();
+		}
+		e = apfs_path_lookup(&vol, where, &start, &dt);
+		if (want_lock) {
+			op_end();
+		}
+		if (e != 0) {
+			fprintf(stderr, "apfs-tool: %s: not found\n", where);
+			return 1;
+		}
 	}
 	memset(&cs, 0, sizeof(cs));
 	cs.vol = &vol;
@@ -577,6 +696,11 @@ cmd_census(const char *path, const char *where, bool meta_only)
 		cs.path_len = n;
 		cs.path[n] = '\0';
 	}
+	if (getenv("APFS_TOOL_WALKERS") != NULL && strtol(getenv("APFS_TOOL_WALKERS"), NULL, 0) > 1) {
+		long n = strtol(getenv("APFS_TOOL_WALKERS"), NULL, 0);
+
+		return census_parallel(&nx, &vol, start, where, cs.chunk, meta_only, (int)(n > 16 ? 16 : n));
+	}
 	error = census_dir(&cs, start);
 	if (error && error != EEXIST) {
 		fprintf(stderr, "apfs-tool: census: %s\n", strerror(error));
@@ -600,6 +724,361 @@ cmd_census(const char *path, const char *where, bool meta_only)
 	free(cs.buf);
 	apfs_nx_close(&nx);
 	return cs.error ? 1 : 0;
+}
+
+/*
+ * APFS_TOOL_WALKERS=N with census: N threads walk at once, taking directories off one shared
+ * stack, each line hashed and the hashes added up (order does not matter): the same sum the
+ * kernel's apfs_check prints. Lines are not printed.
+ */
+struct pjob {
+	uint64_t dir_id;
+	char    *path;
+};
+
+static pthread_mutex_t pmtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pcond = PTHREAD_COND_INITIALIZER;
+static struct pjob *pstack;
+static size_t pcount, pcap;
+static int pbusy;
+
+struct pwalker {
+	struct apfs_vol *vol;
+	const char      *dir;           /* the directory being walked */
+	uint8_t         *buf;
+	size_t           chunk;
+	bool             meta_only;
+	uint64_t         sum, entries, bytes;
+	int              error;
+};
+
+static void
+ppush(uint64_t dir_id, const char *path)
+{
+	pthread_mutex_lock(&pmtx);
+	if (pcount == pcap) {
+		pcap = pcap ? 2 * pcap : 1024;
+		pstack = realloc(pstack, pcap * sizeof(*pstack));
+		if (pstack == NULL) {
+			abort();
+		}
+	}
+	pstack[pcount].dir_id = dir_id;
+	pstack[pcount].path = strdup(path);
+	pcount++;
+	pthread_cond_signal(&pcond);
+	pthread_mutex_unlock(&pmtx);
+}
+
+static uint64_t
+pfile_hash(struct pwalker *w, const struct apfs_inode *ino, uint64_t size, const char *path)
+{
+	uint64_t h = FNV_INIT, off = 0;
+	struct apfs_cfile cf;
+
+	memset(&cf, 0, sizeof(cf));
+	cf.held = APFS_NO_PIECE;
+	for (;;) {
+		size_t got = 0;
+		int error = apfs_read_file(w->vol, ino, &cf, off, w->buf, w->chunk, &got);
+
+		if (error) {
+			fprintf(stderr, "apfs-tool: %s: read at %" PRIu64 ": %s\n", path, off, strerror(error));
+			w->error = error;
+			break;
+		}
+		if (got == 0) {
+			break;
+		}
+		h = fnv1a(w->buf, got, h);
+		off += got;
+		w->bytes += got;
+		if (off >= size) {
+			break;
+		}
+	}
+	apfs_cfile_fini(&cf);
+	return h;
+}
+
+static int
+pcensus_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_t d_type)
+{
+	struct pwalker *w = ctx;
+	struct apfs_inode ino;
+	uint64_t h = 0, size = 0;
+	char path[4096], line[4096 + 128];
+	int n;
+
+	n = snprintf(path, sizeof(path), "%s/%.*s", w->dir, (int)name_len, name);
+	if (n < 0 || (size_t)n >= sizeof(path)) {
+		w->error = ENAMETOOLONG;
+		return 0;
+	}
+	if (apfs_inode_get(w->vol, file_id, &ino) != 0) {
+		fprintf(stderr, "apfs-tool: %s: no inode\n", path);
+		w->error = ENOENT;
+		return 0;
+	}
+	if (apfs_inode_size(w->vol, &ino, &size) != 0) {
+		size = ino.size;
+	}
+	if (!w->meta_only && ((ino.mode & APFS_S_IFMT) == APFS_S_IFREG || (ino.mode & APFS_S_IFMT) == APFS_S_IFLNK)) {
+		h = pfile_hash(w, &ino, size, path);
+	}
+	n = snprintf(line, sizeof(line), "%s\t%u\t%06o\t%u\t%u\t%" PRIu64 "\t%016" PRIx64 "\n", path, d_type,
+	    ino.mode, ino.owner, ino.group, size, h);
+	w->sum += fnv1a((const uint8_t *)line, (size_t)n, FNV_INIT);
+	w->entries++;
+	if (d_type == APFS_DT_DIR) {
+		ppush(file_id, path);
+	}
+	return 0;
+}
+
+static void *
+pwalker_thread(void *p)
+{
+	struct pwalker *w = p;
+
+	for (;;) {
+		struct pjob j;
+		int error;
+
+		pthread_mutex_lock(&pmtx);
+		while (pcount == 0 && pbusy > 0) {
+			pthread_cond_wait(&pcond, &pmtx);
+		}
+		if (pcount == 0) {
+			pthread_cond_broadcast(&pcond);
+			pthread_mutex_unlock(&pmtx);
+			return NULL;
+		}
+		j = pstack[--pcount];
+		pbusy++;
+		pthread_mutex_unlock(&pmtx);
+
+		w->dir = j.path;
+		op_begin();
+		error = apfs_readdir(w->vol, j.dir_id, pcensus_cb, w);
+		op_end();
+		if (error) {
+			fprintf(stderr, "apfs-tool: %s: readdir: %s\n", j.path, strerror(error));
+			w->error = error;
+		}
+		free(j.path);
+
+		pthread_mutex_lock(&pmtx);
+		pbusy--;
+		pthread_cond_broadcast(&pcond);
+		pthread_mutex_unlock(&pmtx);
+	}
+}
+
+static int
+census_parallel(struct apfs_nx *nx, struct apfs_vol *vol, uint64_t start, const char *where, size_t chunk,
+    bool meta_only, int n)
+{
+	struct pwalker w[16];
+	pthread_t th[16];
+	uint64_t sum = 0, entries = 0, bytes = 0;
+	int error = 0;
+
+	ppush(start, where != NULL ? where : "");
+	for (int i = 0; i < n; i++) {
+		memset(&w[i], 0, sizeof(w[i]));
+		w[i].vol = vol;
+		w[i].chunk = chunk;
+		w[i].meta_only = meta_only;
+		w[i].buf = malloc(chunk);
+		if (w[i].buf == NULL || pthread_create(&th[i], NULL, pwalker_thread, &w[i]) != 0) {
+			abort();
+		}
+	}
+	for (int i = 0; i < n; i++) {
+		pthread_join(th[i], NULL);
+		sum += w[i].sum;
+		entries += w[i].entries;
+		bytes += w[i].bytes;
+		if (w[i].error) {
+			error = w[i].error;
+		}
+		free(w[i].buf);
+	}
+	fprintf(stderr, "apfs-tool: %d walkers: %" PRIu64 " entries, %" PRIu64 " content bytes, line-hash sum %016" PRIx64
+	    ", %s\n", n, entries, bytes, sum, error ? "ERRORS" : "no errors");
+	fprintf(stderr, "apfs-tool: metadata read without the lock %" PRIu64 " times, %" PRIu64 " of them already in; "
+	    "retired blocks %" PRIu64 " now, %" PRIu64 " at most\n", nx->unlocked_fills, nx->fill_races, nx->retired_now,
+	    nx->retired_most);
+	free(pstack);
+	{
+		int fd = (int)(intptr_t)nx->dev.ctx;
+
+		apfs_nx_close(nx);
+		close(fd);
+	}
+	return error ? 1 : 0;
+}
+
+/*
+ * cfrace IMAGE N ROUNDS: the compressed files of the volume (up to 400, taken from a walk),
+ * each read whole by N threads at once through one shared apfs_cfile -- as two readers of one
+ * vnode share it in the kernel -- with the cache emptied before every round, so that setting
+ * up the file and its read-ahead let go of the lock in the middle; every read must hash the
+ * same as a read on one thread.
+ */
+struct cf_file {
+	uint64_t           id;
+	struct apfs_inode  ino;
+	uint64_t           size;
+	uint64_t           want;        /* the hash on one thread */
+	struct apfs_cfile  cf;          /* shared by the threads, touched with the lock held */
+};
+
+static struct cf_file *cf_files;
+static size_t cf_nfiles;
+static struct apfs_vol *cf_vol;
+static atomic_uint cf_bad, cf_reads;
+
+static int
+cf_collect_cb(void *ctx, const char *name, size_t name_len, uint64_t file_id, uint8_t d_type)
+{
+	struct apfs_inode ino;
+	struct apfs_cfile cf;
+	uint64_t size;
+
+	(void)ctx;
+	(void)name;
+	(void)name_len;
+	if (cf_nfiles >= 400) {
+		return EEXIST;
+	}
+	if (d_type == APFS_DT_DIR) {
+		return apfs_readdir(cf_vol, file_id, cf_collect_cb, NULL) == EEXIST ? EEXIST : 0;
+	}
+	if (d_type != APFS_DT_REG || apfs_inode_get(cf_vol, file_id, &ino) != 0 ||
+	    apfs_inode_size(cf_vol, &ino, &size) != 0 || size < 3 * 65536) {
+		return 0;
+	}
+	memset(&cf, 0, sizeof(cf));
+	cf.held = APFS_NO_PIECE;
+	if (apfs_cfile_init(cf_vol, &ino, &cf) == 0 && cf.compressed && cf.in_rsrc) {
+		cf_files[cf_nfiles].id = file_id;
+		cf_files[cf_nfiles].ino = ino;
+		cf_files[cf_nfiles].size = size;
+		cf_nfiles++;
+	}
+	apfs_cfile_fini(&cf);
+	return 0;
+}
+
+static uint64_t
+cf_read_whole(struct cf_file *f, struct apfs_cfile *cf, uint8_t *buf, size_t chunk, bool locked)
+{
+	uint64_t h = FNV_INIT, off = 0;
+
+	while (off < f->size) {
+		size_t got = 0;
+		int error;
+
+		if (locked) {
+			op_begin();
+		}
+		error = apfs_read_file(cf_vol, &f->ino, cf, off, buf, chunk, &got);
+		if (locked) {
+			op_end();
+		}
+		if (error || got == 0) {
+			return 0;
+		}
+		h = fnv1a(buf, got, h);
+		off += got;
+	}
+	return h;
+}
+
+static void *
+cf_thread(void *p)
+{
+	uint8_t *buf = malloc(65536);
+
+	(void)p;
+	for (size_t i = 0; i < cf_nfiles; i++) {
+		uint64_t h = cf_read_whole(&cf_files[i], &cf_files[i].cf, buf, 65536, true);
+
+		atomic_fetch_add(&cf_reads, 1);
+		if (h != cf_files[i].want) {
+			atomic_fetch_add(&cf_bad, 1);
+			fprintf(stderr, "apfs-tool: cfrace: inode %" PRIu64 " read DIFFERENTLY\n", cf_files[i].id);
+		}
+	}
+	free(buf);
+	return NULL;
+}
+
+static int
+cmd_cfrace(const char *path, int n, int rounds)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	pthread_t th[16];
+	uint8_t *buf = malloc(65536);
+
+	want_lock = true;
+	if (open_image(path, &nx, &vol) != 0 || buf == NULL || n < 2 || n > 16) {
+		return 1;
+	}
+	cf_vol = &vol;
+	cf_files = calloc(400, sizeof(*cf_files));
+	op_begin();
+	(void)apfs_readdir(&vol, APFS_ROOT_DIR_INO_NUM, cf_collect_cb, NULL);
+	op_end();
+	for (size_t i = 0; i < cf_nfiles; i++) {
+		struct apfs_cfile cf;
+
+		memset(&cf, 0, sizeof(cf));
+		cf.held = APFS_NO_PIECE;
+		cf_files[i].want = cf_read_whole(&cf_files[i], &cf, buf, 65536, true);
+		op_begin();
+		apfs_cfile_fini(&cf);
+		op_end();
+	}
+	fprintf(stderr, "apfs-tool: cfrace: %zu compressed files of 192 KB or more, %d threads, %d rounds\n", cf_nfiles,
+	    n, rounds);
+	if (nx.parallel == NULL) {
+		nx.parallel = host_parallel;    /* read-ahead needs helpers to spare */
+		nx.parallel_max = 4;
+	}
+	for (int r = 0; r < rounds; r++) {
+		pthread_mutex_lock(&host_lock);
+		for (size_t i = 0; i < cf_nfiles; i++) {
+			apfs_cfile_fini(&cf_files[i].cf);
+		}
+		apfs_nx_cache_flush(&nx);
+		pthread_mutex_unlock(&host_lock);
+		for (int t = 0; t < n; t++) {
+			pthread_create(&th[t], NULL, cf_thread, NULL);
+		}
+		for (int t = 0; t < n; t++) {
+			pthread_join(th[t], NULL);
+		}
+	}
+	fprintf(stderr, "apfs-tool: cfrace: %u reads, %u different; metadata read without the lock %" PRIu64
+	    " times, %" PRIu64 " of them already in; read ahead %" PRIu64 " times\n", atomic_load(&cf_reads),
+	    atomic_load(&cf_bad), nx.unlocked_fills, nx.fill_races, nx.ra_batches);
+	/* all given back, so that a leak checker sees only what the library lost */
+	for (size_t i = 0; i < cf_nfiles; i++) {
+		apfs_cfile_fini(&cf_files[i].cf);
+	}
+	free(cf_files);
+	free(buf);
+	{
+		int fd = (int)(intptr_t)nx.dev.ctx;
+
+		apfs_nx_close(&nx);
+		close(fd);
+	}
+	return atomic_load(&cf_bad) != 0;
 }
 
 /*
@@ -768,7 +1247,8 @@ main(int argc, char **argv)
 		    "       apfs-tool stat   IMAGE PATH\n"
 		    "       apfs-tool cat    IMAGE PATH\n"
 		    "       apfs-tool census IMAGE [PATH] [--meta]\n"
-		    "       apfs-tool lookups IMAGE\n");
+		    "       apfs-tool lookups IMAGE\n"
+		    "       apfs-tool cfrace IMAGE [THREADS [ROUNDS]]\n");
 		return 2;
 	}
 	if (strcmp(argv[1], "info") == 0) {
@@ -789,6 +1269,9 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[1], "lookups") == 0) {
 		return cmd_lookups(argv[2]);
+	}
+	if (strcmp(argv[1], "cfrace") == 0) {
+		return cmd_cfrace(argv[2], argc > 3 ? atoi(argv[3]) : 4, argc > 4 ? atoi(argv[4]) : 3);
 	}
 	fprintf(stderr, "apfs-tool: unknown command %s\n", argv[1]);
 	return 2;

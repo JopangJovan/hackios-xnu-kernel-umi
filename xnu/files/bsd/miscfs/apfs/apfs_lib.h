@@ -102,6 +102,13 @@ struct apfs_dev {
 	int     (*read_data)(void *ctx, uint64_t off, void *buf, size_t len);
 };
 
+/* A cached block's memory, given up while somebody may still be reading it (nx->retired) */
+struct apfs_retired {
+	struct apfs_retired *next;
+	uint64_t             epoch;
+	uint8_t             *data;
+};
+
 /* One cached block of metadata. */
 struct apfs_buf {
 	uint64_t  addr;                 /* block address, APFS_BUF_EMPTY if unused */
@@ -190,6 +197,18 @@ struct apfs_nx {
 	uint32_t          hand;
 	uint32_t          fetches;      /* blocks read into the cache, ever (wraps) */
 	uint8_t          *cluster;      /* APFS_META_CLUSTER blocks, made at the first miss */
+	/*
+	 * With a caller's lock (unlock/relock set), a block of metadata missing from the cache is
+	 * read with the lock let go of -- other threads go on meanwhile -- into memory of its own,
+	 * and put in afterwards (unless somebody else put it in first). So that nobody ever reads
+	 * a cached block's memory while it is given to another block, a block that leaves the
+	 * cache leaves its memory behind on `retired`, tagged with `epoch`, and the cache slot
+	 * gets new memory; the caller frees what no operation still running can be looking at
+	 * (apfs_nx_reclaim, with the oldest epoch any of its operations began at).
+	 */
+	uint64_t          epoch;
+	struct apfs_retired *retired;   /* newest first */
+	uint64_t          retired_now, retired_most, unlocked_fills, fill_races;
 	uint32_t          meta_cluster; /* blocks a metadata read brings in, 1..APFS_META_CLUSTER (0: the default) */
 	/*
 	 * A request to the device costs next to nothing (a disk in memory): no reading pieces
@@ -401,6 +420,12 @@ struct apfs_cfile {
 
 int apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev);
 void apfs_nx_close(struct apfs_nx *nx);
+/* Free the retired blocks' memory no operation that began at `oldest` or later can see (lock held) */
+void apfs_nx_reclaim(struct apfs_nx *nx, uint64_t oldest);
+#ifndef KERNEL
+/* For tests on the build machine: every cached block out (retired, with a caller's lock), so all is read again */
+void apfs_nx_cache_flush(struct apfs_nx *nx);
+#endif
 int apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol);
 
 /* ---- records ---- */

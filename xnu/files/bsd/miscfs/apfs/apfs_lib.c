@@ -116,6 +116,67 @@ cache_bucket(uint64_t addr)
 	return (uint32_t)((addr * 0x9E3779B97F4A7C15ULL) >> 40) & (APFS_CACHE_HASH - 1);
 }
 
+/* A cached block's memory leaves the cache; it is freed by apfs_nx_reclaim once nobody can be reading it. */
+static void
+cache_retire(struct apfs_nx *nx, uint8_t *data)
+{
+	struct apfs_retired *r = apfs_alloc(sizeof(*r));
+
+	if (r == NULL) {
+		return;                 /* never freed then: that is safe, merely a block lost */
+	}
+	r->data = data;
+	r->epoch = nx->epoch++;
+	r->next = nx->retired;
+	nx->retired = r;
+	if (++nx->retired_now > nx->retired_most) {
+		nx->retired_most = nx->retired_now;
+	}
+}
+
+void
+apfs_nx_reclaim(struct apfs_nx *nx, uint64_t oldest)
+{
+	struct apfs_retired **pp = &nx->retired, *r;
+
+	/* newest first: past the first one old enough, all are */
+	while (*pp != NULL && (*pp)->epoch >= oldest) {
+		pp = &(*pp)->next;
+	}
+	while ((r = *pp) != NULL) {
+		*pp = r->next;
+		apfs_free(r->data, nx->block_size);
+		apfs_free(r, sizeof(*r));
+		nx->retired_now--;
+	}
+}
+
+#ifndef KERNEL
+void
+apfs_nx_cache_flush(struct apfs_nx *nx)
+{
+	uint32_t i;
+
+	for (i = 0; i < APFS_CACHE_BLOCKS; i++) {
+		struct apfs_buf *b = &nx->cache[i];
+
+		if (b->data != NULL && nx->unlock != NULL) {
+			cache_retire(nx, b->data);
+			b->data = NULL;
+		}
+		b->addr = APFS_BUF_EMPTY;
+		b->next = -1;
+		b->ref = false;
+	}
+	for (i = 0; i < APFS_CACHE_HASH; i++) {
+		nx->cache_hash[i] = -1;
+	}
+	if (nx->omap_cache != NULL) {
+		memset(nx->omap_cache, 0, APFS_OMAP_CACHE * sizeof(*nx->omap_cache));
+	}
+}
+#endif
+
 /* A free slot, or the first the clock hand finds neither used since it last passed nor recent. */
 static struct apfs_buf *
 cache_victim(struct apfs_nx *nx)
@@ -150,6 +211,16 @@ cache_victim(struct apfs_nx *nx)
 			victim = &nx->cache[best];
 			break;
 		}
+	}
+	if (nx->unlock != NULL && victim->data != NULL && victim->addr != APFS_BUF_EMPTY) {
+		/* somebody may still be reading the block that had it: new memory for the new one */
+		uint8_t *fresh = apfs_alloc(nx->block_size);
+
+		if (fresh == NULL) {
+			return NULL;
+		}
+		cache_retire(nx, victim->data);
+		victim->data = fresh;
 	}
 	if (victim->addr != APFS_BUF_EMPTY) {
 		/* out of its old chain */
@@ -189,6 +260,96 @@ cache_find(struct apfs_nx *nx, uint64_t addr)
 	return NULL;
 }
 
+static inline void nx_unlock(struct apfs_nx *nx);
+static inline void nx_relock(struct apfs_nx *nx);
+
+/*
+ * A block of metadata not in the cache, read without the lock: the block and its aligned
+ * neighbours into memory of this call's own, the lock taken back, and put in -- unless
+ * somebody put the block in meanwhile, whose copy is used then (and only the neighbours not
+ * there yet go in). Cache slots that get a block get new memory (cache_victim), so nothing
+ * anyone still reads is overwritten.
+ */
+static int
+nx_block_unlocked(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
+{
+	uint32_t bs = nx->block_size;
+	uint32_t k = nx->meta_cluster != 0 ?
+	    (nx->meta_cluster > APFS_META_CLUSTER ? APFS_META_CLUSTER : nx->meta_cluster) : APFS_META_CLUSTER_DEFAULT;
+	uint64_t first = addr - addr % k, count = nx->block_count - first < k ? nx->block_count - first : k, i, t0, dt;
+	struct apfs_buf *b;
+	uint8_t *mine = apfs_alloc((size_t)count * bs);
+	int error;
+
+	if (mine == NULL) {
+		return ENOMEM;
+	}
+	nx->unlocked_fills++;
+	nx_unlock(nx);
+	t0 = apfs_ticks();
+	error = nx->dev.read_data(nx->dev.ctx, first * (uint64_t)bs, mine, (size_t)count * bs);
+	dt = apfs_ticks() - t0;
+	nx_relock(nx);
+	nx->dev_ticks += dt;
+	nx->dev_calls++;
+	nx->dev_bytes += count * bs;
+	if (error) {
+		apfs_free(mine, (size_t)count * bs);
+		return error;
+	}
+	nx->fetches++;
+	b = cache_find(nx, addr);
+	if (b != NULL) {
+		nx->fill_races++;               /* in already, by somebody else's read */
+		if (verify && !b->checked) {
+			if (!apfs_checksum_ok(b->data, bs)) {
+				apfs_log("block %llu: bad checksum\n", (unsigned long long)addr);
+				apfs_free(mine, (size_t)count * bs);
+				return EIO;
+			}
+			b->checked = true;
+		}
+	} else {
+		b = cache_victim(nx);
+		if (b == NULL) {
+			apfs_free(mine, (size_t)count * bs);
+			return ENOMEM;
+		}
+		memcpy(b->data, mine + (addr - first) * bs, bs);
+		nx->reads++;
+		if (verify && !apfs_checksum_ok(b->data, bs)) {
+			apfs_log("block %llu: bad checksum\n", (unsigned long long)addr);
+			apfs_free(mine, (size_t)count * bs);
+			return EIO;             /* (the slot stays empty: cache_victim took it out of its chain) */
+		}
+		b->checked = verify;
+		cache_link(nx, b, addr);
+	}
+	b->ref = true;
+	b->used = nx->fetches;
+	/* the neighbours not there yet: kept as if long unused, checked when asked for */
+	for (i = first; i < first + count; i++) {
+		struct apfs_buf *nb;
+
+		if (i == addr || i == 0 || cache_find(nx, i) != NULL) {
+			continue;
+		}
+		nb = cache_victim(nx);
+		if (nb == NULL) {
+			break;
+		}
+		memcpy(nb->data, mine + (i - first) * bs, bs);
+		nb->checked = false;
+		nb->ref = false;
+		nb->used = nx->fetches - APFS_CACHE_RECENT;
+		cache_link(nx, nb, i);
+		nx->prefetched++;
+	}
+	apfs_free(mine, (size_t)count * bs);
+	*out = b->data;
+	return 0;
+}
+
 static int
 nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 {
@@ -220,6 +381,9 @@ nx_block(struct apfs_nx *nx, uint64_t addr, const uint8_t **out, bool verify)
 		nx->hits++;
 		*out = b->data;
 		return 0;
+	}
+	if (nx->unlock != NULL && nx->dev.read_data != NULL && !nx->cheap_requests) {
+		return nx_block_unlocked(nx, addr, out, verify);
 	}
 	victim = cache_victim(nx);
 	if (victim == NULL) {
@@ -872,6 +1036,7 @@ apfs_nx_close(struct apfs_nx *nx)
 		apfs_free(nx->cluster, (size_t)APFS_META_CLUSTER * nx->block_size);
 		nx->cluster = NULL;
 	}
+	apfs_nx_reclaim(nx, ~0ULL);
 }
 
 int
@@ -2169,16 +2334,43 @@ out:
 	return error;
 }
 
+static int cfile_setup(struct apfs_vol *vol, const struct apfs_inode *ino, struct apfs_cfile *cf);
+
+/*
+ * Worked out into a copy of its own and only then put in place: working it out reads the
+ * tree, and a read can let go of the lock (nx_block_unlocked), so another reader of the same
+ * file may be doing the same meanwhile -- whoever finishes second throws its copy away.
+ */
 int
 apfs_cfile_init(struct apfs_vol *vol, const struct apfs_inode *ino,
     struct apfs_cfile *cf)
 {
+	struct apfs_cfile mine;
 	int error;
 
 	if (cf->ready && cf->obj_id == ino->obj_id) {
 		return 0;               /* already worked out, with its table and piece */
 	}
+	memset(&mine, 0, sizeof(mine));
+	mine.held = APFS_NO_PIECE;
+	error = cfile_setup(vol, ino, &mine);
+	if (error) {
+		return error;           /* (cfile_setup gave back what it had) */
+	}
+	if (cf->ready && cf->obj_id == ino->obj_id) {
+		apfs_cfile_fini(&mine);
+		return 0;
+	}
 	apfs_cfile_fini(cf);
+	*cf = mine;
+	return 0;
+}
+
+static int
+cfile_setup(struct apfs_vol *vol, const struct apfs_inode *ino, struct apfs_cfile *cf)
+{
+	int error;
+
 	cf->obj_id = ino->obj_id;
 	cf->held = APFS_NO_PIECE;
 
@@ -3000,6 +3192,11 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 				    vol->nx->requests : 1) >= 2) {
 					uint64_t k;
 
+					/*
+					 * Claimed before the pieces are planned: planning reads the tree,
+					 * which can let go of the lock, and nobody else may fill ra_data.
+					 */
+					cf->ra_filling = true;
 					if (cf->ra_data == NULL) {
 						cf->ra_data = apfs_alloc((size_t)APFS_RA_PIECES *
 						    APFS_DECMPFS_BLOCK_SIZE);
@@ -3037,8 +3234,9 @@ read_cfile_rsrc(struct apfs_vol *vol, const struct apfs_inode *ino,
 						nra++;
 					}
 					if (nra > 0) {
-						cf->ra_filling = true;
 						cf->ra_first = i + 1;
+					} else {
+						cf->ra_filling = false;
 					}
 				}
 				continue;
