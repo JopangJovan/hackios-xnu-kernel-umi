@@ -322,6 +322,11 @@ compose_logs(const char *klog, uint64_t klog_len)
 	staged_len = n;
 }
 
+static int hc_list_is_uefis(void);
+static int hc_log_skips;                /* logs not written this run (said twice at most) */
+static void hc_print_state(const char *when);
+static void hc_take_back(const char *when);
+
 static void
 write_logs(const char *klog, uint64_t klog_len)
 {
@@ -341,8 +346,19 @@ write_logs(const char *klog, uint64_t klog_len)
 	}
 	uint64_t bs = bio->media->block_size;
 	uint64_t len = (staged_len + 1 + bs - 1) / bs * bs;
-	efi_status ws = bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf), rs = 0;
+	efi_status ws, rs = 0;
 	int same = 0;
+
+	/* only through UEFI's own transfer list (see hc_take_back) */
+	if (!hc_list_is_uefis()) {
+		if (hc_log_skips++ < 2) {
+			hc_print_state("log not written");
+			print("log: NOT WRITTEN to logdump: UEFI's transfer list is not the one in the controller\n");
+		}
+		compose_logs(klog, klog_len);
+		return;
+	}
+	ws = bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf);
 
 	if (!EFI_ERROR(ws)) {
 		bio->flush_blocks(bio);
@@ -540,6 +556,7 @@ static const struct platform platform_redwood = {
 static void
 reboot(void)
 {
+	hc_take_back("before the reset");
 	flush_log();
 	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 	for (;;) {
@@ -1441,7 +1458,7 @@ ufs_survey(void)
  * back over the data.
  */
 #define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
-#define BLOCK_VERSION      2
+#define BLOCK_VERSION      3
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
@@ -1483,6 +1500,26 @@ struct loader_block {
 		uint64_t served, failed, bytes, ticks;
 	} answer __attribute__((aligned(128)));
 	struct loader_block_part part[BLOCK_MAX_PARTS] __attribute__((aligned(128)));
+	/*
+	 * Written by the loader before the kernel starts, with ufs_native= on the command line: where
+	 * the kernel may put a transfer request list of its own into the UFS host controller for the
+	 * run (hc_area, below), and UEFI's, which the loader puts back. hc_pa 0: it may not.
+	 */
+	struct {
+		uint64_t hc_pa;                /* the controller's registers */
+		uint64_t area_pa;              /* the list (1 KB, at the start) and command descriptors */
+		uint32_t area_size, ucd_offset, ucd_size, slots;
+		uint32_t uefi_utrlba, uefi_utrlbau;
+	} native __attribute__((aligned(128)));
+	/* written by the loader during a run: it takes the controller back (a hung kernel); send nothing more */
+	struct {
+		volatile uint32_t take_back;
+	} loader_native __attribute__((aligned(128)));
+	/* written by the kernel: its list is in the controller (for the loader's log) */
+	struct {
+		volatile uint32_t list_in;
+		uint32_t switched_in, switched_out, reserved;
+	} kernel_native __attribute__((aligned(128)));
 };
 
 /* (8 KB is as far as this target aligns; the kernel maps whole 16 KB pages around both) */
@@ -1537,6 +1574,174 @@ device_path_print(uint64_t unit, const efi_device_path *dp)
 	}
 	print(lun == 0xff ? "\n" : " (LUN %d)\n", (uint64_t)lun);
 	return lun;
+}
+
+/*
+ * The UFS host controller, for the kernel's own driver (ufs_native= on the command line; without it
+ * this loader never touches the controller's registers). The kernel may, for the length of a run,
+ * stop the controller's transfer request list, point it at a list of its own in hc_area (memory of
+ * this loader, so that putting UEFI's back never depends on the kernel's memory), and start it
+ * again; UEFI's list is one slot and its command descriptor, with no room for another request.
+ * This loader keeps UEFI's list address (UTRLBA/UTRLBAU) from before the first run and checks it,
+ * and puts it back if need be, on every way back from a run (hc_take_back) before anything here
+ * touches the storage; it reads for the kernel (block_poll) and writes the log (write_logs) only
+ * while UEFI's list is the one in the controller.
+ */
+#define HC_PA              0x1d84000ULL        /* ufshc@1d84000, "ufs_mem", in this phone's Android device tree */
+#define HC_CAP             0x00
+#define HC_VER             0x08
+#define HC_IS              0x20
+#define HC_IE              0x24
+#define HC_HCS             0x30
+#define HC_HCE             0x34
+#define HC_UTRLBA          0x50
+#define HC_UTRLBAU         0x54
+#define HC_UTRLDBR         0x58
+#define HC_UTRLCLR         0x5c
+#define HC_UTRLRSR         0x60
+#define HC_UTRLCNR         0x64
+#define HC_UTMRLDBR        0x78
+#define HC_SLOTS           32
+#define HC_UCD_OFFSET      0x1000
+#define HC_UCD_SIZE        0x800
+#define HC_AREA_SIZE       (HC_UCD_OFFSET + HC_SLOTS * HC_UCD_SIZE)
+
+static uint8_t hc_area[HC_AREA_SIZE] __attribute__((aligned(0x2000)));
+static int hc_requested;                /* ufs_native= on the command line */
+static int hc_known;                    /* UEFI's list address is kept here: check it, put it back */
+static uint32_t hc_uefi_lo, hc_uefi_hi;
+static int hc_refused_reads;
+
+static inline uint32_t
+hc_rd(uint32_t off)
+{
+	return *(volatile uint32_t *)(uintptr_t)(HC_PA + off);
+}
+
+static inline void
+hc_wr(uint32_t off, uint32_t v)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(uintptr_t)(HC_PA + off) = v;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static uint64_t
+hc_ms_since(uint64_t then)
+{
+	return (READ_SYSREG(CNTVCT_EL0) - then) * 1000 / READ_SYSREG(CNTFRQ_EL0);
+}
+
+/* UEFI's list in, and running: what UEFI's driver needs to read or write */
+static int
+hc_list_is_uefis(void)
+{
+	return !hc_known || (hc_rd(HC_UTRLBA) == hc_uefi_lo && hc_rd(HC_UTRLBAU) == hc_uefi_hi &&
+	       (hc_rd(HC_UTRLRSR) & 1) != 0);
+}
+
+static void
+hc_print_state(const char *when)
+{
+	print("ufs: %s: list %x:%x (UEFI's %x:%x), run %x, doorbell %x, HCS %x, IS %x, IE %x, completion %x, "
+	    "task doorbell %x\n", when, (uint64_t)hc_rd(HC_UTRLBAU), (uint64_t)hc_rd(HC_UTRLBA), (uint64_t)hc_uefi_hi,
+	    (uint64_t)hc_uefi_lo, (uint64_t)hc_rd(HC_UTRLRSR), (uint64_t)hc_rd(HC_UTRLDBR), (uint64_t)hc_rd(HC_HCS),
+	    (uint64_t)hc_rd(HC_IS), (uint64_t)hc_rd(HC_IE), (uint64_t)hc_rd(HC_UTRLCNR), (uint64_t)hc_rd(HC_UTMRLDBR));
+}
+
+/*
+ * Whatever the kernel left: UEFI's list back in the controller. The kernel is told to send nothing
+ * more (it looks before every doorbell, with interrupts off), given 50 ms, then what is in flight
+ * is waited for (1 s), cleared if it does not finish (UTRLCLR: every slot of that list is the
+ * kernel's), the list stopped, UEFI's address written back, the list started, all read back.
+ */
+static void
+hc_take_back(const char *when)
+{
+	uint32_t lo, hi, rsr, db;
+	uint64_t t;
+
+	if (!hc_known) {
+		return;
+	}
+	lo = hc_rd(HC_UTRLBA);
+	hi = hc_rd(HC_UTRLBAU);
+	rsr = hc_rd(HC_UTRLRSR);
+	db = hc_rd(HC_UTRLDBR);
+	if (lo == hc_uefi_lo && hi == hc_uefi_hi && (rsr & 1)) {
+		print("ufs: %s: UEFI's transfer list is in the controller (%x), running, doorbell %x\n", when, (uint64_t)lo,
+		    (uint64_t)db);
+		return;
+	}
+	print("ufs: %s: the controller has list %x:%x (run %x, doorbell %x), not UEFI's %x:%x: taking it back\n", when,
+	    (uint64_t)hi, (uint64_t)lo, (uint64_t)rsr, (uint64_t)db, (uint64_t)hc_uefi_hi, (uint64_t)hc_uefi_lo);
+	block_shared.loader_native.take_back = 1;
+	clean_dcache((uint64_t)(uintptr_t)&block_shared.loader_native,
+	    (uint64_t)(uintptr_t)&block_shared.loader_native + sizeof(block_shared.loader_native));
+	for (t = READ_SYSREG(CNTVCT_EL0); hc_ms_since(t) < 50;) {
+	}
+	for (t = READ_SYSREG(CNTVCT_EL0); (db = hc_rd(HC_UTRLDBR)) != 0 && hc_ms_since(t) < 1000;) {
+	}
+	if (db != 0) {
+		print("ufs: %s: doorbell %x still set after 1 s\n", when, (uint64_t)db);
+		if (hc_rd(HC_UTRLBA) != hc_uefi_lo || hc_rd(HC_UTRLBAU) != hc_uefi_hi) {
+			print("ufs: %s: clearing the kernel's slots (UTRLCLR)\n", when);
+			hc_wr(HC_UTRLCLR, 0);
+			for (t = READ_SYSREG(CNTVCT_EL0); (db = hc_rd(HC_UTRLDBR)) != 0 && hc_ms_since(t) < 1000;) {
+			}
+			print("ufs: %s: doorbell %x after the clear\n", when, (uint64_t)db);
+		}
+	}
+	hc_wr(HC_UTRLRSR, 0);
+	for (t = READ_SYSREG(CNTVCT_EL0); (hc_rd(HC_UTRLRSR) & 1) && hc_ms_since(t) < 100;) {
+	}
+	hc_wr(HC_UTRLBA, hc_uefi_lo);
+	hc_wr(HC_UTRLBAU, hc_uefi_hi);
+	hc_wr(HC_UTRLRSR, 1);
+	for (t = READ_SYSREG(CNTVCT_EL0); hc_ms_since(t) < 50;) {
+	}
+	hc_print_state(when);
+	print("ufs: %s: UEFI's list %s\n", when, hc_list_is_uefis() ? "put back" : "NOT PUT BACK: the storage is not used");
+}
+
+/*
+ * Before a run (ufs_native=): what the controller looks like, and UEFI's list address kept -- the
+ * first time; later it must be the same (or this loader's own area, which is then taken back).
+ */
+static int
+hc_init(void)
+{
+	uint32_t lo, hi, area = (uint32_t)(uintptr_t)hc_area;
+
+	if (!hc_requested) {
+		return 0;
+	}
+	lo = hc_rd(HC_UTRLBA);
+	hi = hc_rd(HC_UTRLBAU);
+	print("ufs: controller at %x: CAP %x, VER %x, HCE %x, HCS %x, IS %x, IE %x, list %x:%x, run %x, doorbell %x\n",
+	    HC_PA, (uint64_t)hc_rd(HC_CAP), (uint64_t)hc_rd(HC_VER), (uint64_t)hc_rd(HC_HCE), (uint64_t)hc_rd(HC_HCS),
+	    (uint64_t)hc_rd(HC_IS), (uint64_t)hc_rd(HC_IE), (uint64_t)hi, (uint64_t)lo, (uint64_t)hc_rd(HC_UTRLRSR),
+	    (uint64_t)hc_rd(HC_UTRLDBR));
+	if (!hc_known) {
+		if (hi == 0 && lo == area) {
+			print("ufs: the controller has this loader's own area for its list before any run: left alone\n");
+			return 0;
+		}
+		hc_uefi_lo = lo;
+		hc_uefi_hi = hi;
+		hc_known = 1;
+		print("ufs: UEFI's transfer list is at %x:%x; it is put back after every run\n", (uint64_t)hi, (uint64_t)lo);
+	} else if (lo != hc_uefi_lo || hi != hc_uefi_hi) {
+		if (hi == 0 && lo == area) {
+			hc_take_back("before the run");
+		} else {
+			print("ufs: UEFI's list moved from %x:%x to %x:%x: that is UEFI's now\n", (uint64_t)hc_uefi_hi,
+			    (uint64_t)hc_uefi_lo, (uint64_t)hi, (uint64_t)lo);
+			hc_uefi_lo = lo;
+			hc_uefi_hi = hi;
+		}
+	}
+	return hc_list_is_uefis();
 }
 
 /*
@@ -1648,6 +1853,25 @@ block_start(void)
 		bp->flags = BLOCK_PART_UNIT;
 		block_bios[block_shared.parts++] = units[u].bio;
 	}
+	/* the kernel's own transfer list: this loader's area, if the controller is as UEFI keeps it */
+	if (hc_known && hc_list_is_uefis() && hc_rd(HC_UTRLDBR) == 0 && (hc_rd(HC_HCE) & 1)) {
+		memset(hc_area, 0, sizeof(hc_area));
+		flush_dcache((uint64_t)(uintptr_t)hc_area, (uint64_t)(uintptr_t)hc_area + sizeof(hc_area));
+		block_shared.native.hc_pa = HC_PA;
+		block_shared.native.area_pa = (uint64_t)(uintptr_t)hc_area;
+		block_shared.native.area_size = sizeof(hc_area);
+		block_shared.native.ucd_offset = HC_UCD_OFFSET;
+		block_shared.native.ucd_size = HC_UCD_SIZE;
+		block_shared.native.slots = HC_SLOTS;
+		block_shared.native.uefi_utrlba = hc_uefi_lo;
+		block_shared.native.uefi_utrlbau = hc_uefi_hi;
+		print("ufs: the kernel may put its own transfer list in, at %x (this loader's), for the run\n",
+		    (uint64_t)(uintptr_t)hc_area);
+	} else if (hc_requested) {
+		print("ufs: the kernel's own transfer list is not offered: the controller is not as UEFI keeps it\n");
+	}
+	hc_refused_reads = 0;
+	hc_log_skips = 0;
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
 	block_shared.size = sizeof(block_shared);
@@ -1764,7 +1988,16 @@ block_poll(void)
 		efi_block_io *bio = block_bios[part];
 
 		bytes = count * block_shared.part[part].block_size;
-		s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+		if (!hc_list_is_uefis()) {
+			/* the kernel's own list is in: UEFI's driver must not ring now (the kernel should not ask) */
+			if (hc_refused_reads++ < 4) {
+				print("ufs: a read asked for while the kernel's own transfer list is in the controller: refused\n");
+			}
+			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
+			bytes = 0;
+		} else {
+			s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+		}
 		/* what the controller wrote is in memory; drop whatever this core held of the buffer */
 		flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
 	}
@@ -1951,7 +2184,8 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 		}
 		/* Qualcomm's UEFI charger stack owns the PMIC/GLINK side; keep XNU's cache live. */
-		if (charger_enabled && seconds_since(last_battery) >= 5) {
+		if (charger_enabled && seconds_since(last_battery) >= 5 && hc_list_is_uefis()) {
+			/* (not while the kernel's own transfer list is in: Qualcomm's DXEs are not to touch the storage) */
 			charger_poll();
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
@@ -2481,9 +2715,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ufs_requested = c[4] - '0';
 		}
 		block_probe_requested |= starts_with(c, "ufs_probe=1") && (c == pi.cmdline || c[-1] == ' ');
+		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
+		    c[11] <= '9';
 	}
 	if (battery_requested) {
 		charger_start();
+	}
+	if (ufs_requested >= 2) {
+		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
 	}
 	if (ufs_requested >= 1) {
 		ufs_survey();
@@ -2908,6 +3147,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
 
 			wdt_set_ms(WDT_BITE_MS);
+			if (status != 0) {
+				/* a kernel that hung may have left its own transfer list in the controller */
+				hc_take_back(status == OTHER_CPU_HUNG ? "the kernel hung" : "the kernel did not start");
+			}
 			if (status == OTHER_CPU_HUNG) {
 				/* the kernel still has that core; what it logged can be had all the same */
 				print("THE KERNEL HUNG on core %x: no sign of life for %d seconds; its log follows\n", kernel_mpidr,
@@ -2933,6 +3176,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	/* --- the kernel came back ------------------------------------------- */
 	wdt_set_ms(WDT_BITE_MS);
+	hc_take_back("the kernel came back");   /* before anything here touches the storage */
+	if (hc_known) {
+		flush_dcache((uint64_t)(uintptr_t)&block_shared.kernel_native,
+		    (uint64_t)(uintptr_t)&block_shared.kernel_native + sizeof(block_shared.kernel_native));
+		print("ufs: the kernel put its own list in %d times and took it out %d times\n",
+		    (uint64_t)block_shared.kernel_native.switched_in, (uint64_t)block_shared.kernel_native.switched_out);
+	}
 	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */
 	for (int i = 1; i < cpu_count; i++) {
 		int64_t state = psci_call(PSCI_AFFINITY_INFO, cpu_mpidr[i], 0, 0);
