@@ -10,6 +10,8 @@
  *        vol_ls hash FILE...         FNV-1a of the whole file through read(2) and through a
  *                                    mapping, and its size: the hash tools/apfs prints on the
  *                                    build machine for the same file
+ *        vol_ls sysctl NAME...       a string the kernel keeps (kern.apfs_stats: where the APFS
+ *                                    driver's time went -- reads, page-ins, the lock)
  */
 #include <dirent.h>
 #include <errno.h>
@@ -20,6 +22,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #define FNV_INIT  0xcbf29ce484222325ULL
@@ -205,7 +208,7 @@ main(int argc, char **argv)
 	int i, bad = 0;
 
 	if (argc < 3) {
-		printf("usage: vol_ls fs PATH | ls DIR... | cat FILE [BYTES] | hash FILE...\n");
+		printf("usage: vol_ls fs PATH | ls DIR... | cat FILE [BYTES] | hash FILE... | sysctl NAME...\n");
 		return 2;
 	}
 	if (strcmp(argv[1], "fs") == 0) {
@@ -213,6 +216,21 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[1], "cat") == 0) {
 		return do_cat(argv[2], argc > 3 ? atol(argv[3]) : 4096);
+	}
+	if (strcmp(argv[1], "sysctl") == 0) {
+		for (i = 2; i < argc; i++) {
+			static char text[16384];
+			size_t len = sizeof(text) - 1;
+
+			if (sysctlbyname(argv[i], text, &len, NULL, 0) != 0) {
+				printf("%s: %s\n", argv[i], strerror(errno));
+				bad++;
+				continue;
+			}
+			text[len] = 0;
+			printf("%s:\n%s\n", argv[i], text);
+		}
+		return bad ? 1 : 0;
 	}
 	for (i = 2; i < argc; i++) {
 		if (strcmp(argv[1], "ls") == 0) {

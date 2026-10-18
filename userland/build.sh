@@ -289,6 +289,17 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes
 	cp obj/stage0 flashboot/sbin/launchd
 	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot/Cryptexes/OS; else mkdir -p flashboot/Cryptexes/OS; fi
+	# the audio DSP's firmware and the speaker amplifiers' configuration, as in the system image's /fw: the kernel
+	# reads the firmware as soon as there is a root (this image, adsp=1), the configuration maybe later -- by then
+	# from the iOS volume's /fw, which src/init.c (flash_root) binds to this
+	if [ -f ../fw-audio/adsp.mdt ]; then
+		mkdir -p flashboot/fw
+		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] flashboot/fw/
+	fi
+	if [ -f ../fw-audio/aw882xx_acf.bin ]; then
+		mkdir -p flashboot/fw
+		cp ../fw-audio/aw882xx_acf.bin flashboot/fw/
+	fi
 	D=flashboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do

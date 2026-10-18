@@ -140,6 +140,7 @@ flash_root(const char *dev)
 {
 	static char buf[8192];
 	char devpath[96], name[256], from[800], to[400];
+	struct stat fw_st;
 	off_t pos = 0;
 	ssize_t n;
 	int fd, ok, apps = 0, bound = 0;
@@ -161,6 +162,10 @@ flash_root(const char *dev)
 	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
 	    "our audio device, not Apple's plug-ins");
+	if (stat("/fw", &fw_st) == 0) {
+		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
+		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");
+	}
 
 	fd = open("/flash/private/var/staged_system_apps", O_RDONLY | O_DIRECTORY, 0);
 	while (fd >= 0 && (n = getdirentries(fd, buf, sizeof(buf), &pos)) > 0) {
