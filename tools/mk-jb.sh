@@ -139,6 +139,25 @@ cat > "$OUT/root/var/jb/prep.sh" <<'PREP'
 #!/var/jb/bin/sh
 # Run once per boot, after the prefix has been grafted onto /var/jb (rc.jobs.sileo does it).
 /var/jb/usr/libexec/firmware
+# The prefix's applications: in the system image they are in /Applications already (userland/build.sh),
+# where LaunchServices finds them by itself; with the iOS volume on the flash as the root they are not,
+# and are registered from the prefix as a rootless jailbreak does it (uikittools' uicache) -- by where the
+# bundle really is, as there: in /var/jb, grafted, its files are links into the boot volume
+# (/private/preboot/jb), and LaunchServices refuses a bundle made of links ("Unable to register").
+# Asked again every five seconds, two minutes at most, aside: right after SpringBoard it may be busy.
+for app in /var/jb/Applications/*.app; do
+	[ -d "/Applications/${app##*/}" ] && continue
+	real=$(/var/jb/usr/bin/readlink "$app/Info.plist") && app=${real%/Info.plist}
+	(
+		for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
+			case "$(/var/jb/usr/bin/uicache -p "$app" 2>&1)" in
+			*Error*) sleep 5 ;;
+			*) echo "prep.sh: ${app##*/} registered (try $try)"; exit 0 ;;
+			esac
+		done
+		echo "prep.sh: ${app##*/} could not be registered"
+	) &
+done
 /var/jb/usr/sbin/pwd_mkdb -p /var/jb/etc/master.passwd 2>/dev/null
 for package in debianutils apt dash bash zsh vi; do
 	[ -x "/var/jb/Library/dpkg/info/$package.postinst" ] &&

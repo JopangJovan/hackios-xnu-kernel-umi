@@ -78,6 +78,9 @@ IOS_JOBS=${JOBS-"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is
 # libredwood-media.dylib).
+# What Sileo runs from /bin (see the package manager's prefix below): the system image's /bin, or the
+# boot volume's bin, bound over the iOS volume's /bin when that is the root (src/init.c, flash_root).
+SILEO_BIN="chmod cp mkdir mv rm"
 INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libredwood-sb.dylib SpringBoard
 /redwood/lib/libredwood-media.dylib mediaserverd"}
@@ -226,6 +229,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"
 	done >> root/etc/var.skel
+	# mobile's own temporary directory, $HOME/tmp, which iOS's template does not have: an application of
+	# mobile's without a data container of its own keeps its temporary files there -- Sileo, registered from
+	# the prefix with the root on the flash, downloads every package and index there, and without it each
+	# download ended in "No such file or directory"
+	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
@@ -327,6 +335,19 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 		mkdir -p flashboot/fw
 		cp ../fw-audio/aw882xx_acf.bin flashboot/fw/
 	fi
+	# the package manager's prefix, when tools/mk-jb.sh has fetched one: /jb of the boot volume, which is
+	# /private/preboot/jb once the iOS volume is the root -- the volume where a rootless jailbreak keeps its
+	# Procursus on an iPhone as well; init grafts it onto /var/jb (src/init.c, mount_writable)
+	if [ -d ../jb/root/var/jb ]; then
+		cp -a ../jb/root/var/jb flashboot/jb
+		mkdir -p flashboot/jb-rw        # where init mounts the prefix's writable copy (src/init.c)
+		# and what Sileo runs from /bin, for init to put over the iOS volume's /bin (see the system image below)
+		mkdir -p flashboot/jb-bin
+		for c in $SILEO_BIN; do
+			ln -s /var/jb/usr/bin/$c flashboot/jb-bin/$c
+		done
+		echo "  the package manager's prefix: $(du -sh flashboot/jb | cut -f1) as /jb of the boot volume"
+	fi
 	D=flashboot.os/System/Library/Caches/com.apple.dyld
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do
@@ -402,6 +423,13 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		# database afresh at every boot by walking /Applications, which is how their icons appear
 		for app in sysroot/jb/Applications/*.app; do
 			[ -d "$app" ] && cp -a "$app" sysroot/Applications/
+		done
+		# Sileo moves, copies and removes files as root with /bin/mv, /bin/cp, /bin/rm, /bin/mkdir and
+		# /bin/chmod -- where a jailbreak with a writable root keeps them -- and iOS's /bin has df and ps
+		# alone: every one of those spawns failed with nothing said, and the package it had downloaded never
+		# reached apt's archives ("Unable to fetch some archives"). The prefix's own programs, by those names.
+		for c in $SILEO_BIN; do
+			ln -sf /var/jb/usr/bin/$c sysroot/bin/$c
 		done
 		echo "  the package manager's prefix: $(du -sh sysroot/jb | cut -f1) as /jb (init puts it at /var/jb)"
 	fi

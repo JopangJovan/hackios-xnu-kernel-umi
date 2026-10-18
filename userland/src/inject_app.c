@@ -135,6 +135,68 @@ keep_to_the_repositories(void)
 }
 
 /*
+ * apt-get install, not its simulation (-s...): the one that ends in "Unable to fetch some archives"
+ * when Sileo runs it and installs the package when a terminal runs the same command.
+ */
+static int
+apt_install(char *const argv[])
+{
+	int install = 0;
+
+	if (argv == NULL || argv[0] == NULL || strcmp(argv[0], "apt-get") != 0) {
+		return 0;
+	}
+	for (int i = 1; argv[i] != NULL; i++) {
+		if (argv[i][0] == '-' && argv[i][1] == 's') {
+			return 0;
+		}
+		install |= strcmp(argv[i], "install") == 0;
+	}
+	return install;
+}
+
+/*
+ * What apt says goes to Sileo, which shows a line of it at most. Run the same apt-get, with the same
+ * descriptors, credential and environment, under a shell that first says on the console who it runs
+ * as, what lies in apt's archives and what Sileo's index says of the package, and afterwards how apt
+ * ended and what the archives hold then. This is how "Unable to fetch some archives" was found: the
+ * archives were empty, Sileo's /bin/mv having never run.
+ */
+static int
+spawn_apt_said(pid_t *pid, const posix_spawn_file_actions_t *actions, const posix_spawnattr_t *attr,
+    char *const argv[], char *const envp[])
+{
+	static char script[] =
+	    "exec 7>/dev/console; J=/var/jb\n"
+	    "echo \"redwood: apt-get runs as $($J/usr/bin/id), in $(pwd)\" >&7\n"
+	    "$J/bin/ls -ln $J/var/cache/apt/archives $J/var/lib/apt/sileolists >&7 2>&1\n"
+	    "for a in \"$@\"; do case $a in -*|install) ;; *) p=${a%%=*}\n"
+	    "  echo \"redwood: $p in sileolists:\" >&7\n"
+	    "  $J/usr/bin/grep -h -A30 \"^Package: $p\\$\" $J/var/lib/apt/sileolists/*Packages 2>&1 | $J/usr/bin/head -40 >&7 ;; esac; done\n"
+	    "$J/usr/bin/apt-get \"$@\"\n"
+	    "s=$?; echo \"redwood: apt-get exits $s; its archives after:\" >&7\n"
+	    "$J/bin/ls -ln $J/var/cache/apt/archives >&7 2>&1; exit $s\n";
+	char *wrapped[96];
+	int k = 0;
+
+	for (int i = 0; envp != NULL && envp[i] != NULL; i++) {
+		char line[600];
+		int n = snprintf(line, sizeof(line), "redwood: %s: apt-get's environment: %s\n", who, envp[i]);
+
+		say(line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+	}
+	wrapped[k++] = "sh";
+	wrapped[k++] = "-c";
+	wrapped[k++] = script;
+	wrapped[k++] = "apt-get";
+	for (int i = 1; argv[i] != NULL && k < 95; i++) {
+		wrapped[k++] = argv[i];
+	}
+	wrapped[k] = NULL;
+	return posix_spawn(pid, "/var/jb/bin/sh", actions, attr, wrapped, envp);
+}
+
+/*
  * Every program the application starts, with its arguments. Sileo does everything to the system by
  * spawning its set-user-ID helper, which execs apt or dpkg; the arguments are the whole question
  * when apt's answer to Sileo differs from apt's answer on the command line.
@@ -167,7 +229,89 @@ watched_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *ac
 	}
 	n += snprintf(line + n, sizeof(line) - (size_t)n, "\n");
 	say(line, (size_t)n);
-	return posix_spawn(pid, path, actions, attr, argv, envp);
+	if (apt_install(argv)) {
+		return spawn_apt_said(pid, actions, attr, argv, envp);
+	}
+	n = posix_spawn(pid, path, actions, attr, argv, envp);
+	if (n != 0) {
+		char said[300];
+		int k = snprintf(said, sizeof(said), "redwood: %s: ... and that spawn failed: %s\n", who, strerror(n));
+
+		say(said, (size_t)(k < (int)sizeof(said) ? k : (int)sizeof(said) - 1));
+	}
+	return n;
+}
+
+/*
+ * A file the application moves or copies itself (NSFileManager, under Swift's FileManager), when it
+ * fails: from where, to where, and what the error says. Sileo moves each download into place this
+ * way, and says only "The operation couldn't be completed. No such file or directory".
+ */
+static const char *
+text_of(id object)
+{
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
+	id text;
+
+	if (object == NULL) {
+		return "(nil)";
+	}
+	text = (class_respondsToSelector(object_getClass(object), sel_registerName("path")) ?
+	    get(object, sel_registerName("path")) : get(object, sel_registerName("description")));
+	return text != NULL ? utf8(text, sel_registerName("UTF8String")) : "?";
+}
+
+static signed char (*move_url)(id, SEL, id, id, id *), (*copy_url)(id, SEL, id, id, id *);
+static signed char (*move_path)(id, SEL, id, id, id *), (*copy_path)(id, SEL, id, id, id *);
+
+static signed char
+file_said(const char *what, signed char ok, id from, id to, id error)
+{
+	if (!ok) {
+		char line[1400];
+		int n = snprintf(line, sizeof(line), "redwood: %s: %s %s -> %s failed: %s\n", who, what, text_of(from),
+		    text_of(to), error != NULL ? text_of(error) : "(no error given)");
+
+		say(line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+	}
+	return ok;
+}
+
+static signed char
+watched_move_url(id self, SEL cmd, id from, id to, id *error)
+{
+	id mine = NULL;
+	signed char ok = move_url(self, cmd, from, to, error != NULL ? error : &mine);
+
+	return file_said("moveItemAtURL", ok, from, to, error != NULL ? *error : mine);
+}
+
+static signed char
+watched_copy_url(id self, SEL cmd, id from, id to, id *error)
+{
+	id mine = NULL;
+	signed char ok = copy_url(self, cmd, from, to, error != NULL ? error : &mine);
+
+	return file_said("copyItemAtURL", ok, from, to, error != NULL ? *error : mine);
+}
+
+static signed char
+watched_move_path(id self, SEL cmd, id from, id to, id *error)
+{
+	id mine = NULL;
+	signed char ok = move_path(self, cmd, from, to, error != NULL ? error : &mine);
+
+	return file_said("moveItemAtPath", ok, from, to, error != NULL ? *error : mine);
+}
+
+static signed char
+watched_copy_path(id self, SEL cmd, id from, id to, id *error)
+{
+	id mine = NULL;
+	signed char ok = copy_path(self, cmd, from, to, error != NULL ? error : &mine);
+
+	return file_said("copyItemAtPath", ok, from, to, error != NULL ? *error : mine);
 }
 
 __attribute__((used)) static struct {
@@ -227,6 +371,10 @@ redwood_app_init(void)
 	 * would leave ours as the "original" of itself -- a call that never returns.
 	 */
 	watch("NSURLSessionTask", "resume", (IMP)watched_resume_task, &resume_task);
+	watch("NSFileManager", "moveItemAtURL:toURL:error:", (IMP)watched_move_url, &move_url);
+	watch("NSFileManager", "copyItemAtURL:toURL:error:", (IMP)watched_copy_url, &copy_url);
+	watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
+	watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
 	n = snprintf(line, sizeof(line), "redwood: %s: started as uid %d (effective %d), watching for what kills it\n",
 	    name, (int)getuid(), (int)geteuid());
 	say(line, (size_t)(n > 0 ? n : 0));

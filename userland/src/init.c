@@ -202,6 +202,19 @@ flash_root(const char *dev)
 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
 		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");
 	}
+	if (stat("/jb-bin", &fw_st) == 0) {
+		/*
+		 * The package manager's prefix is in the boot volume (/jb), and Sileo runs mv, cp, rm, mkdir
+		 * and chmod from /bin, where iOS has df and ps alone (userland/build.sh, SILEO_BIN): the boot
+		 * volume's jb-bin -- those five, links into the prefix -- over the volume's /bin as a union
+		 * mount, through which what it does not have is found in the /bin below.
+		 */
+		ok = mount("bindfs", "/flash/bin", MNT_RDONLY | MNT_UNION, (void *)"/jb-bin") == 0;
+		if (!ok) {
+			printf("  bindfs /jb-bin on /flash/bin, union: %s\n", strerror(errno));
+		}
+		check(ok, "Sileo's programs in /bin, over the volume's own");
+	}
 
 	fd = open("/flash/private/var/staged_system_apps", O_RDONLY | O_DIRECTORY, 0);
 	while (fd >= 0 && (n = getdirentries(fd, buf, sizeof(buf), &pos)) > 0) {
@@ -628,8 +641,9 @@ own_tree(const char *path, int uid)
 
 /*
  * The rootless prefix of a package manager, /var/jb: the Procursus bootstrap with Sileo in it
- * (tools/mk-jb.sh) rides in the system image as /jb, which is a packfs image and cannot be written
- * to, while dpkg and apt must be able to write anywhere in their own prefix.
+ * (tools/mk-jb.sh) rides in the system image as /jb (or in the boot volume, /private/preboot/jb,
+ * with the root on the flash), an APFS image that cannot be written to, while dpkg and apt must be
+ * able to write anywhere in their own prefix.
  *
  * Copying all 124 MB of it into the memory filesystem is more than this machine has to spare (the
  * system image is already 2.8 GB of its 4.3 GB), so the prefix is grafted instead: every directory
@@ -772,6 +786,7 @@ mount_writable(void)
 	static const char *const markers[] = { "/private/var/db/diagnostics/.migrated",
 		                               "/private/var/db/diagnostics/timesync/.migrated", "/private/var/db/uuidtext/.migrated" };
 	int ok, fd, made = 0, files = 0;
+	const char *jb;
 	struct stat st;
 	ssize_t n;
 
@@ -831,9 +846,34 @@ mount_writable(void)
 	printf("  %d directories, %d files\n", made, files);
 	check(ok && made > 50, "create the directories of the data volume");
 
-	/* and the package manager's prefix, when the image was built with one (tools/mk-jb.sh) */
-	if (ok && stat("/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR) {
-		int dirs = 0, entries = 0, grafted = graft_tree("/jb", "/private/var/jb", 1, &dirs, &entries);
+	/*
+	 * and the package manager's prefix, when the image was built with one (tools/mk-jb.sh): /jb of
+	 * the system image in RAM, or, with the iOS volume on the flash as the root, /private/preboot/jb
+	 * -- the boot volume, where a rootless jailbreak on an iPhone keeps its Procursus too
+	 * (/var/jb leads into /private/preboot there)
+	 */
+	jb = stat("/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/jb" :
+	    stat("/private/preboot/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/private/preboot/jb" : NULL;
+	if (ok && jb != NULL) {
+		const char *to = "/private/var/jb";
+		int dirs = 0, entries = 0, grafted;
+
+		/*
+		 * With the root on the flash, the prefix's writable copy goes into a memory filesystem of its own
+		 * on the boot volume's jb-rw, as procursus, and /var/jb is a link to it: where /var/jb leads on
+		 * an iPhone with a rootless jailbreak, into /private/preboot. LaunchServices registers an
+		 * application from there, and from /private/var not at all -- everything a package put in
+		 * /var/jb/Applications was "Unable to register", with nothing on the files even looked at.
+		 */
+		if (strcmp(jb, "/private/preboot/jb") == 0 && stat("/private/preboot/jb-rw", &st) == 0) {
+			if (mount("ramfs", "/private/preboot/jb-rw", 0, NULL) == 0 &&
+			    symlink("/private/preboot/jb-rw/procursus", "/private/var/jb") == 0) {
+				to = "/private/preboot/jb-rw/procursus";
+			} else {
+				printf("  the prefix on /private/preboot/jb-rw: %s\n", strerror(errno));
+			}
+		}
+		grafted = graft_tree(jb, to, 1, &dirs, &entries);
 
 		/*
 		 * All of it belongs to root, as it does on a phone, but for the user's corner of it: an
@@ -856,7 +896,7 @@ mount_writable(void)
 			grafted = chown(mobiles[i], 501, 501) == 0 && grafted;
 		}
 		grafted = own_tree("/private/var/jb/var/mobile", 501) && grafted;
-		printf("  /var/jb: %d directories, %d files and links\n", dirs, entries);
+		printf("  /var/jb from %s, in %s: %d directories, %d files and links\n", jb, to, dirs, entries);
 		check(grafted, "graft the package manager's prefix onto the data volume");
 	}
 }

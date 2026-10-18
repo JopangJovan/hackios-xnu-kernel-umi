@@ -67,6 +67,7 @@ struct sockaddr_un {
 #define MAP_FAILED      ((void *)-1)
 
 #define MNT_RDONLY      1
+#define MNT_UNION       0x00000020      /* what is not in the mounted directory is found in the one below */
 
 #define S_IFMT          0170000
 #define S_IFDIR         0040000
