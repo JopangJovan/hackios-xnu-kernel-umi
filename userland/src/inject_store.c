@@ -49,10 +49,30 @@
  * nothing is ever resumed. Not one task is resumed in the whole daemon in a six-minute session,
  * which is why the socket log never had appstored in it. The store still shows LOADING, as it must:
  * the bag never loads.
- * Where to look next is one step further in: what that request promise waits on -- the request
- * encoder and the headers AMS adds before sending (ams_addCookiesForAccount:clientInfo:bag:,
- * ams_addStoreFrontHeaderForAccount:client:withBag:, ams_addAnisetteHeadersForAccount:type:bag:,
- * -[AMSURLSession _prepareRequest:properties:error:]). One of those never comes back.
+ * AND THEN, with entry and exit counted separately -- a method that hangs and a method that is
+ * never called leave the same silence below them, so every wrapper counts both:
+ *   entered    1 returned    1 -[AMSBagNetworkTask _createRequestWithQueryItems:]
+ *   entered    0 returned    0  the four steps that finish a request (cookies, storefront header,
+ *                               anisette headers, -[AMSURLSession _prepareRequest:properties:error:])
+ *   entered   12 returned   12 -[AMSMutablePromise continueWithBlock:]
+ *   entered    5 returned    5 -[AMSMutablePromise thenWithBlock:]
+ *   entered    1 returned    1 -[AMSMutablePromise _finishWithResult:error:logDuplicateFinishes:]
+ * Nothing hangs. _createRequestWithQueryItems: returns at once, with a promise -- and that promise is
+ * never finished. Seventeen continuations are attached to promises in that session and exactly ONE
+ * promise is ever finished, and by address it is not the request's:
+ *   PROMISE 0x101709240 waited on (continue)
+ *   STEP _createRequestWithQueryItems: -> <AMSMutablePromise: 0x10170b930>
+ *   PROMISE 0x10170b930 waited on (then) / (continue)
+ *   PROMISE 0x101414370 finished          <- the only one, and a different promise
+ * So the bag request is never produced at all: the step that would produce it is waiting on
+ * something that never arrives, which is why no header is ever added, no session asked for, no task
+ * made and nothing resumed. The anisette guess is ruled out with the other three: none is entered.
+ *
+ * Where to look next: name the code that waits. The fault reporter here already walks frame pointers
+ * (say_the_fault), and the same walk at thenWithBlock: for the request's promise would print unslid
+ * return addresses that "ipsw dyld a2s" turns into the function that built the chain. The input
+ * promise is in the log too, created a moment before the request's (0x101709240 above), and it is
+ * never finished either.
  *
  * Two things this library learned about itself, for whoever writes the next one:
  *   - class_getInstanceMethod walks up the chain, so replacing what a class only INHERITS replaces it
@@ -105,7 +125,9 @@ enum {
 	COUNT_ams_storefront, COUNT_cachedStorefront, COUNT_bagStorefront_fixed, COUNT_bagStorefront_active,
 	COUNT_copyStorefront, COUNT_bagAccount, COUNT_performFetch, COUNT_queryItems, COUNT_performRequest,
 	COUNT_performRequestBlock, COUNT_resume, COUNT_resumeLocal, COUNT_createRequest, COUNT_sessionPromise,
-	COUNT_dataTaskPromise, COUNT_dataTask, COUNT_last
+	COUNT_dataTaskPromise, COUNT_dataTask, COUNT_addCookies, COUNT_addStorefrontHeader, COUNT_addAnisette,
+	COUNT_prepareRequest, COUNT_finishWithResult, COUNT_finishWithError, COUNT_finishFunnel,
+	COUNT_finishResultError, COUNT_thenWithBlock, COUNT_continueWithBlock, COUNT_last
 };
 static const char *const counted[COUNT_last] = {
 	"-[ACAccount ams_storefront]", "-[AMSBagNetworkDataSource cachedStorefront]",
@@ -118,9 +140,22 @@ static const char *const counted[COUNT_last] = {
 	"-[AMSURLSession performRequest:completionBlock:]", "-[NSURLSessionTask resume]",
 	"-[__NSCFLocalSessionTask resume]", "-[AMSBagNetworkTask _createRequestWithQueryItems:]",
 	"-[AMSBagNetworkTask URLSessionPromise]", "-[AMSURLSession dataTaskPromiseWithRequest:]",
-	"-[AMSURLSession dataTaskWithRequest:]",
+	"-[AMSURLSession dataTaskWithRequest:]", "ams_addCookiesForAccount:clientInfo:bag:",
+	"ams_addStoreFrontHeaderForAccount:client:withBag:", "ams_addAnisetteHeadersForAccount:type:bag:",
+	"-[AMSURLSession _prepareRequest:properties:error:]", "-[AMSMutablePromise finishWithResult:]",
+	"-[AMSMutablePromise finishWithError:]", "-[AMSMutablePromise _finishWithResult:error:logDuplicateFinishes:]",
+	"-[AMSMutablePromise finishWithResult:error:]", "-[AMSMutablePromise thenWithBlock:]",
+	"-[AMSMutablePromise continueWithBlock:]",
 };
 static unsigned long entered[COUNT_last];
+/*
+ * And how many times each came BACK. A method that hangs and a method that is never called look the
+ * same in one counter -- both leave everything below them at zero -- so every wrapper counts its
+ * entry and its return separately. The one with entered > returned is where the thread is.
+ */
+static unsigned long returned[COUNT_last];
+static unsigned serial;
+
 
 /* Each line of ours alone on the console: it drops them under the start's flood (see rc.jobs.store). */
 static void
@@ -154,6 +189,23 @@ text_of(id object, char *buffer, size_t size)
 		return "(?)";
 	}
 	return buffer;
+}
+
+static unsigned
+step_in(int which)
+{
+	unsigned n = __sync_add_and_fetch(&serial, 1);
+
+	entered[which]++;
+	say("redwood: appstored: -> #%u %s\n", n, counted[which]);
+	return n;
+}
+
+static void
+step_out(int which, unsigned n, bool got_something)
+{
+	returned[which]++;
+	say("redwood: appstored: <- #%u %s%s\n", n, counted[which], got_something ? "" : " (nil)");
 }
 
 /*
@@ -238,6 +290,7 @@ new_ams_storefront(id self, SEL _cmd)
 		said = true;
 		say("redwood: appstored: ams_storefront was %s, now " STOREFRONT "\n", text_of(was, buffer, sizeof(buffer)));
 	}
+	returned[COUNT_ams_storefront]++;
 	return was != NULL ? was : (id)storefront;
 }
 
@@ -248,6 +301,7 @@ new_cached_storefront(id self, SEL _cmd)
 	id was = old_cached_storefront != NULL ? old_cached_storefront(self, _cmd) : NULL;
 
 	say("redwood: appstored: cachedStorefront was %s\n", was != NULL ? "set" : "(nil), now " STOREFRONT);
+	returned[COUNT_cachedStorefront]++;
 	return was != NULL ? was : (id)storefront;
 }
 
@@ -260,6 +314,7 @@ new_bag_storefront(id self, SEL _cmd, id media_type)
 
 	say("redwood: appstored: bagStorefrontForAccountMediaType:%s was %s\n", text_of(media_type, buffer, sizeof(buffer)),
 	    was != NULL ? "set" : "(nil), now " STOREFRONT);
+	returned[COUNT_bagStorefront_fixed]++;
 	return was != NULL ? was : (id)storefront;
 }
 
@@ -272,6 +327,7 @@ new_bag_storefront_active(id self, SEL _cmd, id media_type)
 
 	say("redwood: appstored: active bagStorefrontForAccountMediaType:%s was %s\n",
 	    text_of(media_type, buffer, sizeof(buffer)), was != NULL ? "set" : "(nil), now " STOREFRONT);
+	returned[COUNT_bagStorefront_active]++;
 	return was != NULL ? was : (id)storefront;
 }
 
@@ -283,6 +339,7 @@ new_copy_storefront(id self, SEL _cmd, id account)
 
 	say("redwood: appstored: ams_copyStorefrontFromAccount: was %s\n",
 	    was != NULL ? "set" : "(nil), now " STOREFRONT);
+	returned[COUNT_copyStorefront]++;
 	return was != NULL ? was : (id)storefront;
 }
 
@@ -292,6 +349,7 @@ new_bag_account(id self, SEL _cmd, id media_type, bool must_contain_storefront)
 {
 	entered[COUNT_bagAccount]++;
 	id account = old_bag_account(self, _cmd, media_type, must_contain_storefront);
+	returned[COUNT_bagAccount]++;
 	char one[128], two[192];
 
 	say("redwood: appstored: _bagAccountForAccountMediaType:%s mustContainStorefront:%d -> %s\n",
@@ -318,6 +376,7 @@ new_perform_fetch(id self, SEL _cmd, long attempt, id account, id front)
 		}
 	}
 	promise = old_perform_fetch(self, _cmd, attempt, account, front);
+	returned[COUNT_performFetch]++;
 	say("redwood: appstored: BAG FETCH returned %s\n", promise != NULL ? "a promise" : "(nil)");
 	return promise;
 }
@@ -375,6 +434,7 @@ new_resume_base(id self, SEL _cmd)
 	entered[COUNT_resume]++;
 	say_resume(self, "NSURLSessionTask");
 	old_resume_base(self, _cmd);
+	returned[COUNT_resume]++;
 }
 
 static void
@@ -423,9 +483,12 @@ late_report(__unused void *ignored)
 		}
 	}
 	for (int i = 0; i < COUNT_last; i++) {
-		say("redwood: appstored: entered %4lu %s\n", entered[i], counted[i]);
+		say("redwood: appstored: entered %4lu returned %4lu %s%s\n", entered[i], returned[i], counted[i],
+		    entered[i] > returned[i] ? "   <-- STILL IN IT" : "");
 	}
 	dump_selectors("AMSURLSession", "equest");
+	dump_selectors("AMSMutablePromise", NULL);
+	dump_selectors("AMSBagNetworkTask", " queryItems");
 	dump_selectors("AMSBagNetworkTask", NULL);
 	return NULL;
 }
@@ -446,6 +509,7 @@ new_create_request(id self, SEL _cmd, id items)
 
 	entered[COUNT_createRequest]++;
 	request = old_create_request(self, _cmd, items);
+	returned[COUNT_createRequest]++;
 	say("redwood: appstored: STEP _createRequestWithQueryItems: -> %s\n", text_of(request, buffer, sizeof(buffer)));
 	return request;
 }
@@ -458,6 +522,7 @@ new_session_promise(id self, SEL _cmd)
 
 	entered[COUNT_sessionPromise]++;
 	promise = old_session_promise(self, _cmd);
+	returned[COUNT_sessionPromise]++;
 	say("redwood: appstored: STEP URLSessionPromise -> %s\n", text_of(promise, buffer, sizeof(buffer)));
 	return promise;
 }
@@ -470,6 +535,7 @@ new_data_task_promise(id self, SEL _cmd, id request)
 
 	entered[COUNT_dataTaskPromise]++;
 	promise = old_data_task_promise(self, _cmd, request);
+	returned[COUNT_dataTaskPromise]++;
 	say("redwood: appstored: STEP dataTaskPromiseWithRequest: -> %s\n", text_of(promise, buffer, sizeof(buffer)));
 	return promise;
 }
@@ -482,9 +548,122 @@ new_data_task(id self, SEL _cmd, id request)
 
 	entered[COUNT_dataTask]++;
 	task = old_data_task(self, _cmd, request);
+	returned[COUNT_dataTask]++;
 	say("redwood: appstored: STEP dataTaskWithRequest: -> %s\n", text_of(task, buffer, sizeof(buffer)));
 	return task;
 }
+
+/*
+ * What the request promise waits on. _createRequestWithQueryItems: hands back an AMSMutablePromise
+ * and nothing below it is ever reached, so the thread is sitting in one of the steps that finish the
+ * request: the cookies (which come from amsaccountsd), the storefront header, the anisette headers
+ * (which come from AuthKit through akd, and this device has never been provisioned), or the
+ * session's own preparation. Each is entered and left under its own number; the one that is entered
+ * and not left is the answer. Arguments are forwarded untouched and never looked at: an anisette
+ * "type" is a scalar and _prepareRequest: takes an NSError **, and a description of either would be
+ * a crash, not a measurement.
+ */
+#define WRAP3(name) \
+static void *(*old_##name)(id, SEL, void *, void *, void *); \
+static void * \
+new_##name(id self, SEL cmd, void *a, void *b, void *c) \
+{ \
+	unsigned n = step_in(COUNT_##name); \
+	void *result = old_##name(self, cmd, a, b, c); \
+	step_out(COUNT_##name, n, result != NULL); \
+	return result; \
+}
+
+#define WRAP1(name) \
+static void *(*old_##name)(id, SEL, void *); \
+static void * \
+new_##name(id self, SEL cmd, void *a) \
+{ \
+	unsigned n = step_in(COUNT_##name); \
+	void *result = old_##name(self, cmd, a); \
+	say("redwood: appstored: #%u is for promise %p\n", n, (void *)self); \
+	step_out(COUNT_##name, n, result != NULL); \
+	return result; \
+}
+
+/* counters only, for the ones that would flood the console: the number is the measurement */
+#define WRAPQ1(name) \
+static void *(*old_##name)(id, SEL, void *); \
+static void * \
+new_##name(id self, SEL cmd, void *a) \
+{ \
+	entered[COUNT_##name]++; \
+	void *result = old_##name(self, cmd, a); \
+	returned[COUNT_##name]++; \
+	return result; \
+}
+#define WRAPQ2(name) \
+static void *(*old_##name)(id, SEL, void *, void *); \
+static void * \
+new_##name(id self, SEL cmd, void *a, void *b) \
+{ \
+	entered[COUNT_##name]++; \
+	void *result = old_##name(self, cmd, a, b); \
+	returned[COUNT_##name]++; \
+	return result; \
+}
+#define WRAPQ3(name) \
+static void *(*old_##name)(id, SEL, void *, void *, void *); \
+static void * \
+new_##name(id self, SEL cmd, void *a, void *b, void *c) \
+{ \
+	entered[COUNT_##name]++; \
+	void *result = old_##name(self, cmd, a, b, c); \
+	returned[COUNT_##name]++; \
+	return result; \
+}
+
+/* the funnel every finished promise goes through, and the two ways of waiting on one */
+/* this one says which promise, because one promise in seventeen is finished and we want its name */
+static void *(*old_finishFunnel)(id, SEL, void *, void *, void *);
+static void *
+new_finishFunnel(id self, SEL cmd, void *a, void *b, void *c)
+{
+	void *result;
+
+	entered[COUNT_finishFunnel]++;
+	say("redwood: appstored: PROMISE %p finished%s\n", (void *)self, b != NULL ? " with an error" : "");
+	result = old_finishFunnel(self, cmd, a, b, c);
+	returned[COUNT_finishFunnel]++;
+	return result;
+}
+WRAPQ2(finishResultError)
+static void *(*old_thenWithBlock)(id, SEL, void *);
+static void *
+new_thenWithBlock(id self, SEL cmd, void *a)
+{
+	void *result;
+
+	entered[COUNT_thenWithBlock]++;
+	say("redwood: appstored: PROMISE %p waited on (then)\n", (void *)self);
+	result = old_thenWithBlock(self, cmd, a);
+	returned[COUNT_thenWithBlock]++;
+	return result;
+}
+static void *(*old_continueWithBlock)(id, SEL, void *);
+static void *
+new_continueWithBlock(id self, SEL cmd, void *a)
+{
+	void *result;
+
+	entered[COUNT_continueWithBlock]++;
+	say("redwood: appstored: PROMISE %p waited on (continue)\n", (void *)self);
+	result = old_continueWithBlock(self, cmd, a);
+	returned[COUNT_continueWithBlock]++;
+	return result;
+}
+
+WRAP1(finishWithResult)
+WRAP1(finishWithError)
+WRAP3(addCookies)
+WRAP3(addStorefrontHeader)
+WRAP3(addAnisette)
+WRAP3(prepareRequest)
 
 /* ---- installing them --------------------------------------------------------------------------- */
 
@@ -514,6 +693,23 @@ static struct replacement replacements[] = {
 	{ "AMSURLSession", "dataTaskPromiseWithRequest:", false, (IMP)new_data_task_promise, (IMP *)&old_data_task_promise,
 	  false },
 	{ "AMSURLSession", "dataTaskWithRequest:", false, (IMP)new_data_task, (IMP *)&old_data_task, false },
+	{ "NSMutableURLRequest", "ams_addCookiesForAccount:clientInfo:bag:", false, (IMP)new_addCookies,
+	  (IMP *)&old_addCookies, false },
+	{ "NSMutableURLRequest", "ams_addStoreFrontHeaderForAccount:client:withBag:", false, (IMP)new_addStorefrontHeader,
+	  (IMP *)&old_addStorefrontHeader, false },
+	{ "NSMutableURLRequest", "ams_addAnisetteHeadersForAccount:type:bag:", false, (IMP)new_addAnisette,
+	  (IMP *)&old_addAnisette, false },
+	{ "AMSURLSession", "_prepareRequest:properties:error:", false, (IMP)new_prepareRequest,
+	  (IMP *)&old_prepareRequest, false },
+	{ "AMSMutablePromise", "finishWithResult:", false, (IMP)new_finishWithResult, (IMP *)&old_finishWithResult, false },
+	{ "AMSMutablePromise", "finishWithError:", false, (IMP)new_finishWithError, (IMP *)&old_finishWithError, false },
+	{ "AMSMutablePromise", "_finishWithResult:error:logDuplicateFinishes:", false, (IMP)new_finishFunnel,
+	  (IMP *)&old_finishFunnel, false },
+	{ "AMSMutablePromise", "finishWithResult:error:", false, (IMP)new_finishResultError,
+	  (IMP *)&old_finishResultError, false },
+	{ "AMSMutablePromise", "thenWithBlock:", false, (IMP)new_thenWithBlock, (IMP *)&old_thenWithBlock, false },
+	{ "AMSMutablePromise", "continueWithBlock:", false, (IMP)new_continueWithBlock, (IMP *)&old_continueWithBlock,
+	  false },
 	{ "NSURLSessionTask", "resume", false, (IMP)new_resume_base, (IMP *)&old_resume_base, false },
 	{ "__NSCFLocalSessionTask", "resume", false, (IMP)new_resume_local, (IMP *)&old_resume_local, false },
 };

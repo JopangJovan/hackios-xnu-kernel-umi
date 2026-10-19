@@ -1778,10 +1778,37 @@ entered    0 -[NSURLSessionTask resume]
 `resume` не зовётся ни разу — ни для мешка, ни вообще, за весь шестиминутный сеанс. Отсюда и пустота в
 журнале соединений ядра. Магазин по-прежнему показывает «LOADING»: мешок не загрузился.
 
-Следующий шаг — на шаг глубже: чего ждёт этот промис запроса. Это кодировщик запроса и заголовки, которые
-AMS добавляет перед отправкой (`ams_addCookiesForAccount:clientInfo:bag:`,
-`ams_addStoreFrontHeaderForAccount:client:withBag:`, `ams_addAnisetteHeadersForAccount:type:bag:`,
-`-[AMSURLSession _prepareRequest:properties:error:]`). Что-то из этого не возвращается.
+Дальше считали **входы и выходы порознь** — потому что зависший вызов и вызов, которого не было, дают
+одинаковую тишину ниже себя:
+
+```
+entered    1 returned    1 -[AMSBagNetworkTask _createRequestWithQueryItems:]
+entered    0 returned    0 четыре шага, которые дописывают запрос (куки, заголовок витрины,
+                           заголовки anisette, -[AMSURLSession _prepareRequest:properties:error:])
+entered   12 returned   12 -[AMSMutablePromise continueWithBlock:]
+entered    5 returned    5 -[AMSMutablePromise thenWithBlock:]
+entered    1 returned    1 -[AMSMutablePromise _finishWithResult:error:logDuplicateFinishes:]
+```
+
+Ничего не висит. `_createRequestWithQueryItems:` возвращается сразу — промисом, и **этот промис никто
+никогда не завершает**. За сеанс к промисам привязано семнадцать продолжений и завершён ровно один, и по
+адресу это не промис запроса:
+
+```
+PROMISE 0x101709240 waited on (continue)
+STEP _createRequestWithQueryItems: -> <AMSMutablePromise: 0x10170b930>
+PROMISE 0x10170b930 waited on (then) / (continue)
+PROMISE 0x101414370 finished          <- единственный, и другой
+```
+
+То есть запрос мешка вообще не изготавливается: шаг, который его изготовил бы, ждёт чего-то, что не
+приходит, — оттого и ни одного добавленного заголовка, ни запрошенной сессии, ни задачи, ни `resume`.
+Догадка про anisette не подтвердилась вместе с остальными тремя: ни один из четырёх шагов не вызывается.
+
+Следующий шаг — назвать того, кто ждёт. Сторож аварий в этой же библиотеке уже умеет ходить по кадрам
+стека; та же прогулка в `thenWithBlock:` для промиса запроса напечатает несмещённые адреса возврата,
+которые `ipsw dyld a2s` превращает в имя функции. Входной промис тоже виден в журнале (0x101709240,
+создан мгновением раньше) и тоже не завершается никогда.
 
 Две вещи, которые стоили по прогону и которые стоит знать тому, кто будет писать следующую такую
 библиотеку. `class_getInstanceMethod` идёт вверх по цепочке, и подмена метода, который класс только
