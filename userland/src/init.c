@@ -902,7 +902,9 @@ mount_writable(void)
 		 * /var/jb/etc/pwd.db -- a Berkeley database that pwd_mkdb makes from master.passwd and
 		 * that the bootstrap does not ship, only the text it is made from. Without it every
 		 * program of the prefix answers "no such user": an sshd from here refused every login
-		 * with "Invalid user root" while iOS's own /bin/ps resolved users perfectly. The
+		 * with "Invalid user root" while iOS's own /bin/ps resolved users perfectly -- and the
+		 * asymmetry is exactly this, not anything about iOS's own database or the launchd domain
+		 * its server sits in, because a program of the prefix never asks iOS at all. The
 		 * writable copy of the prefix is new at every boot, so the database is made at every
 		 * boot; it takes milliseconds.
 		 */

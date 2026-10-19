@@ -258,9 +258,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		mkdir -p root/var/root/.ssh
 		printf 'd\t700\t0\t0\t/private/var/root/.ssh\n' >> root/etc/var.skel
 		# the key that lets us in, and the host's own key beside it: made here and not on the
-		# phone, because ssh-keygen asks the system who uid 0 is and gets "No user exists for
-		# uid 0" -- the job that answers that (com.apple.mobile.usermanagerd) is loaded into
-		# the user's domain, where a program of root's does not find it
+		# phone, because ssh-keygen asks who uid 0 is and gets "No user exists for uid 0" --
+		# it asks through libiosexec, which reads a database the bootstrap does not ship (see
+		# init.c, where it is now built at every boot); the key is made here all the same,
+		# since nothing should depend on the order of those two
 		for k in authorized_keys ssh_host_ed25519_key ssh_host_ed25519_key.pub; do
 			[ -f ../ssh/$k ] || continue
 			cp ../ssh/$k root/var/root/.ssh/$k
