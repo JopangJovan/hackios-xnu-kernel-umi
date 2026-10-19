@@ -214,11 +214,26 @@ LLVM parameter type, and the NIR value is cut or converted to it.
 A shader is reported as *working* only when its output was compared, never because it compiled.
 Three references, each independent of the translator:
 
-1. **LLVM on the CPU (the strongest).** `tools/air/cpuref` retargets the module to the host,
-   compiles it with `llc` and calls the entry point from a harness that fills its parameters from
-   the same metadata (buffers with seeded data, varyings, position, thread ids) and implements the
-   `air.*` functions in C. LLVM — not our reader, not our translator — decides what the shader
-   means. Needs no Apple hardware and no GPU.
+1. **LLVM on the CPU (the strongest).** `tools/air/cpuref.py` changes the module's triple to the
+   host's, compiles it with `llc`, fills a buffer per `air.buffer` argument with a fixed pattern
+   and calls the entry point; `air2nir --eval` replaces the same buffer loads in *our* NIR with
+   the same bytes and folds it with `nir_opt_constant_folding` (no algebraic rewriting, so the
+   arithmetic stays IEEE and comparable); the two sets of numbers are compared. LLVM — not our
+   reader, not our translator — decides what the shader means, and neither side can see the
+   other's answer. Needs no Apple hardware and no GPU.
+
+   **255 shaders agree, bit for bit, and none differ.** The call into the shader is made from a
+   wrapper written in LLVM IR rather than from C, because a shader returns a struct of vectors by
+   value and how `llc` lowers that is its own business: a C declaration of the same struct agrees
+   for a single vector and stops agreeing past it (this cost an afternoon's false "243 differ").
+   With the wrapper, only `void(const void *, void *)` crosses into C and the question does not
+   arise.
+
+   What it cannot decide, and says so rather than passing: a shader with a non-buffer argument —
+   a varying, `air.position`, a thread id — because what is in it is the GPU's business (19 in
+   AppleMetalGLRenderer, all of them the texture ones), and a compute kernel, which returns
+   nothing and writes through pointers (47 of them). Reading the buffers back after the call
+   would settle the kernels and is M4's acceptance test; it is not written.
 2. **The same shader through our NIR on two different Mesa backends.** `air-run` renders (or
    dispatches) the translated NIR with Gallium: on the host through softpipe (NIR → TGSI →
    an interpreter in C), on the phone through freedreno/ir3 on the Adreno. Both outputs are
@@ -277,14 +292,17 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
   `llvm-dis` on every one.
 - **M1** — `clearFragment01` reaches *adreno*: translated, compiled by ir3, rendered on the
   Adreno, framebuffer equal to the colour in its constant buffer.
-  **Compiled, not yet run.** It is `nir_load_ubo` + a store to `FRAG_RESULT_DATA0` as predicted,
-  and ir3 turns it into five Adreno instructions (four `mov`s out of the constant file, which is
-  where ir3 promoted the UBO load to). The framebuffer half of the test needs the phone.
+  **Compiled and checked against LLVM, not yet run on the GPU.** It is `nir_load_ubo` + a store
+  to `FRAG_RESULT_DATA0` as predicted, and ir3 turns it into five Adreno instructions (four
+  `mov`s out of the constant file, where ir3 promoted the UBO load). Over a buffer of known
+  bytes, LLVM's own execution of the module and our folded NIR give the same four floats, bit for
+  bit. The framebuffer half of the test — ir3's code actually running on the Adreno and the
+  colour read back — needs the phone and has not been done.
 - **M2** — the 283 modules with no `air.*` call: a stated fraction reach *ir3*, a growing subset
   *softpipe*/*adreno*.
-  **262 of the 283 reach ir3.** The other 21 are `air.visible` library functions, which are not
-  entry points at all (below). Counting every entry point rather than every module: 275 of 321,
-  86%.
+  **262 of the 283 reach ir3**, and 255 of them agree with LLVM numerically. The other 21 are
+  `air.visible` library functions, which are not entry points at all (below). Counting every
+  entry point rather than every module: 275 of 321, 86%. Nothing has run on the Adreno.
 - **M3** — textures and samplers, each form with a test that renders a known image.
   Not started, and it is what nearly everything left is waiting for: 46 modules stop at a texture
   call, including all 11 of AV1SW's.
@@ -308,7 +326,7 @@ M2 count (262) differ.
 
 ```
 tools/air/mk-host.sh            # Mesa for this machine (x86-64): the frontend, ir3, softpipe
-tools/air/check.sh              # the reader against llvm-dis, then the corpus report
+tools/air/check.sh              # the reader against llvm-dis, the corpus report, and LLVM
 ```
 
 and on one shader:
@@ -316,8 +334,11 @@ and on one shader:
 ```
 build/mesa-host/build/src/compiler/air/air2nir --ll  FILE[.metallib] [FUNCTION]   # what the reader read
 build/mesa-host/build/src/compiler/air/air2nir       FILE[.metallib] [FUNCTION]   # the NIR
+build/mesa-host/build/src/compiler/air/air2nir --eval FILE[.metallib] [FUNCTION]  # folded to numbers
 build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler \
         --chip-id 0x007506030500 FILE[.metallib] [FUNCTION]                      # Adreno code
+tools/air/cpuref.py --compare FILE[.metallib] [FUNCTION]   # ours against LLVM's own answer
+tools/air/cpuref.py --all FILE.metallib                    # every function of a library
 ```
 
 `0x007506030500` is how freedreno names the redwood's Adreno 7c+ Gen 3 (A635); it has no

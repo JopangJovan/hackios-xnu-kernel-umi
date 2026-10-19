@@ -52,4 +52,17 @@ else
 	echo "check.sh: wrote docs/air-report.md"
 fi
 
-exit $reader_rc
+echo
+echo "== against LLVM on the processor, shader by shader"
+# The strongest check there is, and it needs no GPU: LLVM runs the same module
+# over the same buffer bytes, our NIR is folded over them, and the numbers are
+# compared. Only the class where this is decidable -- an entry point whose
+# arguments are all buffers and which returns its result -- is counted; the
+# rest say why not. See tools/air/cpuref.py.
+cpu_rc=0
+for f in "${LIBS[@]}"; do
+	printf '%-52s ' "$(basename "$(dirname "$f")")/$(basename "$f")"
+	python3 "$ROOT/tools/air/cpuref.py" --all "$f" 2>&1 | tail -1 || cpu_rc=1
+done
+
+exit $((reader_rc | cpu_rc))
