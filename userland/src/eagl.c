@@ -270,6 +270,8 @@ struct eagl {
 	GLint group_blend_func[4];
 	GLuint box;                     /* and one that makes a picture eight times smaller */
 	GLint box_matrix, box_places;
+	GLuint blur4;                   /* and for the four samples of a shadow's blur (blur4_fragment) */
+	GLint blur4_matrix, blur4_places;
 	GLuint halve, vblur;            /* and two for the blur whose radius varies (vblur_level(), vblur_draw_begin()) */
 	GLint halve_texel, vblur_matrix, vblur_radius, vblur_levels, vblur_normalize, vblur_paint;
 	struct vblur_chain {
@@ -1457,6 +1459,10 @@ trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices,
 	char textures[160] = "";
 	size_t used = 0;
 
+	if (trace_shaders) {
+		trace_program(e);               /* (gltrace_shaders=1: the text of each program as it first draws here) */
+	}
+
 	if (e->arrays[0].pointer == NULL || e->arrays[0].type != GL_FLOAT) {
 		return;
 	}
@@ -1656,6 +1662,7 @@ static const char table_fragment[] =
 #define FUNCTION_DOWNSAMPLE_8           28
 #define FUNCTION_VARIABLE_DOWNSAMPLE    38
 #define FUNCTION_VARIABLE_BLUR          39
+#define FUNCTION_SHADOW_BLUR            40
 #define FUNCTION_VIBRANT_MATRIX         45
 
 static const char vibrant_fragment[] =
@@ -1703,6 +1710,29 @@ static const char masking_fragment[] =
  *   on a picture too dark: the minus came out stained with what was behind it instead of the
  *   light grey it is on a phone.
  */
+/*
+ *   "sb3" (40): four samples around a point, averaged -- the same four places as "ds4" is given,
+ *   one pixel out each way, with no weights of its own. It is asked for where a shadow is laid
+ *   over what is behind it (the cards of the switcher of running applications) and in the home
+ *   screen's edit mode. CoreAnimation's OpenGL ES renderer has no shader for it and, unlike the
+ *   ones it never asks about, it asks and is told no -- and then what needs it is not drawn at
+ *   all, so the shadow is missing. This waits for a way to hand CoreAnimation a program where it
+ *   looks for one: answering that the renderer has the function (src/inject.c, glyes=40) only
+ *   kills the window server, and no draw with no program ever arrives here (see there).
+ */
+static const char blur4_fragment[] =
+    "#version 300 es\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform highp vec2 places[4];\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "out lowp vec4 result;\n"
+    "void main() {\n"
+    "  highp vec2 middle = texcoord / vec2(textureSize(texture0, 0));\n"
+    "  result = .25 * (texture(texture0, middle + places[0]) + texture(texture0, middle + places[1]) +\n"
+    "      texture(texture0, middle + places[2]) + texture(texture0, middle + places[3]));\n"
+    "}\n";
+
 static const char box_fragment[] =
     "#version 300 es\n"
     "uniform lowp sampler2D texture0;\n"
@@ -1720,6 +1750,25 @@ static const char box_fragment[] =
     "  result = sum * .0625;\n"
     "}\n";
 
+static int function_numbers;            /* boot-arg glnumbers=1 */
+
+/* Four of a function's numbers at a time, for the line above (one of a few buffers in turn). */
+static const char *
+number_text(const float *values, size_t from, size_t count)
+{
+	static char texts[5][80];
+	static unsigned which;
+	char *text = texts[which++ % (sizeof(texts) / sizeof(texts[0]))];
+
+	if (from >= count) {
+		return "";
+	}
+	snprintf(text, sizeof(texts[0]), " [%g %g %g %g]", (double)values[from],
+	    from + 1 < count ? (double)values[from + 1] : 0.0, from + 2 < count ? (double)values[from + 2] : 0.0,
+	    from + 3 < count ? (double)values[from + 3] : 0.0);
+	return text;
+}
+
 static void *ca_context;                /* CoreAnimation's GLContext */
 static GLfloat function_values[90][20];
 static uint8_t function_given[90];
@@ -1734,13 +1783,18 @@ redwood_gl_function_values(void *context, unsigned function, unsigned index, siz
 	if (function >= 90 || index != 0 || components * count > 20) {
 		return;
 	}
+	/* (boot-arg glnumbers=1: every set of numbers a function is given that is not the one before,
+	   up to a dozen of them -- the same function serves many a layer, with a matrix of its own) */
+	if (!said[function] || (function_numbers && said[function] < 12 &&
+	    memcmp(function_values[function], values, components * count * sizeof(values[0])) != 0)) {
+		said[function]++;
+		say("redwood-gl: CoreAnimation gives its function %u numbers: %zu of %zu:%s%s%s%s%s%s%s%s%s%s\n", function, count,
+		    components, number_text(values, 0, components * count), number_text(values, 4, components * count),
+		    number_text(values, 8, components * count), number_text(values, 12, components * count),
+		    number_text(values, 16, components * count), "", "", "", "", "");
+	}
 	memcpy(function_values[function], values, components * count * sizeof(values[0]));
 	function_given[function] = (uint8_t)(components * count);
-	if (!said[function]) {
-		said[function] = 1;
-		say("redwood-gl: CoreAnimation gives its function %u numbers: %zu of %zu, the first %g %g %g %g\n", function, count,
-		    components, (double)values[0], (double)values[1], (double)values[2], (double)values[3]);
-	}
 }
 
 /* boot-arg glplain=0: leave such draws as they are; 2: also those without a texture; 3: the two with a colour matrix drawn plainly too */
@@ -2114,13 +2168,14 @@ plain_program(const char *fragment, const char *what)
  * in those seconds (which is what tells the screens of a scenario apart); and with that the
  * count of each since the start.
  */
-enum { CENSUS_NOT_DRAWN, CENSUS_PLAIN, CENSUS_TABLE, CENSUS_VIBRANT, CENSUS_MASKING, CENSUS_BOX, CENSUS_LEVEL, CENSUS_VBLUR,
-       CENSUS_KINDS };
+enum { CENSUS_NOT_DRAWN, CENSUS_PLAIN, CENSUS_TABLE, CENSUS_VIBRANT, CENSUS_MASKING, CENSUS_BOX, CENSUS_BLUR4, CENSUS_LEVEL,
+       CENSUS_VBLUR, CENSUS_KINDS };
 static const char *const census_kinds[CENSUS_KINDS] = {
 	"NOT DRAWN (no program, and no texture, or nothing of ours to draw it with, or it would read what it writes)", "drawn as the picture it is given (colour times texture)",
 	"drawn through a table (ours, for the home indicator)", "drawn with our program for a colour matrix over what is behind",
 	"drawn with our program for a colour matrix over premultiplied pixels",
 	"drawn with our program that makes a picture eight times smaller",
+	"drawn with our program that averages four samples around a point (a shadow's blur)",
 	"made into a level of ours, half the size of the one before (a blur whose radius varies)",
 	"drawn with our program that reads the levels by the mask (a blur whose radius varies)",
 };
@@ -2828,6 +2883,24 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 			census_draw(e, function, CENSUS_VBLUR);
 			return true;
 		}
+	}
+	if (e->bound[0] != 0 && plain_draws != 3 && function == FUNCTION_SHADOW_BLUR && function_given[function] == 8) {
+		if (e->blur4 == 0) {
+			e->blur4 = plain_program(blur4_fragment, "four samples around a point");
+			e->blur4_matrix = glGetUniformLocation(e->blur4, "vertex_matrix");
+			e->blur4_places = glGetUniformLocation(e->blur4, "places");
+		}
+		census_draw(e, function, CENSUS_BLUR4);
+		glUseProgram(e->blur4);
+		glUniformMatrix4fv(e->blur4_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
+		glUniform2fv(e->blur4_places, 4, function_values[function]);
+		for (GLuint i = 0; i < 3; i++) {
+			glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+			if (!enabled[i]) {
+				glEnableVertexAttribArray(i);
+			}
+		}
+		return true;
 	}
 	if (e->bound[0] != 0 && plain_draws != 3 && function == FUNCTION_DOWNSAMPLE_8 && function_given[function] == 8) {
 		if (e->box == 0) {
@@ -3829,6 +3902,7 @@ install(void)
 		trace_lit = strstr(arguments, "gltrace_lit=1") != NULL;
 		trace_look = strstr(arguments, "gltrace_look=1") != NULL;
 		trace_shaders = strstr(arguments, "gltrace_shaders=1") != NULL;
+		function_numbers = strstr(arguments, "glnumbers=1") != NULL;
 		trace_uniforms_on = strstr(arguments, "gltrace_uniforms=1") != NULL;
 		if ((argument = strstr(arguments, "gltrace_corners=")) != NULL) {
 			trace_corners = (GLsizei)strtol(argument + 16, NULL, 10);

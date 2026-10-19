@@ -227,14 +227,36 @@ static int (*orig_function_supported)(void *context);
  * For finding out what a missing function is for: with it the draw is made, its numbers arrive
  * (function_uniform below), and the picture says whether the thing was that function's.
  */
+/*
+ * Saying yes to a function the renderer has no shader for is not enough and not safe. Told yes for
+ * "sb3" (40) -- the four samples of a shadow's blur, which our OpenGL ES library has a stand-in for
+ * (eagl.c, blur4_fragment) -- CoreAnimation takes the way of one it has a shader for, finds none,
+ * and the window server dies; it came back every half a minute, with SpringBoard after it, and the
+ * stand-in was never reached: a function it asks about and is told yes to is not one it draws with
+ * no program. What is needed is to hand it a program where it looks for one, which is another
+ * entry of the same table. Until then it is told the truth, and what needs that function is not
+ * drawn -- the shadow under a card of the switcher of running applications.
+ */
 static uint8_t say_yes[90];
 
 static void
 functions_said_yes(const char *arguments)
 {
 	static const char names[] = REDWOOD_CA_FUNCTIONS;
-	const char *argument = strstr(arguments, "glyes=");
+	const char *argument = strstr(arguments, "glno=");
 
+	/* glno=N[,N...]: and the other way about, for seeing what a function of ours stands in for */
+	for (argument = argument != NULL ? argument + 5 : NULL; argument != NULL && *argument >= '0' && *argument <= '9';) {
+		unsigned function = (unsigned)strtoul(argument, (char **)&argument, 10);
+
+		if (function < 90) {
+			say_yes[function] = 0;
+			say("redwood: the renderer will not answer that it has CoreAnimation's function %u (\"%.3s\")\n",
+			    function, names + 4 * function);
+		}
+		argument = *argument == ',' ? argument + 1 : NULL;
+	}
+	argument = strstr(arguments, "glyes=");
 	for (argument = argument != NULL ? argument + 6 : NULL; argument != NULL && *argument >= '0' && *argument <= '9';) {
 		unsigned function = (unsigned)strtoul(argument, (char **)&argument, 10);
 
@@ -255,10 +277,10 @@ my_function_supported(void *context)
 	int supported = orig_function_supported(context);
 	uint8_t function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
 
-	if (!supported && function < 90 && say_yes[function]) {
+	if (!supported && function < 90 && say_yes[function] && gl_loaded) {
 		if (!said[function]) {
 			said[function] = 1;
-			say("redwood: CoreAnimation's function %u (\"%.3s\"): the renderer says it has it (glyes)\n",
+			say("redwood: CoreAnimation's function %u (\"%.3s\"): the renderer is made to say it has it\n",
 			    function, names + 4 * function);
 		}
 		return 1;
