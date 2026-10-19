@@ -13,7 +13,11 @@ import os
 import struct
 import sys
 
-TYPES = {0: 'vertex', 1: 'fragment', 2: 'kernel', 3: 'visible', 4: 'intersection', 5: 'none'}
+# The TYPE tag. Corrected against the metadata of all 456 modules: 4 is what
+# the 135 stitchable functions of PortraitFilters carry, and every one of them
+# says !air.visible, so 4 is "visible" and 3 is not.
+TYPES = {0: 'vertex', 1: 'fragment', 2: 'kernel', 3: 'unqualified', 4: 'visible',
+         5: 'extern', 6: 'intersection'}
 
 
 def parse(path):
