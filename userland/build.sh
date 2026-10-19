@@ -259,7 +259,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# in /var/jb) as it is, since it lives on the prefix and is there at run time
 		case "$library" in
 		"") ;;
-		/redwood/lib/*) [ -f "root/lib/${library#/redwood/lib/}" ] && echo "$library $names" ;;
+		# an "if" and not "&& echo": a last line whose library is absent would make the loop,
+		# and with it the pipeline and the whole build under set -e, fail -- which is what a tree
+		# with only prebuilt/userland in it does, since not every injection library is shipped there
+		/redwood/lib/*) if [ -f "root/lib/${library#/redwood/lib/}" ]; then echo "$library $names"; fi ;;
 		*) echo "$library $names" ;;
 		esac
 	done > root/etc/inject.conf
