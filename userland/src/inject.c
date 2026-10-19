@@ -307,14 +307,23 @@ watch_for_faults(void)
  * own, so this is ds4's own shader with the weights taken out, in the dialect the others are
  * written in (sampler2DRect, varying, gl_FragData -- the preamble is added by the renderer).
  *
- * Where this stands: with the entry filled the window server no longer dies -- thirty-odd crashes
- * a run become none, with glyes=40 as well -- but the shadow is still not drawn, and the picture
- * is identical to the pixel. So the fragment source is not the only thing missing. The four places
- * reach the shader as varyings that a *vertex* shader computes (one of CoreAnimation's own reads
- * "uniform highp vec2 offset[4]" and sets texcoord0..3 = t0 + offset[i], which is where the two
- * groups of four numbers function_uniform delivers end up), and that side is chosen by something
- * other than this table -- it is not in the three hundred entries after it. That is the next
- * thing to find, and it is now a small question rather than a mystery.
+ * Where this stands. With the entry filled the window server no longer dies: thirty-odd crashes a
+ * run become none, with glyes=40 as well, and the function really is drawn -- the renderer rewrites
+ * our source into its own dialect (sampler2DRect becomes sampler2D) and compiles it, and the
+ * picture changes by a level or two across the whole screen where before it did not change at all.
+ *
+ * What it does not do is bring back a shadow, and the reason is that none was missing. This
+ * function was taken up because a note here said the shadow under a card of the switcher was not
+ * drawn; that note was reasoning from "the function is refused", not an observation. Against the
+ * same frame drawn by CoreAnimation's software renderer -- which draws everything correctly, only
+ * slowly -- the edge of a card is the same to the level: 18, 17, 17, then the card. There is no
+ * soft falloff there in either, so there is nothing of that kind to restore.
+ *
+ * Its effect is nil for a second reason worth writing down: the four places reach the shader as
+ * varyings that a vertex shader computes from "uniform highp vec2 offset[4]", and the two groups
+ * of four numbers function_uniform delivers for it are of the order of 5e-19 -- zero, for a
+ * blur. CoreAnimation asks for the single-pass blur exactly when the radius is too small to need
+ * the multi-pass one, so the four samples coincide and the pass copies what it was given.
  */
 #define CA_SHADER_TABLE         0x1d5b54790UL
 
