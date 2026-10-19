@@ -306,7 +306,9 @@ frontend passes it to the runtime verbatim (`air_resource::sampler_state`), assi
 index after the API's, and says so rather than guessing: a wrong filter or wrap mode renders
 plausibly and wrongly, which is the failure that costs a week later instead of an hour now.
 
-What is known is only the shape. Three distinct words occur in the corpus:
+What is known is only the shape. Three distinct words occur in the corpus, quoted here so that
+the inference below can be checked and extended rather than taken on trust — that is the whole
+reason for writing a guess down as a guess:
 
 ```
 0x807bff0000088049    0x807bff0000088a00    0x807bff0000088a49
@@ -326,6 +328,26 @@ So it needs a different kind of evidence — the driver that programs the hardwa
 all (they fetch by integer coordinate), 9 take one as an API argument, and 2 declare their own. So
 this is a narrow gap and not a blocked family — but it is the reason no result here says anything
 about Apple's filtering.
+
+### 3.4 A question for daylight: what of Apple's may this repository contain?
+
+Raised on 20 October and deliberately not settled at three in the morning. The working line is
+**explanation, not input**: a short excerpt quoted beside an analysis so a reader can check it is
+technical writing, while corpus bytes committed as an *input* — a fixture a test opens, a trimmed
+`.metallib`, a dump something parses — is redistribution for use. The repository should never be a
+place to get Apple's shaders; it may be a place that explains them.
+
+By that line, two things in these documents are excerpts and are kept: the three sampler words
+above, and the six-line listing of `clearFragment01` in `docs/metal.md` section 9.5. Neither
+substitutes for the thing it came from, and both carry the analysis they exist to support. Nothing
+committed anywhere is corpus bytes as an input: `docs/air-report.md` holds module names, counts and
+error strings, which are facts about Apple's shaders and not Apple's shaders, and no test here has
+a fixture — `tools/air/check.sh` reads `ios165/rootfs`, which is not in the repository and cannot
+be.
+
+The part needing a decision rather than a convention: whether that line is the right one, and what
+it says about the twenty-odd screenshots in `docs/` of the running port, which are Apple's rendered
+artwork and a different class again. That belongs to whoever owns the repository, awake.
 
 ## 4. How it is proven right
 
