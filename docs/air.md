@@ -393,7 +393,7 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
   `air.visible` library functions, which are not entry points at all (below). Counting every
   entry point rather than every module: 275 of 321, 86%. Nothing has run on the Adreno.
 - **M3** — textures and samplers, each form with a test that renders a known image.
-  **Translated, compiled, and six of them rendered and checked.** The family took the corpus from 275 modules to
+  **Translated, compiled, and six of them rendered on the Adreno and checked.** The family took the corpus from 275 modules to
   313, and all 313 compile for the Adreno. What is *not* done is M3's acceptance test: not one
   texture operation had been run until `air_run` learned to bind one. The forms written are 2D, 3D, 1D,
   cube and their array and multisample variants, for sampling (plain, explicit level, bias,
@@ -413,6 +413,21 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
   Binding the matching target mattered more than it looks: with a 2D texture bound for a 3D
   sampler the three 3D shaders also "passed", by accident. With a real 4×4×4 texture they return
   `101 201 303 400` — the 3D texel — and only then are they evidence.
+
+  **And all six draw on the Adreno and return the same exact texels** (20 October,
+  `logs/003327-run.log`, `RC_JOBS=rc.jobs.airtex`): three `101 201 302 400` for the 2D samplers
+  and three `101 201 303 400` for the 3D ones, each under its own
+  `air_run: … on Adreno 7c+ Gen 3 (the GPU, through the kernel's msm device)`. No crash, no
+  fallback, both flash-root mount lines present, nothing said about missing firmware.
+
+  That run was worth more than its five minutes, and a peer session had to argue for it: softpipe's
+  agreement proves least exactly here. Softpipe takes a `pipe_sampler_view` and samples it in C,
+  while a6xx wants real descriptors in memory, a sampler state block and the right binding slots
+  for the texture instructions ir3 emits — so six exact texels on softpipe said nothing about any
+  of it, and the whole texture path could have been one the phone never takes. It was also the
+  most diagnostic moment this test will ever have: nearest filtering at a texel centre has no
+  weights to round and clamped addressing has no arithmetic, so a mismatch could only have been
+  binding or descriptors. That narrowness disappears as soon as real filtering is tested.
 
   Of 55 texture shaders, 49 are not run, and the reasons are the honest part: 24 are compute
   kernels (`air_run` draws, it does not dispatch); 11 are `air.visible` library functions; 4
