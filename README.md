@@ -1097,6 +1097,27 @@ REST=1 userland/build.sh
 список исключений — `DENY` в `userland/mkjobs.py`, пропустить службу из него для опыта: `ALLOW="слово"`.
 Остальные переменные (`JOBS`, `OSLOG`, `INJECT`, `RC_JOBS`) описаны в начале `userland/build.sh`.
 
+**Служба push-уведомлений (`apsd`).** Из всех служб, которых в образе не было, её спрашивали чаще всех:
+29 % всех строк `failed lookup` в журналах запусков — это `com.apple.apsd`, в одном сеансе 250–300 строк
+от 22 разных демонов (securityd, akd, amsaccountsd, imagent, remindd, healthd, fmfd — весь учётный слой
+спрашивает её прежде, чем что-нибудь сделать). В `DENY` она стояла с первого дня, и её ни разу не пробовали.
+Теперь она в образе «по требованию»: демон поднимается за 60 мс, когда его первый раз спрашивают, объявляет
+`com.apple.apsd` и `com.apple.apsd.nsxpc` и остаётся работать; строк `failed lookup` про него в сеансе
+больше нет ни одной, а клиенты получают свои порты (`com.apple.securityd.aps`,
+`com.apple.coreservices.appleid.aps`, `com.apple.icloud.fmfd.aps`, `com.apple.coreduet.knowledge.sync.push`).
+Самих уведомлений от Apple при этом нет и быть не может: курьеру нужен клиентский сертификат устройства,
+который `apsd` берёт из связки ключей, а если его там нет — у `mobileactivationd` («No identity found in
+keychain. Copying activation identity» → «Device is probably unactivated»). И этого сертификата здесь не
+будет: цепочка активации растёт из Secure Enclave — `mobileactivationd` проверяет UCRT против UIK
+устройства по `SEPRootCA.pem`, — а Secure Enclave у этого телефона нет, ключи классов защиты заменяет
+обратимое преобразование в ядре (`MiniAppleKeyStore.cpp`, см. «Связка ключей»). Польза ровно в том, что
+учётный слой получает ответ вместо ошибки и перестаёт переспрашивать.
+
+Следующая по тому же признаку — `com.apple.CommCenter-noncellular` (телефонию SpringBoard спрашивает
+10 тысяч раз за все сеансы). Это тот вариант задания, который iOS держит как раз для устройства без модема
+(`_LimitLoadFromDeviceTree = baseband`, а узла `baseband` в дереве у нас нет), программа у него та же,
+что у сотового, и в образе она есть; `DENY` отсекает оба по слову `CommCenter`.
+
 `GL=1 REST=1 userland/build.sh` — образ, в котором оконный сервер рисует через OpenGL ES, а не программным
 растеризатором CoreAnimation: за `EAGLContext` встаёт Mesa (прослойка — `userland/src/eagl.c`). На телефоне с
 параметром ядра `gpu=1` рисует сам Adreno: драйвер freedreno из Mesa говорит с ядром

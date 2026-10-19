@@ -27,13 +27,19 @@ import plistlib
 import sys
 
 # substrings of labels. (mediaserverd is not among them, for all that there is neither sound nor a camera:
-# it is where VideoToolbox decodes for every other process, a HEIC picture included; see src/inject_media.c.)
+# it is where VideoToolbox decodes for every other process, a HEIC picture included; see src/inject_media.c.
+# apsd is not among them either: it was left out from the first day without ever being tried, and it is the
+# service the rest of the system misses most -- near a third of every "failed lookup" line in the run logs is
+# one of 22 daemons asking for com.apple.apsd, and the whole account stack asks before it will do anything.
+# It needs no hardware we have not got, and it serves its clients whether or not it reaches a push courier,
+# which it never will: the courier wants a device identity rooted in the Secure Enclave this phone has not
+# got (apsd -> mobileactivationd, "Device is probably unactivated"), so the push itself stays out of reach.)
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'locationd', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties', 'mobileactivationd',
         'installcoordinationd', 'purplebuddy', 'restore', 'usb', 'accessoryd',
-        'mobileassetd', 'nsurlsessiond', 'apsd', 'itunesstored', 'appstored', 'cloudd', 'bird',
+        'mobileassetd', 'nsurlsessiond', 'itunesstored', 'appstored', 'cloudd', 'bird',
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # iOS 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
