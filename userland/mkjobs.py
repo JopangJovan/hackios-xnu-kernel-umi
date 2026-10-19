@@ -40,7 +40,21 @@ import os
 import plistlib
 import sys
 
-# substrings of labels. (nsurlsessiond is not among them either, taken out in the sileo2 copy: it is the
+# Substrings of labels -- and two things to know before adding to this list or believing anything in it.
+#
+# A daemon here may be misbehaving BECAUSE OF ANOTHER ENTRY, so the tuple cannot be judged one line at a
+# time. cloudd was the proof: it looked like a daemon that cost the home screen, on the phone as well as in
+# QEMU, until it turned out to be retrying com.apple.nsurlsessiond thousands of times because nsurlsessiond
+# was itself denied. With that one word gone, cloudd stops spinning and the home screen comes back. Anything
+# written below about a daemon was measured against whatever else was denied at the time, which may no longer
+# be what is denied now -- when a note here was written before a word came out, retest before trusting it.
+#
+# And measure against a control from the same afternoon. Every stalled run of mine happened to be later than
+# every good one, and another session's QEMU was running on the same machine, so the obvious reading was that
+# the machine was loaded rather than that the daemons did it. It was not: one good run sat squarely between
+# two stalled ones. A time-ordered pattern is not a cause; put a control next to the thing you changed.
+#
+# (nsurlsessiond is not among them either, taken out in the sileo2 copy: it is the
 # daemon that carries out background URLSession downloads, and without it an application's download never
 # starts and never fails -- Sileo sits on "Queued" for ever. It matters here for a second reason, below:
 # cloudd spins on it when it is missing.
