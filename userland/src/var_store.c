@@ -222,6 +222,8 @@ head_checksum(const struct head *h)
 
 static int fd = -1;
 static uint8_t *buffer;
+static uint8_t *already;                /* what the slot holds there now, to not write it again */
+static uint64_t skipped_blocks, written_blocks;
 static uint64_t buffered;               /* bytes in the buffer: to be written, or still to be read */
 static uint64_t taken;                  /* of those, already read out (load) */
 static off_t at;                        /* where in the device the buffer begins */
@@ -297,8 +299,19 @@ out_flush(int last)
 		printf("var_store: the archive does not fit in its slot: nothing more is written\n");
 		return 0;
 	}
-	if (!device_write(at, buffer, n)) {
+	/*
+	 * What is already there is read first, and if it is what we were about to write, it is not
+	 * written. A volume that iOS has stopped touching packs to the very same bytes -- measured:
+	 * two saves a minute apart came out with the same checksum -- and the slots hold alternate
+	 * copies of it, so a save that changes nothing then costs reads and no writes at all. Reads
+	 * of this storage are several times cheaper than writes, and flash wears by writing.
+	 */
+	if (already != NULL && device_read(at, already, n) && memcmp(already, buffer, (size_t)n) == 0) {
+		skipped_blocks += n / BLOCK;
+	} else if (!device_write(at, buffer, n)) {
 		return 0;
+	} else {
+		written_blocks += n / BLOCK;
 	}
 	at += (off_t)n;
 	buffered = 0;
@@ -464,6 +477,14 @@ newest(struct head *out_head)
 
 /* ---- packing ---- */
 
+/*
+ * How much of this save is new since the last one: an entry whose time of writing is later than
+ * the second the previous generation was saved at. It costs nothing to count -- the walk has every
+ * entry's time in hand anyway -- and it is what says whether saving only the difference would be
+ * worth building, or whether iOS rewrites the volume faster than any such thing could help.
+ */
+static uint64_t last_saved_at, changed_entries, changed_bytes;
+
 static char path[MAX_PATH];               /* the whole path, under ROOT */
 static struct { uint64_t ino; char path[LINK_PATH]; } *links;
 static uint64_t skipped_kinds, skipped_big;
@@ -600,6 +621,10 @@ pack_one(const char *relative, const struct stat *st)
 	e.mtime_sec = st->st_mtimespec.tv_sec;
 	e.mtime_nsec = (uint32_t)st->st_mtimespec.tv_nsec;
 	e.size = size;
+	if (last_saved_at != 0 && (uint64_t)st->st_mtimespec.tv_sec > last_saved_at) {
+		changed_entries++;
+		changed_bytes += size;
+	}
 	{
 		uint64_t xlen = pack_xattrs(&e.nxattr);
 
@@ -663,6 +688,67 @@ pack_dirtime(const char *relative, const struct stat *st)
 	return 1;
 }
 
+/*
+ * The names of one directory, gathered and sorted. The archive is meant to come out the same
+ * bytes for the same tree: the order getdirentries gives shifts as a directory is written to, and
+ * then every byte after it in the archive moves, which is the difference between a save that
+ * writes nothing into the flash and one that writes all of itself. Both arenas are used as stacks
+ * -- a level marks them on the way in and gives them back on the way out.
+ */
+#define NAME_ARENA      (2u << 20)
+#define NAME_MAX_NAMES  65536
+
+static char name_arena[NAME_ARENA];
+static uint32_t name_at[NAME_MAX_NAMES];
+static uint64_t arena_used, names_used, unsorted_dirs;
+
+static void
+sort_names(uint32_t *at, uint64_t n)
+{
+	/* insertion sort: a directory holds tens of names, and this keeps the program small */
+	for (uint64_t i = 1; i < n; i++) {
+		uint32_t v = at[i];
+		uint64_t j = i;
+
+		while (j > 0 && strcmp(name_arena + at[j - 1], name_arena + v) > 0) {
+			at[j] = at[j - 1];
+			j--;
+		}
+		at[j] = v;
+	}
+}
+
+/* Every name in the open directory into the arena, sorted. Returns the count, or -1 if it did not fit. */
+static long
+gather_names(int dir_fd, char *buf, size_t bufsize, uint64_t mark_a, uint64_t mark_n)
+{
+	off_t position = 0;
+	ssize_t n;
+
+	while ((n = getdirentries(dir_fd, buf, bufsize, &position)) > 0) {
+		for (ssize_t i = 0; i < n;) {
+			struct dirent *d = (struct dirent *)(buf + i);
+			const char *name = d->d_name;
+			size_t len = strlen(name);
+
+			i += d->d_reclen;
+			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+				continue;
+			}
+			if (arena_used + len + 1 > NAME_ARENA || names_used >= NAME_MAX_NAMES) {
+				arena_used = mark_a;
+				names_used = mark_n;
+				return -1;
+			}
+			name_at[names_used++] = (uint32_t)arena_used;
+			strcpy(name_arena + arena_used, name);
+			arena_used += len + 1;
+		}
+	}
+	sort_names(name_at + mark_n, names_used - mark_n);
+	return (long)(names_used - mark_n);
+}
+
 /* relative: the path under ROOT, "" for ROOT itself. path holds the whole of it. */
 static int
 pack_tree(const char *relative)
@@ -670,8 +756,6 @@ pack_tree(const char *relative)
 	static char dirbuf[MAX_DEPTH][4096];    /* one read buffer a level */
 	static int depth;
 	struct stat st;
-	off_t position = 0;
-	ssize_t n;
 	size_t base = strlen(path), rbase = strlen(relative);
 	int dir_fd, ok = 1;
 
@@ -692,16 +776,18 @@ pack_tree(const char *relative)
 		return 1;
 	}
 	depth++;
-	while (ok && (n = getdirentries(dir_fd, dirbuf[depth - 1], sizeof(dirbuf[0]), &position)) > 0) {
-		for (ssize_t i = 0; ok && i < n;) {
-			struct dirent *d = (struct dirent *)(dirbuf[depth - 1] + i);
-			const char *name = d->d_name;
+	{
+		uint64_t mark_a = arena_used, mark_n = names_used;
+		long count = gather_names(dir_fd, dirbuf[depth - 1], sizeof(dirbuf[0]), mark_a, mark_n);
+
+		if (count < 0) {
+			/* more names than the arena holds: this one goes in whatever order it is given */
+			unsorted_dirs++;
+		}
+		for (long k = 0; ok && k < count; k++) {
+			const char *name = name_arena + name_at[mark_n + k];
 			char child[MAX_PATH];           /* the caller's while this one recurses: not static */
 
-			i += d->d_reclen;
-			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
-				continue;
-			}
 			if (base + 1 + strlen(name) >= MAX_PATH || rbase + 1 + strlen(name) >= MAX_PATH) {
 				printf("var_store: %s/%s: the path is too long\n", path, name);
 				continue;
@@ -718,6 +804,8 @@ pack_tree(const char *relative)
 			ok = pack_tree(child);
 			path[base] = 0;
 		}
+		arena_used = mark_a;
+		names_used = mark_n;
 	}
 	depth--;
 	close(dir_fd);
@@ -747,6 +835,10 @@ save(void)
 	}
 	stream_start(slot, 0);
 	entries = 0;
+	last_saved_at = best < 0 ? 0 : old.seconds;
+	changed_entries = changed_bytes = 0;
+	skipped_blocks = written_blocks = 0;
+	arena_used = names_used = unsorted_dirs = 0;
 	/* a watcher saves more than once: nothing of the save before is carried into this one */
 	memset(links, 0, LINKS * sizeof(*links));
 	skipped_kinds = skipped_big = 0;
@@ -783,6 +875,14 @@ save(void)
 	    (unsigned long long)h.generation, (unsigned long long)h.entries, (unsigned long long)h.bytes,
 	    h.crc, skipped_kinds ? " (sockets and the like left out)" : "",
 	    skipped_big ? " (something too big left out)" : "");
+	if (last_saved_at != 0) {
+		printf("var_store: %llu entries and %llu bytes of it were written since the last save "
+		    "(%llu seconds ago)\n", (unsigned long long)changed_entries,
+		    (unsigned long long)changed_bytes, (unsigned long long)(h.seconds - last_saved_at));
+	}
+	printf("var_store: %llu blocks into the flash, %llu left alone (they held this already)%s\n",
+	    (unsigned long long)written_blocks, (unsigned long long)skipped_blocks,
+	    unsorted_dirs ? " (a directory was too big to put in order)" : "");
 	return 1;
 }
 
@@ -1270,6 +1370,11 @@ main(int argc, char **argv, char **envp)
 	if (buffer == MAP_FAILED || links == MAP_FAILED) {
 		printf("var_store: no memory for the buffers\n");
 		return 1;
+	}
+	/* for comparing with what the slot holds before writing over it; doing without is only slower */
+	already = mmap(NULL, BUFFER, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	if (already == MAP_FAILED) {
+		already = NULL;
 	}
 	if (strcmp(what, "watch") == 0) {
 		if (!boot_arg_is("var_store", "1")) {
