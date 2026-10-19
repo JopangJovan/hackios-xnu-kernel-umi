@@ -78,4 +78,18 @@ echo "== the air.* operations, one at a time"
 python3 "$ROOT/tools/air/intrincheck.py" 2>&1 | tail -8
 intrin_rc=${PIPESTATUS[0]}
 
-exit $((reader_rc | cpu_rc | intrin_rc))
+echo
+echo "== the same operations run, not folded"
+# A different check and not a slower one: folding asks NIR's constant
+# expression, this builds the arguments into a buffer so nothing can be folded
+# and hands the shader to a driver that compiles and executes it. That is how
+# air.sign(-0) was caught -- NIR's folder keeps the sign of a zero, softpipe
+# does not, and nir_fsign promises neither.
+#
+# --cases 4 and not the whole pool: 612 cases in 79 seconds against 2586 in
+# 300, and it still catches that bug, which is how the subset was chosen rather
+# than guessed. The full run is `intrincheck.py --run --few`.
+python3 "$ROOT/tools/air/intrincheck.py" --run --cases 4 2>&1 | tail -6
+run_rc=${PIPESTATUS[0]}
+
+exit $((reader_rc | cpu_rc | intrin_rc | run_rc))

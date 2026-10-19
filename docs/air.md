@@ -30,8 +30,9 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | | of 119 |
 | --- | --- |
 | checked numerically, one operation at a time, against a reference outside this tree | 78 |
-| of those, exactly defined and agreeing on every case (44 028 cases) | 71 |
+| of those, exactly defined and agreeing on every case (45 607 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
+| of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
 | textures, atomics, barriers, derivatives and simd: no reference here | 41 |
 
 313 of 456 is 313 of 321 entry points — 97.5% — because 135 modules are `air.visible` library
@@ -39,18 +40,22 @@ functions and not entry points at all.
 
 **What those numbers are not**, because they will be quoted without this paragraph otherwise:
 
-- **The arithmetic operations are now checked; the reference is not the Adreno.** 71 of the
-  corpus's declarations agree with C's own functions on every one of 44 028 cases, which is a real
-  answer to what used to be the largest hole here (section 4, item 4). But what is folded is NIR's
-  constant expression for each opcode, on this machine — so an opcode whose Adreno instruction
-  differs from what `nir_opt_constant_folding` computes would be invisible to all 44 028 of them.
-  Nothing in this table's bottom row calls an `air.*` function: **no operation has been run on the
-  GPU.**
+- **The arithmetic operations are now checked; nothing checked them against the Adreno.** 71 of
+  the corpus's declarations agree with C's own functions on every one of 45 607 cases, and 47 of
+  them agree again when *executed* by softpipe instead of folded — which is a real answer to what
+  used to be the largest hole here (section 4, item 4), and found three bugs getting there. But
+  both engines are on an x86 host. An opcode whose Adreno instruction differs from what
+  `nir_opt_constant_folding` and TGSI compute is invisible to all 48 193 of those cases, and the
+  24 narrow-type declarations softpipe cannot run at all are exactly the ones where ir3 differs
+  most from it. None of the seven shaders that have run on the phone calls an `air.*` function:
+  **no operation has been run on the GPU.**
 - **Still unverified by anything: the atomics, the barrier, the derivatives and the simd
   reductions** — 41 declarations with no reference in `intrincheck.py`, because what they mean
   depends on more than one thread or on neighbouring fragments and a folded constant cannot say
   it. The texture operations among them are covered differently and partly, by the six shaders
-  that returned the exact texel on the Adreno.
+  that returned the exact texel on the Adreno. One thing *is* now settled about the atomics
+  without running any: every one in the corpus asks for `memory_order_relaxed`, and the lowering
+  refuses any other order by name instead of ignoring the argument, which it used to do.
 - **Nothing here tests Metal's own filtering or addressing.** The six texture shaders that drew on
   the Adreno took their sampler from the API, which this harness chose: nearest, clamped, sampled
   at a texel centre. That is evidence about binding, descriptors and ir3's texture instructions —
@@ -433,7 +438,7 @@ Three references, each independent of the translator:
    --eval`. The reference is the C library's own `roundf`, `floorf`, `fmaxf`, `ldexpf` and the
    IEEE definitions, evaluated at the operation's own precision.
 
-   **71 exactly defined operations agree on every one of 44 028 cases; none differ.** Seven are
+   **71 exactly defined operations agree on every one of 45 607 cases; none differ.** Seven are
    approximate (`fast_sin`, `fast_cos`, `fast_exp`, `fast_pow`, `fast_atan2`) and are reported
    with their worst distance from libm and counted as nothing — see below.
 
@@ -473,10 +478,16 @@ Three references, each independent of the translator:
      `dst = ldexpf(src0, src1); /* flush denormals to zero. */ if (!isnormal(dst)) dst =
      copysignf(0.0f, src0);` — and `!isnormal` is true of an infinity as well as of a denormal, so
      `ldexp(0.5, 32767)` folds to `0` where Metal, OpenCL and C all say `+inf`. The comment names
-     denormals; the condition catches more than it means to. Found in Mesa 25.0.7, which is what
-     this port pins. **Not checked against Mesa main** — freedesktop's GitLab is behind bot
-     protection from here, so neither the file nor the 2020 merge request that looks like its
-     origin could be read. Worth reporting upstream by someone who can open the page; not worked
+     denormals; the condition catches more than it means to. Present in Mesa 26.2.5, the newest
+     release at the time of writing, byte for byte — checked by extracting that one file from
+     `archive.mesa3d.org`, which is a plain file server, because freedesktop's GitLab is behind
+     bot protection and the GitHub mirror paths 404. The merge request that looks like its origin
+     is freedesktop 3982, "nir: Flush to zero with OOB low exponents in ldexp", whose title says
+     both what it was for and what it missed: out-of-bounds *low* exponents, the high end never
+     considered. The MR itself could not be read, so treat the origin as likely and the state of
+     the current release as established. A one-line fix would be `isfinite(dst) && !isnormal(dst)`.
+     Worth reporting upstream by someone who can open the page; it is a bug for every Mesa
+     frontend whose language keeps IEEE overflow, which is OpenCL and Metal at least. Not worked
      around here, because the frontend's `nir_ldexp` is the right opcode.
 
    **The check can fail,** which is the first thing to establish about any check in this
@@ -486,6 +497,49 @@ Three references, each independent of the translator:
    caught on 83 of 100 cases. Every component of a vector result is compared, and every component
    of a vector argument is given a *different* value, because with the same value in all of them a
    lowering that swizzled or dropped a component returns the right answer for the wrong reason.
+
+   **Folded is not run, and the difference is not a matter of degree.** `--eval` asks NIR's
+   constant folder; `intrincheck.py --run` builds the same operations into shaders that *load
+   their arguments from a buffer* and hands them to `air_run`, which draws with them through a
+   real driver's compilation and execution. The buffer is the whole point: ir3 folds too, so a
+   shader calling `air.fast_round(0.5)` on an immediate is answered by the compiler and the
+   hardware never sees the instruction — a GPU test built that way passes with the GPU switched
+   off. A value loaded from a buffer cannot be folded, and `air_run` puts bytes the harness chose
+   there (`AIR_RUN_BUFFER`, added for this).
+
+   **47 of the 78 declarations agree on every one of 2 586 cases, run by softpipe rather than
+   folded; none differ.** Seven more are the approximate ones. The remaining 24 touch a type
+   narrower than 32 bits (`i1`, `i8`, `i16`, `f16`) and TGSI's registers are 32-bit, so softpipe
+   cannot answer for them: `nir_to_tgsi` asserts for the integers, which is loud and fine, and
+   for a half it computes at 32 bits instead — it answered `32767` where a half rounds to
+   `32768`, which is a verdict about softpipe and not about this frontend. `--check` reads the
+   screen out of `air_run`'s own first line and sets those aside by name. ir3 has real 16-bit
+   registers, so they are a question for the phone and are open.
+
+   Running them found two things the folding check could not, and could never have:
+
+   - **`air.sign(-0)` gave `+0`.** Metal's `sign` is OpenCL's, where `sign(-0)` is `-0` and
+     `sign(NaN)` is `+0`. `nir_fsign` does not promise either; its own documentation says that
+     for a zero source "there is a preference for the result to have the same sign, but this is
+     not required (it is required by OpenCL)". So a backend is licensed to lose it, NIR's
+     *constant folder* happens not to, and softpipe does — which is exactly why folding the
+     shader could not show it. Same shape as the atan2 bug: an opcode whose contract is weaker
+     than Metal's requirement. `air_intrinsics.c` now builds `sign` from comparisons, which
+     promise what Metal needs, rather than asking for a preference.
+   - **The 16-bit gap above, which is softpipe's and not ours** — but it took a wrong answer
+     (`32767` for a half that rounds to `32768`) to notice, not an assertion, and a check that
+     had trusted the number would have recorded a frontend bug that does not exist.
+
+   **It has not run on the phone.** `--emit DIR` writes the modules, the bytes for their input
+   buffer, a `manifest.json` of what each should return, and a `run.sh` that uses only `for`,
+   `echo` and shell parameter expansion — no `sed`, no `paste` — because what runs it is a Darwin
+   userland and not this machine's shell. `--check DIR LOG` then judges the log wherever it was
+   produced, so the arithmetic reference never leaves the host and the device needs nothing but
+   `air_run`. `--cases 4` cuts it to 211 modules and 1.7 MB, which is carryable. What is missing
+   is only the carrying: getting that directory into the boot image is the flash-root machinery of
+   subsystem (2), which this work is not supposed to touch, and the phone was held by another
+   session all night. **So every number above is from an x86 host, and the bottom row of the
+   table at the top of this document still reads 7.**
 
 Where a shader has a known GLSL equivalent (AppleMetalGLRenderer's shaders *are* the GL
 pipeline's fixed functions), rendering both through the port's GLES and comparing images is a
@@ -810,7 +864,10 @@ build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler \
         --chip-id 0x007506030500 FILE[.metallib] [FUNCTION]                      # Adreno code
 tools/air/cpuref.py --compare FILE[.metallib] [FUNCTION]   # ours against LLVM's own answer
 tools/air/cpuref.py --all --draw FILE.metallib             # every function: LLVM, folded, drawn
-tools/air/intrincheck.py [-v] [OP ...]                     # one air.* operation at a time
+tools/air/intrincheck.py [-v] [OP ...]                     # one air.* operation at a time, folded
+tools/air/intrincheck.py --run --few [OP ...]              # the same, drawn by a real driver
+tools/air/intrincheck.py --emit DIR --few                  # modules + inputs + run.sh, to carry
+tools/air/intrincheck.py --check DIR RUN.LOG               # judge what the runner printed
 build/mesa-host/build/src/gallium/drivers/freedreno/air_run \
         FILE[.metallib] [FUNCTION]                         # draw with it, print the pixel
 tools/air/texcheck.sh [FILE.metallib ...]                  # every texture shader, the texel it returns
@@ -820,11 +877,18 @@ tools/air/texcheck.sh [FILE.metallib ...]                  # every texture shade
 it checks only those, which is how it is used while changing a lowering:
 `tools/air/intrincheck.py atan2`.
 
+`--run` is the same operations *executed* instead of folded, and it is a different check, not a
+slower one — section 4 item 4 says what each can see that the other cannot. `--emit` writes the
+modules, the bytes for their input buffer, a `manifest.json` of what each should return and a
+`run.sh` that uses only `for`, `echo` and parameter expansion, because what runs it may be the
+phone's Darwin userland and not this machine's shell. `--check` then judges the log wherever it
+was produced: the arithmetic reference never leaves the host.
+
 `0x007506030500` is how freedreno names the redwood's Adreno 7c+ Gen 3 (A635); it has no
 `gpu-id`, which is why `tools/mesa/air-ir3.patch` adds `--chip-id` to that tool.
 
 There is no hosted CI: the corpus is Apple's code and stays out of the repository (and out of
-GitHub). `check.sh` is the CI; it takes about four minutes, most of it the per-operation check, so it runs before every commit that touches
+GitHub). `check.sh` is the CI; it takes about five minutes, most of it the two per-operation checks, so it runs before every commit that touches
 the frontend, and the report it writes is committed as `docs/air-report.md` with the numbers of
 that commit.
 

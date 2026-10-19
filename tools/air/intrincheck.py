@@ -42,9 +42,13 @@ What this does NOT prove, and no amount of it will:
   - Denormals. Apple compiles with air.compile.denorms_disable, so the
     hardware may flush where this check does not. Inputs are kept normal.
 
-usage: intrincheck.py [-v] [--decls FILE] [OP ...]
+usage: intrincheck.py [-v] [--decls FILE] [OP ...]           fold it, exhaustively
+       intrincheck.py --run [--few] [--cases N] [OP ...]     run it through a real driver
+       intrincheck.py --emit DIR [--few] [--cases N]         write it out to carry somewhere
+       intrincheck.py --check DIR RUN.LOG                    judge what the runner printed
 """
 
+import json
 import math
 import os
 import re
@@ -230,6 +234,57 @@ def _powr(x, y):
     return math.pow(x, y)
 
 
+# Python raises where C returns a value. Metal's math functions are OpenCL's,
+# which keep the IEEE results at the edge of the domain, so raising here would
+# silently drop the cases that matter most -- it had already dropped every case
+# of air.fast_sqrt.v4f32, whose rotated components always include a negative.
+def _sqrt(x):
+    if math.isnan(x):
+        return x
+    return float("nan") if x < 0 else math.sqrt(x)   # sqrt(-0) is -0
+
+
+def _log(f, zero):
+    def g(x):
+        if math.isnan(x):
+            return x
+        if x == 0.0:
+            return zero
+        return float("nan") if x < 0 else f(x)
+    return g
+
+
+def _rsqrt(x):
+    if math.isnan(x):
+        return x
+    if x == 0.0:
+        return math.copysign(float("inf"), x)
+    return float("nan") if x < 0 else 1.0 / math.sqrt(x)
+
+
+def _fmod(x, y):
+    if y == 0.0 or math.isnan(x) or math.isnan(y) or math.isinf(x):
+        return float("nan")
+    return math.fmod(x, y)
+
+
+def _pow(x, y):
+    # C: pow(+-0, y) for a negative odd integer y is +-inf, keeping the zero's
+    # sign; for any other negative y it is +inf. Python raises for both, and
+    # the fallback that guessed +inf made the shader's correct -inf for
+    # pow(-0, -1) look like an infinite-ulp disagreement.
+    if x == 0.0 and y < 0:
+        odd = y == int(y) and int(y) % 2 != 0
+        return math.copysign(float("inf"), x) if odd else float("inf")
+    try:
+        return math.pow(x, y)
+    except ValueError:
+        return float("nan")        # x < 0 with a fractional y
+    except OverflowError:
+        return math.copysign(float("inf"), x if x < 0 and y == int(y)
+                             and int(y) % 2 != 0 else 1.0)
+
+
 def _ldexp(x, n):
     try:
         return math.ldexp(x, n)
@@ -252,10 +307,10 @@ OPS = {
     "fmax":        (2, _fmax, True),
     "clamp":       (3, _clamp_f, True),
     "mix":         (3, _mix, True),
-    "fmod":        (2, math.fmod, True),
-    "mod":         (2, math.fmod, True),
+    "fmod":        (2, _fmod, True),
+    "mod":         (2, _fmod, True),
     "divide":      (2, lambda a, b: a / b if b else math.copysign(float("inf"), a) if a else float("nan"), True),
-    "sqrt":        (1, math.sqrt, True),   # IEEE: exactly rounded
+    "sqrt":        (1, _sqrt, True),      # IEEE: exactly rounded
     "fma":         (3, lambda a, b, c: math.fma(a, b, c), True),
     "ldexp":       (2, _ldexp, True),
     # approximate: the reference is libm, the shader is allowed to differ
@@ -266,12 +321,12 @@ OPS = {
     "exp":         (1, math.exp, False),
     "exp2":        (1, lambda x: math.pow(2.0, x), False),
     "exp10":       (1, lambda x: math.pow(10.0, x), False),
-    "log":         (1, math.log, False),
-    "log2":        (1, math.log2, False),
-    "log10":       (1, math.log10, False),
-    "pow":         (2, math.pow, False),
+    "log":         (1, _log(math.log, float("-inf")), False),
+    "log2":        (1, _log(math.log2, float("-inf")), False),
+    "log10":       (1, _log(math.log10, float("-inf")), False),
+    "pow":         (2, _pow, False),
     "powr":        (2, _powr, False),
-    "rsqrt":       (1, lambda x: 1.0 / math.sqrt(x), False),
+    "rsqrt":       (1, _rsqrt, False),
 }
 
 # integer operations, by (base name, signed)
@@ -451,6 +506,142 @@ define <{ <4 x %(outty)s> }> @ic() local_unnamed_addr {
 !6 = !{}
 """
 
+# The same shader with its arguments read from a constant buffer instead of
+# written in as immediates. That is the only form worth running on a GPU: ir3
+# folds, so air.fast_round(0.5) written as a constant is answered by the
+# compiler and the hardware never sees the instruction -- the test would pass
+# with the GPU switched off. A value loaded from a buffer cannot be folded, and
+# air_run puts bytes we choose there (AIR_RUN_BUFFER).
+BUF_SKELETON = """source_filename = "ic"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64-apple-ios16.5.0"
+
+%(decl)s
+
+define <{ <4 x %(outty)s> }> @ic(ptr addrspace(2) %%in) local_unnamed_addr {
+%(body)s
+  %%r = insertvalue <{ <4 x %(outty)s> }> undef, <4 x %(outty)s> %%v3, 0
+  ret <{ <4 x %(outty)s> }> %%r
+}
+
+!llvm.module.flags = !{!0}
+!air.version = !{!1}
+!air.language_version = !{!2}
+!air.fragment = !{!3}
+
+!0 = !{i32 1, !"wchar_size", i32 4}
+!1 = !{i32 2, i32 5, i32 0}
+!2 = !{!"Metal", i32 3, i32 0, i32 0}
+!3 = !{ptr @ic, !4, !6}
+!4 = !{!5}
+!5 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"%(outname)s", !"air.arg_name", !"out"}
+!6 = !{!7}
+!7 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4096, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"in"}
+"""
+
+# One case's arguments occupy MAXARG * 4 four-byte slots of that buffer, so a
+# component's address is arithmetic on its indices and nothing has to be packed
+# tightly.
+MAXARG = 3
+SLOTS_PER_ARG = 4
+SLOTS_PER_CASE = MAXARG * SLOTS_PER_ARG
+
+
+def slot_bytes(bty, v):
+    """One four-byte slot holding `v` as type `bty`, little-endian.
+
+    A narrow type is written into the low bytes of its slot, which is where a
+    little-endian load of that width at a four-byte-aligned address reads it.
+    """
+    if bty == "float":
+        return struct.pack("<f", f32(v))
+    if bty == "half":
+        h = f16(v)
+        b = (struct.pack("<H", 0x7C00 if h > 0 else 0xFC00) if math.isinf(h)
+             else struct.pack("<e", h))
+        return b + b"\0\0"
+    if bty == "double":
+        return struct.pack("<d", v)[:4]
+    w = int(bty[1:])
+    if w == 1:
+        return struct.pack("<B", 1 if v else 0) + b"\0\0\0"
+    return struct.pack("<i", wrap(v, 32, True) if w >= 32
+                       else wrap(v, w, True) & ((1 << w) - 1))
+
+
+def emit_buffered(decl, name, argtys, retty, cases, signed):
+    """The .ll of a shader that loads its arguments, and the bytes to load.
+
+    Returns (source, input bytes). The caller assembles the source and gives
+    the bytes to air_run.
+    """
+    rty, rn = parse_type(retty)
+    outty = "float" if rty in ("float", "half", "double") else "i32"
+    outname = "float4" if outty == "float" else "int4"
+
+    data = bytearray()
+    lines = []
+    slots = []
+    for i, args in enumerate(cases):
+        while len(data) < (i + 1) * SLOTS_PER_CASE * 4:
+            data += b"\0\0\0\0"
+        argvals = []
+        for j, (ty, v) in enumerate(zip(argtys, args)):
+            bty, bn = parse_type(ty)
+            comps = []
+            for c in range(bn):
+                slot = i * SLOTS_PER_CASE + j * SLOTS_PER_ARG + c
+                data[slot * 4:slot * 4 + 4] = slot_bytes(bty, v[c])
+                nm = "%%l%d_%d_%d" % (i, j, c)
+                lines.append("  %sp = getelementptr inbounds i8, "
+                             "ptr addrspace(2) %%in, i64 %d" % (nm, slot * 4))
+                lines.append("  %s = load %s, ptr addrspace(2) %sp, align 4"
+                             % (nm, bty, nm))
+                comps.append(nm)
+            if bn == 1:
+                argvals.append("%s %s" % (bty, comps[0]))
+            else:
+                prev = "undef"
+                for c, nm in enumerate(comps):
+                    vv = "%%g%d_%d_%d" % (i, j, c)
+                    lines.append("  %s = insertelement <%d x %s> %s, %s %s, i32 %d"
+                                 % (vv, bn, bty, prev, bty, nm, c))
+                    prev = vv
+                argvals.append("<%d x %s> %s" % (bn, bty, prev))
+
+        lines.append("  %%c%d = call %s @%s(%s)"
+                     % (i, retty, name, ", ".join(argvals)))
+        for k in range(rn):
+            s_ = "%%c%d" % i
+            if rn > 1:
+                s_ = "%%e%d_%d" % (i, k)
+                lines.append("  %s = extractelement %s %%c%d, i32 %d"
+                             % (s_, retty, i, k))
+            if rty == "half":
+                lines.append("  %%f%d_%d = fpext half %s to float" % (i, k, s_))
+                s_ = "%%f%d_%d" % (i, k)
+            elif rty in ("i1", "i8", "i16") and outty == "i32":
+                lines.append("  %%f%d_%d = %s %s %s to i32"
+                             % (i, k, "sext" if signed else "zext", rty, s_))
+                s_ = "%%f%d_%d" % (i, k)
+            elif rty == "i64" and outty == "i32":
+                lines.append("  %%f%d_%d = trunc i64 %s to i32" % (i, k, s_))
+                s_ = "%%f%d_%d" % (i, k)
+            slots.append(s_)
+
+    pad = "0.0" if outty == "float" else "0"
+    packed = (slots + [pad] * 4)[:4]
+    prev = "undef"
+    for i, s_ in enumerate(packed):
+        lines.append("  %%v%d = insertelement <4 x %s> %s, %s %s, i32 %d"
+                     % (i, outty, prev, outty, s_, i))
+        prev = "%%v%d" % i
+
+    return (BUF_SKELETON % dict(decl=decl, outty=outty, outname=outname,
+                                body="\n".join(lines)),
+            bytes(data))
+
+
 
 def fconst(ty, x):
     """A float constant LLVM will read back bit-for-bit."""
@@ -576,7 +767,36 @@ def base_and_sign(name):
 DOT_FLOATS = [0.0, 1.0, -1.0, 2.0, 3.0, -4.0, 0.5, -0.25, 8.0, -16.0]
 
 
-def pool_for(ty, family):
+# A short pool, for the run on real hardware: 300 ms a module here and more on
+# the phone, so the full cross product is 12 031 modules and an hour. What the
+# GPU run has to establish is that each operation *executes* correctly, not the
+# input coverage -- the folding check above already does the grid exhaustively.
+# So these are the values that have actually broken something: both zeros, the
+# half-way cases that separate round from rint, the largest float below a half,
+# and the integer extremes.
+FEW_FLOATS = [0.0, -0.0, 0.5, -0.5,
+              struct.unpack("<f", struct.pack("<I", 0x3EFFFFFF))[0],
+              2.5, -2.5, 3.7]
+FEW_FLOATS2 = [1.0, -1.0, 0.0, 0.25]
+FEW_INTS = [0, 1, -1, 7, -32768, 32767, 2147483647, -2147483648]
+FEW_INTS2 = [1, -1, 0, 7]
+FEW_DOT = [0.0, 1.0, -1.0, 2.0, -4.0, 0.5, -0.25, 8.0]
+
+
+def pool_for(ty, family, few=False, nth=0):
+    if few:
+        bty, _ = parse_type(ty)
+        if bty == "i1":
+            return [0, 1]
+        if bty.startswith("i"):
+            return FEW_INTS if nth == 0 else FEW_INTS2
+        if family == "dot":
+            return FEW_DOT
+        return FEW_FLOATS if nth == 0 else FEW_FLOATS2
+    return pool_for_full(ty, family)
+
+
+def pool_for_full(ty, family):
     bty, _ = parse_type(ty)
     if bty == "i1":
         return [0, 1]
@@ -585,7 +805,7 @@ def pool_for(ty, family):
     return DOT_FLOATS if family == "dot" else FLOATS
 
 
-def inputs_for(argtys, family):
+def inputs_for(argtys, family, few=False, cases=0):
     """The cases to try: one list per argument, holding its components.
 
     Every component of a vector argument gets a different value. With the same
@@ -593,14 +813,20 @@ def inputs_for(argtys, family):
     one, or swizzled, would return the right answer for the wrong reason --
     which is the mistake this port has already made four times with textures.
     """
-    pools = [pool_for(t, family) for t in argtys]
+    pools = [pool_for(t, family, few, n) for n, t in enumerate(argtys)]
     widths = [parse_type(t)[1] for t in argtys]
 
     # the whole pool for the first argument, less of it for the others, or a
     # three-argument operation is tens of thousands of shader builds
-    limits = [len(pools[0])]
-    limits += [min(12, len(p)) for p in pools[1:2]]
-    limits += [min(6, len(p)) for p in pools[2:]]
+    # --cases N takes the first N of the first argument's pool and narrows the
+    # others with it: that is how a suite small enough to carry to the phone is
+    # cut, and the values are still in the order of how dangerous they are
+    first = min(cases, len(pools[0])) if cases else len(pools[0])
+    limits = [first]
+    limits += [min(max(1, first // 2) if cases else (4 if few else 12), len(p))
+               for p in pools[1:2]]
+    limits += [min(max(1, first // 4) if cases else (2 if few else 6), len(p))
+               for p in pools[2:]]
 
     grid = [()]
     for lim in limits:
@@ -643,10 +869,272 @@ def ulps(a, b):
     return abs(ia - ib)
 
 
+# ---------------------------------------------------------------------------
+# the same operations, run rather than folded
+#
+# --emit writes a directory of modules whose arguments come from a buffer, the
+# bytes for that buffer, and a runner that needs only `for`, `echo` and
+# parameter expansion -- the phone's userland is not this machine's. --check
+# reads what the runner printed, wherever it ran, and compares it with the
+# expectations in the manifest. --run does both here, through softpipe, which
+# is already a second engine: softpipe executes TGSI, so a disagreement between
+# it and air2nir --eval is NIR's constant folder against nir_to_tgsi and the
+# answer is not pre-decided by either.
+
+RUNNER = """#!/bin/sh
+# Run every generated module and print its whole output after a marker line.
+# Parsing happens on the host (intrincheck.py --check); this stays dumb on
+# purpose, because what is here may be a Darwin userland with no sed or paste.
+D=`dirname "$0"`
+AIR_RUN=${AIR_RUN:-$D/air_run}
+for bc in "$D"/*.bc; do
+	id=${bc##*/}
+	id=${id%.bc}
+	echo "=== $id"
+	AIR_RUN_BUFFER="$D/$id.bin" "$AIR_RUN" "$bc" 2>&1
+done
+"""
+
+
+def emit_suite(arith, outdir, want, verbose, few=False, cases=0):
+    """Write the modules, their inputs, the manifest and the runner."""
+    os.makedirs(outdir, exist_ok=True)
+    manifest = []
+    n = 0
+    for d, name, retty, argtys, op, plain, sign, family in arith:
+        if want and not any(w in name for w in want):
+            continue
+        rn = parse_type(retty)[1]
+        per_shader = max(1, 4 // rn)
+        cases_l = inputs_for(argtys, family, few, cases)
+        for k in range(0, len(cases_l), per_shader):
+            batch = cases_l[k:k + per_shader]
+            expect = []
+            keep = []
+            for args in batch:
+                try:
+                    expect.append(reference(family, plain, name, args, argtys,
+                                            retty, True if sign is None else sign))
+                    keep.append(args)
+                except (ValueError, OverflowError, ZeroDivisionError):
+                    pass
+            if not keep:
+                continue
+            src, data = emit_buffered(d, name, argtys, retty, keep, sign)
+            ident = "%04d" % n
+            ll = os.path.join(outdir, ident + ".ll")
+            with open(ll, "w") as f:
+                f.write(src)
+            q = subprocess.run(["llvm-as", "-o", os.path.join(outdir, ident + ".bc"), ll],
+                               capture_output=True)
+            if q.returncode:
+                print("REFUSED %-34s llvm-as: %s"
+                      % (name, q.stderr.decode().strip().splitlines()[0]))
+                continue
+            os.remove(ll)
+            with open(os.path.join(outdir, ident + ".bin"), "wb") as f:
+                f.write(data)
+            manifest.append(dict(id=ident, name=name, retty=retty, rn=rn,
+                                 exact=bool(OPS[plain][2] if plain in OPS else True),
+                                 op=plain, signed=True if sign is None else bool(sign),
+                                 cases=[[list(a) for a in c] for c in keep],
+                                 expect=expect))
+            n += 1
+
+    with open(os.path.join(outdir, "manifest.json"), "w") as f:
+        json.dump(manifest, f)
+    run = os.path.join(outdir, "run.sh")
+    with open(run, "w") as f:
+        f.write(RUNNER)
+    os.chmod(run, 0o755)
+    print("intrincheck: %d modules in %s, %d declarations, with run.sh and manifest.json"
+          % (len(manifest), outdir, len(set(m["name"] for m in manifest))))
+    return 0
+
+
+NARROW = {"i1", "i8", "i16", "f16", "half"}
+
+
+def is_narrow(name, retty):
+    """Does this declaration touch a type narrower than 32 bits?
+
+    Read off the mangled name, which carries every operand's type, not only
+    the result's: air.convert.f.v2f32.s.v2i16 returns floats and takes i16.
+    """
+    for part in name.split(".") + [parse_type(retty)[0]]:
+        if re.sub(r"^v\d+", "", part) in NARROW:
+            return True
+    return False
+
+
+def parse_runner_log(path):
+    """({id: result}, screen) from whatever the runner printed.
+
+    The screen matters: air_run says which one it opened, and softpipe has no
+    16-bit types -- nir_to_tgsi asserts on most of them and silently computes
+    the rest at 32 bits, which answered 32767 where a half rounds to 32768.
+    That is the engine's limit and not the frontend's, so a half operation
+    judged on softpipe would be a verdict about nothing.
+    """
+    out = {}
+    screen = None
+    ident = None
+    block = []
+    def finish():
+        if ident is None:
+            return
+        text = "\n".join(block)
+        i = text.find("came back as")
+        if i < 0:
+            why = ""
+            for line in block:
+                if any(w in line for w in ("this harness", "Assertion", "error",
+                                           "no gallium", "stores nothing", "no function")):
+                    why = line.strip()
+                    break
+            out[ident] = ("refused", why or (block[-1].strip() if block else "no output"))
+            return
+        vals = []
+        for line in text[i:].splitlines()[1:]:
+            t = line.strip()
+            if not t or not re.match(r"^-?[0-9.]|^-?(inf|nan)", t):
+                break
+            vals.append(t)
+        out[ident] = ("ok", vals)
+
+    for line in open(path, errors="replace"):
+        if screen is None and " on " in line and line.startswith("air_run: "):
+            screen = "softpipe" if "softpipe" in line else line.split(" on ")[-1].strip()
+        if line.startswith("=== "):
+            finish()
+            ident = line[4:].strip()
+            block = []
+        else:
+            block.append(line.rstrip("\n"))
+    finish()
+    return out, screen
+
+
+def check_log(outdir, logpath, verbose):
+    """Compare a runner log against the manifest. Where it ran is not our
+    business; what it computed is."""
+    with open(os.path.join(outdir, "manifest.json")) as f:
+        manifest = json.load(f)
+    got, screen = parse_runner_log(logpath)
+    # TGSI's registers are 32-bit, so softpipe cannot run an operation on a
+    # narrow type: nir_to_tgsi asserts for i1, i8 and i16, and for a half it
+    # computes at 32 bits instead and answers 32767 where a half rounds to
+    # 32768. Either way the verdict would be about softpipe. ir3 has real
+    # 16-bit registers, so these are a question for the phone and stay open.
+    narrow_here = screen == "softpipe"
+
+    per_decl = {}
+    narrow_skipped = set()
+    missing = 0
+    refused = {}
+    total = 0
+    for m in manifest:
+        if narrow_here and is_narrow(m["name"], m["retty"]):
+            narrow_skipped.add(m["name"])
+            continue
+        r = got.get(m["id"])
+        if r is None:
+            missing += 1
+            continue
+        if r[0] == "refused":
+            refused.setdefault(m["name"], r[1])
+            continue
+        vals = r[1]
+        isf = parse_type(m["retty"])[0] in ("float", "half", "double")
+        flat = []
+        for v in vals:
+            try:
+                flat.append(float(v) if isf else int(float(v)))
+            except ValueError:
+                flat.append(float("nan"))
+        if not isf and m["signed"]:
+            flat = [wrap(v, 32, True) for v in flat]
+        st = per_decl.setdefault(m["name"], dict(exact=m["exact"], n=0, bad=[],
+                                                 worst=0, worst_case=None))
+        for i, args in enumerate(m["cases"]):
+            for c, exp in enumerate(m["expect"][i]):
+                idx = i * m["rn"] + c
+                if idx >= len(flat):
+                    continue
+                if (isinstance(exp, float)
+                        and (math.isinf(exp)
+                             or (exp != 0.0 and abs(exp) < 1.17549435e-38))):
+                    continue
+                st["n"] += 1
+                total += 1
+                g = flat[idx]
+                if st["exact"]:
+                    if isinstance(exp, int):
+                        same = g == exp
+                    else:
+                        same = (to_f32_bits(f32(g)) == to_f32_bits(f32(exp))
+                                or (math.isnan(g) and math.isnan(exp)))
+                    if not same:
+                        st["bad"].append((args, c, g, exp))
+                else:
+                    u = ulps(g, exp)
+                    if u > st["worst"]:
+                        st["worst"], st["worst_case"] = u, (args, c, g, exp)
+
+    ok = bad = approx = 0
+    for name in sorted(per_decl):
+        st = per_decl[name]
+        if not st["n"]:
+            continue
+        if st["exact"]:
+            if st["bad"]:
+                bad += 1
+                print("WRONG   %-34s %d of %d cases differ" % (name, len(st["bad"]), st["n"]))
+                for args, c, g, exp in st["bad"][:4]:
+                    fmt = (lambda v: "%.9g" % v) if isinstance(g, float) else str
+                    print("          %-34s [%d] got %-16s want %s"
+                          % (showargs(args), c, fmt(g), fmt(exp)))
+            else:
+                ok += 1
+                if verbose:
+                    print("exact   %-34s %d cases" % (name, st["n"]))
+        else:
+            approx += 1
+            where = ""
+            if st["worst_case"] and st["worst"] > 64:
+                args, c, g, exp = st["worst_case"]
+                where = "   at %s [%d]: %.9g against %.9g" % (showargs(args), c, g, exp)
+            print("approx  %-34s %d cases, worst %s ulp from libm%s"
+                  % (name, st["n"], st["worst"], where))
+
+    for name in sorted(refused):
+        print("refused %-34s %s" % (name, refused[name][:80]))
+    print()
+    print("intrincheck: %d exactly defined operations agree on every case, %d differ"
+          % (ok, bad))
+    print("intrincheck: %d are approximate, compared with this machine's libm and not counted"
+          % approx)
+    if refused:
+        print("intrincheck: %d declarations were refused by the harness" % len(refused))
+    if missing:
+        print("intrincheck: %d modules are in the manifest and not in the log" % missing)
+    if narrow_skipped:
+        print("intrincheck: %d declarations left out: a narrow type (i1, i8, i16, f16) "
+              "and this ran on softpipe, whose registers are 32-bit" % len(narrow_skipped))
+    print("intrincheck: %d cases in all, as RUN on %s and not as folded"
+          % (total, screen or "an unnamed screen"))
+    return 1 if (bad or missing) else 0
+
+
 def main(argv):
     verbose = False
     want = []
     decls_file = None
+    emit_dir = None
+    check_pair = None
+    run_here = False
+    few = False
+    ncases = 0
     i = 0
     while i < len(argv):
         if argv[i] == "-v":
@@ -654,9 +1142,25 @@ def main(argv):
         elif argv[i] == "--decls":
             i += 1
             decls_file = argv[i]
+        elif argv[i] == "--emit":
+            i += 1
+            emit_dir = argv[i]
+        elif argv[i] == "--check":
+            check_pair = (argv[i + 1], argv[i + 2])
+            i += 2
+        elif argv[i] == "--run":
+            run_here = True
+        elif argv[i] == "--few":
+            few = True
+        elif argv[i] == "--cases":
+            i += 1
+            ncases = int(argv[i])
         else:
             want.append(argv[i])
         i += 1
+
+    if check_pair:
+        return check_log(check_pair[0], check_pair[1], verbose)
 
     if not os.path.exists(AIR2NIR):
         print("intrincheck: run tools/air/mk-host.sh first", file=sys.stderr)
@@ -698,6 +1202,29 @@ def main(argv):
                             % (len(argtys), want_args)))
             continue
         arith.append((d, name, retty, argtys, op, plain, sign, family))
+
+    if emit_dir:
+        return emit_suite(arith, emit_dir, want, verbose, few, ncases)
+
+    if run_here:
+        # the same modules, drawn by whatever screen air_run opens -- softpipe
+        # here, the Adreno on the phone
+        d = tempfile.mkdtemp(prefix="intrincheck.run.")
+        if emit_suite(arith, d, want, verbose, few, ncases):
+            return 1
+        log = os.path.join(d, "run.log")
+        air_run = os.environ.get("AIR_RUN", os.path.join(
+            ROOT, "build/mesa-host/build/src/gallium/drivers/freedreno/air_run"))
+        if not os.path.exists(air_run):
+            print("intrincheck: no air_run at %s" % air_run, file=sys.stderr)
+            return 1
+        with open(log, "w") as f:
+            q = subprocess.run(["sh", os.path.join(d, "run.sh")],
+                               env=dict(os.environ, AIR_RUN=air_run),
+                               stdout=f, stderr=subprocess.STDOUT)
+        if q.returncode:
+            print("intrincheck: run.sh exited %d" % q.returncode, file=sys.stderr)
+        return check_log(d, log, verbose)
 
     tmp = tempfile.mkdtemp(prefix="intrincheck.")
     exact_ok = exact_bad = approx = refused = denorm = notnormal = 0
