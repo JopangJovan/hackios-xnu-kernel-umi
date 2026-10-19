@@ -67,15 +67,25 @@ import sys
 # Stubbing the first driver is the kind of work RedwoodBattery already is, but the second is an Apple
 # baseband on PCIe, and this phone's modem is on the SoC and speaks QMI to a Qualcomm subsystem -- so what
 # is behind the driver is missing too, not just the driver.
-# cloudd and mobileassetd were tried too, and they behave: no crash in a seven-minute session, each spawned
-# once on demand and stayed, and between them 42 failed lookups a session go away (com.apple.cloudd 26,
-# com.apple.mobileassetd.v2 16). They are out all the same, for now, because of what they cost in QEMU: with
-# the two of them in, the boot reaches 76 processes against 119 in 420 s and 84 in 700 s, and the home screen
-# never arrives at all -- not one widget or poster process starts, where the same image without them has
-# Spotlight, PosterBoard and a dozen widgets up inside 420 s. Nothing is wrong with the daemons; an emulated
-# CPU cannot carry CloudKit and asset downloads and still draw a home screen. On the phone, with eight real
-# cores, the cost is probably nothing -- but nobody has measured it there yet, and QEMU is how this is mostly
-# run. Measure it on the phone and they can come straight in: ALLOW="cloudd mobileassetd".
+# cloudd is out, and the reason is not what it first looked like. Neither daemon crashes, and between them
+# 42 failed lookups a session go away (com.apple.cloudd 26, com.apple.mobileassetd.v2 16) -- but with the two
+# of them in, the home screen never arrives: the boot reaches 76-78 processes against 119, and not one widget
+# or poster process starts, where the same image without them has Spotlight, PosterBoard and a dozen widgets
+# inside 420 s. I first put that down to the emulated CPU and guessed the phone would not care. The phone was
+# measured and cares more: the same recipe, the same four and a half minutes, 42 processes against 128, no
+# home screen, and the applications the scenario taps never open at all.
+# What it actually is: cloudd retries com.apple.nsurlsessiond without ever stopping -- 2351 times on the
+# phone, 120 to 406 in QEMU, against a dozen in a session without it -- because nsurlsessiond was itself in
+# this tuple until a few lines above took it out. So this is two daemons' problem with a one-word fix, and
+# the word is already gone: the sileo2 copy removed nsurlsessiond for Sileo's downloads and it is removed
+# here too. On its own it costs nothing -- that copy's phone session reaches 118 processes and 20 widgets
+# with nsurlsessiond in and cloudd still denied -- so cloudd deserves another try now that it is there.
+# Two measurements outstanding: mobileassetd alone (it is not the one spinning, 2 retries against cloudd's
+# 2351), and cloudd with nsurlsessiond actually present.
+# One thing still unexplained: ALLOW="syncdefaultsd appstored" loses the home screen the same way (77
+# processes, no widgets) with no retry storm at all -- a dozen nsurlsessiond lookups, nothing spinning. So
+# the stall has at least one other cause, and whoever picks this up should not assume nsurlsessiond is all of
+# it.
 # syncdefaultsd (com.apple.kvsd) is out on its own merits. It serves cloudkeychainproxy3 its store, then
 # aborts inside changeTokenForStoreWithConfiguration:reply: with
 #   *** Terminating app due to uncaught exception 'NSInvalidArgumentException',
