@@ -330,7 +330,8 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# the network the radio is to join: its name on the first line, its passphrase on the second. Yours, and
 	# so not in the repository; it goes where the firmware goes and the kernel reads it there (wifi_join=1)
 	rm -f root/fw/network
-	[ -f ../fw-wifi/network ] && install -m 0600 ../fw-wifi/network root/fw/network
+	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
+	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/redwood_haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
@@ -365,6 +366,12 @@ for d in gpu wifi haptic camera audio; do
 	if [ -d ../fw-$d ]; then fwhave="$fwhave $d"; else fwnone="$fwnone $d"; fi
 done
 echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${fwhave:- none present}${fwnone:+, absent:$fwnone}"
+# an image carrying fw/network carries the name and passphrase of your network, and the images are
+# what somebody would be handed to run this on a second phone
+if [ -f root/fw/network ]; then
+	echo "build.sh: and fw/network -- the name and passphrase of your Wi-Fi. Do not pass this image on;"
+	echo "build.sh: SHARE=1 builds the same image without it."
+fi
 # When the iOS volume on the phone's flash is to become the root (boot-arg root_apfs=ufs_darwin,
 # with flashboot.apfs resident; src/init.c, flash_root): an empty directory to hide iOS's
 # NanoLaunchDaemons and LaunchAngels with,
