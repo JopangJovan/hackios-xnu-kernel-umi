@@ -108,7 +108,7 @@ echo "== the texture operations, on more than one texel"
 # lowering that ignored the coordinate and always fetched (1, 1) would pass all
 # six of them. These ask for the corners too, so swapping x and y is caught on
 # the five asymmetric coordinates and correctly not on the symmetric ones.
-python3 "$ROOT/tools/air/texopcheck.py" 2>&1 | tail -6
+python3 "$ROOT/tools/air/texopcheck.py" 2>&1 | tail -10
 texop_rc=${PIPESTATUS[0]}
 
 exit $((reader_rc | cpu_rc | intrin_rc | run_rc | atomic_rc | texop_rc))

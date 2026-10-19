@@ -73,10 +73,10 @@ target triple = "air64-apple-ios16.5.0"
 
 %(decl)s
 
-define <{ <4 x float> }> @tex(%(params)s) local_unnamed_addr {
+define <{ <4 x %(outty)s> }> @tex(%(params)s) local_unnamed_addr {
 %(body)s
-  %%out = insertvalue <{ <4 x float> }> undef, <4 x float> %%v, 0
-  ret <{ <4 x float> }> %%out
+  %%out = insertvalue <{ <4 x %(outty)s> }> undef, <4 x %(outty)s> %%v, 0
+  ret <{ <4 x %(outty)s> }> %%out
 }
 
 !llvm.module.flags = !{!0}
@@ -88,7 +88,7 @@ define <{ <4 x float> }> @tex(%(params)s) local_unnamed_addr {
 !2 = !{!"Metal", i32 3, i32 0, i32 0}
 !3 = !{ptr @tex, !4, !6}
 !4 = !{!5}
-!5 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+!5 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"%(outname)s", !"air.arg_name", !"out"}
 !6 = !{%(args)s}
 %(argmd)s
 """
@@ -99,15 +99,23 @@ SAMPLER_MD = ('!{i32 %d, !"air.sampler", !"air.location_index", i32 0, i32 1, '
               '!"air.arg_type_name", !"sampler", !"air.arg_name", !"s"}')
 
 
-def build(decl, call, needs_sampler, kind, access):
-    """One shader: `call` computes %v from %t (and %s), `decl` declares it."""
+def build(decl, call, needs_sampler, kind, access, outty="float"):
+    """One shader: `call` computes %v from %t (and %s), `decl` declares it.
+
+    outty is the render target's component type. It has to follow the
+    declaration: air_run picks the texture's format from what the shader
+    samples into (its own comment says why -- "a Metal texture2d<uint> read out
+    of a float texture gives numbers that are neither right nor obviously
+    wrong"), and the render target has to be able to hold the result.
+    """
     params = ["ptr addrspace(1) %t"]
     md = [TEXTURE_MD % (0, access, kind)]
     if needs_sampler:
         params.append("ptr addrspace(2) %s")
         md.append(SAMPLER_MD % 1)
     return SKELETON % dict(
-        decl=decl, params=", ".join(params), body=call,
+        decl=decl, params=", ".join(params), body=call, outty=outty,
+        outname="float4" if outty == "float" else "int4",
         args=", ".join("!%d" % (7 + i) for i in range(len(md))),
         argmd="\n".join("!%d = %s" % (7 + i, m) for i, m in enumerate(md)))
 
@@ -131,7 +139,7 @@ def cases(decls):
             out.append(("%s (%d,%d)" % (name, x, y),
                         build(have[name], body, False, "2d<float, access::read>",
                               "air.read"),
-                        texel(x, y)))
+                        texel(x, y), False))
 
     # the same fetch with 16-bit coordinates, which is a separate declaration
     name = "air.read_texture_2d.i16.v4f32"
@@ -143,7 +151,7 @@ def cases(decls):
             out.append(("%s (%d,%d)" % (name, x, y),
                         build(have[name], body, False, "2d<float, access::read>",
                               "air.read"),
-                        texel(x, y)))
+                        texel(x, y), False))
 
     # -- the size queries ---------------------------------------------------
     for name, want in (("air.get_width_texture_2d", TEX),
@@ -158,7 +166,7 @@ def cases(decls):
                 '  %%v = insertelement <4 x float> %%v2, float %%f, i32 3' % name)
         out.append((name, build(have[name], body, False,
                                 "2d<float, access::read>", "air.read"),
-                    [want] * 4))
+                    [want] * 4, False))
 
     # -- sampling, at the centre of several texels --------------------------
     name = "air.sample_texture_2d.v4f32"
@@ -173,7 +181,7 @@ def cases(decls):
             out.append(("%s (%d,%d)" % (name, x, y),
                         build(have[name], body, True, "2d<float, sample>",
                               "air.sample"),
-                        texel(x, y)))
+                        texel(x, y), False))
 
     name = "air.sample_texture_3d.v4f32"
     if name in have:
@@ -187,7 +195,127 @@ def cases(decls):
             out.append(("%s (%d,%d,%d)" % (name, x, y, z),
                         build(have[name], body, True, "3d<float, sample>",
                               "air.sample"),
-                        texel(x, y, z)))
+                        texel(x, y, z), False))
+    # -- the integer-typed reads and samples ---------------------------------
+    #
+    # air_run picks the texture's format from what the shader samples into, so
+    # these get an R32G32B32A32_SINT or _UINT texture holding the same numbers
+    # cast to int. The render target has to follow too, or the bits come back
+    # read the wrong way.
+    for name in sorted(have):
+        m = re.match(r"^air\.(read|sample)_texture_(2d|3d)"
+                     r"(\.i16)?\.([su])\.v4i(16|32)$", name)
+        if not m:
+            continue
+        kindop, nd, narrow_coord, sign, width = m.groups()
+        n = 3 if nd == "3d" else 2
+        rty = "<4 x i%s>" % width
+        decl = have[name]
+        for coord in ([(1, 1, 1), (2, 3, 1)] if nd == "3d" else [(1, 1), (2, 3)]):
+            if kindop == "read":
+                cty = "i16" if narrow_coord else "i32"
+                cv = ", ".join("%s %d" % (cty, v) for v in coord[:n])
+                body = ('  %%r = tail call { %s, i8 } @%s(ptr addrspace(1) %%t, '
+                        '<%d x %s> <%s>, %s 0, i32 0)\n'
+                        % (rty, name, n, cty, cv, cty))
+                access, kind = "air.read", "%s<%s, access::read>" % (
+                    nd, "int" if sign == "s" else "uint")
+            else:
+                cv = ", ".join("float %.9e" % ((v + 0.5) / TEX) for v in coord[:n])
+                body = ('  %%r = tail call { %s, i8 } @%s(ptr addrspace(1) %%t, '
+                        'ptr addrspace(2) %%s, <%d x float> <%s>, i1 true, '
+                        '<%d x i32> zeroinitializer, i1 false, float 0.0, '
+                        'float 0.0, i32 0)\n' % (rty, name, n, cv, n))
+                access, kind = "air.sample", "%s<%s, sample>" % (
+                    nd, "int" if sign == "s" else "uint")
+            body += '  %%t0 = extractvalue { %s, i8 } %%r, 0\n' % rty
+            if width == "16":
+                # widen to the render target, by the declaration's own sign
+                body += ('  %%v = %s <4 x i16> %%t0 to <4 x i32>'
+                         % ("sext" if sign == "s" else "zext"))
+            else:
+                body += '  %v = bitcast <4 x i32> %t0 to <4 x i32>'
+            out.append(("%s %s" % (name, coord[:n]),
+                        build(decl, body, kindop == "sample", kind, access, "i32"),
+                        texel(*coord[:3] if nd == "3d" else (coord[0], coord[1])),
+                        False))
+
+    # -- the gather ----------------------------------------------------------
+    #
+    # A gather returns one channel of the four texels around the coordinate.
+    # Metal fixes the order they come back in and this does not know it, so the
+    # four values are compared as a multiset: that checks the footprint and the
+    # channel selection without committing to an order convention, and every
+    # channel gives a different multiset, so a wrong channel still shows.
+    #
+    # The coordinate is 1.75/4, so in texel space it is 1.25 and the footprint
+    # is x,y in {1, 2} with nothing ambiguous about the rounding.
+    for name in sorted(have):
+        m = re.match(r"^air\.gather_texture_2d(\.[su])?\.v4(f32|f16|i32|i16)$", name)
+        if not m:
+            continue
+        sign, width = m.group(1), m.group(2)
+        rty = "<4 x %s>" % {"f32": "float", "f16": "half",
+                            "i32": "i32", "i16": "i16"}[width]
+        outty = "float" if width.startswith("f") else "i32"
+        base = {"f32": "float", "f16": "half",
+                "i32": "uint" if sign == ".u" else "int",
+                "i16": "uint" if sign == ".u" else "int"}[width]
+        u = 1.75 / TEX
+        for comp in range(4):
+            want = sorted(texel(x, y)[comp] for x in (1, 2) for y in (1, 2))
+            body = ('  %%r = tail call { %s, i8 } @%s(ptr addrspace(1) %%t, '
+                    'ptr addrspace(2) %%s, <2 x float> <float %.9e, float %.9e>, '
+                    'i1 true, <2 x i32> zeroinitializer, i32 %d, i32 0)\n'
+                    % (rty, name, u, u, comp))
+            body += '  %%g = extractvalue { %s, i8 } %%r, 0\n' % rty
+            if width == "f16":
+                body += '  %v = fpext <4 x half> %g to <4 x float>'
+            elif width == "i16":
+                body += ('  %%v = %s <4 x i16> %%g to <4 x i32>'
+                         % ("zext" if sign == ".u" else "sext"))
+            elif width == "i32":
+                body += '  %v = bitcast <4 x i32> %g to <4 x i32>'
+            else:
+                body += '  %v = bitcast <4 x float> %g to <4 x float>'
+            out.append(("%s channel %d" % (name, comp),
+                        build(have[name], body, True, "2d<%s, sample>" % base,
+                              "air.sample", outty),
+                        want, True))
+
+    # -- the half-typed reads and samples ------------------------------------
+    #
+    # These belong with the rest rather than in a list of things with no case:
+    # they are generated, they are correct as far as this can tell, and
+    # softpipe sets them aside for the one reason it sets aside every 16-bit
+    # operation. On ir3 they are a real question.
+    for name in sorted(have):
+        m = re.match(r"^air\.(read|sample)_texture_(2d|3d)\.v4f16$", name)
+        if not m:
+            continue
+        kindop, nd = m.groups()
+        n = 3 if nd == "3d" else 2
+        coord = (1, 1, 1) if nd == "3d" else (1, 1)
+        if kindop == "read":
+            cv = ", ".join("i32 %d" % v for v in coord[:n])
+            body = ('  %%r = tail call { <4 x half>, i8 } @%s(ptr addrspace(1) %%t, '
+                    '<%d x i32> <%s>, i32 0, i32 0)\n' % (name, n, cv))
+            access, kind = "air.read", "%s<half, access::read>" % nd
+            sampler = False
+        else:
+            cv = ", ".join("float %.9e" % ((v + 0.5) / TEX) for v in coord[:n])
+            body = ('  %%r = tail call { <4 x half>, i8 } @%s(ptr addrspace(1) %%t, '
+                    'ptr addrspace(2) %%s, <%d x float> <%s>, i1 true, '
+                    '<%d x i32> zeroinitializer, i1 false, float 0.0, float 0.0, '
+                    'i32 0)\n' % (name, n, cv, n))
+            access, kind = "air.sample", "%s<half, sample>" % nd
+            sampler = True
+        body += '  %g = extractvalue { <4 x half>, i8 } %r, 0\n'
+        body += '  %v = fpext <4 x half> %g to <4 x float>'
+        out.append(("%s %s" % (name, coord[:n]),
+                    build(have[name], body, sampler, kind, access),
+                    texel(*coord[:3]) if nd == "3d" else texel(*coord[:2]), False))
+
     return out
 
 
@@ -252,28 +380,48 @@ def main(argv):
     d = keep or tempfile.mkdtemp(prefix="texopcheck.")
     os.makedirs(d, exist_ok=True)
     exact = other = refused = 0
-    screen = None
-    for i, (label, source, want) in enumerate(todo):
+    narrow = set()
+    for i, (label, source, want, unordered) in enumerate(todo):
         got, err = run(d, i, source)
         if got is None:
+            # TGSI's registers are 32-bit, so softpipe cannot carry a 16-bit
+            # texture result: nir_to_tgsi asserts. That is softpipe's limit and
+            # not the frontend's, and it is the same one intrincheck.py sets
+            # aside for the narrow arithmetic. ir3 has real 16-bit registers,
+            # so these are a question for the phone.
+            if "nir_to_tgsi" in err and re.search(r"v4i16|v4f16", label):
+                narrow.add(label.split(" ")[0])
+                continue
             print("refused %-44s %s" % (label, err[:80]))
             refused += 1
             continue
-        if [float(w) for w in want] == got[:4]:
+        g4 = sorted(got[:4]) if unordered else got[:4]
+        w4 = sorted(float(w) for w in want) if unordered else [float(w) for w in want]
+        if w4 == g4:
             exact += 1
             if verbose:
                 print("EXACT   %-44s %s" % (label, " ".join("%g" % g for g in got[:4])))
         else:
             other += 1
-            print("WRONG   %-44s got %s  want %s"
-                  % (label, " ".join("%g" % g for g in got[:4]),
-                     " ".join("%g" % w for w in want)))
+            print("WRONG   %-44s got %s  want %s%s"
+                  % (label, " ".join("%g" % g for g in g4),
+                     " ".join("%g" % w for w in w4),
+                     " (in any order)" if unordered else ""))
 
     print()
-    print("texopcheck: %d texture calls run: %d returned the exact texel, %d did not, "
-          "%d refused" % (len(todo), exact, other, refused))
+    print("texopcheck: %d texture calls run: %d returned exactly what was put there, "
+          "%d did not, %d refused" % (len(todo) - sum(1 for l, _, _, _ in todo
+                                          if l.split(" ")[0] in narrow),
+                          exact, other, refused))
+    if narrow:
+        print("texopcheck: %d declarations left out: a 16-bit result, and TGSI's registers"
+              % len(narrow))
+        print("texopcheck: are 32-bit, so softpipe asserts rather than answering wrongly")
     print("texopcheck: the coordinates differ between calls, so a lowering that ignored")
     print("texopcheck: them and always fetched (1,1) would fail here and not in texcheck.sh")
+    print("texopcheck: a gather is compared as a multiset: it came back in GL's order,")
+    print("texopcheck: (i0j1, i1j1, i1j0, i0j0), but Metal's own order is not established")
+    print("texopcheck: here, so the footprint and the channel are checked and not the order")
     print("texopcheck: nothing here tests Metal's sampler state: the sampler is the API's")
     print("texopcheck: (nearest, clamped) and the 64-bit sampler word is not decoded")
     if keep:

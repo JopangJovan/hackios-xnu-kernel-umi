@@ -33,9 +33,10 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | of those, exactly defined and agreeing on every case (45 607 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
 | of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
-| the atomics and the barrier, against a kernel written for them (`atomiccheck.py`) | 10 |
-| texture operations checked exactly, on several texels each (`texopcheck.py`) | 6 |
-| texture operations with no check: integer-typed, multisample, write, depth | 25 |
+| the atomics and the barrier, against kernels written for them (`atomiccheck.py`) | 10 |
+| texture operations verified exactly, on several texels each (`texopcheck.py`) | 13 |
+| texture operations with a case softpipe cannot run: a 16-bit result | 7 |
+| texture operations with no case: multisample, depth, write | 11 |
 
 313 of 456 is 313 of 321 entry points — 97.5% — because 135 modules are `air.visible` library
 functions and not entry points at all.
@@ -63,19 +64,26 @@ functions and not entry points at all.
   however the lowering is written. That needs the phone. Two things are settled without running
   anything: every atomic in the corpus asks for `memory_order_relaxed`, and a stronger order is
   now refused by name instead of ignored, which is what the lowering used to do.
-- **Every one of the 119 declarations the corpus calls now has some numerical check**, which is
-  new as of tonight and is the first time that has been true: 78 arithmetic ones against C's own
-  functions, 10 atomics and the barrier against a kernel written for them, and 31 texture ones
-  partly — 6 declarations exactly, on several texels each (section 4, item 6), and the rest not,
-  for reasons given there. The derivatives and the simd reductions have no check either, and no
-  module of the corpus calls them: they are unexercised code, not untested behaviour, and saying
-  "unverified" of them would overstate what is at stake.
-- **The weakest of the three is the textures**, and the gap is not in the fetch but in everything
-  Metal's sampler state decides. The 64-bit `constexpr sampler` word is still not decoded
-  (section 3.3), every coordinate checked is a texel centre where nearest filtering has no
-  weights to round, and the integer-typed reads and samples are not checked at all because
-  `air_run` binds one float texture and a shader declaring an integer one against it is a type
-  mismatch whose answer would mean nothing.
+- **All 119 declarations are now accounted for**, which is new as of tonight and is a weaker
+  claim than "all checked" — the distinction matters and an earlier draft of this paragraph, and
+  the commit message of `bbf6c3c`, ran the two together:
+
+  | | of 119 |
+  | --- | --- |
+  | verified: the answer was compared with one computed elsewhere and agreed | 94 |
+  | measured, no verdict: approximate arithmetic, against this machine's libm | 7 |
+  | has a case, which softpipe cannot run: a 16-bit result or operand | 7 |
+  | has no case, for a reason given in section 4 item 6: multisample, depth, write | 11 |
+
+  The 94 are 71 arithmetic operations, 10 atomics and the barrier, and 13 texture operations. The
+  derivatives and the simd reductions are in none of these rows because **no module of the corpus
+  calls them**: unexercised code, not untested behaviour, and saying "unverified" of them would
+  overstate what is at stake.
+- **The weakest of the three groups is the textures**, and the gap is not in the fetch — which is
+  now checked at the corners as well as the middle, and for integer and unsigned textures too —
+  but in everything Metal's sampler state decides. The 64-bit `constexpr sampler` word is still
+  not decoded (section 3.3) and every coordinate checked is a texel centre or a clean footprint
+  corner, where nearest filtering has no weights to round and clamping has no arithmetic.
 - **Nothing here tests Metal's own filtering or addressing.** The six texture shaders that drew on
   the Adreno took their sampler from the API, which this harness chose: nearest, clamped, sampled
   at a texel centre. That is evidence about binding, descriptors and ir3's texture instructions —
@@ -618,12 +626,28 @@ Three references, each independent of the translator:
      entirely and always fetched `(1, 1)` would pass all six of them.
 
    `tools/air/texopcheck.py` generates a fragment shader per operation *and coordinate*, asking
-   for the corners as well as the middle. **All 17 calls return the exact texel**, covering six
-   declarations: `read_texture_2d` with 32- and with 16-bit coordinates, `get_width_texture_2d`,
-   `get_height_texture_2d`, `sample_texture_2d` and `sample_texture_3d`. The coordinates are
-   immediates here, unlike the arithmetic: a texture fetch is not constant-folded by NIR or by
-   ir3, so there is nothing for the compiler to answer in the shader's place and no buffer is
-   needed.
+   for the corners as well as the middle. **All 35 calls return exactly what was put there**,
+   covering 13 of the 31 texture declarations: `read_texture_2d` with 32- and with 16-bit
+   coordinates, the two size queries, `sample_texture_2d` and `sample_texture_3d`, each of those
+   for float, signed-integer and unsigned-integer textures, and `gather_texture_2d`. The
+   coordinates are immediates here, unlike the arithmetic: a texture fetch is not constant-folded
+   by NIR or by ir3, so there is nothing for the compiler to answer in the shader's place and no
+   buffer is needed to defeat it.
+
+   The integer-typed textures work because `air_run` already picks the texture's format from what
+   the shader samples into, with its own comment saying why — "a Metal `texture2d<uint>` read out
+   of a float texture gives numbers that are neither right nor obviously wrong". An earlier
+   version of this section said those declarations could not be checked for exactly that reason,
+   which was written from the probe's output without reading the code beside it. They can, and
+   the render target's type has to follow as well or the bits come back read the wrong way.
+
+   A gather returns one channel of the four texels around the coordinate, and Metal fixes the
+   order they come back in. They came back in GL's order, `(i0j1, i1j1, i1j0, i0j0)`, but that
+   Metal's convention is the same is not established here — so the four values are compared as a
+   multiset. That checks the footprint and the channel selection without committing to an order,
+   and since every channel gives a different multiset a wrong channel still shows. The coordinate
+   is `1.75/4`, which is `1.25` in texel space, so the footprint is `{1,2}×{1,2}` with nothing
+   ambiguous about the rounding.
 
    Made to fail: swapping the first two coordinate components is caught on all five asymmetric
    coordinates and correctly *not* on the three symmetric ones, which is the difference between
@@ -634,15 +658,16 @@ Three references, each independent of the translator:
    - Metal's own sampler state. The sampler is the API's — nearest, clamped — and every
      coordinate is a texel centre, where nearest filtering has no weights to round and clamping
      has no arithmetic. The 64-bit `constexpr sampler` word remains undecoded (section 3.3).
-   - The integer-typed reads and samples (`read_texture_2d.s.v4i16`,
-     `sample_texture_2d.u.v4i32` and the rest, 14 declarations). `air_run` binds one
-     `r32g32b32a32_float` texture, and a shader declaring an integer texture against it is a type
-     mismatch whose result would say nothing about the lowering. Binding a texture whose format
-     follows the declaration is a change to `air_run` that is not made.
-   - `write_texture_2d`, which needs the texture read back after the draw, and the multisample
-     reads, which need a multisample texture. Neither is bound.
-   - The depth sample: nothing binds a depth texture, and a shader reading an attachment nothing
-     stored to is one of the four tests this port has already had pass for the wrong reason.
+   - The seven declarations whose result or coordinate is 16-bit. They have cases and softpipe
+     refuses them: TGSI's registers are 32-bit, so `nir_to_tgsi` asserts rather than answering
+     wrongly, which is the better of its two failure modes. ir3 has real 16-bit registers, so
+     these are a question for the phone.
+   - `write_texture_2d` and `write_texture_3d` (4 declarations), which need the texture read back
+     after the draw, and the multisample reads (5), which need a multisample texture. Neither is
+     bound by `air_run`.
+   - The depth sample and the multisample depth read (2): nothing binds a depth texture, and a
+     shader reading an attachment nothing stored to is one of the four tests this port has
+     already had pass for the wrong reason.
 
 Where a shader has a known GLSL equivalent (AppleMetalGLRenderer's shaders *are* the GL
 pipeline's fixed functions), rendering both through the port's GLES and comparing images is a
