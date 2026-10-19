@@ -84,18 +84,15 @@ functions and not entry points at all.
   but in everything Metal's sampler state decides. The 64-bit `constexpr sampler` word is still
   not decoded (section 3.3) and every coordinate checked is a texel centre or a clean footprint
   corner, where nearest filtering has no weights to round and clamping has no arithmetic.
-- **Nothing here tests Metal's own filtering or addressing.** The six texture shaders that drew on
-  the Adreno took their sampler from the API, which this harness chose: nearest, clamped, sampled
-  at a texel centre. That is evidence about binding, descriptors and ir3's texture instructions —
-  exactly what it was built to be — and silence about everything Metal's sampler state decides.
-  **The 64-bit `constexpr sampler` word is not decoded** (section 3.3). Two modules of the corpus
-  declare such a sampler; everywhere else the API supplies it.
-- **Compute has just started being checked, and atomics are not among it.** `air_run` can now
-  dispatch a kernel and read its device buffers back (section 5b); the first one agrees with its
-  NIR exactly. But 17 of the 40 kernels that translate use a global atomic, and *a total written
-  by threads that never raced looks exactly like one written by threads that did* — so nothing
-  here is evidence about atomicity. The 24 kernels that use textures are not dispatched at all
-  yet: the harness binds textures for a draw and not for a dispatch.
+  The six texture shaders that drew on the Adreno took their sampler from the API too, so what
+  they are evidence about is binding, descriptors and ir3's texture instructions — exactly what
+  they were built to be — and silence about everything Metal's sampler state decides. Two modules
+  of the corpus declare a `constexpr sampler`; everywhere else the API supplies it.
+- **Of Apple's own kernels, one has been dispatched, and on software.** `air_run` can dispatch a
+  kernel and read its device buffers back (section 5b), and the one that has agrees with its NIR
+  exactly. The 24 kernels that use textures are not dispatched at all: the harness binds textures
+  for a draw and not for a dispatch. So the atomics being checked (above) is a statement about
+  two kernels written here for that purpose, not about the 17 of Apple's 40 that use one.
 
 ## 1. Where the frontend lives: inside Mesa, as `src/compiler/air`
 
