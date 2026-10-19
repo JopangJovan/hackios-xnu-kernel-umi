@@ -79,10 +79,12 @@ IOS_JOBS=${JOBS-"
 # bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
 # networks the radio hears. NOT FINISHED: a network cannot be joined from Settings yet.
 # It is in by default now, because it costs nothing where there is no radio at all: in QEMU it comes up, talks
-# to itself about country codes and sits there -- 228 processes started against 228 without it, no crash -- and
-# it answers what the rest of the system keeps asking for anyway. com.apple.wifi.manager, which wifid registers
-# itself rather than declaring in its plist, fell from 60 failed lookups a session to 6, com.apple.private.corewifi*
-# from 6 to none, and the session's whole failed-lookup count from 659 to 605. WIFID=0 leaves it out.
+# to itself about country codes and sits there -- 114 processes started against 119 without it, no crash, never
+# restarted -- and it answers what the rest of the system keeps asking for anyway. com.apple.wifi.manager, which
+# wifid registers itself rather than declaring in its plist, fell from 30 failed lookups a session to 3,
+# com.apple.private.corewifi-xpc from 1 to none, and the session's whole failed-lookup count from 331 to 305.
+# (Count a QEMU run log with its duplicate lines removed: run-ios.sh prints launchd's log twice.)
+# WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is

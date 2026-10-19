@@ -47,15 +47,15 @@ import sys
 # CommCenter stays, and this is what it cost to find out. Shipping both of its plists is the stock
 # arrangement -- they carry the same label and launchd picks by the device tree, so with no "baseband" node
 # it takes com.apple.CommCenter-noncellular, the variant iOS has for a device with no modem -- and it does
-# pick it. It then gets a long way: it answers com.apple.commcenter.xpc and .coretelephony.xpc (148 and 36
+# pick it. It then gets a long way: it answers com.apple.commcenter.xpc and .coretelephony.xpc (85 and 18
 # failed lookups in a session become none), serves geod its policy, loads the network-extension
 # configurations. And then it dies, every time, on one of two IOKit drivers of the cellular path that this
 # kernel has not got: "Could not find AppleIPAppender service" (matched by name, user client
 # ApplePDPHelperInterface -- PDP contexts, traffic-class flows, dedicated bearers) and SIGSEGV 50 ms later,
 # or "Unable to communicate with AppleBaseband driver" (com.apple.driver.AppleBasebandPCI) and SIGABRT.
-# It respawns and does it again: 36 crashes in a seven-minute session where the same image without it has
-# none. The boot is not held up -- it reaches the same 236 processes against 240 -- so the trade is 184
-# failed lookups a session against a process dying every twelve seconds for ever, which is a bad one.
+# It respawns and does it again: 18 crashes in a seven-minute session where the same image without it has
+# none. The boot is not held up -- it reaches the same 118 processes against 119 -- so the trade is 103
+# failed lookups a session against a process dying every fifteen seconds for ever, which is a bad one.
 # Stubbing the first driver is the kind of work RedwoodBattery already is, but the second is an Apple
 # baseband on PCIe, and this phone's modem is on the SoC and speaks QMI to a Qualcomm subsystem -- so what
 # is behind the driver is missing too, not just the driver.
