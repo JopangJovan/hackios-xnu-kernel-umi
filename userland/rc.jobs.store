@@ -20,6 +20,20 @@
 # And no second DHCP: configd configures en0 by itself here (the job com.redwood.wifi, with wifi=1),
 # so "dhcp en0" asks IPConfiguration for a service that is already being made. Wait for the address.
 #
+# Two things are asked at once here, because one window answers both. The storefront is put on the
+# local account with store_test, which is not an invention: it is the value bag.itunes.apple.com
+# returned for this device when asked with none (x-set-apple-store-front: 143469-2,8), a region and
+# not an account. If the store lists applications with it in place, then "AMS will not bootstrap its
+# own storefront" is the whole of what is left, and the store already does what was asked of it --
+# browse without an Apple ID, and no way to install, there being nothing to buy with.
+# The other half is the kernel's command line: atm_diagnostic_config=0x20000000
+# (ATM_ENABLE_LEGACY_LOGGING, osfmk/atm/atm_types.h) is what libtrace reads out of the boot
+# arguments to turn on full logging, and it is the only way in to AMS's own account-side lines --
+# "Attempted a bag load but an account wasn't provided", "Failed to fetch local account. This will
+# prevent initial bag requests from specifying storefront" -- which sit below the level
+# OS_ACTIVITY_DT_MODE prints. Only the jobs named in OSLOG print to the console, so the extra volume
+# is the one daemon's and not the whole system's.
+#
 # QUIET=1 is not enough by itself, measured: launchd's lines keep coming (7755 in a 320 s run against
 # 8013 in a 263 s one without it), and of five net_test steps run early only the last printed. So the
 # steps wait out the start first -- the flood is heaviest while launchd spawns its two hundred
@@ -28,10 +42,11 @@
 # that is what emptied the first run of this file.
 /redwood/bin/rwtouch wait 55 swipe 0.5 0.985 0.5 0.3 250 wait 20
 /redwood/bin/net_test waitaddr en0 60
-/redwood/bin/net_test fetch https://www.apple.com/library/test/success.html
-/redwood/bin/net_test resolve bag.itunes.apple.com reach bag.itunes.apple.com
 /redwood/bin/net_test fetch https://bag.itunes.apple.com/bag.xml
-/redwood/bin/net_test fetch https://init.itunes.apple.com/bag.xml
+# the account as it stands, then the number the bag server gave THIS device, by AMS's own setter.
+# (Answered, and the answer is no: the value sets in memory and does not keep, because AMS's local
+# account is made fresh every boot and accountsd has no iTunes account at all. See src/store_test.m.)
+/redwood/bin/store_test user 501 set 143469-2,8
 # and only then the store, open long enough to time out (30 s) and try again
 /redwood/bin/rwtouch tap 0.615 0.59 wait 95
 /bin/ps -A

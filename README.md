@@ -1676,6 +1676,35 @@ fetch local account. This will prevent initial bag requests from specifying stor
 отвечает: в журнале видно и подключение `appstored` к нему, и его транзакции `AMSDCookieService.getCookies`.
 Сценарий — `userland/rc.jobs.store`.
 
+**Витрину руками положить некуда.** Раз сервер выдал номер именно этому устройству
+(`x-set-apple-store-front: 143469-2,8`), оставалось проверить, не в нём ли одном дело: положить его на
+учётную запись самим. Для этого есть `userland/src/store_test.m` — он подписан теми же правами, что и
+`appstored` (`ldid -e` с его двоичного файла: `com.apple.accounts.appleaccount.fullaccess`,
+`com.apple.private.accounts.allaccounts`), сам загружает AppleMediaServices и зовёт её же методы.
+Ответ отрицательный, и он много объясняет:
+
+```
+store_test: uid 501, euid 501; AppleMediaServices loaded
+store_test: before: ams_localiTunesAccount: user local
+store_test: before: ams_localiTunesAccount: id 7BA65770-7DC2-488D-8B57-81B17A8B12F0
+store_test: before: ams_localiTunesAccount: STOREFRONT (null)
+store_test: set: in memory now 143469-2,8
+store_test: set: ams_saveAccount: done
+store_test: after: ams_localiTunesAccount: STOREFRONT (null)
+```
+
+Установщик работает, значение не сохраняется. В `accountsd` нет ни одной записи типа
+`com.apple.account.iTunesStore` — для телефона, в который не входили, это правильно, — а та «местная»
+учётная запись, которую отдаёт AMS, не её строка: её идентификатор каждый раз новый (в трёх сеансах
+`appstored` это 143B8A92…, 8D31AF5C…, C976F334…, у нас 7BA65770…). То есть она создаётся заново при
+каждой загрузке, с пустой витриной, и записать её негде: единственное, что её заполняет, — ответ
+сервера мешка (`_setStorefrontFromURLResponse:bagData:`), тот самый запрос, которого не происходит.
+
+Значит, снаружи процесса витрину этому устройству не отдать, и следующее место — внутри `appstored`:
+в порту уже есть механизм подсадки своей библиотеки в штатные программы (`INJECT` в `build.sh`,
+`src/inject_sb.c` и соседние). Она и положила бы витрину на ту самую учётную запись, которой
+пользуется AMS, и заодно показала бы, строится ли запрос мешка вообще.
+
 **`mobileactivationd` — ещё одна служба из списка «никогда не пробовали».** Её спрашивал как раз
 `appstored` (четыре ненайденных обращения за сеанс и двадцать строк «[HRNSupport] Failed to copy activation
 record ... MobileActivation.ErrorDomain Code=-1 "IPC Error"» из каждого потока, который трогает мешок).
