@@ -1049,6 +1049,15 @@ wdev_io(struct wdev *w, uint64_t off, void *buf, size_t len, int flag)
 		buf_setlblkno(bp, (daddr64_t)(off / w->devblock));
 		buf_setcount(bp, (uint32_t)n);
 		buf_setdataptr(bp, (uintptr_t)p);
+		/*
+		 * A write buffer of our own has to be counted against the device's vnode before
+		 * it is issued: buf_biodone() undoes that count, and without it the kernel
+		 * panics on the way back (vnode_writedone: numoutput < 0).  This is what
+		 * cluster_io() does for the same kind of raw buffer.
+		 */
+		if (flag != B_READ) {
+			vnode_startwrite(w->vp);
+		}
 		error = VNOP_STRATEGY(bp);
 		if (error == 0) {
 			error = (int)buf_biowait(bp);
