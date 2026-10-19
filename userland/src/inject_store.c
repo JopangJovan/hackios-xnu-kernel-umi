@@ -91,8 +91,25 @@
  * Answering _ams_localiTunesAccountAfterUpdatingStorefront: at once (above) does cut that wait --
  * _bagAccountForAccountMediaType: goes from blocked to 3 entered 3 returned -- and the bag still
  * does not load: four threads are still blocked in resultBeforeDate:error: elsewhere. So the stall
- * is not one method; AMS's promises in this daemon are not being completed at all, and the bag is
- * only the one we were watching. That is the next thing to take apart.
+ * is not one method; AMS's promises in this daemon are not being completed at all.
+ *
+ * THE ROOT, found by the promise graph rather than by recognising another circle. Every promise is
+ * remembered here by address, with where it was first seen, how many continuations were attached,
+ * which threads block in it and whether it was ever finished; the table is printed at 150 s beside
+ * the thread dump, and a promise with waiters and no finish is marked. Sixteen promises in a
+ * session, seven of them so marked, the bag's request and the bag's fetch among them. Following the
+ * threads of the marked ones down (ipsw dyld a2s again) ends outside AMS altogether:
+ *   thread 4: mach_msg2_trap <- _AMSFairPlayGetDeviceType <- _CjHbHx <- (three FairPlay functions)
+ * -- an AMS thread blocked in a Mach call into FairPlay, waiting for a reply. And in the same
+ * session's launchd log:
+ *   com.apple.fairplayd.H2: 34 spawns, every one "Service only ran for 0 seconds",
+ *   "exited due to exit(0)", "service throttled by 10 seconds"
+ * fairplayd does not crash: it starts, decides there is nothing it can do here, and leaves at once,
+ * over and over. So the reply AMS is waiting for never comes, the promise behind it is never
+ * fulfilled, and seventeen waits queue behind that one. The storefront deadlock sits on top of this,
+ * not beside it.
+ * The next piece of work is therefore not in AMS at all: find why fairplayd.H2 exits 0 immediately
+ * and keep it up. Everything in this file above that line is a consequence of it.
  *
  * Two things this library learned about itself, for whoever writes the next one:
  *   - class_getInstanceMethod walks up the chain, so replacing what a class only INHERITS replaces it
@@ -150,7 +167,7 @@ enum {
 	COUNT_dataTaskPromise, COUNT_dataTask, COUNT_addCookies, COUNT_addStorefrontHeader, COUNT_addAnisette,
 	COUNT_prepareRequest, COUNT_finishWithResult, COUNT_finishWithError, COUNT_finishFunnel,
 	COUNT_finishResultError, COUNT_thenWithBlock, COUNT_continueWithBlock, COUNT_bagValue,
-	COUNT_resultBefore, COUNT_afterUpdating, COUNT_last
+	COUNT_resultBefore, COUNT_afterUpdating, COUNT_addCookies4, COUNT_last
 };
 static const char *const counted[COUNT_last] = {
 	"-[ACAccount ams_storefront]", "-[AMSBagNetworkDataSource cachedStorefront]",
@@ -172,6 +189,7 @@ static const char *const counted[COUNT_last] = {
 	"-[AMSPromise resultBeforeDate:error:]",
 	"-[AMSBagValue valueWithError:]", "-[AMSPromise resultBeforeDate:error:]",
 	"-[ACAccountStore _ams_localiTunesAccountAfterUpdatingStorefront:]",
+	"ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:",
 };
 static unsigned long entered[COUNT_last];
 /*
@@ -257,6 +275,109 @@ frames_from(uintptr_t fp, char *text, size_t size)
 		}
 		used += (size_t)snprintf(text + used, size - used, " %#lx", ret - slide);
 		fp = next > fp ? next : 0;      /* the chain only ever goes up the stack */
+	}
+}
+
+/*
+ * A GRAPH OF PROMISES, not a list of calls. One promise in seventeen is ever finished here, and
+ * naming the next deadlock by hand would take a slot each: what is wanted is the root -- a promise
+ * with waiters, no finish, and a producer that is itself waiting on nothing anybody is fulfilling.
+ * So every promise this library sees is remembered by address, with where it was first seen (two or
+ * three frames of the walk, which "ipsw dyld a2s" names), how many continuations were attached to
+ * it, how many threads are blocked in it synchronously and which, and whether it was ever finished.
+ * The table is printed at 150 s beside the thread dump, so a blocked thread id in one is the same
+ * thread in the other, and a cycle shows up as a cycle instead of as something to recognise.
+ */
+#define PROMISES 192
+struct promise_note {
+	void *promise;
+	const char *label;
+	unsigned waiters;
+	unsigned sync_waiters;
+	unsigned finished;
+	uint64_t tid;                   /* the last thread seen blocked in it */
+	char frames[160];
+};
+static struct promise_note promises[PROMISES];
+static unsigned promise_count;
+static pthread_mutex_t promise_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* (the lock is never held across a call into AMS, so this cannot be part of the jam it measures) */
+static struct promise_note *
+note_for(void *promise, const char *frames)
+{
+	for (unsigned i = 0; i < promise_count; i++) {
+		if (promises[i].promise == promise) {
+			return &promises[i];
+		}
+	}
+	if (promise_count >= PROMISES) {
+		return NULL;
+	}
+	promises[promise_count].promise = promise;
+	if (frames != NULL) {
+		strlcpy(promises[promise_count].frames, frames, sizeof(promises[0].frames));
+	}
+	return &promises[promise_count++];
+}
+
+static void
+note_waiter(void *promise, const char *frames, bool synchronous)
+{
+	struct promise_note *note;
+	uint64_t tid = 0;
+
+	pthread_threadid_np(NULL, &tid);
+	pthread_mutex_lock(&promise_lock);
+	note = note_for(promise, frames);
+	if (note != NULL) {
+		note->waiters++;
+		if (synchronous) {
+			note->sync_waiters++;
+			note->tid = tid;
+		}
+	}
+	pthread_mutex_unlock(&promise_lock);
+}
+
+static void
+note_finished(void *promise)
+{
+	struct promise_note *note;
+
+	pthread_mutex_lock(&promise_lock);
+	note = note_for(promise, NULL);
+	if (note != NULL) {
+		note->finished++;
+	}
+	pthread_mutex_unlock(&promise_lock);
+}
+
+static void
+note_label(void *promise, const char *label, const char *frames)
+{
+	struct promise_note *note;
+
+	pthread_mutex_lock(&promise_lock);
+	note = note_for(promise, frames);
+	if (note != NULL) {
+		note->label = label;
+	}
+	pthread_mutex_unlock(&promise_lock);
+}
+
+static void
+dump_promises(void)
+{
+	say("redwood: appstored: %u promises seen\n", promise_count);
+	for (unsigned i = 0; i < promise_count; i++) {
+		struct promise_note *note = &promises[i];
+
+		say("redwood: appstored: promise %p %-16s waiters %2u sync %u finished %u%s tid %llu seen from%s\n",
+		    note->promise, note->label != NULL ? note->label : "", note->waiters, note->sync_waiters,
+		    note->finished,
+		    note->finished == 0 && note->sync_waiters > 0 ? "  <-- NOBODY FULFILS IT" : "",
+		    (unsigned long long)note->tid, note->frames);
 	}
 }
 
@@ -464,6 +585,7 @@ new_perform_fetch(id self, SEL _cmd, long attempt, id account, id front)
 	}
 	promise = old_perform_fetch(self, _cmd, attempt, account, front);
 	returned[COUNT_performFetch]++;
+	note_label(promise, "THE BAG FETCH", NULL);
 	say("redwood: appstored: BAG FETCH returned %s\n", promise != NULL ? "a promise" : "(nil)");
 	return promise;
 }
@@ -570,9 +692,18 @@ late_report(__unused void *ignored)
 		}
 	}
 	for (int i = 0; i < COUNT_last; i++) {
+		/*
+		 * A hook that never fires says so loudly, once. Silence from one is not evidence about the
+		 * code: ams_addCookiesForAccount:clientInfo:bag: was hooked and never entered all night
+		 * because the cookies go through the FOUR-argument
+		 * ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies: instead. Hooked and never
+		 * entered can mean the hook is wrong, not the code.
+		 */
 		say("redwood: appstored: entered %4lu returned %4lu %s%s\n", entered[i], returned[i], counted[i],
-		    entered[i] > returned[i] ? "   <-- STILL IN IT" : "");
+		    entered[i] > returned[i] ? "   <-- STILL IN IT" :
+		    entered[i] == 0 ? "   <-- NEVER ENTERED: suspect the hook, not the code" : "");
 	}
+	dump_promises();
 	dump_threads();
 	dump_selectors("AMSURLSession", "equest");
 	dump_selectors("AMSMutablePromise", NULL);
@@ -599,6 +730,7 @@ new_create_request(id self, SEL _cmd, id items)
 	request = old_create_request(self, _cmd, items);
 	returned[COUNT_createRequest]++;
 	say("redwood: appstored: STEP _createRequestWithQueryItems: -> %s\n", text_of(request, buffer, sizeof(buffer)));
+	note_label(request, "THE BAG REQUEST", NULL);
 	return request;
 }
 
@@ -651,6 +783,17 @@ new_data_task(id self, SEL _cmd, id request)
  * "type" is a scalar and _prepareRequest: takes an NSError **, and a description of either would be
  * a crash, not a measurement.
  */
+#define WRAP4(name) \
+static void *(*old_##name)(id, SEL, void *, void *, void *, void *); \
+static void * \
+new_##name(id self, SEL cmd, void *a, void *b, void *c, void *d) \
+{ \
+	unsigned n = step_in(COUNT_##name); \
+	void *result = old_##name(self, cmd, a, b, c, d); \
+	step_out(COUNT_##name, n, result != NULL); \
+	return result; \
+}
+
 #define WRAP3(name) \
 static void *(*old_##name)(id, SEL, void *, void *, void *); \
 static void * \
@@ -771,7 +914,7 @@ new_resultBefore(id self, SEL cmd, void *date, void *error)
 
 	entered[COUNT_resultBefore]++;
 	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-	say("redwood: appstored: WAIT promise %p resultBeforeDate: from%s\n", (void *)self, frames);
+	note_waiter((void *)self, frames, true);
 	result = old_resultBefore(self, cmd, date, error);
 	returned[COUNT_resultBefore]++;
 	return result;
@@ -785,7 +928,7 @@ new_finishFunnel(id self, SEL cmd, void *a, void *b, void *c)
 	void *result;
 
 	entered[COUNT_finishFunnel]++;
-	say("redwood: appstored: PROMISE %p finished%s\n", (void *)self, b != NULL ? " with an error" : "");
+	note_finished((void *)self);
 	result = old_finishFunnel(self, cmd, a, b, c);
 	returned[COUNT_finishFunnel]++;
 	return result;
@@ -801,7 +944,7 @@ new_thenWithBlock(id self, SEL cmd, void *a)
 
 	entered[COUNT_thenWithBlock]++;
 	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-	say("redwood: appstored: PROMISE %p waited on (then) from%s\n", (void *)self, frames);
+	note_waiter((void *)self, frames, false);
 	result = old_thenWithBlock(self, cmd, a);
 	returned[COUNT_thenWithBlock]++;
 	return result;
@@ -816,7 +959,7 @@ new_continueWithBlock(id self, SEL cmd, void *a)
 
 	entered[COUNT_continueWithBlock]++;
 	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-	say("redwood: appstored: PROMISE %p waited on (continue) from%s\n", (void *)self, frames);
+	note_waiter((void *)self, frames, false);
 	result = old_continueWithBlock(self, cmd, a);
 	returned[COUNT_continueWithBlock]++;
 	return result;
@@ -828,6 +971,7 @@ WRAP3(addCookies)
 WRAP3(addStorefrontHeader)
 WRAP3(addAnisette)
 WRAP3(prepareRequest)
+WRAP4(addCookies4)
 
 /* ---- installing them --------------------------------------------------------------------------- */
 
@@ -876,6 +1020,8 @@ static struct replacement replacements[] = {
 	  false },
 	{ "ACAccountStore", "_ams_localiTunesAccountAfterUpdatingStorefront:", false, (IMP)new_afterUpdating,
 	  (IMP *)&old_afterUpdating, false },
+	{ "NSMutableURLRequest", "ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:", false,
+	  (IMP)new_addCookies4, (IMP *)&old_addCookies4, false },
 	{ "AMSBagValue", "valueWithError:", false, (IMP)new_bagValue, (IMP *)&old_bagValue, false },
 	{ "AMSPromise", "resultBeforeDate:error:", false, (IMP)new_resultBefore, (IMP *)&old_resultBefore, false },
 	{ "NSURLSessionTask", "resume", false, (IMP)new_resume_base, (IMP *)&old_resume_base, false },
