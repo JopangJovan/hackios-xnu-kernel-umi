@@ -92,4 +92,13 @@ echo "== the same operations run, not folded"
 python3 "$ROOT/tools/air/intrincheck.py" --run --cases 4 2>&1 | tail -6
 run_rc=${PIPESTATUS[0]}
 
-exit $((reader_rc | cpu_rc | intrin_rc | run_rc))
+echo
+echo "== the atomics, with a kernel written to make a lost update show"
+# None of Apple's kernels can test an atomic: a sum written by threads that
+# never raced reads the same as one written by threads that did. This one
+# dispatches sixteen threads whose fetch_add results must be the numbers 0..15
+# with nothing repeated, so a lost update leaves a duplicate and a gap.
+python3 "$ROOT/tools/air/atomiccheck.py" 2>&1 | tail -8
+atomic_rc=${PIPESTATUS[0]}
+
+exit $((reader_rc | cpu_rc | intrin_rc | run_rc | atomic_rc))

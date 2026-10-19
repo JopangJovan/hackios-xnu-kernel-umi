@@ -49,13 +49,21 @@ functions and not entry points at all.
   24 narrow-type declarations softpipe cannot run at all are exactly the ones where ir3 differs
   most from it. None of the seven shaders that have run on the phone calls an `air.*` function:
   **no operation has been run on the GPU.**
-- **Still unverified by anything: the atomics, the barrier, the derivatives and the simd
-  reductions** — 41 declarations with no reference in `intrincheck.py`, because what they mean
-  depends on more than one thread or on neighbouring fragments and a folded constant cannot say
-  it. The texture operations among them are covered differently and partly, by the six shaders
-  that returned the exact texel on the Adreno. One thing *is* now settled about the atomics
-  without running any: every one in the corpus asks for `memory_order_relaxed`, and the lowering
-  refuses any other order by name instead of ignoring the argument, which it used to do.
+- **The atomics compute the right thing; whether they are atomic is still open.**
+  `tools/air/atomiccheck.py` dispatches a kernel written for the purpose (section 4, item 5) and
+  the five operations the corpus uses — global `add.s`, `load`, `max.s`, `min.s`, `store` — agree,
+  including a signed minimum taken across negative values, which is where an unsigned one would
+  pass unnoticed. Sixteen threads each incremented a counter once and each was handed a different
+  predecessor count, so no update was lost. But it ran in software, which need not have run two
+  threads at once, so that is evidence about the arithmetic and none about atomicity. Two other
+  things are settled without running anything: every atomic in the corpus asks for
+  `memory_order_relaxed`, and a stronger order is now refused by name instead of being ignored,
+  which is what the lowering used to do.
+- **Still unverified by anything: the barrier, the derivatives, the simd reductions and the
+  threadgroup atomics** — what they mean depends on more than one thread or on neighbouring
+  fragments, and neither a folded constant nor a software dispatch can say it. The texture
+  operations are covered differently and partly, by the six shaders that returned the exact texel
+  on the Adreno.
 - **Nothing here tests Metal's own filtering or addressing.** The six texture shaders that drew on
   the Adreno took their sampler from the API, which this harness chose: nearest, clamped, sampled
   at a texel centre. That is evidence about binding, descriptors and ir3's texture instructions —
@@ -541,6 +549,39 @@ Three references, each independent of the translator:
    session all night. **So every number above is from an x86 host, and the bottom row of the
    table at the top of this document still reads 7.**
 
+5. **The atomics, with a kernel written to make a lost update show.** This document used to say
+   that none of Apple's kernels could test an atomic and why: "a sum written by threads that never
+   raced looks exactly like a sum written by threads that did. Detecting a lost update needs the
+   expected total to depend on every thread having contributed — which needs a kernel whose
+   arithmetic is known, i.e. one written for the purpose rather than one of Apple's."
+   `tools/air/atomiccheck.py` is that kernel, generated as AIR, assembled with `llvm-as` and
+   dispatched by `air_run` over its 4×4 threads, with both device buffers' initial bytes chosen
+   rather than left to the harness's pattern.
+
+   Four of its five checks are ordinary: the counter reaches the thread count, the atomic load
+   returns what was put there, the signed maximum is the largest thread index, and the signed
+   minimum of `index - 100` is `-100` — that last one is where an unsigned minimum would answer
+   `0xffffff9c` as a huge number, and where it did when the lowering was broken on purpose to see
+   whether this check works.
+
+   The fifth is the one that can see a race, and it needs no knowledge of the order the threads
+   ran in. Each thread writes the value its own `fetch_add` returned, so if the increment is
+   atomic those sixteen returned values are the numbers 0 to 15 in *some* order. A lost update
+   leaves a duplicate and a gap, and the gap names the increment that went missing. Each is
+   written as `old * 16 + index + 1`, so a slot no thread wrote cannot look like a result and a
+   thread writing another thread's slot does not read as correct either.
+
+   **The five operations agree, and this is still not evidence of atomicity**, because it ran on
+   softpipe, which need not have run two threads at once — serial execution produces a correct
+   permutation too. The check passes there by being right rather than by being unopposed. What
+   would make it evidence is the same kernel on the Adreno, where the threads do run at once, and
+   that has not happened. It is also only the five operations the corpus proves exist, read off
+   its own declarations; `air_intrinsics.c` also handles `and`, `or`, `xor` and `xchg`, and those
+   are untested because the names Apple would emit for them are a guess, and a test of a guessed
+   name is a test of the guess. The threadgroup atomics (`air.atomic.local.*`, three declarations)
+   are untested too: they go through `nir_shared_atomic` and a different path for the memory, and
+   that path has not been exercised at all.
+
 Where a shader has a known GLSL equivalent (AppleMetalGLRenderer's shaders *are* the GL
 pipeline's fixed functions), rendering both through the port's GLES and comparing images is a
 fourth check; it is not built yet.
@@ -868,6 +909,7 @@ tools/air/intrincheck.py [-v] [OP ...]                     # one air.* operation
 tools/air/intrincheck.py --run --few [OP ...]              # the same, drawn by a real driver
 tools/air/intrincheck.py --emit DIR --few                  # modules + inputs + run.sh, to carry
 tools/air/intrincheck.py --check DIR RUN.LOG               # judge what the runner printed
+tools/air/atomiccheck.py [--keep DIR]                      # the atomics, with its own kernel
 build/mesa-host/build/src/gallium/drivers/freedreno/air_run \
         FILE[.metallib] [FUNCTION]                         # draw with it, print the pixel
 tools/air/texcheck.sh [FILE.metallib ...]                  # every texture shader, the texel it returns
