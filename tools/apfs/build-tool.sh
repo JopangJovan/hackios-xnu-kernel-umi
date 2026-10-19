@@ -40,5 +40,6 @@ else
 	echo "build-tool.sh: no bsd/vfs/vfs_unicode.c: names other than plain ASCII are found by reading the directory" >&2
 fi
 cc -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wno-unused-parameter -I"$SRC" -I"$HERE" \
-	$TOOL_CFLAGS -o "$OUT" "$HERE/apfs-tool.c" "$SRC/apfs_lib.c" "$SRC/apfs_zbitmap.c" "$OBJ/apfs_deflate.o" $UNI -lz -lcrypto -pthread
+	$TOOL_CFLAGS -o "$OUT" "$HERE/apfs-tool.c" "$SRC/apfs_lib.c" "$SRC/apfs_write.c" "$SRC/apfs_zbitmap.c" \
+	"$OBJ/apfs_deflate.o" $UNI -lz -lcrypto -pthread
 echo "build-tool.sh: $OUT (from $SRC)"

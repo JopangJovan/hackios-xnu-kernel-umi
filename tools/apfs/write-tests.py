@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""Judge apfs_write.c on images on this machine, where a ruined one costs nothing.
+
+Driven by tools/apfs/write-tests.sh, which builds what this needs.  Nothing here reads the
+image with the code under test alone: every claim about what is in an image afterwards is made
+by at least one reader that is not apfs_write.c's and preferably by all of them --
+
+  apfsck      linux-apfs/apfsprogs: checksums, every tree, the space manager's bitmaps against
+              every block anything refers to, reference counts, extents.  Knows nothing of us.
+  apfs.py     this repository's own Python reader, which verify.py has already checked against
+              7-Zip over the whole iOS root volume.
+  7-Zip       a third implementation entirely.
+  apfs-tool   the kernel's own apfs_lib.c -- the one reader that is partly the code under test
+              (it shares struct definitions), so it is never the only witness.
+
+and by the one witness that needs no reader at all: which blocks of the image changed.  A write
+in place must change blocks that hold the contents of the one file named and not one block more,
+and that is checked by comparing the image with the copy it was made from, block by block.
+
+usage: write-tests.py [-k] [TEST ...]       (-k: keep the images in the work directory)
+"""
+import hashlib
+import os
+import shutil
+import struct
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, HERE)
+import apfs                                                     # noqa: E402  (after sys.path)
+import mkapfs                                                   # noqa: E402
+
+BS = 4096
+WORK = os.path.join(ROOT, 'apfs-work', 'write-tests')
+TOOL = os.path.join(ROOT, 'apfs-work', 'apfs-tool')
+APFSCK = os.path.join(ROOT, 'xnu-deps', 'build', 'apfsprogs', 'apfsck', 'apfsck')
+
+failures = []
+done = 0
+
+
+def say(ok, what):
+    global done
+    done += 1
+    print('%s %s' % ('[ ok ]' if ok else '[FAIL]', what))
+    if not ok:
+        failures.append(what)
+    return ok
+
+
+def run(*argv, **kw):
+    """A command, with its output; never raises -- the caller judges the exit status."""
+    p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
+    return p.returncode, p.stdout.decode('utf-8', 'replace')
+
+
+# ---------------------------------------------------------------- the image under test
+
+#: the tree every test image is made of: the sizes a write has to get right
+TREE = {
+    'empty': 0,
+    'one': 1,
+    'small': BS - 1,
+    'block': BS,
+    'block1': BS + 1,
+    'two': 2 * BS,
+    'big': 1 << 20,
+    'sub/text': 1300,
+}
+
+
+def make_tree(at):
+    """Random bytes, the same every run: a file that compresses well would be stored
+    compressed, which is a case of its own (test_compressed)."""
+    import random
+
+    rng = random.Random(20261019)
+    os.makedirs(os.path.join(at, 'sub'), exist_ok=True)
+    for name, size in sorted(TREE.items()):
+        with open(os.path.join(at, name), 'wb') as f:
+            f.write(bytes(rng.randrange(256) for _ in range(size)))
+
+
+def make_image(path, compress=False):
+    tree = os.path.join(WORK, 'tree')
+    make_tree(tree)
+    argv = [sys.executable, os.path.join(HERE, 'mkapfs.py'), '-o', path]
+    if compress:
+        argv.append('-z')
+    argv.append('data=' + tree)
+    rc, out = run(*argv)
+    if rc != 0:
+        raise SystemExit('write-tests.py: mkapfs.py failed:\n' + out)
+    return path
+
+
+# ---------------------------------------------------------------- the readers
+
+def read_apfsck(image):
+    rc, out = run(APFSCK, '-cw', image)
+    return rc == 0, out
+
+
+def read_py(image, path):
+    rc, out = run(sys.executable, os.path.join(HERE, 'apfs.py'), 'cat', image, path)
+    return None if rc != 0 else out
+
+
+def read_py_bytes(image, path):
+    p = subprocess.run([sys.executable, os.path.join(HERE, 'apfs.py'), 'cat', image, path],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return None if p.returncode != 0 else p.stdout
+
+
+def read_tool_bytes(image, path):
+    p = subprocess.run([TOOL, 'cat', image, path], stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL)
+    return None if p.returncode != 0 else p.stdout
+
+
+def read_7z_bytes(image, path):
+    p = subprocess.run(['7z', 'x', '-so', image, path.lstrip('/')], stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL)
+    return None if p.returncode != 0 else p.stdout
+
+
+READERS = [('apfs.py', read_py_bytes), ('7-Zip', read_7z_bytes), ('apfs-tool', read_tool_bytes)]
+
+
+def contents(image, path):
+    """What every reader says the file holds, as a dict reader -> bytes (or None)."""
+    return dict((name, fn(image, path)) for name, fn in READERS)
+
+
+def all_agree(image, path, want):
+    got = contents(image, path)
+    bad = [n for n, b in got.items() if b != want]
+    return not bad, ', '.join('%s: %s' % (n, 'cannot read' if got[n] is None else
+                                          'sha %s' % hashlib.sha256(got[n]).hexdigest()[:12])
+                              for n in bad)
+
+
+def census(image):
+    """Every entry of the volume with a hash of its contents, by the Python reader: the
+    witness that no other file was touched."""
+    rc, out = run(sys.executable, os.path.join(HERE, 'verify.py'), 'clines', image)
+    return out if rc == 0 else None
+
+
+# ---------------------------------------------------------------- which blocks changed
+
+def changed_blocks(a, b):
+    """The blocks where two images differ.  No reader, no structure: just bytes."""
+    out = []
+    fa, fb = open(a, 'rb'), open(b, 'rb')
+    n = 0
+    while True:
+        x, y = fa.read(BS), fb.read(BS)
+        if not x and not y:
+            break
+        if x != y:
+            out.append(n)
+        n += 1
+    fa.close()
+    fb.close()
+    return out
+
+
+def extents_of(image, path):
+    """Where the file's bytes are, by the Python reader: [(logical, length, phys), ...]."""
+    c = apfs.Container(image)
+    try:
+        vol = c.volumes()[0]
+        oid, _dtype = vol.lookup(path)
+        return vol.extents(vol.inode(oid).private_id)
+    finally:
+        c.close()
+
+
+def stream_of(image, path):
+    c = apfs.Container(image)
+    try:
+        vol = c.volumes()[0]
+        oid, _dtype = vol.lookup(path)
+        return vol.inode(oid).private_id
+    finally:
+        c.close()
+
+
+def blocks_of(image, path):
+    s = set()
+    for _logical, length, phys in extents_of(image, path):
+        if phys:
+            s.update(range(phys, phys + length // BS))
+    return s
+
+
+# ---------------------------------------------------------------- poking an image
+
+def reseal(image, bno):
+    """Put the Fletcher-64 of a block back after changing it, the way mkapfs.py seals one."""
+    with open(image, 'r+b') as f:
+        f.seek(bno * BS)
+        blk = bytearray(f.read(BS))
+        struct.pack_into('<Q', blk, 0, mkapfs.fletcher64(bytes(blk)))
+        f.seek(bno * BS)
+        f.write(bytes(blk))
+
+
+def find_object(image, want_type, want_subtype=None, leaf_only=False):
+    """Every block of the image that carries an object of this type: a scan, which is fine
+    because the test images are a few megabytes."""
+    found = []
+    size = os.path.getsize(image)
+    with open(image, 'rb') as f:
+        for bno in range(size // BS):
+            f.seek(bno * BS)
+            blk = f.read(BS)
+            if len(blk) < 32 or blk[0:8] == b'\0' * 8:
+                continue
+            otype = struct.unpack_from('<I', blk, 24)[0]
+            subtype = struct.unpack_from('<I', blk, 28)[0]
+            if (otype & 0xffff) != want_type:
+                continue
+            if want_subtype is not None and (subtype & 0xffff) != want_subtype:
+                continue
+            if leaf_only and not (struct.unpack_from('<H', blk, 32)[0] & 0x0002):
+                continue
+            found.append(bno)
+    return found
+
+
+def patch(image, bno, off, data, seal=True):
+    with open(image, 'r+b') as f:
+        f.seek(bno * BS + off)
+        f.write(data)
+    if seal:
+        reseal(image, bno)
+
+
+def find_record(image, bno, key):
+    """Where the value of the record with this key lives in this block, read with apfs.py's own
+    node parser so that a poke cannot land in the wrong place: (offset in the block, length)."""
+    with open(image, 'rb') as f:
+        f.seek(bno * BS)
+        blk = f.read(BS)
+    n = apfs.Node(bno, blk, BS)
+    if not n.is_leaf or n.fixed:
+        return None, None
+    for i in range(n.nkeys):
+        koff, klen, voff, vlen = struct.unpack_from('<HHHH', blk, n.toc_off + 8 * i)
+        k = blk[n.key_base + koff:n.key_base + koff + klen]
+        if k == key and voff != 0xFFFF:
+            return n.val_end - voff, vlen
+    return None, None
+
+
+# ---------------------------------------------------------------- the tests
+
+def write(image, path, at, data, fail_after=None):
+    """apfs-tool write: the kernel's apfs_write.c on this image."""
+    argv = [TOOL, 'write', image, path, str(at), '-']
+    if fail_after is not None:
+        argv += ['--fail-after', str(fail_after)]
+    p = subprocess.run(argv, input=data, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return p.returncode, p.stdout.decode('utf-8', 'replace')
+
+
+def fresh(name, compress=False):
+    """A pristine image and a copy of it to write on, so the two can be compared."""
+    base = os.path.join(WORK, 'base%s.apfs' % ('-z' if compress else ''))
+    if not os.path.exists(base):
+        make_image(base, compress)
+    out = os.path.join(WORK, name + '.apfs')
+    shutil.copyfile(base, out)
+    return base, out
+
+
+def expect_contents(path, at, data):
+    """What the file should hold after the write: its old bytes with `data` dropped in."""
+    base = os.path.join(WORK, 'base.apfs')
+    old = read_py_bytes(base, path)
+    return old[:at] + data + old[at + len(data):]
+
+
+def test_baseline():
+    """The image we start from is sound and all four readers agree about it."""
+    base, _ = fresh('baseline')
+    ok, out = read_apfsck(base)
+    say(ok, 'the fresh image is clean to apfsck' + ('' if ok else ':\n' + out))
+    good = True
+    for path in sorted(TREE):
+        want = read_py_bytes(base, '/' + path)
+        agree, bad = all_agree(base, '/' + path, want)
+        good = good and agree and want is not None and len(want) == TREE[path]
+        if not agree:
+            print('       /%s: %s' % (path, bad))
+    say(good, 'every reader reads every file of the fresh image the same')
+
+
+def do_write(name, path, at, data, why=None):
+    """One write that is expected to go through, judged every way there is."""
+    base, img = fresh(name)
+    before = census(base)
+    target = blocks_of(base, path)
+    rc, out = write(img, path, at, data)
+    if not say(rc == 0, 'write %d bytes at %d of %s' % (len(data), at, path) +
+               ('' if rc == 0 else ':\n' + out.strip())):
+        return
+    want = expect_contents(path, at, data)
+    agree, bad = all_agree(img, path, want)
+    say(agree, '  every reader reads back what was written' + ('' if agree else ': ' + bad))
+    ok, ck = read_apfsck(img)
+    say(ok, '  apfsck still finds the container clean' + ('' if ok else ':\n' + ck))
+    diff = set(changed_blocks(base, img))
+    say(diff <= target, '  only the file\'s own blocks changed (%d of them, all inside its %d)'
+        % (len(diff), len(target)) if diff <= target else
+        '  blocks outside the file changed: %s' % sorted(diff - target))
+    after = census(img)
+    moved = [l for l in (after or '').splitlines() if l not in (before or '').splitlines()]
+    say(len(moved) == 1 and path in moved[0],
+        '  of the whole volume only %s reads differently' % path if len(moved) == 1 else
+        '  these entries changed, not just the one: %s' % moved[:4])
+
+
+def test_writes():
+    do_write('w-aligned', '/block', 0, b'\xa5' * BS)
+    do_write('w-unaligned', '/block1', 4090, b'Z' * 7)       # across the block boundary, to EOF
+    do_write('w-middle', '/big', 5000, bytes(range(256)) * 40)
+    do_write('w-tail', '/small', BS - 2, b'\x01\x02'[:1])
+    do_write('w-one', '/one', 0, b'!')
+    do_write('w-whole', '/two', 0, b'\x5a' * (2 * BS))
+    do_write('w-cross', '/two', BS - 3, b'\xee' * 6)
+
+
+def expect_refusal(name, path, at, data, what, compress=False):
+    base, img = fresh(name, compress)
+    rc, out = write(img, path, at, data)
+    refused = rc != 0
+    unchanged = changed_blocks(base, img) == []
+    say(refused and unchanged, 'refused: %s' % what +
+        ('' if refused and unchanged else
+         (' -- it was NOT refused' if not refused else '') +
+         (' -- and the image changed' if not unchanged else '')))
+    return out
+
+
+def test_refusals():
+    expect_refusal('r-past', '/block', BS, b'x', 'a write that starts at the end of the file')
+    expect_refusal('r-over', '/block', BS - 1, b'xx', 'a write that would run past the end')
+    expect_refusal('r-empty', '/empty', 0, b'x', 'any write into a file of no length')
+    expect_refusal('r-dir', '/sub', 0, b'x', 'a write into a directory')
+    expect_refusal('r-zcomp', '/sub/text', 0, b'x', 'a write into a compressed file',
+                   compress=True)
+
+
+def test_volume_gates():
+    """The checks that are made of the volume before any file is named.  Each is tested by
+    changing the volume superblock, which apfsck would rightly dislike -- the point is only
+    that the writer refuses."""
+    for what, off, value in (('a sealed volume', 56, 0x08 | 0x20),
+                             ('a volume with snapshots', 216, 1),
+                             ('a volume with integrity metadata', 1024, 999),
+                             ("iOS's own system volume, by its role", 964, 1),
+                             ('the preboot volume, by its role', 964, 0x10)):
+        base, img = fresh('g-%d-%d' % (off, value))
+        sb = find_object(img, 0x0d)             # APFS_OBJECT_TYPE_FS: the volume superblock
+        if len(sb) != 1:
+            say(False, '%s: expected one volume superblock, found %d' % (what, len(sb)))
+            continue
+        patch(img, sb[0], off, struct.pack('<Q', value))
+        rc, out = write(img, '/block', 0, b'q' * BS)
+        say(rc != 0, 'refused: %s' % what + ('' if rc != 0 else ':\n' + out.strip()))
+
+
+def test_extent_gates():
+    """The checks that are made of the blocks themselves.  Each one is set up by changing a
+    record of a tree so that it says something a correct volume never says, and each one
+    stands between a misread tree and somebody else's data."""
+    fresh('e-base')                             # so that base.apfs is there to read
+    stream = stream_of(os.path.join(WORK, 'base.apfs'), '/block')
+
+    # a hole: the file's own extent record saying there is no block here
+    base, img = fresh('e-hole')
+    leaves = find_object(img, 0x03, 0x0e, leaf_only=True) + find_object(img, 0x02, 0x0e)
+    did = False
+    for bno in leaves:
+        key = struct.pack('<Q', (8 << 60) | stream) + struct.pack('<Q', 0)
+        v_at, vl = find_record(img, bno, key)
+        if v_at is not None and vl >= 24:
+            patch(img, bno, v_at + 8, struct.pack('<Q', 0))     # phys_block_num = 0
+            did = True
+            break
+    if did:
+        rc, out = write(img, '/block', 0, b'h' * BS)
+        say(rc != 0 and 'hole' in out, 'refused: a hole where the bytes would go' +
+            ('' if rc != 0 else ':\n' + out.strip()))
+    else:
+        say(False, 'could not find the file extent record to make a hole of')
+
+    # the extent pointed at the container's own structures: the bound that needs no tree
+    base, img = fresh('e-ring')
+    did = False
+    for bno in leaves:
+        key = struct.pack('<Q', (8 << 60) | stream) + struct.pack('<Q', 0)
+        v_at, vl = find_record(img, bno, key)
+        if v_at is not None and vl >= 24:
+            patch(img, bno, v_at + 8, struct.pack('<Q', 2))     # into the descriptor ring
+            did = True
+            break
+    if did:
+        rc, out = write(img, '/block', 0, b'h' * BS)
+        say(rc != 0, 'refused: an extent inside the checkpoint descriptor ring' +
+            ('' if rc != 0 else ':\n' + out.strip()))
+        say(changed_blocks(base, img) == [bno], '  and nothing but the poked block changed')
+    else:
+        say(False, 'could not find the file extent record to move into the ring')
+
+    # shared blocks: the extent-reference tree saying something else refers to them too
+    base, img = fresh('e-shared')
+    phys = sorted(blocks_of(base, '/block'))[0]
+    er = find_object(img, 0x03, 0x0f, leaf_only=True) + find_object(img, 0x02, 0x0f)
+    did = False
+    for bno in er:
+        key = struct.pack('<Q', (2 << 60) | phys)
+        v_at, vl = find_record(img, bno, key)
+        if v_at is not None and vl >= 20:
+            patch(img, bno, v_at + 16, struct.pack('<i', 2))    # refcnt = 2
+            did = True
+            break
+    if did:
+        rc, out = write(img, '/block', 0, b's' * BS)
+        say(rc != 0 and 'more than once' in out,
+            'refused: an extent the extent-reference tree says is shared' +
+            ('' if rc != 0 else ':\n' + out.strip()))
+    else:
+        say(False, 'could not find the extent-reference record to share')
+
+    # another owner: the same tree saying the blocks are a different stream's
+    base, img = fresh('e-owner')
+    did = False
+    for bno in er:
+        key = struct.pack('<Q', (2 << 60) | phys)
+        v_at, vl = find_record(img, bno, key)
+        if v_at is not None and vl >= 20:
+            patch(img, bno, v_at + 8, struct.pack('<Q', stream + 1000))
+            did = True
+            break
+    if did:
+        rc, out = write(img, '/block', 0, b'o' * BS)
+        say(rc != 0 and 'owner' in out,
+            'refused: an extent owned by another stream' + ('' if rc != 0 else ':\n' + out.strip()))
+    else:
+        say(False, 'could not find the extent-reference record to give away')
+
+
+def test_power_failure():
+    """The power out in the middle of a write, at every block in turn.  What must hold after
+    each: the container is clean, the volume mounts, every other file is byte for byte what it
+    was, and the blocks that changed are the target file's own and in order -- so a caller whose
+    own checksum goes in last can tell that the write did not finish."""
+    path, size = '/big', 1 << 20
+    base, _ = fresh('pf-base')
+    old = read_py_bytes(base, path)
+    at, n = 8192, 12 * BS
+    data = bytes((i * 7 + 3) & 0xff for i in range(n))
+    want_blocks = sorted(blocks_of(base, path))[at // BS:at // BS + n // BS]
+    good = True
+    for k in range(0, n // BS + 1):
+        _, img = fresh('pf-%d' % k)
+        rc, out = write(img, path, at, data, fail_after=k)
+        if k == n // BS:
+            if rc != 0:
+                good = say(False, '  a write stopped after every block of it should go through')
+                continue
+        elif rc == 0:
+            good = say(False, '  a write stopped after %d blocks reported success' % k)
+            continue
+        ck_ok, ck = read_apfsck(img)
+        if not ck_ok:
+            good = say(False, '  stopped after %d blocks: apfsck is unhappy:\n%s' % (k, ck))
+            continue
+        diff = set(changed_blocks(base, img))
+        if diff != set(want_blocks[:k]):
+            good = say(False, '  stopped after %d blocks: %d blocks changed, expected %d (%s)'
+                       % (k, len(diff), k, sorted(diff ^ set(want_blocks[:k]))[:6]))
+            continue
+        # the file itself: the first k blocks new, the rest as they were, by every reader
+        want = old[:at] + data[:k * BS] + old[at + k * BS:]
+        agree, bad = all_agree(img, path, want)
+        if not agree:
+            good = say(False, '  stopped after %d blocks: the file is neither old nor new: %s'
+                       % (k, bad))
+            continue
+        # and nothing else in the volume moved: of every entry only this one reads differently
+        moved = [l for l in (census(img) or '').splitlines()
+                 if l not in (census(base) or '').splitlines()]
+        if len(moved) > (1 if k else 0) or (moved and path not in moved[0]):
+            good = say(False, '  stopped after %d blocks: these entries changed: %s'
+                       % (k, moved[:4]))
+            continue
+    say(good, 'the power out after each of the %d blocks: the volume is sound every time, and '
+        'exactly the blocks already written hold the new bytes' % (n // BS))
+
+
+def test_real_images():
+    """What the gates say about the images this port really has.  The iOS root volume is the one
+    that matters: it is read through apfs.py because apfs-tool does not open a .dmg, and what it
+    says about it is the reason apfs_write_volume_ok() refuses a volume by its role as well."""
+    for rel in ('userland/root.apfs', 'userland/system.apfs', 'userland/flashboot.apfs'):
+        path = os.path.join(ROOT, rel)
+        if not os.path.exists(path):
+            print('[skip] %s is not here' % rel)
+            continue
+        rc, out = run(TOOL, 'writable', path)
+        say(rc == 0, '%s: %s' % (rel, out.strip().splitlines()[0].split(': ', 1)[-1]))
+
+    dmg = os.path.join(ROOT, 'ios165', 'rootfs.dmg')
+    if not os.path.exists(dmg):
+        print('[skip] ios165/rootfs.dmg is not here')
+        return
+    c = apfs.Container(dmg)
+    try:
+        oid = next(o for o in c.nx['fs_oid'] if o)
+        blk = c.blocks.get(c.omap.lookup(oid, c.xid))
+        incompat, snaps = struct.unpack_from('<Q', blk, 56)[0], struct.unpack_from('<Q', blk, 216)[0]
+        integrity, role = struct.unpack_from('<Q', blk, 1024)[0], struct.unpack_from('<H', blk, 964)[0]
+    finally:
+        c.close()
+    sealed = bool(incompat & 0x20)
+    print('       the iOS root volume: incompatible 0x%x (sealed: %s), snapshots %d, '
+          'integrity metadata %d, role 0x%04x' % (incompat, sealed, snaps, integrity, role))
+    say(not sealed and snaps == 0 and integrity == 0,
+        'the iOS root volume would pass every APFS gate there is -- so the role gate is the '
+        'one that refuses it, and where a write may go is what really keeps it safe')
+    say(role == 0x0001, '  and it is refused: its role is the system volume')
+
+
+TESTS = {
+    'baseline': test_baseline,
+    'writes': test_writes,
+    'refusals': test_refusals,
+    'volume-gates': test_volume_gates,
+    'extent-gates': test_extent_gates,
+    'power-failure': test_power_failure,
+    'real-images': test_real_images,
+}
+
+
+def main(argv):
+    keep = '-k' in argv
+    argv = [a for a in argv if a != '-k']
+    which = argv or list(TESTS)
+    os.makedirs(WORK, exist_ok=True)
+    for name in which:
+        if name not in TESTS:
+            raise SystemExit('write-tests.py: no test called %s (have: %s)'
+                             % (name, ' '.join(TESTS)))
+        print('--- %s' % name)
+        TESTS[name]()
+    print('\n%d checks, %d failed' % (done, len(failures)))
+    for f in failures:
+        print('  %s' % f.strip())
+    if not keep:
+        shutil.rmtree(WORK, ignore_errors=True)
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
