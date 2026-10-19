@@ -37,26 +37,31 @@ rm -rf $K/BUILD
 )
 # what the kernel build needs besides the tree
 cp -a --reflink=auto "$ROOT/xnu-deps/." xnu-deps/
-# the files of iOS and the system image made of them. The App cryptex goes along with the rest: without it
-# a workspace quietly builds images with no /System/Cryptexes/App at all, and Safari's daemons and
-# AuthenticationServicesAgent -- eight jobs -- then look to mkjobs.py like programs nobody has
-# (build.sh at cryptex-app, mkjobs.py present()).
-for d in rootfs cryptex "20F66__iPhone10,3_6"; do cp -al "$ROOT/ios165/$d" ios165/; done
-# (the App cryptex only if this copy has it: fetch.sh unpacks it, and not every copy has run that far)
-[ -d "$ROOT/ios165/cryptex-app" ] && cp -al "$ROOT/ios165/cryptex-app" ios165/
-# The phone's own firmware, which somebody pulled out of its Android and which is in no repository: without
-# it build.sh quietly makes images with no GPU, no Wi-Fi and no audio DSP, and a workspace cannot produce a
-# phone image that works at all. Hard links, so carrying it costs nothing.
-for d in fw-gpu fw-wifi fw-audio fw-camera fw-haptic; do
-	[ -d "$ROOT/$d" ] && cp -al "$ROOT/$d" .
+# The files of iOS and the system image made of them. Every one of these is taken only if it is
+# there: a main copy that has not built its images yet has no system.apfs nor root.apfs, and
+# cryptex-app is unpacked only where somebody has needed it -- under "set -e" a copy of a file that
+# is not there used to end the script halfway, leaving a workspace without its QEMU instance number
+# and without a kernel. What a missing cryptex-app costs, when there is one to take: the images come
+# out with no /System/Cryptexes/App at all, and Safari's daemons and AuthenticationServicesAgent --
+# eight jobs -- then look to mkjobs.py like programs nobody has (build.sh at cryptex-app, present()).
+for d in rootfs cryptex cryptex-app "20F66__iPhone10,3_6"; do
+	if [ -e "$ROOT/ios165/$d" ]; then cp -al "$ROOT/ios165/$d" ios165/; fi
 done
-for f in system.files system.manifest var.skel .done-rootfs .done-cryptex a2s.json cryptex-app.dmg; do
-	[ -e "$ROOT/ios165/$f" ] && cp -a "$ROOT/ios165/$f" ios165/
+for f in system.files system.manifest var.skel .done-rootfs .done-cryptex .done-cryptex-app a2s.json; do
+	if [ -e "$ROOT/ios165/$f" ]; then cp -a "$ROOT/ios165/$f" ios165/; fi
 done
-for f in rootfs.dmg rootfs.slt extracted; do
-	[ -e "$ROOT/ios165/$f" ] && ln -s "$ROOT/ios165/$f" ios165/
+for f in rootfs.dmg rootfs.slt cryptex-app.dmg extracted; do
+	if [ -e "$ROOT/ios165/$f" ]; then ln -s "$ROOT/ios165/$f" ios165/; fi
 done
-cp -a --reflink=auto "$ROOT/userland/obj" "$ROOT/userland/system.apfs" "$ROOT/userland/root.apfs" "$ROOT/userland/hello" userland/
+# The firmware the build puts into the images -- the radio's, the audio DSP's, the GPU's. A copy
+# without them builds an image with no /fw and says nothing about it: gpu=1 then starts no GPU.
+# Links, not copies: there is one set of these on this computer and they are not small.
+for d in "$ROOT"/fw-*; do
+	if [ -d "$d" ]; then ln -s "$d" ./; fi
+done
+for f in obj system.apfs root.apfs hello; do
+	if [ -e "$ROOT/userland/$f" ]; then cp -a --reflink=auto "$ROOT/userland/$f" userland/; fi
+done
 [ -f "$ROOT/xnuloader/loader.efi" ] && cp -a "$ROOT/xnuloader/loader.efi" xnuloader/
 [ -f "$ROOT/qemu/kernel.syms" ] && cp -a "$ROOT/qemu/kernel.syms" qemu/
 echo "$INSTANCE" > qemu/instance
