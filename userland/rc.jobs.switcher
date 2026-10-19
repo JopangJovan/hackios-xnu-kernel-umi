@@ -1,0 +1,12 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The switcher of running applications (RC_JOBS=rc.jobs.switcher, gpu=1): four applications are
+# started one after another, each left running by a drag up from the bottom edge that goes home,
+# and then a drag that stops halfway up opens the switcher, where the cards behind the front one
+# are dimmed. Those of the two on the left came out purple instead.
+/redwood/bin/sound_test springboard
+/redwood/bin/rwtouch wait 25 swipe 0.5 0.985 0.5 0.3 200 wait 8
+/redwood/bin/rwtouch tap 0.148 0.344 wait 14 drag 0.5 0.99 0.5 0.5 250 400 wait 6
+/redwood/bin/rwtouch tap 0.388 0.344 wait 14 drag 0.5 0.99 0.5 0.5 250 400 wait 6
+/redwood/bin/rwtouch tap 0.617 0.344 wait 14 drag 0.5 0.99 0.5 0.5 250 400 wait 6
+/redwood/bin/rwtouch tap 0.148 0.467 wait 14 drag 0.5 0.99 0.5 0.5 250 400 wait 6
+/redwood/bin/rwtouch drag 0.5 0.99 0.5 0.55 300 1200 wait 25

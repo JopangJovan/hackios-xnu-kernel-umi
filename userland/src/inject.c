@@ -219,6 +219,34 @@ static int gl_loaded;                           /* CoreAnimation draws with Open
 static void (*gl_function_refused)(unsigned function);  /* our OpenGL ES library keeps count (eagl.c, the census) */
 static int (*orig_function_supported)(void *context);
 
+/*
+ * Boot-arg glyes=N[,N...]: the renderer is made to answer that it has those functions after all.
+ * It has no shader for them, so CoreAnimation draws them with no program -- which is the way the
+ * functions it never asks about are drawn, and which our OpenGL ES library stands in for
+ * (eagl.c, plain_draw_begin()); without this, what needs such a function is not drawn at all.
+ * For finding out what a missing function is for: with it the draw is made, its numbers arrive
+ * (function_uniform below), and the picture says whether the thing was that function's.
+ */
+static uint8_t say_yes[90];
+
+static void
+functions_said_yes(const char *arguments)
+{
+	static const char names[] = REDWOOD_CA_FUNCTIONS;
+	const char *argument = strstr(arguments, "glyes=");
+
+	for (argument = argument != NULL ? argument + 6 : NULL; argument != NULL && *argument >= '0' && *argument <= '9';) {
+		unsigned function = (unsigned)strtoul(argument, (char **)&argument, 10);
+
+		if (function < 90) {
+			say_yes[function] = 1;
+			say("redwood: the renderer will answer that it has CoreAnimation's function %u (\"%.3s\")\n",
+			    function, names + 4 * function);
+		}
+		argument = *argument == ',' ? argument + 1 : NULL;
+	}
+}
+
 static int
 my_function_supported(void *context)
 {
@@ -227,6 +255,14 @@ my_function_supported(void *context)
 	int supported = orig_function_supported(context);
 	uint8_t function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
 
+	if (!supported && function < 90 && say_yes[function]) {
+		if (!said[function]) {
+			said[function] = 1;
+			say("redwood: CoreAnimation's function %u (\"%.3s\"): the renderer says it has it (glyes)\n",
+			    function, names + 4 * function);
+		}
+		return 1;
+	}
 	if (!supported && gl_function_refused != NULL) {
 		gl_function_refused(function);
 	}
@@ -790,6 +826,7 @@ opengl_es(void)
 		return;                                 /* (an image built without it) */
 	}
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		functions_said_yes(arguments);
 		for (argument = arguments; (argument = strstr(argument, "gl=")) != NULL; argument += 3) {
 			if (argument == arguments || argument[-1] == ' ') {
 				wanted = argument[3] != '0';

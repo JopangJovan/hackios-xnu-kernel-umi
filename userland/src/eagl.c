@@ -44,9 +44,12 @@
  * N frames from any of them on; gltrace_place=X0,Y0,X1,Y1 writes down, of those frames, only the draws whose corners
  * reach into that rectangle, a line each (lines "gl-at:"; writing everything down is slow, and a
  * window server that is slow draws other frames), gltrace_look=1 adds the pixel each of them
- * left in the middle of itself; glcensus=1 keeps count of the draws CoreAnimation makes with no
+ * left in the middle of itself; gltrace_shaders=1 writes down the text of the shaders of every
+ * program a traced draw uses, the first time it draws, gltrace_uniforms=1 what every traced draw
+ * gave its program, by the names the shaders use, gltrace_corners=N how many of a draw's corners
+ * to write down (twelve by default); glcensus=1 keeps count of the draws CoreAnimation makes with no
  * program and of the functions it asks for in vain (see census_draw()); glshaders=1 writes down
- * the text of every shader, glshow=TEXTURE puts that texture over the corner of the picture, glplain=0 leaves the
+ * the text of every shader, glshow=TEXTURE (or WxH, with glshow_part=W,H and glshow_zoom=N) puts that texture over the corner of the picture, glplain=0 leaves the
  * draws without a program alone, glcopy=1 copies every IOSurface as if the library could not
  * share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
  * wait_for_frames), glfetch=0 keeps EXT_shader_framebuffer_fetch from CoreAnimation (see
@@ -304,8 +307,8 @@ struct eagl {
 	unsigned frames, shaders, programs, errors, shared, refused;
 	uint64_t all_calls, all_draws, all_triangles, readback_us, wait_us, attach_us, flush_us, frame_us;
 	unsigned most_calls, most_triangles;
-	const char *sources[64];        /* the text of the shaders being made, by name modulo this */
-	bool fragment[64];              /* ... and which of the two kinds each is */
+	const char *sources[256];       /* the text of the shaders being made, by name (modulo this) */
+	bool fragment[256];             /* ... and which of the two kinds each is */
 	unsigned plain_said;
 };
 
@@ -319,6 +322,9 @@ static int trace_function_met;                                  /* ... CoreAnima
 static float trace_place[4];                    /* boot-arg gltrace_place=X0,Y0,X1,Y1: of those frames, only the draws that touch this */
 static int trace_placed, trace_placing;         /* ... is set; ... and this frame is one of them */
 static int trace_look;                          /* boot-arg gltrace_look=1: ... and what each of them left in the middle of itself */
+static int trace_shaders;                       /* boot-arg gltrace_shaders=1: the text of the shaders of every program that draws */
+static int trace_uniforms_on;                   /* boot-arg gltrace_uniforms=1: and what every traced draw gave its program */
+static GLsizei trace_corners = 12;              /* boot-arg gltrace_corners=N: how many corners of a traced draw to write down */
 static float trace_middle[2];                   /* ... which is here, as CoreAnimation counts */
 static int trace_listed;                        /* the draw at hand is one of them */
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
@@ -808,12 +814,70 @@ target_to_surface(struct eagl *e, struct image *image)
 
 /*
  * For looking at what is drawn on the way to the picture (boot-arg glshow=TEXTURE): that texture's
- * pixels are put over the top left corner of the picture as it goes out.
+ * pixels are put over the top left corner of the picture as it goes out. glshow=WxH takes, instead
+ * of a name that is a new one every run, whichever texture is of that size; glshow_part=W,H only
+ * that much of its corner and glshow_zoom=N every pixel of it as a square of N, for a texture
+ * whose few pixels in a corner are what matters (a material's backdrop, say).
  */
 #define GL_TEXTURE_WIDTH        0x1000
 #define GL_TEXTURE_HEIGHT       0x1001
 
 static GLuint shown_texture;
+static GLint shown_wanted[2];                   /* boot-arg glshow=WxH: the size to look for instead */
+static GLint shown_part[2];                     /* boot-arg glshow_part=W,H: that much of its corner */
+static GLint shown_zoom = 1;                    /* boot-arg glshow_zoom=N */
+
+static GLuint shown_told;                       /* (the one written down as being shown) */
+
+/* What sizes the textures are, when the one asked for is not among them. */
+static void
+say_sizes(void)
+{
+	GLint bound = 0;
+	char line[600] = "";
+	size_t used = 0;
+
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	for (GLuint name = 1; name < 512 && used < sizeof(line) - 24; name++) {
+		GLint width = 0, height = 0;
+
+		if (!glIsTexture(name)) {
+			continue;
+		}
+		glBindTexture(GL_TEXTURE_2D, name);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+		used += (size_t)snprintf(line + used, sizeof(line) - used, " %u:%dx%d", name, width, height);
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	say("redwood-gl: glshow: the textures there are:%s\n", line);
+}
+
+/* glshow=WxH: the first texture of that size there is (names are handed out afresh every run). */
+static GLuint
+texture_of_size(GLint want_width, GLint want_height)
+{
+	GLint bound = 0;
+	GLuint found = 0;
+
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	for (GLuint name = 1; name < 512 && found == 0; name++) {
+		GLint width = 0, height = 0;
+
+		if (!glIsTexture(name)) {
+			continue;
+		}
+		glBindTexture(GL_TEXTURE_2D, name);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+		/* within a few pixels: the size of a backdrop's texture is a pixel or two different every run */
+		if (width - want_width <= 8 && want_width - width <= 8 && height - want_height <= 8 && want_height - height <= 8) {
+			found = name;
+		}
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	return found;
+}
 
 static void
 show_texture(struct eagl *e, struct image *image)
@@ -821,26 +885,49 @@ show_texture(struct eagl *e, struct image *image)
 	GLint width = 0, height = 0, bound = 0;
 	size_t row = IOSurfaceGetBytesPerRow(image->surface);
 	uint8_t *pixels, *base;
+	GLuint texture = shown_texture;
 
+	if (shown_wanted[0] > 0 && (texture = texture_of_size(shown_wanted[0], shown_wanted[1])) == 0) {
+		static unsigned said;
+
+		if (said++ == 0) {
+			say("redwood-gl: glshow: there is no texture of %d x %d\n", shown_wanted[0], shown_wanted[1]);
+			say_sizes();
+		}
+		return;
+	}
+	if (shown_told != texture) {
+		shown_told = texture;
+		say("redwood-gl: glshow: the texture %u, %d of it by %d, every pixel a square of %d\n", texture,
+		    shown_part[0] > 0 ? shown_part[0] : -1, shown_part[1] > 0 ? shown_part[1] : -1, shown_zoom);
+	}
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
-	glBindTexture(GL_TEXTURE_2D, shown_texture);
+	glBindTexture(GL_TEXTURE_2D, texture);
 	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
 	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
 	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	if (shown_part[0] > 0) {
+		width = shown_part[0] < width ? shown_part[0] : width;
+		height = shown_part[1] < height ? shown_part[1] : height;
+	}
 	if (width <= 0 || height <= 0 || (pixels = malloc((size_t)width * (size_t)height * 4)) == NULL) {
 		return;
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, shown_texture, 0);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
 	glPixelStorei(GL_PACK_ALIGNMENT, 1);
 	glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
 	glPixelStorei(GL_PACK_ALIGNMENT, 4);
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
 	if (glGetError() == 0 && IOSurfaceLock(image->surface, 0, NULL) == 0) {
 		base = IOSurfaceGetBaseAddress(image->surface);
-		for (GLint y = 0; y < height && y < image->height; y++) {
-			memcpy(base + row * (size_t)y, pixels + (size_t)y * (size_t)width * 4,
-			    (size_t)(width < image->width ? width : image->width) * 4);
+		for (GLint y = 0; y < height * shown_zoom && y < image->height; y++) {
+			const uint8_t *from = pixels + (size_t)(y / shown_zoom) * (size_t)width * 4;
+			uint8_t *to = base + row * (size_t)y;
+
+			for (GLint x = 0; x < width * shown_zoom && x < image->width; x++) {
+				memcpy(to + 4 * (size_t)x, from + 4 * (size_t)(x / shown_zoom), 4);
+			}
 		}
 		IOSurfaceUnlock(image->surface, 0, NULL);
 	}
@@ -1162,6 +1249,119 @@ trace_pixels(struct eagl *e)
 #define GL_TEXTURE0                     0x84c0
 #define GL_UNSIGNED_SHORT               0x1403
 #define GL_FLOAT                        0x1406
+#define GL_HALF_FLOAT                   0x140b
+
+static float half_float(uint16_t half);
+
+#define GL_ACTIVE_UNIFORMS              0x8b86
+#define GL_ACTIVE_UNIFORM_MAX_LENGTH    0x8b87
+#define GL_FLOAT_VEC2                   0x8b50
+#define GL_FLOAT_VEC3                   0x8b51
+#define GL_FLOAT_VEC4                   0x8b52
+#define GL_FLOAT_MAT2                   0x8b5a
+#define GL_FLOAT_MAT3                   0x8b5b
+#define GL_FLOAT_MAT4                   0x8b5c
+
+/* How many numbers a uniform of this type is made of (0: not one of floats). */
+static unsigned
+uniform_floats(GLenum type)
+{
+	switch (type) {
+	case GL_FLOAT:          return 1;
+	case GL_FLOAT_VEC2:     return 2;
+	case GL_FLOAT_VEC3:     return 3;
+	case GL_FLOAT_VEC4:     return 4;
+	case GL_FLOAT_MAT2:     return 4;
+	case GL_FLOAT_MAT3:     return 9;
+	case GL_FLOAT_MAT4:     return 16;
+	default:                return 0;
+	}
+}
+
+/*
+ * gltrace_uniforms=1: what the program of a traced draw was given, by the names its shaders use
+ * (coord_arg, texmat0, ...). CoreAnimation sets them by number, and a number says nothing; this
+ * asks the program itself what it has and what is in it.
+ */
+static void
+trace_uniforms(struct eagl *e)
+{
+	GLint count = 0, longest = 0;
+
+	glGetProgramiv(e->program, GL_ACTIVE_UNIFORMS, &count);
+	glGetProgramiv(e->program, GL_ACTIVE_UNIFORM_MAX_LENGTH, &longest);
+	for (GLint i = 0; i < count; i++) {
+		char name[128] = "", line[400] = "";
+		GLint size = 0, place;
+		GLenum type = 0;
+		unsigned floats;
+		size_t used = 0;
+
+		if (longest >= (GLint)sizeof(name)) {
+			break;
+		}
+		glGetActiveUniform(e->program, (GLuint)i, (GLsizei)sizeof(name), NULL, &size, &type, name);
+		place = glGetUniformLocation(e->program, name);
+		if (place < 0) {
+			continue;
+		}
+		if ((floats = uniform_floats(type)) == 0) {
+			GLint whole[4] = { 0 };
+
+			glGetUniformiv(e->program, place, whole);
+			eagl_trace("      %s (%d) = %d\n", name, place, whole[0]);
+			continue;
+		}
+		for (GLint k = 0; k < size && k < 8 && used < sizeof(line) - 80; k++) {
+			GLfloat values[16] = { 0 };
+
+			glGetUniformfv(e->program, place + k, values);
+			if (size > 1) {
+				used += (size_t)snprintf(line + used, sizeof(line) - used, " [%d]", k);
+			}
+			for (unsigned c = 0; c < floats; c++) {
+				used += (size_t)snprintf(line + used, sizeof(line) - used, " %.6g", (double)values[c]);
+			}
+		}
+		eagl_trace("      %s (%d) =%s\n", name, place, line);
+	}
+}
+
+/*
+ * gltrace_shaders=1: the text of the shaders the program of a traced draw is made of, the first
+ * time that program draws. A program's number says nothing by itself, and CoreAnimation's own
+ * shaders are what tells what a draw means; the text is the one my_glShaderSource() kept.
+ */
+static void
+trace_program(struct eagl *e)
+{
+	static GLuint told[64];
+	static unsigned telling;
+	GLuint shaders[8] = { 0 };
+	GLsizei count = 0;
+
+	for (unsigned i = 0; i < telling; i++) {
+		if (told[i] == e->program) {
+			return;
+		}
+	}
+	if (telling < sizeof(told) / sizeof(told[0])) {
+		told[telling++] = e->program;
+	}
+	glGetAttachedShaders(e->program, (GLsizei)(sizeof(shaders) / sizeof(shaders[0])), &count, shaders);
+	for (GLsizei i = 0; i < count; i++) {
+		const char *text = e->sources[shaders[i] % 256];
+		size_t length = text != NULL ? strlen(text) : 0;
+
+		eagl_trace("    program %u, shader %u, %zu characters:\n", e->program, shaders[i], length);
+		for (size_t at = 0; at < length; at += 900) {
+			write(2, text + at, length - at < 900 ? length - at : 900);
+		}
+		if (length > 0 && text[length - 1] != '\n') {
+			write(2, "\n", 1);
+		}
+	}
+}
 
 /*
  * What a draw that is being written down is made of: the texture on the first unit, and the
@@ -1172,6 +1372,13 @@ trace_draw(struct eagl *e, GLenum type, const void *indices, GLint first, GLsize
 {
 	char textures[160] = "";
 	size_t used = 0;
+
+	if (trace_shaders) {
+		trace_program(e);
+	}
+	if (trace_uniforms_on) {
+		trace_uniforms(e);
+	}
 
 	for (unsigned unit = 0; unit < 4; unit++) {
 		GLint width = 0, height = 0, format = 0;
@@ -1187,8 +1394,8 @@ trace_draw(struct eagl *e, GLenum type, const void *indices, GLint first, GLsize
 		    width, height, (unsigned)format);
 	}
 	glActiveTexture(GL_TEXTURE0 + e->unit);
-	eagl_trace("    program %u, framebuffer %u, textures%s\n", e->program, e->framebuffer, textures);
-	for (GLsizei i = 0; i < count && i < 12; i++) {
+	eagl_trace("    program %u, framebuffer %u (into texture %u), textures%s\n", e->program, e->framebuffer, e->colour, textures);
+	for (GLsizei i = 0; i < count && i < trace_corners; i++) {
 		unsigned vertex = indices == NULL ? (unsigned)(first + i) : type == GL_UNSIGNED_SHORT ?
 		    ((const uint16_t *)indices)[i] : type == GL_UNSIGNED_BYTE ? ((const uint8_t *)indices)[i] :
 		    ((const uint32_t *)indices)[i];
@@ -1203,7 +1410,7 @@ trace_draw(struct eagl *e, GLenum type, const void *indices, GLint first, GLsize
 				continue;
 			}
 			at += (size_t)vertex * (size_t)(e->arrays[a].stride ? e->arrays[a].stride :
-			    size * (e->arrays[a].type == GL_FLOAT ? 4 : 1));
+			    size * (e->arrays[a].type == GL_FLOAT ? 4 : e->arrays[a].type == GL_HALF_FLOAT ? 2 : 1));
 			used += (size_t)snprintf(line + used, sizeof(line) - used, " [%u]", a);
 			for (GLint c = 0; c < size; c++) {
 				if (e->arrays[a].type == GL_FLOAT) {
@@ -1211,6 +1418,13 @@ trace_draw(struct eagl *e, GLenum type, const void *indices, GLint first, GLsize
 
 					memcpy(&value, at + 4 * c, 4);
 					used += (size_t)snprintf(line + used, sizeof(line) - used, " %.5g", (double)value);
+				} else if (e->arrays[a].type == GL_HALF_FLOAT) {
+					/* (a layer's colour comes this way: four half floats, not four bytes) */
+					uint16_t half;
+
+					memcpy(&half, at + 2 * c, 2);
+					used += (size_t)snprintf(line + used, sizeof(line) - used, " %.4g",
+					    (double)half_float(half));
 				} else {
 					used += (size_t)snprintf(line + used, sizeof(line) - used, " %u", at[c]);
 				}
@@ -1223,7 +1437,6 @@ trace_draw(struct eagl *e, GLenum type, const void *indices, GLint first, GLsize
 #define GL_BLEND                        0x0be2
 #define GL_BLEND_DST_RGB                0x80c8
 #define GL_BLEND_SRC_RGB                0x80c9
-#define GL_HALF_FLOAT                   0x140b
 
 static float
 half_float(uint16_t half)
@@ -1482,6 +1695,13 @@ static const char masking_fragment[] =
  *   for four and for six samples are of that kind; for this one the OpenGL ES renderer has none.)
  *   Drawn as it was given, one sample in the middle, four pixels of the sixty-four made the one:
  *   what is blurred after that shimmers when it moves.
+ *   The colour of the corners is not the picture's to take: CoreAnimation's own shaders for four
+ *   and for six samples do not touch it, and it is the layer's opacity, which it applies where the
+ *   layer is laid on the screen. Multiplied in here, what was captured came out at the opacity of
+ *   the layer that asked for it -- 0.45 for the translucent minus on a jiggling icon -- and
+ *   everything made of it after, the blur, the curve of brightness and the colour matrix, worked
+ *   on a picture too dark: the minus came out stained with what was behind it instead of the
+ *   light grey it is on a phone.
  */
 static const char box_fragment[] =
     "#version 300 es\n"
@@ -1497,7 +1717,7 @@ static const char box_fragment[] =
     "    sum += texture(texture0, middle + places[i]) + texture(texture0, middle - places[i]);\n"
     "    sum += texture(texture0, middle + places[i] * vec2(1., -1.)) + texture(texture0, middle + places[i] * vec2(-1., 1.));\n"
     "  }\n"
-    "  result = color * sum * .0625;\n"
+    "  result = sum * .0625;\n"
     "}\n";
 
 static void *ca_context;                /* CoreAnimation's GLContext */
@@ -3218,7 +3438,7 @@ my_glCreateShader(void *context, GLenum type)
 
 	EAGL_ENTER(e, 0x1298);
 	shader = glCreateShader(type);
-	e->fragment[shader % 64] = type == GL_FRAGMENT_SHADER;
+	e->fragment[shader % 256] = type == GL_FRAGMENT_SHADER;
 	EAGL_LEAVE(e, 0x1298);
 	return shader;
 }
@@ -3231,7 +3451,7 @@ static void
 my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *const *strings, const GLint *lengths)
 {
 	struct eagl *e = context;
-	bool fragment = e->fragment[shader % 64], fetch;
+	bool fragment = e->fragment[shader % 256], fetch;
 	const GLchar *parts[6] = { "#version 300 es\n", fragment ? fragment_start : vertex_start, "", NULL, "",
 		                   full_precision ? all_highp : "" };
 	size_t size = 1, extensions = 0;
@@ -3266,8 +3486,8 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 		parts[2] = fetch ? fragment_fetch : fragment_plain;
 		parts[4] = fetch ? fragment_fetch_end : fragment_plain_end;
 	}
-	free((void *)e->sources[shader % 64]);
-	e->sources[shader % 64] = text;
+	free((void *)e->sources[shader % 256]);
+	e->sources[shader % 256] = text;
 	glShaderSource(shader, 6, (const GLchar *const[6]){ parts[0], parts[5], parts[1], parts[2], parts[3], parts[4] }, NULL);
 	EAGL_LEAVE(e, 0x12a0);
 }
@@ -3296,12 +3516,12 @@ my_glCompileShader(void *context, GLuint shader)
 	if (!good) {
 		glGetShaderInfoLog(shader, sizeof(said), NULL, said);
 		say("redwood-gl: A SHADER DOES NOT COMPILE (shader %u): %s\n", shader, said);
-		if (e->sources[shader % 64] != NULL) {
-			say_long("its text", e->sources[shader % 64]);
+		if (e->sources[shader % 256] != NULL) {
+			say_long("its text", e->sources[shader % 256]);
 		}
-	} else if ((e->shaders <= 2 || all_shaders) && e->sources[shader % 64] != NULL) {
+	} else if ((e->shaders <= 2 || all_shaders) && e->sources[shader % 256] != NULL) {
 		say("redwood-gl: shader %u:\n", shader);
-		say_long(all_shaders ? "a shader" : "the first shaders, for the record", e->sources[shader % 64]);
+		say_long(all_shaders ? "a shader" : "the first shaders, for the record", e->sources[shader % 256]);
 	}
 	EAGL_LEAVE(e, 0x12a8);
 }
@@ -3608,6 +3828,11 @@ install(void)
 		}
 		trace_lit = strstr(arguments, "gltrace_lit=1") != NULL;
 		trace_look = strstr(arguments, "gltrace_look=1") != NULL;
+		trace_shaders = strstr(arguments, "gltrace_shaders=1") != NULL;
+		trace_uniforms_on = strstr(arguments, "gltrace_uniforms=1") != NULL;
+		if ((argument = strstr(arguments, "gltrace_corners=")) != NULL) {
+			trace_corners = (GLsizei)strtol(argument + 16, NULL, 10);
+		}
 		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
 		group_vibrant_on = strstr(arguments, "glgroup=0") == NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
@@ -3632,7 +3857,22 @@ install(void)
 			plain_draws = (int)strtoul(argument + 8, NULL, 10);
 		}
 		if ((argument = strstr(arguments, "glshow=")) != NULL) {
-			shown_texture = (GLuint)strtoul(argument + 7, NULL, 10);
+			if (strchr(argument + 7, 'x') != NULL && strchr(argument + 7, 'x') < argument + 7 + strcspn(argument + 7, " ")) {
+				shown_wanted[0] = (GLint)strtol(argument + 7, NULL, 10);
+				shown_wanted[1] = (GLint)strtol(strchr(argument + 7, 'x') + 1, NULL, 10);
+				shown_texture = 1;              /* (that there is one to show at all) */
+			} else {
+				shown_texture = (GLuint)strtoul(argument + 7, NULL, 10);
+			}
+			if ((argument = strstr(arguments, "glshow_part=")) != NULL) {
+				shown_part[0] = (GLint)strtol(argument + 12, NULL, 10);
+				shown_part[1] = strchr(argument + 12, ',') != NULL ?
+				    (GLint)strtol(strchr(argument + 12, ',') + 1, NULL, 10) : shown_part[0];
+			}
+			if ((argument = strstr(arguments, "glshow_zoom=")) != NULL) {
+				shown_zoom = (GLint)strtol(argument + 12, NULL, 10);
+				shown_zoom = shown_zoom < 1 ? 1 : shown_zoom;
+			}
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
