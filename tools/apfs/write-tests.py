@@ -98,8 +98,11 @@ def make_image(path, compress=False):
 
 # ---------------------------------------------------------------- the readers
 
-def read_apfsck(image):
-    rc, out = run(APFSCK, '-cw', image)
+def read_apfsck(image, crash=True):
+    """-w: is the container sound.  -c as well: and does it also look cleanly unmounted, which
+    is a different question -- a container committed and not yet unmounted is sound but not
+    clean, because block zero still holds the superblock copy from before."""
+    rc, out = run(APFSCK, '-cw' if crash else '-w', image)
     return rc == 0, out
 
 
@@ -538,8 +541,73 @@ def test_real_images():
     say(role == 0x0001, '  and it is refused: its role is the system volume')
 
 
+def mtime_of(image, path):
+    c = apfs.Container(image)
+    try:
+        vol = c.volumes()[0]
+        oid, _dtype = vol.lookup(path)
+        return vol.inode(oid).mod_time
+    finally:
+        c.close()
+
+
+def test_transaction():
+    """txn-probe.py: one record changed and committed as a new checkpoint, which is the next
+    milestone and the measurement of what it costs.  What must hold: an independent checker
+    finds the container clean afterwards, the change is there and nothing else moved, and -- the
+    whole point of a transaction -- the power out at any block before the commit leaves the
+    checkpoint before it live and the volume exactly as it was."""
+    base, img = fresh('txn')
+    rc, out = run(sys.executable, os.path.join(HERE, 'txn-probe.py'), img, '/block')
+    if not say(rc == 0, 'one record changed and committed' + ('' if rc == 0 else ':\n' + out)):
+        return
+    total = int(out.split(' of ')[1].split()[0])
+    ok, ck = read_apfsck(img)
+    say(ok, '  apfsck -cw finds the committed container clean' + ('' if ok else ':\n' + ck))
+    say(mtime_of(img, '/block') == mtime_of(base, '/block') + 1000000000,
+        '  the changed field reads back changed')
+    say(census(img) == census(base), '  and of the whole volume nothing else moved')
+    good = True
+    for k in range(total):
+        _, part = fresh('txn-%d' % k)
+        rc, out = run(sys.executable, os.path.join(HERE, 'txn-probe.py'), part, '/block',
+                      '--stop-after', str(k))
+        if rc != 0:
+            good = say(False, '  stopped after %d blocks: the probe itself failed:\n%s' % (k, out))
+            continue
+        # before the commit block lands, the checkpoint before it is still the live one
+        committed = mtime_of(part, '/block') != mtime_of(base, '/block')
+        ck_ok, ck = read_apfsck(part, crash=False)
+        if not ck_ok:
+            good = say(False, '  stopped after %d blocks: apfsck is unhappy:\n%s' % (k, ck))
+            continue
+        if not committed and census(part) != census(base):
+            good = say(False, '  stopped after %d blocks: not committed, yet the volume moved' % k)
+            continue
+        if committed and k < total - 2:
+            good = say(False, '  stopped after %d of %d blocks and it committed anyway' % (k, total))
+            continue
+    say(good, 'the power out after each of the %d blocks of the transaction: the container is '
+        'sound every time, and until the superblock lands the checkpoint before it is live'
+        % total)
+
+    # One after another: the descriptor ring holds four of these checkpoints and the internal
+    # pool's bitmap ring sixteen, so going round them both is where a half-modelled space
+    # manager would come apart.
+    _, many = fresh('txn-many')
+    good = True
+    for i in range(20):
+        rc, out = run(sys.executable, os.path.join(HERE, 'txn-probe.py'), many, '/block')
+        ok, ck = read_apfsck(many)
+        if rc != 0 or not ok:
+            good = say(False, '  transaction %d: %s' % (i + 2, (out + ck).strip()))
+            break
+    say(good, 'twenty transactions one after another, each one clean: both rings go round')
+
+
 TESTS = {
     'baseline': test_baseline,
+    'transaction': test_transaction,
     'writes': test_writes,
     'refusals': test_refusals,
     'volume-gates': test_volume_gates,
