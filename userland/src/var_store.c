@@ -696,7 +696,7 @@ save(void)
 
 /* ---- unpacking ---- */
 
-static uint64_t made_dirs, made_files, made_links, made_bytes;
+static uint64_t made_dirs, made_files, made_links, made_bytes, short_files, lost_bytes;
 
 static int
 whole_path(const char *relative, uint32_t len)
@@ -766,7 +766,7 @@ unpack_one(int make)
 		case ENT_FILE:
 			out_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, (int)e.mode);
 			if (out_fd < 0) {
-				printf("var_store: %s: %s\n", path, strerror(errno));
+				printf("var_store: %s cannot be made: %s\n", path, strerror(errno));
 			} else {
 				made_files++;
 			}
@@ -806,24 +806,49 @@ unpack_one(int make)
 	/* the contents */
 	if (e.kind == ENT_FILE) {
 		static uint8_t piece[256 * 1024];
-		uint64_t left = e.size;
+		uint64_t left = e.size, in_file = 0;
 
 		while (left > 0) {
-			uint64_t want = left > sizeof(piece) ? sizeof(piece) : left;
+			uint64_t want = left > sizeof(piece) ? sizeof(piece) : left, done = 0;
 
 			if (!in(piece, want)) {
 				ok = 0;
 				break;
 			}
-			if (out_fd >= 0 && write(out_fd, piece, (size_t)want) != (ssize_t)want) {
-				printf("var_store: %s: %s\n", path, strerror(errno));
-				close(out_fd);
-				out_fd = -1;
+			/*
+			 * A whole data volume goes in at once, faster than the memory filesystem can find
+			 * pages for it, and it then says ENOSPC for want of one page rather than for want
+			 * of room (bsd/miscfs/ramfs, ramfs_grow_slots and the page limit). So a short write
+			 * is waited out and tried again, and only a file that will not go in at all after a
+			 * second of trying is given up on -- with its name, so it is known which.
+			 */
+			while (out_fd >= 0 && done < want) {
+				ssize_t wrote = write(out_fd, piece + done, (size_t)(want - done));
+				static int tries;
+
+				if (wrote > 0) {
+					done += (uint64_t)wrote;
+					tries = 0;
+					continue;
+				}
+				if (++tries > 200) {
+					printf("var_store: %s: %llu of %llu bytes, no more would go in: %s\n",
+					    path, (unsigned long long)(in_file + done),
+					    (unsigned long long)e.size, strerror(errno));
+					short_files++;
+					lost_bytes += e.size - in_file - done;
+					close(out_fd);
+					out_fd = -1;
+					tries = 0;
+					break;
+				}
+				usleep(5000);
 			}
+			in_file += done;
 			left -= want;
 		}
 		if (make) {
-			made_bytes += e.size;
+			made_bytes += in_file;
 		}
 	} else if (e.kind == ENT_SYMLINK || e.kind == ENT_HARDLINK) {
 		static char target[MAX_PATH];
@@ -835,6 +860,8 @@ unpack_one(int make)
 		} else {
 			target[e.size] = 0;
 			if (make && e.kind == ENT_SYMLINK) {
+				/* a name the skeleton made too comes out as the store has it */
+				unlink(path);
 				if (symlink(target, path) == 0) {
 					made_links++;
 				}
@@ -846,6 +873,7 @@ unpack_one(int make)
 				if (whole_path(target, (uint32_t)e.size)) {
 					strcpy(from, path);
 					strcpy(path, keep);
+					unlink(path);
 					if (link(from, path) == 0) {
 						made_links++;
 					}
@@ -961,6 +989,10 @@ load(void)
 	printf("var_store: %llu directories, %llu files (%llu bytes), %llu links back in /private/var\n",
 	    (unsigned long long)made_dirs, (unsigned long long)made_files, (unsigned long long)made_bytes,
 	    (unsigned long long)made_links);
+	if (short_files != 0) {
+		printf("var_store: %llu files did not fit: %llu bytes of them are not there\n",
+		    (unsigned long long)short_files, (unsigned long long)lost_bytes);
+	}
 	return 1;
 }
 

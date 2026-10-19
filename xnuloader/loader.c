@@ -1462,7 +1462,7 @@ ufs_survey(void)
  * for a write, cleans its own lines of it before it asks.
  */
 #define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
-#define BLOCK_VERSION      4
+#define BLOCK_VERSION      3
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
@@ -1506,6 +1506,17 @@ struct loader_block {
 	uint32_t version, size;
 	uint32_t parts, buffer_size;
 	uint64_t buffer_pa;
+	/*
+	 * Which partition takes writes this run, as its index among part[] plus one (0: none), and
+	 * from which of its blocks. They are here, in what was padding before ask, so that the page
+	 * stays the size and the version it was: one phone is shared between working copies, and a
+	 * kernel built before writes existed must go on reading through a loader built after them,
+	 * and the other way about -- a kernel that does not know these fields leaves ask.op zero,
+	 * which is a read, and a loader that does not know them leaves these zero, which is no write.
+	 */
+	uint32_t write_part_plus_one;
+	uint32_t write_reserved;
+	uint64_t write_first;
 	/* written by the kernel: what it wants, then request is advanced */
 	struct {
 		volatile uint32_t request;
@@ -1544,6 +1555,9 @@ struct loader_block {
 		volatile uint32_t cnr_at_switch;       /* UTRLCNR when the kernel's list went in */
 	} kernel_native __attribute__((aligned(128)));
 };
+
+_Static_assert(__builtin_offsetof(struct loader_block, ask) == 128,
+    "the page must stay the size it was: the fields before ask have to fit in what was padding");
 
 /* (8 KB is as far as this target aligns; the kernel maps whole 16 KB pages around both) */
 static struct loader_block block_shared __attribute__((aligned(0x2000)));
@@ -1822,8 +1836,10 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 		why = "its unique GUID is not the one it had";
 	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
 		why = "it does not begin and end where it did";
-	} else if (bp->lun != 0) {
-		why = "it is not on logical unit 0";
+	} else if (bp->unit != 0) {
+		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
+		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
+		why = "it is not on the first logical unit";
 	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_DARWIN_LAST - BLOCK_DARWIN_FIRST + 1) {
 		why = "its blocks are not what they were";
 	} else if (bio->media->read_only) {
@@ -1952,6 +1968,10 @@ block_start(void)
 	}
 	hc_refused_reads = 0;
 	hc_log_skips = 0;
+	if (block_write_part >= 0) {
+		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
+		block_shared.write_first = BLOCK_WRITE_FIRST;
+	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
 	block_shared.size = sizeof(block_shared);
@@ -2821,6 +2841,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
+	/* a run that does not ask for writes does not get them, whatever an earlier run of this
+	 * loader asked for (the loader stays resident across runs) */
+	block_write_requested = 0;
+	block_write_part = -1;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;

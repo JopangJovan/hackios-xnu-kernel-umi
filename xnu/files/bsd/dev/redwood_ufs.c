@@ -62,7 +62,7 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 
 /* the page the loader publishes: the same layout as struct loader_block in xnuloader/loader.c */
 #define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
-#define BLOCK_VERSION      4
+#define BLOCK_VERSION      3
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* a whole logical unit, not a partition */
@@ -95,6 +95,16 @@ struct loader_block {
 	uint32_t version, size;
 	uint32_t parts, buffer_size;
 	uint64_t buffer_pa;
+	/*
+	 * Which partition the loader will take writes for this run (its index plus one; 0: none) and
+	 * from which of its blocks. They sit in what was padding, so the page is the size and the
+	 * version it was and one phone goes on being shared: a loader built before writes existed
+	 * leaves them zero, which is no write, and a kernel built before them leaves ask.op zero,
+	 * which is a read.
+	 */
+	uint32_t write_part_plus_one;
+	uint32_t write_reserved;
+	uint64_t write_first;
 	struct {
 		volatile uint32_t request;
 		uint32_t part;
@@ -125,6 +135,9 @@ struct loader_block {
 		volatile uint32_t cnr_at_switch;       /* UTRLCNR when its list went in (for the loader's take-back) */
 	} kernel_native __attribute__((aligned(128)));
 };
+
+_Static_assert(__builtin_offsetof(struct loader_block, ask) == 128,
+    "the loader's page must stay the size it was: what is before ask has to fit in its padding");
 
 #define UFS_PAGE           0x4000UL
 #define UFS_TIMEOUT_MS     20000        /* core 0 answers in well under a second; this is for a dead loader */
@@ -162,6 +175,7 @@ static LCK_MTX_DECLARE(ufs_write_mtx, &ufs_lck_grp);
 /* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
 static int ufs_write_part = -1;
 static volatile bool ufs_write_busy;            /* a write of ours has this kernel's list out: not a failure */
+static bool ufs_write_out, ufs_write_was_native;        /* the list is out for writing, and was in before */
 static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
 
 SYSCTL_DECL(_kern_redwood);
@@ -457,7 +471,6 @@ static int
 ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 {
 	uint64_t nbs, per;
-	bool native;
 	int error = 0;
 
 	if (!ufs_ready || ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
@@ -477,15 +490,21 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	per = ufs_buffer_size / nbs;
 	lck_mtx_lock(&ufs_write_mtx);
 	/*
-	 * ufs_native_on goes first, so that a reader about to start sees it and goes the other way
-	 * of its own accord; one already inside this kernel's driver gets an error and is sent the
-	 * other way by ufs_write_busy.
+	 * The list goes out once, at the first write, and comes back when the device is closed: a
+	 * whole data volume is written a bufferful at a time, and switching the controller's list
+	 * for each of those would say so a hundred times over and buy nothing. ufs_native_on is
+	 * cleared first, so that a reader about to start goes the other way of its own accord; one
+	 * already inside this kernel's driver gets an error and is sent the other way by
+	 * ufs_write_busy.
 	 */
-	native = ufs_native_on;
-	ufs_write_busy = true;
-	if (native) {
-		ufs_native_on = false;
-		ufs_native_out("a write of the data volume");
+	if (!ufs_write_out) {
+		ufs_write_was_native = ufs_native_on;
+		ufs_write_busy = true;
+		ufs_write_out = true;
+		if (ufs_write_was_native) {
+			ufs_native_on = false;
+			ufs_native_out("writing the data volume into darwin");
+		}
 	}
 	while (len > 0 && error == 0) {
 		uint64_t count = len / nbs;
@@ -505,15 +524,26 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 		src += count * nbs;
 		len -= count * nbs;
 	}
-	if (native && ufs_native_in(false) == 0) {
-		ufs_native_on = true;
-	}
-	ufs_write_busy = false;
 	lck_mtx_unlock(&ufs_write_mtx);
 	if (error != 0) {
 		ufs_write_errors++;
 	}
 	return error;
+}
+
+/* The writing over: this kernel's own transfer list back in, and reads through it again. */
+static void
+ufs_write_restore(void)
+{
+	lck_mtx_lock(&ufs_write_mtx);
+	if (ufs_write_out) {
+		if (ufs_write_was_native && ufs_native_in(false) == 0) {
+			ufs_native_on = true;
+		}
+		ufs_write_busy = false;
+		ufs_write_out = false;
+	}
+	lck_mtx_unlock(&ufs_write_mtx);
 }
 
 /* ---- the devices ---- */
@@ -544,6 +574,18 @@ static int
 ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
 {
 	return 0;
+}
+
+static void ufs_write_restore(void);
+
+/* The last close of /dev/rufs_darwin ends the writing: this kernel's own transfer list goes back in. */
+static int
+ufs_cclose(dev_t dev, int flags, int devtype, proc_t p)
+{
+	if (ufs_write_part >= 0 && (uint32_t)minor(dev) == (uint32_t)ufs_write_part) {
+		ufs_write_restore();
+	}
+	return ufs_close(dev, flags, devtype, p);
 }
 
 static void
@@ -633,11 +675,48 @@ ufs_psize(dev_t dev)
 	return ufs_ready && part < ufs_parts ? (int)ufs_bsize[part] : -1;
 }
 
+/*
+ * A read of /dev/rufs_NAME: a bufferful at a time into memory of this kernel's and out to the
+ * reader with uiomove. Not physio, which hands the driver the reader's own address to copy to --
+ * and this kernel may not touch user memory itself (PAN): the copy has to go through uiomove.
+ * Nothing of this driver is held while it does, for a fault in the reader's memory can come back
+ * here as a read of the storage.
+ */
 static int
 ufs_cread(dev_t dev, struct uio *uio, __unused int ioflag)
 {
-	return physio(ufs_strategy, NULL, dev, B_READ, (u_int (*)(buf_t))ufs_psize, uio,
-	    ufs_bsize[minor(dev) < BLOCK_MAX_PARTS ? minor(dev) : 0]);
+	uint32_t part = (uint32_t)minor(dev);
+	uint64_t size;
+	uint8_t *bounce;
+	int error = 0;
+
+	if (!ufs_ready || part >= ufs_parts) {
+		return ENXIO;
+	}
+	size = ufs_part_bytes(part);
+	if (uio_offset(uio) < 0) {
+		return EINVAL;
+	}
+	bounce = kalloc_data(ufs_buffer_size, Z_WAITOK);
+	if (bounce == NULL) {
+		return ENOMEM;
+	}
+	while (error == 0 && uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < size) {
+		uint64_t at = (uint64_t)uio_offset(uio), want = (uint64_t)uio_resid(uio);
+
+		if (want > ufs_buffer_size) {
+			want = ufs_buffer_size;
+		}
+		if (want > size - at) {
+			want = size - at;
+		}
+		error = ufs_read(part, at, bounce, want);
+		if (error == 0) {
+			error = uiomove((caddr_t)bounce, (int)want, uio);
+		}
+	}
+	kfree_data(bounce, ufs_buffer_size);
+	return error;
 }
 
 /*
@@ -697,7 +776,7 @@ static const struct bdevsw ufs_bdevsw = {
 
 static const struct cdevsw ufs_cdevsw = {
 	.d_open       = ufs_copen,
-	.d_close      = ufs_close,
+	.d_close      = ufs_cclose,
 	.d_read       = ufs_cread,
 	.d_write      = ufs_cwrite,
 	.d_ioctl      = ufs_ioctl,
@@ -1287,16 +1366,27 @@ redwood_ufs_init(void)
 	 */
 	check = 0;
 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
-		for (uint32_t i = 0; i < ufs_parts; i++) {
+		uint32_t offered = ufs_page->write_part_plus_one;
+
+		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
+			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
+			    "line too, and a loader that knows about writes)\n");
+		}
+		for (uint32_t i = 0; offered != 0 && i < ufs_parts; i++) {
 			const char *why = NULL;
 
 			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0) {
 				continue;
 			}
-			if (ufs_page->part[i].flags & BLOCK_PART_UNIT) {
+			if (i != offered - 1) {
+				why = "the loader offers another partition";
+			} else if (ufs_page->part[i].flags & BLOCK_PART_UNIT) {
 				why = "it is a whole logical unit, not the partition";
-			} else if (ufs_page->part[i].lun != 0) {
-				why = "it is not on logical unit 0";
+			} else if (ufs_page->part[i].unit != 0) {
+				/* the first unit UEFI lists, which this kernel's own driver reads as LUN 0 and
+				 * has compared with the loader's reads; the device path this firmware gives
+				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
+				why = "it is not on the first logical unit";
 			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
 				why = "it does not begin where it did";
 			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
