@@ -416,9 +416,18 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	cp obj/stage0 flashboot/sbin/launchd
 	# the OS cryptex, and the shared cache in it, only where this image will carry it:
 	# with CRYPTEXES=flash the cryptexes are read from the phone's flash and this tree is
-	# built and thrown away unused
+	# built and thrown away unused. The guard ends with the cache: everything after it goes
+	# into the boot volume, which every recipe carries, flash cryptexes included
 	if [ "$CRYPTEXES" != flash ]; then
-	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
+		if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
+		D=flashboot.os/System/Library/Caches/com.apple.dyld
+		mkdir -p $D
+		for f in $CACHE/dyld_shared_cache_arm64*; do
+			case "$f" in *.symbols) continue ;; esac
+			# -f: a cryptex fetched with the cache already in it would otherwise stop the build
+			ln -f "$f" $D/
+		done
+	fi
 	# the audio DSP's firmware and the speaker amplifiers' configuration, as in the system image's /fw: the kernel
 	# reads the firmware as soon as there is a root (this image, adsp=1), the configuration maybe later -- by then
 	# from the iOS volume's /fw, which src/init.c (flash_root) binds to this
@@ -442,14 +451,6 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 			ln -s /var/jb/usr/bin/$c flashboot/jb-bin/$c
 		done
 		echo "  the package manager's prefix: $(du -sh flashboot/jb | cut -f1) as /jb of the boot volume"
-	fi
-	D=flashboot.os/System/Library/Caches/com.apple.dyld
-	mkdir -p $D
-	for f in $CACHE/dyld_shared_cache_arm64*; do
-		case "$f" in *.symbols) continue ;; esac
-		# -f: a cryptex fetched with the cache already in it would otherwise stop the build
-		ln -f "$f" $D/
-	done
 	fi
 	python3 ../tools/apfs/mkapfs.py -z --plain fw -o flashboot.boot.apfs Boot=flashboot | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh flashboot.boot.apfs Boot=flashboot
