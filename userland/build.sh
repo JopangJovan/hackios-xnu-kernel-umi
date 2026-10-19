@@ -327,6 +327,16 @@ if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
 fi
+# Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
+# device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
+# slot on 19 October 2026. It is the vendor's and never in the repository, so a copy made with bare
+# git worktree add has none of it, and neither has one whose tools/new-workspace.sh predates the fw-*
+# loop there. Say what went in and what was not there to go in; what each one is for is above.
+fwhave= fwnone=
+for d in gpu wifi haptic camera audio; do
+	if [ -d ../fw-$d ]; then fwhave="$fwhave $d"; else fwnone="$fwnone $d"; fi
+done
+echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${fwhave:- none present}${fwnone:+, absent:$fwnone}"
 # When the iOS volume on the phone's flash is to become the root (boot-arg root_apfs=ufs_darwin,
 # with flashboot.apfs resident; src/init.c, flash_root): an empty directory to hide iOS's
 # NanoLaunchDaemons and LaunchAngels with,
