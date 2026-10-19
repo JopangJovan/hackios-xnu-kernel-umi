@@ -1143,6 +1143,28 @@ keychain. Copying activation identity» → «Device is probably unactivated»).
 обратимое преобразование в ядре (`MiniAppleKeyStore.cpp`, см. «Связка ключей»). Польза ровно в том, что
 учётный слой получает ответ вместо ошибки и перестаёт переспрашивать.
 
+**App Store: открывается и ждёт.** `appstored`, `itunesstored` и `installcoordinationd` теперь в образе —
+первых двух App Store просит, как только его открыть, — и с ними сеанс на телефоне чистый: 135 процессов,
+17 процессов виджетов и постеров, ни одной аварии. Сам App Store открывается и показывает свой «LOADING»
+с вертушкой, и на этом остаётся (`logs/app3-*.png`). Это **не** стена FairPlay и **не** вход в учётную
+запись: витрина вообще не открывает ни одного TCP-соединения (trustd, mDNSResponder, geod, nsurlsessiond
+открывают, а `appstored`, `itunesstored` и `AppStore` — нет), то есть всё кончается до сети. `appstored`
+сам говорит, где именно:
+
+```
+[bag] AMSBagActiveAccountProvider: The local account doesn't have a storefront.
+      localAccount = <ACAccount type = iTunesStore | username = local | storefront = (null)>
+[bag] AMSBagNetworkDataSource: Could not fetch initial cached storefront
+[Bag]  Error creating snapshot of bag: Timed out while waiting for snapshot bag to load
+```
+
+Нет витрины (storefront) — нет «мешка» (bag, конфигурация Apple) — не загружается и главная страница.
+Storefront — это регион, и на настоящем устройстве он берётся либо из учётной записи, в которую вошли,
+либо из SIM через CoreTelephony. Единственное, чего `appstored` не находит при открытом магазине кроме
+этого, — `com.apple.commcenter.coretelephony.xpc`, то есть CommCenter, который здесь падает по кругу на
+двух отсутствующих драйверах IOKit. Так что пустой магазин и телефония — это одна и та же находка дважды.
+Входить в настоящую учётную запись Apple здесь нельзя, и это решение не наше.
+
 **Телефония (`CommCenter`) — пробовали, не вышло.** Следующей по числу обращений была она: `com.apple.commcenter.xpc`
 SpringBoard спрашивает десять тысяч раз за все сеансы. iOS держит два задания с одним и тем же именем и выбирает
 по дереву устройств, и узла `baseband` у нас нет, так что launchd сам берёт `com.apple.CommCenter-noncellular` —

@@ -97,6 +97,21 @@ import sys
 #     longer costs the boot. In QEMU it does start and behaves: 0 retries, 100 processes, 12 widgets.
 # Taking 'cloudd' out of the tuple also lets com.apple.itunescloudd through, which has never been asked
 # for in any session measured here.
+# The App Store: itunesstored and installcoordinationd are in, and this is exactly how far it gets.
+# appstored asks for both the moment the store is opened, and with them it runs clean -- 135 processes,
+# 17 widget and poster processes, no crash. The App Store opens and shows its own LOADING spinner and
+# stays there. It is NOT the FairPlay wall and NOT a sign-in: the store stack never opens a TCP
+# connection at all (trustd, mDNSResponder, geod, nsurlsessiond all do; appstored, itunesstored and
+# AppStore do not), so it stops before the network. appstored says why, in one line:
+#   [bag] AMSBagActiveAccountProvider: The local account doesn't have a storefront.
+#         localAccount = <ACAccount type = iTunesStore | username = local | storefront = (null)>
+#   [bag] AMSBagNetworkDataSource: Could not fetch initial cached storefront
+#   [Bag] Error creating snapshot of bag: Timed out while waiting for snapshot bag to load
+# No storefront -> no bag -> the front page never loads. A storefront is a region, and on a real device
+# it comes from the signed-in account or from the SIM through CoreTelephony; appstored's only other
+# failed lookup while the store is open is com.apple.commcenter.coretelephony.xpc, which is CommCenter,
+# which crash-loops here on two missing IOKit drivers. So the empty store and the telephony finding are
+# the same finding twice. Signing in is not an option that may be taken here.
 # The one stall that looked like a second cause was the same cause. ALLOW="syncdefaultsd appstored" lost the
 # home screen too (77 processes, no widgets) with no retry storm at all, which seemed to rule nsurlsessiond
 # out -- but that run was built before nsurlsessiond came out of this tuple. Built again with it there, the
@@ -131,8 +146,8 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties', 'mobileactivationd',
-        'installcoordinationd', 'purplebuddy', 'restore', 'usb', 'accessoryd',
-        'mobileassetd', 'itunesstored', 'bird',
+        'purplebuddy', 'restore', 'usb', 'accessoryd',
+        'mobileassetd', 'bird',
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # iOS 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
