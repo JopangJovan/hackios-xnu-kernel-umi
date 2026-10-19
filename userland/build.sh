@@ -44,7 +44,11 @@
 #                    changing the recipe below).
 #   flashboot.apfs   FLASHBOOT=1: the RAM part of a boot whose root is the iOS volume on the phone's
 #                    flash (see below); with CRYPTEXES=flash the boot volume alone, the cryptexes being
-#                    on the flash
+#                    on the flash. FLASHBOOT=1 also decides what goes into root.apfs: the job list is
+#                    then made for the whole iOS volume (mkjobs.py --root-volume), so it holds daemons
+#                    -- fairplayd, identityservicesd, passd ... -- that the system image has not got.
+#                    That root.apfs is for a flash boot; a RAM boot wants one built without FLASHBOOT=1,
+#                    or launchd will fail to start those few when something asks for them.
 #
 #   PREBUILT=1       do not compile anything: take our programs from ../prebuilt/userland (this is also
 #                    what happens when the cross toolchain is not set up, see ../xnu-deps/setup.sh);
