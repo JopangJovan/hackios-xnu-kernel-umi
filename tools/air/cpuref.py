@@ -388,7 +388,7 @@ def compare(theirs, ours, tol):
 def run_all(args):
     """Every function of a .metallib, with a count at the end."""
     b, header, funcs = metallib.parse(args.file)
-    agree = differ = skipped = 0
+    agree = differ = skipped = with_air = 0
     for f in funcs:
         name = f.get("name")
         if not name:
@@ -422,10 +422,32 @@ def run_all(args):
             differ += 1
         else:
             agree += 1
+            if calls_air(b, header, f):
+                with_air += 1
             print("agree  %-44s %s" % (name, " ".join(theirs[:4])))
     print("\ncpuref: %d agree with LLVM, %d differ, %d could not be compared (of %d)"
           % (agree, differ, skipped, len(funcs)))
+    # Which part of the frontend this actually exercised. A shader that calls
+    # no air.* checks the reader, the interface and the instructions, and says
+    # nothing whatever about air_intrinsics.c.
+    print("cpuref: of the %d that agree, %d call an air.* function; %d are plain LLVM IR, "
+          "so they test the reader, the interface and the instructions but no intrinsic"
+          % (agree, with_air, agree - with_air))
     return 1 if differ else 0
+
+
+def calls_air(b, header, f):
+    """Does this module declare any air.* function?"""
+    bc, _ = metallib.bitcode_of(b, header, f)
+    with tempfile.TemporaryDirectory() as work:
+        p = os.path.join(work, "m.bc")
+        with open(p, "wb") as fp:
+            fp.write(bc)
+        try:
+            ll = disassemble(p)
+        except subprocess.CalledProcessError:
+            return False
+    return bool(re.search(r"^declare[^@\n]*@air\.", ll, re.M))
 
 
 if __name__ == "__main__":

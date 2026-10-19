@@ -229,6 +229,21 @@ Three references, each independent of the translator:
    With the wrapper, only `void(const void *, void *)` crosses into C and the question does not
    arise.
 
+   **And what those 255 do not cover: not one `air.*` function.** Every one of them is plain
+   LLVM IR, so the agreement is a strong statement about the reader, the interface mapping
+   (buffers to the right UBO index, result fields to the right render targets in the right order)
+   and the instruction translation — and no statement at all about `air_intrinsics.c`. The
+   shaders that do call `air.*` are exactly the ones this check cannot judge: the texture ones
+   have a varying for a parameter, the math-heavy ones are compute kernels or `air.visible`
+   library functions. So **all ~50 operations in `air_intrinsics.c` are unverified**, including
+   two whose meaning is a guess and marked `UNVERIFIED` in the code (`air.fast_exp`: natural
+   `exp` or `exp2`? and `air.fast_round`: away from zero or to even?). What would settle them is
+   a shader whose intrinsic result is observable through a device buffer, compared the same way
+   — which needs the buffer-readback half of this tool, i.e. M4's acceptance test. Writing C
+   implementations of the `air.*` functions for the CPU side would *not* settle them: those
+   implementations would encode the same beliefs as the translator, and a reference that agrees
+   with you by construction is not a reference.
+
    What it cannot decide, and says so rather than passing: a shader with a non-buffer argument —
    a varying, `air.position`, a thread id — because what is in it is the GPU's business (19 in
    AppleMetalGLRenderer, all of them the texture ones), and a compute kernel, which returns
