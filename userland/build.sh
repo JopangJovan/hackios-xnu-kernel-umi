@@ -61,6 +61,18 @@ LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
 DYN="xnu-clang -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1"
 IOS=../ios165
 CACHE=$IOS/20F66__iPhone10,3_6
+# ios165/rootfs and ios165/cryptex must be this copy's own directories of hard links, the way
+# tools/new-workspace.sh makes them. A symlink to another copy's tree makes sysroot a symlink too, because
+# cp -a does not follow one, and then every rm -rf and mv below edits the shared extraction in place. That
+# happened on 19 October 2026: 491 LaunchDaemons, NanoLaunchDaemons, LaunchAngels, xpc/launchd.plist and
+# private/var went out of the main copy's tree, and only the hard links in the other copies still held them.
+for d in rootfs cryptex cryptex-app; do
+	[ -L $IOS/$d ] || continue
+	echo "build.sh: ios165/$d is a symlink to $(readlink $IOS/$d)" >&2
+	echo "build.sh: it has to be a directory of this copy's own: rm it and cp -al the original over," >&2
+	echo "build.sh: as tools/new-workspace.sh does. Building against a link damages the shared tree." >&2
+	exit 1
+done
 # The stock iOS jobs given to launchd, roughly in the order they were brought up.
 IOS_JOBS=${JOBS-"
 	com.apple.notifyd com.apple.cfprefsd.xpc.daemon com.apple.cfprefsd.xpc.daemon.system com.apple.logd
