@@ -485,9 +485,38 @@ own firmware, which is not in the repository. **Not the driver refusing work: no
 exactly what that first line is for: the pixel was right, and reporting it as a result on the
 Adreno would have been false. Read the line before the numbers.
 
-What is *not* known until it is tried is whether the kernel's GPU driver and the submit path
-behave for a draw that does not come from CoreAnimation: the GLES path is that driver's only
-consumer today. `rc.jobs.air` asks with the GPU idle; `rc.jobs.air2` asks again after SpringBoard
+**Second run, with the firmware in place: the GPU driver came up and `air_run` died reaching it.**
+`logs/233855-run.log` has the Adreno starting properly — the GMU, the zap shader through
+TrustZone, the SMMU — and then nothing from `air_run` but one line, which is the whole reason
+that line exists:
+
+```
+air_run: signal 11 at 0x10, pc 0x10037e404, lr 0x1002829b0,
+         called from 0x1002829b0 0x1000a139c 0x1000077e8 0x1c3fef344 (unslid)
+```
+
+Joined against `llvm-nm` of the binary by nearest preceding symbol, that is
+
+```
+pc   driParseConfigFiles + 0x54     <- the fault, at address 0x10
+lr   fd_screen_create + 0x344
+     u_pipe_screen_lookup_or_create + 0xa4
+     main + 0x1f8
+```
+
+`fd_screen_create` passes the `pipe_screen_config` straight to `driParseConfigFiles`, which
+dereferences it; this program handed it a zeroed struct. The port's own
+`osmesa_create_gpu_screen()` fills it in with `driParseOptionInfo` and `driParseConfigFiles` over
+`driinfo_freedreno.h`, and that sequence — the one CoreAnimation goes through on this device every
+day — is now what `air_run` uses. **A machine with no `msm` device never reaches that code**, so
+no amount of running it here would have found it; it took the first contact with real hardware.
+
+Without the fault handler there would have been nothing at all to go on: iOS answers a crash here
+with "Failed to send exception EXC_CORPSE_NOTIFY" and no report. Four lines of borrowed code
+turned a silent exit into an exact address.
+
+What is *still* not known is whether the kernel's GPU driver and the submit path behave for a draw
+that does not come from CoreAnimation: the GLES path is that driver's only consumer today. `rc.jobs.air` asks with the GPU idle; `rc.jobs.air2` asks again after SpringBoard
 is up and holding it. A refusal is a finding the whole port needs, not just this frontend, so
 either answer is worth the run.
 
