@@ -216,6 +216,42 @@ chown(const char *path, int uid, int gid)
 }
 
 int
+lchown(const char *path, int uid, int gid)
+{
+	return (int)SC(SYS_lchown, path, uid, gid, 0, 0, 0);
+}
+
+int
+chflags(const char *path, int flags)
+{
+	return (int)SC(SYS_chflags, path, flags, 0, 0, 0, 0);
+}
+
+int
+utimes(const char *path, const struct timeval times[2])
+{
+	return (int)SC(SYS_utimes, path, times, 0, 0, 0, 0);
+}
+
+ssize_t
+listxattr(const char *path, char *names, size_t size, int options)
+{
+	return SC(SYS_listxattr, path, names, size, options, 0, 0);
+}
+
+ssize_t
+getxattr(const char *path, const char *name, void *value, size_t size, uint32_t position, int options)
+{
+	return SC(SYS_getxattr, path, name, value, size, position, options);
+}
+
+int
+setxattr(const char *path, const char *name, const void *value, size_t size, uint32_t position, int options)
+{
+	return (int)SC(SYS_setxattr, path, name, value, size, position, options);
+}
+
+int
 ftruncate(int fd, off_t length)
 {
 	return (int)SC(SYS_ftruncate, fd, length, 0, 0, 0, 0);

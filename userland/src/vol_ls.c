@@ -124,12 +124,14 @@ do_ls(const char *dir)
 			ssize_t len = readlink(path, target, sizeof(target) - 1);
 
 			target[len > 0 ? len : 0] = '\0';
-			printf("  %s %3u %4u %4u %12lld %s -> %s\n", mode, (unsigned)st.st_nlink,
-			    (unsigned)st.st_uid, (unsigned)st.st_gid, (long long)st.st_size, names[i],
-			    target);
+			/* the time of writing as the seconds of the epoch: whether a name is this boot's */
+			printf("  %s %3u %4u %4u %12lld %11lld %s -> %s\n", mode, (unsigned)st.st_nlink,
+			    (unsigned)st.st_uid, (unsigned)st.st_gid, (long long)st.st_size,
+			    (long long)st.st_mtimespec.tv_sec, names[i], target);
 		} else {
-			printf("  %s %3u %4u %4u %12lld %s\n", mode, (unsigned)st.st_nlink,
-			    (unsigned)st.st_uid, (unsigned)st.st_gid, (long long)st.st_size, names[i]);
+			printf("  %s %3u %4u %4u %12lld %11lld %s\n", mode, (unsigned)st.st_nlink,
+			    (unsigned)st.st_uid, (unsigned)st.st_gid, (long long)st.st_size,
+			    (long long)st.st_mtimespec.tv_sec, names[i]);
 		}
 		free(names[i]);
 	}
