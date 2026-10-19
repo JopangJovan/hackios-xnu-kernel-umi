@@ -49,21 +49,22 @@ functions and not entry points at all.
   24 narrow-type declarations softpipe cannot run at all are exactly the ones where ir3 differs
   most from it. None of the seven shaders that have run on the phone calls an `air.*` function:
   **no operation has been run on the GPU.**
-- **The atomics compute the right thing; whether they are atomic is still open.**
-  `tools/air/atomiccheck.py` dispatches a kernel written for the purpose (section 4, item 5) and
-  the five operations the corpus uses — global `add.s`, `load`, `max.s`, `min.s`, `store` — agree,
-  including a signed minimum taken across negative values, which is where an unsigned one would
-  pass unnoticed. Sixteen threads each incremented a counter once and each was handed a different
-  predecessor count, so no update was lost. But it ran in software, which need not have run two
-  threads at once, so that is evidence about the arithmetic and none about atomicity. Two other
-  things are settled without running anything: every atomic in the corpus asks for
-  `memory_order_relaxed`, and a stronger order is now refused by name instead of being ignored,
-  which is what the lowering used to do.
-- **Still unverified by anything: the barrier, the derivatives, the simd reductions and the
-  threadgroup atomics** — what they mean depends on more than one thread or on neighbouring
-  fragments, and neither a folded constant nor a software dispatch can say it. The texture
-  operations are covered differently and partly, by the six shaders that returned the exact texel
-  on the Adreno.
+- **The atomics compute the right thing and the barrier waits; whether the atomics are *atomic*
+  is still open.** `tools/air/atomiccheck.py` dispatches two kernels written for the purpose
+  (section 4, item 5) and all eight operations the corpus uses agree — five on device memory
+  (`add.s`, `load`, `max.s`, `min.s`, `store`), three on threadgroup memory (`add.u`, `load`,
+  `store`) across two `air.wg.barrier`s. Among them a signed minimum taken across negative
+  values, which is where an unsigned one passes unnoticed. The barrier is genuinely under test:
+  softpipe advances its invocations in groups of four, so making the barrier a no-op leaves every
+  thread seeing 4 of 16 increments, and the check says exactly that. **Atomicity is not under
+  test**, because softpipe applies a group's atomic lane by lane and so cannot lose an update
+  however the lowering is written. That needs the phone. Two things are settled without running
+  anything: every atomic in the corpus asks for `memory_order_relaxed`, and a stronger order is
+  now refused by name instead of ignored, which is what the lowering used to do.
+- **Still unverified by anything: the derivatives and the simd reductions** — what they mean
+  depends on neighbouring fragments or on the width of a simdgroup, and a folded constant cannot
+  say it. The texture operations are covered differently and partly, by the six shaders that
+  returned the exact texel on the Adreno.
 - **Nothing here tests Metal's own filtering or addressing.** The six texture shaders that drew on
   the Adreno took their sampler from the API, which this harness chose: nearest, clamped, sampled
   at a texel centre. That is evidence about binding, descriptors and ir3's texture instructions —
@@ -571,16 +572,29 @@ Three references, each independent of the translator:
    written as `old * 16 + index + 1`, so a slot no thread wrote cannot look like a result and a
    thread writing another thread's slot does not read as correct either.
 
-   **The five operations agree, and this is still not evidence of atomicity**, because it ran on
-   softpipe, which need not have run two threads at once — serial execution produces a correct
-   permutation too. The check passes there by being right rather than by being unopposed. What
-   would make it evidence is the same kernel on the Adreno, where the threads do run at once, and
-   that has not happened. It is also only the five operations the corpus proves exist, read off
-   its own declarations; `air_intrinsics.c` also handles `and`, `or`, `xor` and `xchg`, and those
-   are untested because the names Apple would emit for them are a guess, and a test of a guessed
-   name is a test of the guess. The threadgroup atomics (`air.atomic.local.*`, three declarations)
-   are untested too: they go through `nir_shared_atomic` and a different path for the memory, and
-   that path has not been exercised at all.
+   A second kernel does the threadgroup atomics and the barrier, which the first cannot reach —
+   they go through `nir_shared_atomic` and a different path for the memory. Threadgroup memory is
+   not zeroed at dispatch, and neither Metal nor Mesa promises it is, so the kernel initialises
+   it: every thread storing 0 to the same two words does that without needing a branch. Then each
+   thread adds 1 to one word and `1 << its own index` to the other, and after the second barrier
+   reads both back into its own slot of two device buffers. Every slot must hold 16 and `0xffff`,
+   and the two ways it can fail are told apart by *which* slot is wrong: a lost add clears a bit
+   in every slot and the bit names the thread whose increment went missing, while a barrier that
+   did not wait leaves a smaller number in the slot of the thread that ran ahead.
+
+   **All eight operations agree.** The barrier is genuinely under test, which was a surprise worth
+   recording: softpipe does not advance its invocations one at a time but in groups of four, so
+   with `barrier_op` made a no-op every thread sees 4 of 16 increments and the check says so,
+   naming the twelve threads whose bits are missing.
+
+   **Atomicity is still not under test.** Softpipe applies a group's atomic lane by lane, so it
+   cannot lose an update however the lowering is written, and the permutation comes out correct by
+   construction. The check passes there by being right rather than by being unopposed. What would
+   make it evidence is the same two kernels on the Adreno, where sixteen threads really do race,
+   and that has not happened. It is also only the eight operations the corpus proves exist, read
+   off its own declarations; `air_intrinsics.c` also handles `and`, `or`, `xor` and `xchg`, and
+   those stay untested because the names Apple would emit for them are a guess, and a test of a
+   guessed name is a test of the guess.
 
 Where a shader has a known GLSL equivalent (AppleMetalGLRenderer's shaders *are* the GL
 pipeline's fixed functions), rendering both through the port's GLES and comparing images is a
