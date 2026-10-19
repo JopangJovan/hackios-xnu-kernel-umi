@@ -41,6 +41,9 @@
  *                             container on apfs_dev where they lie, with the kernel's own
  *                             bsd/miscfs/apfs/apfs_write.c, and read them back out of a
  *                             container opened again from nothing (apfs_write_check below)
+ *   apfs_check=8              the store of fixed-length slot files on apfs_dev: save a payload
+ *                             into it and read it back out of a container opened again from
+ *                             nothing (apfs_store_check below)
  *
  * A line is the same one tools/apfs/apfs-tool's census and `verify.py clines` print:
  *
@@ -89,6 +92,7 @@
 #include <sys/redwood_apfs_check.h>
 #include <miscfs/apfs/apfs_lib.h>
 #include <miscfs/apfs/apfs_write.h>
+#include <miscfs/apfs/apfs_store.h>
 #include <sys/disk.h>
 #include <sys/buf.h>
 #include <sys/fcntl.h>
@@ -1325,6 +1329,169 @@ out:
 	}
 }
 
+/* -------------------------------------- apfs_check=8: the store, in the kernel, on a device */
+
+/*
+ * The store of fixed-length slot files (bsd/miscfs/apfs/apfs_store.c) run where it will live: in
+ * the kernel, on a block device, under the kernel's own allocator.  A payload of apfs_store_len
+ * bytes of a pattern this works out twice -- once to save, once to compare -- goes into the
+ * store on apfs_dev; then the container is opened again from nothing and the newest good slot is
+ * read back, so what is reported came off the device.
+ *
+ *   apfs_check=8
+ *   apfs_dev=md1              the store volume (default rvblk0); its name must be RedwoodStore
+ *   apfs_store_len=N          how many bytes of payload (default 40000)
+ *   apfs_store_seed=N         which pattern (default 1); a different seed is a different payload
+ *   apfs_store_note=N         the writer's own number, kept in the header (default 0)
+ */
+#define APFS_STORE_TEST_MAX (4u << 20)
+
+static void
+store_pattern(uint8_t *buf, uint32_t len, uint32_t seed)
+{
+	uint32_t i;
+
+	for (i = 0; i < len; i++) {
+		buf[i] = (uint8_t)(i * (7 + seed) + 5 + seed);
+	}
+}
+
+static void
+apfs_store_check(const char *devname)
+{
+	vfs_context_t ctx = vfs_context_kernel();
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	struct apfs_store st;
+	struct apfs_store_head head;
+	struct apfs_store_write w;
+	struct apfs_dev dev;
+	struct wdev wd = { NULLVP, 0 };
+	uint8_t *data = NULL, *scratch = NULL;
+	uint32_t len = 40000, seed = 1;
+	uint64_t note = 0, want = FNV_INIT;
+	const char *why = NULL;
+	bool opened = false, nx_open = false;
+	int best, error, tries;
+	uint32_t i;
+
+	PE_parse_boot_argn("apfs_store_len", &len, sizeof(len));
+	PE_parse_boot_argn("apfs_store_seed", &seed, sizeof(seed));
+	PE_parse_boot_argn("apfs_store_note", &note, sizeof(note));
+	if (len == 0 || len > APFS_STORE_TEST_MAX) {
+		printf("apfs-store: apfs_store_len=%u is not between 1 and %u\n", len,
+		    APFS_STORE_TEST_MAX);
+		return;
+	}
+	for (tries = 0; tries < 100; tries++) {
+		if (vnode_lookup(devname, 0, &wd.vp, ctx) == 0) {
+			break;
+		}
+		delay_for_interval(20, NSEC_PER_MSEC);
+	}
+	if (wd.vp == NULLVP) {
+		printf("apfs-store: %s never showed up in /dev\n", devname);
+		return;
+	}
+	error = VNOP_OPEN(wd.vp, FREAD | FWRITE, ctx);
+	if (error) {
+		printf("apfs-store: %s will not open for writing: %d\n", devname, error);
+		goto out;
+	}
+	opened = true;
+	if (VNOP_IOCTL(wd.vp, DKIOCGETBLOCKSIZE, (caddr_t)&wd.devblock, 0, ctx) != 0 ||
+	    wd.devblock == 0 || (4096 % wd.devblock) != 0) {
+		printf("apfs-store: %s has no usable block size\n", devname);
+		goto out;
+	}
+	data = kalloc_data(len, Z_WAITOK);
+	scratch = kalloc_data(READ_CHUNK, Z_WAITOK);
+	if (data == NULL || scratch == NULL) {
+		printf("apfs-store: out of memory\n");
+		goto out;
+	}
+	store_pattern(data, len, seed);
+	for (i = 0; i < len; i++) {
+		want ^= data[i];
+		want *= FNV_PRIME;
+	}
+
+	memset(&dev, 0, sizeof(dev));
+	dev.ctx = &wd;
+	dev.read = wdev_read;
+	dev.read_data = wdev_read;
+	dev.write = wdev_write;
+	error = apfs_nx_open(&nx, &dev);
+	if (error) {
+		printf("apfs-store: %s is not a container we can read: %d\n", devname, error);
+		goto out;
+	}
+	nx_open = true;
+	error = wdev_open_volume(&nx, &vol);
+	if (error == 0) {
+		error = apfs_store_open(&vol, &st, &why);
+	}
+	if (error) {
+		printf("apfs-store: %s holds no store: %s\n", devname,
+		    why != NULL ? why : "cannot be opened");
+		goto out;
+	}
+	best = apfs_store_newest(&st, scratch, READ_CHUNK, &head);
+	printf("apfs-store: %s: %d slots of %llu bytes, %llu of payload; the newest good slot is "
+	    "%d%s\n", vol.name, (int)APFS_STORE_SLOTS, st.slot_bytes, st.payload_max, best,
+	    best < 0 ? " (none)" : "");
+
+	error = apfs_store_save(&st, data, len, 0, note, scratch, READ_CHUNK, &w);
+	printf("apfs-store: %u bytes into slot %d as generation %llu: %s; %llu blocks\n", len,
+	    w.slot, w.generation, error == 0 ? "saved" : "failed", w.blocks);
+	apfs_nx_close(&nx);
+	nx_open = false;
+	if (error) {
+		printf("apfs-store: the save failed: %d\n", error);
+		goto out;
+	}
+
+	/* again from nothing: no cache of the first opening survives into the second */
+	error = apfs_nx_open(&nx, &dev);
+	if (error == 0) {
+		nx_open = true;
+		error = wdev_open_volume(&nx, &vol);
+	}
+	if (error == 0) {
+		error = apfs_store_open(&vol, &st, &why);
+	}
+	if (error) {
+		printf("apfs-store: the store will not open again: %d\n", error);
+		goto out;
+	}
+	best = apfs_store_newest(&st, scratch, READ_CHUNK, &head);
+	if (best < 0) {
+		printf("apfs-store: after the save no slot holds anything good\n");
+		goto out;
+	}
+	printf("apfs-store: read back from a container opened again: slot %d, generation %llu, "
+	    "%llu bytes, note %llu, sum %016llx; the payload is %s\n", best, head.generation,
+	    head.bytes, head.note, head.sum,
+	    (head.bytes == len && head.sum == want) ? "the one that was saved" :
+	    "NOT what was saved");
+out:
+	if (nx_open) {
+		apfs_nx_close(&nx);
+	}
+	if (data != NULL) {
+		kfree_data(data, len);
+	}
+	if (scratch != NULL) {
+		kfree_data(scratch, READ_CHUNK);
+	}
+	if (opened) {
+		(void)VNOP_CLOSE(wd.vp, FREAD | FWRITE, ctx);
+	}
+	if (wd.vp != NULLVP) {
+		vnode_put(wd.vp);
+	}
+}
+
 static void
 apfs_check_thread(void *arg, __unused wait_result_t wr)
 {
@@ -1362,9 +1529,13 @@ apfs_check_thread(void *arg, __unused wait_result_t wr)
 	}
 	subtree[0] = '\0';
 
-	/* the one mode that writes: no walk, no mount, no census -- see apfs_write_check() */
+	/* the modes that write: no walk, no mount, no census */
 	if (mode == 7) {
 		apfs_write_check(devname);
+		return;
+	}
+	if (mode == 8) {
+		apfs_store_check(devname);
 		return;
 	}
 
