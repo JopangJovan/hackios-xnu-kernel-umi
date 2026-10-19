@@ -209,6 +209,58 @@ LLVM parameter type, and the NIR value is cut or converted to it.
 | `fast` flags on an instruction | the NIR ALU is not `exact`; without them it is |
 | `air.<op>.<type suffix>` | one handler per op in `air_intrinsics.c`; the suffix is checked against the LLVM types, not trusted |
 
+### 3.2 The vocabulary, read off Apple's own compiler
+
+What each `air.*` name means was a guess until this was read, and one of the guesses was wrong.
+`AGXCompilerCore` — the back end of Apple's own shader compiler, in **this device's** shared
+cache (`ios165/20F66__iPhone10,3_6`, never another device's) — carries its whole operation
+vocabulary as a run of C strings at file offsets `0x16cf9f`–`0x16d400`, which is virtual
+`0x1bbf43f9f`–`0x1bbf44400` (`__cstring` begins at file 1 482 768 for `0x1bbf41010`). 137 names,
+and they are suffixes: the full function is `air.` + name + `.` + a type suffix, which is why
+grepping the library for `air.fast_exp` finds nothing.
+
+```
+.add .sub .or .xor .and .min .max  global local  .s .u  .max.u.i64 .min.u.i64 .xchg.i32
+.cmpxchg.weak.i32 .store.i32 .load.i32  global.{add,sub,xchg,cmpxchg.weak,store,load}.f32
+acos asin atan atan2 acosh asinh atanh pow powr cosh sinh tanh exp10 log10 cos sin tan sincos
+rint round fmod ceil exp exp2 fabs floor fma fmax fmin fract ldexp log log2 mad rsqrt sqrt trunc
+fast_{acos asin atan atan2 exp10 log10 acosh asinh atanh pow powr cosh sinh tanh cos sin tan
+      sincos round fmod mod exp exp2 ldexp log log2 rsqrt sqrt ceil fabs floor fract rint trunc
+      fmax fmin clamp saturate}
+gamma_expand gamma_compress gamma_expand_xr gamma_compress_xr  convert pack unpack
+abs abs_diff add_sat sub_sat hadd rhadd clamp clz ctz mad_hi mad_sat mul_hi rotate popcount
+extract_bits insert_bits reverse_bits  any all any_msb all_msb  saturate mix sign dot
+dfdx dfdy fwidth  atomic assert  get_simd_width get_thread_execution_width
+```
+
+**This settles the two operations whose meaning was a guess, and corrects one of them.** The list
+distinguishes exactly the functions the Metal Shading Language Specification defines, one name per
+function:
+
+| the question | what the list says | what we had |
+| --- | --- | --- |
+| is `air.fast_exp` the natural `exp` or `exp2`? | `exp` and `exp2` are separate names, and so are `fast_exp` and `fast_exp2` | right: natural `exp` |
+| does `air.fast_round` take a half away from zero (`round`) or to even (`rint`)? | `round` and `rint` are separate, **and so are `fast_round` and `fast_rint`** | **wrong**: it was `nir_fround_even`, which is `rint` |
+
+`air.fast_round` is now `trunc(x)`, stepped one away from zero when `|x - trunc(x)| >= 0.5`.
+Not `trunc(x + copysign(0.5, x))`, which is the obvious formula and is wrong: for an `x` just
+below a half that addition itself rounds up and the answer comes out 1 where it should be 0.
+The subtraction is exact for every float, so the version used needs no magnitude guard and keeps
+the sign of a negative zero; it was checked bit-exact against C's `roundf` over the halves, the
+sub-halves, both zeros and 2^24.
+
+Reading the list also closed gaps that had not been noticed: `exp10`, `log10`, `powr`, `fmod`,
+`mod`, `mad`, `abs`, `abs_diff`, `add_sat`, `sub_sat`, `mul_hi`, `popcount`, `clz`, `ctz`,
+`rotate`, `reverse_bits`, `extract_bits`, `insert_bits`, `dfdx`, `dfdy`, `fwidth`,
+`get_simd_width` and `rint` itself are all implemented now. None of them occurs in the 456-module
+corpus, so none is tested by anything here; they are in because the list says they exist and
+guessing at them later would be the same mistake again.
+
+Still unimplemented, and now known by name rather than by surprise: the inverse and hyperbolic
+trigonometry (`acos`, `asin`, `atan`, `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`),
+`sincos` (two results from one call), `hadd`, `rhadd`, `mad_hi`, `mad_sat`, `any_msb`/`all_msb`,
+the `gamma_*` conversions, `pack`/`unpack`, and `assert`.
+
 ## 4. How it is proven right
 
 A shader is reported as *working* only when its output was compared, never because it compiled.
@@ -243,6 +295,13 @@ Three references, each independent of the translator:
    implementations of the `air.*` functions for the CPU side would *not* settle them: those
    implementations would encode the same beliefs as the translator, and a reference that agrees
    with you by construction is not a reference.
+
+   There is one oracle for the intrinsics that needs no hardware and is not circular, and
+   section 3.2 is it: **Apple's own compiler, which knows what each name means because it
+   compiles it.** Its vocabulary settled the two guesses and found one of them wrong. What that
+   oracle gives is each operation's *identity*, not its numerical result, so it decides
+   `round` against `rint` and `exp` against `exp2` and cannot decide how many ULP Apple's
+   `fast_sin` is allowed to be out by. For that, M4's buffer readback is still the test.
 
    What it cannot decide, and says so rather than passing: a shader with a non-buffer argument —
    a varying, `air.position`, a thread id — because what is in it is the GPU's business (19 in
