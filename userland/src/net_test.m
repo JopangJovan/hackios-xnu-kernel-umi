@@ -12,7 +12,9 @@
  *                         servers configd has told it about
  *   tcp HOST PORT         connect a socket, send an HTTP request, show the first line of the answer
  *   fetch URL             the same through CFNetwork (NSURLSession): for https this is TLS, the
- *                         system's trust store and trustd as well
+ *                         system's trust store and trustd as well. The status, the length, an HTML
+ *                         title if there is one, and the answer's own "x-" headers -- where Apple's
+ *                         services say what they decided (X-Set-Apple-Store-Front; rc.jobs.store)
  *   reach NAME            what SCNetworkReachability says: the question applications ask first
  *   wait SECONDS
  *   wifi                  what the job com.redwood.wifi runs in every image: if the kernel was
@@ -322,6 +324,8 @@ fetch(const char *address)
 			NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
 			NSRange title = [text rangeOfString:@"<title>"], close = [text rangeOfString:@"</title>"];
 
+			NSDictionary *headers = [(NSHTTPURLResponse *)response allHeaderFields];
+
 			printf("net_test: fetch %s: status %ld, %lu bytes in %.2f s", address,
 			    (long)((NSHTTPURLResponse *)response).statusCode, (unsigned long)data.length, seconds() - start);
 			if (title.location != NSNotFound && close.location != NSNotFound && close.location > title.location) {
@@ -329,6 +333,16 @@ fetch(const char *address)
 				    close.location - NSMaxRange(title))].UTF8String);
 			}
 			printf("\n");
+			/* The answer's own "x-" headers, which are where Apple's services say what they decided: a bag
+			   request made with no storefront comes back with X-Set-Apple-Store-Front, and that header is
+			   the whole question for the App Store (see rc.jobs.store). Nothing else is printed: a header
+			   of ours could carry a token. */
+			for (NSString *name in headers) {
+				if ([name rangeOfString:@"x-" options:NSCaseInsensitiveSearch | NSAnchoredSearch].location == 0) {
+					printf("net_test: fetch %s: %s: %.200s\n", address, name.UTF8String,
+					    [headers[name] description].UTF8String);
+				}
+			}
 		}
 		dispatch_semaphore_signal(done);
 	}] resume];

@@ -1,0 +1,38 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The App Store and the thing it is actually waiting for (RC_JOBS=rc.jobs.store, built with
+# FLASHBOOT=1 so that the root is the iOS volume on the flash, QUIET=1, and wifi=1 among XL_CMDLINE).
+#
+# A SIM-less, never-signed-in iPhone gets its storefront from the bag server: AppleMediaServices asks
+# for https://bag.itunes.apple.com/bag.xml with no storefront, the server picks one from the request's
+# address and returns it in an X-Set-Apple-Store-Front header, and AMS loads the bag again and writes
+# the value onto the local account (AMSBagDataSource _setStorefrontFromURLResponse:bagData:). So the
+# question is not where a storefront comes from but whether that fetch completes. Ask by hand first,
+# before anything touches the screen, so the answer does not depend on the store: a control fetch that
+# is known to work anywhere, then DNS for the bag's host, a plain reach, then the real HTTPS GET
+# through CFNetwork. (appstored hands its own transfers to nsurlsessiond, which is why no socket of
+# its own is ever seen; that is not a sign of anything.)
+#
+# Two things the first runs of this file got wrong, both worth more than the steps below.
+# QUIET=1: without it launchd's own stderr -- thousands of failed lookups and "Last log repeated 2312
+# times" -- pushes everything else off /dev/console, and the scenario's output disappears while the
+# scenario itself goes on running. A fetch that printed nothing could not be told from one that never
+# happened, and a whole conclusion was built on exactly that.
+# And no second DHCP: configd configures en0 by itself here (the job com.redwood.wifi, with wifi=1),
+# so "dhcp en0" asks IPConfiguration for a service that is already being made. Wait for the address.
+#
+# QUIET=1 is not enough by itself, measured: launchd's lines keep coming (7755 in a 320 s run against
+# 8013 in a 263 s one without it), and of five net_test steps run early only the last printed. So the
+# steps wait out the start first -- the flood is heaviest while launchd spawns its two hundred
+# processes -- and each fetch is a command of its own, so that a dropped burst costs one line, not all
+# of them. The home screen is not drawn before about a minute either, and a tap before that is lost:
+# that is what emptied the first run of this file.
+/redwood/bin/rwtouch wait 55 swipe 0.5 0.985 0.5 0.3 250 wait 20
+/redwood/bin/net_test waitaddr en0 60
+/redwood/bin/net_test fetch https://www.apple.com/library/test/success.html
+/redwood/bin/net_test resolve bag.itunes.apple.com reach bag.itunes.apple.com
+/redwood/bin/net_test fetch https://bag.itunes.apple.com/bag.xml
+/redwood/bin/net_test fetch https://init.itunes.apple.com/bag.xml
+# and only then the store, open long enough to time out (30 s) and try again
+/redwood/bin/rwtouch tap 0.615 0.59 wait 95
+/bin/ps -A
+/redwood/bin/rwtouch button home wait 6
