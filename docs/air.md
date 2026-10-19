@@ -309,12 +309,22 @@ Three references, each independent of the translator:
    AppleMetalGLRenderer, all of them the texture ones), and a compute kernel, which returns
    nothing and writes through pointers (47 of them). Reading the buffers back after the call
    would settle the kernels and is M4's acceptance test; it is not written.
-2. **The same shader through our NIR on two different Mesa backends.** `air-run` renders (or
-   dispatches) the translated NIR with Gallium: on the host through softpipe (NIR → TGSI →
-   an interpreter in C), on the phone through freedreno/ir3 on the Adreno. Both outputs are
-   compared numerically to (1), per pixel or per buffer element, against a tolerance stated per
-   comparison (exact for integer results; a few ULP for arithmetic; looser only where Metal's own
-   `fast_` functions allow it, and then it is printed).
+2. **The same shader drawn by a Gallium driver, and the pixel read back.** `air_run.c` puts the
+   translated NIR into a `pipe_shader_state` as `PIPE_SHADER_IR_NIR`, draws one quad into a
+   32-bit render target and prints the pixel. Both drivers of interest take NIR directly: ir3 is
+   a NIR compiler, and softpipe takes it through `nir_to_tgsi`.
+
+   **255 shaders draw and the pixel matches LLVM, bit for bit, with no GPU** — `cpuref.py --all
+   --draw` compares all three (LLVM's execution, the folded NIR, the drawn pixel). That is M1's
+   acceptance test, run 255 times, with softpipe standing in for the Adreno.
+
+   Three things this caught that compiling never would, each of which looks like a translation
+   bug and is not one: an integer-returning shader read back through a float target (the bits are
+   right, read the wrong way); a shader whose outputs outnumber the framebuffer's attachments,
+   which draws nothing at all; and `clearFragment04`, which writes `FRAG_RESULT_DATA1` alone, so
+   target 0 holds the clear colour. The harness now takes its format from the shader's output
+   type, binds an attachment per render target, and reads back the lowest target the shader
+   actually writes.
 3. **NIR's own checks:** `nir_validate` after every pass (the translator runs with validation
    on), and unit tests on Mesa's `nir_tests` framework for the translator's building blocks.
 
@@ -367,15 +377,17 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
   `llvm-dis` on every one.
 - **M1** — `clearFragment01` reaches *adreno*: translated, compiled by ir3, rendered on the
   Adreno, framebuffer equal to the colour in its constant buffer.
-  **Compiled and checked against LLVM, not yet run on the GPU.** It is `nir_load_ubo` + a store
-  to `FRAG_RESULT_DATA0` as predicted, and ir3 turns it into five Adreno instructions (four
-  `mov`s out of the constant file, where ir3 promoted the UBO load). Over a buffer of known
-  bytes, LLVM's own execution of the module and our folded NIR give the same four floats, bit for
-  bit. The framebuffer half of the test — ir3's code actually running on the Adreno and the
-  colour read back — needs the phone and has not been done.
+  **Done except for the Adreno itself.** It is `nir_load_ubo` + a store to `FRAG_RESULT_DATA0`
+  as predicted, and ir3 turns it into five Adreno instructions (four `mov`s out of the constant
+  file, where ir3 promoted the UBO load). Over a buffer of known bytes, LLVM's own execution of
+  the module, our folded NIR, and **the pixel drawn by a Gallium driver and read back** all give
+  the same four floats, bit for bit. What has not happened is the draw going through *ir3 on the
+  phone's GPU*: the screen here is softpipe. Section 5a says what is left for that, and it is
+  not much.
 - **M2** — the 283 modules with no `air.*` call: a stated fraction reach *ir3*, a growing subset
   *softpipe*/*adreno*.
-  **262 of the 283 reach ir3**, and 255 of them agree with LLVM numerically. The other 21 are
+  **262 of the 283 reach ir3**, 255 of them agree with LLVM numerically, and those same 255 draw
+  a matching pixel. The other 21 are
   `air.visible` library functions, which are not entry points at all (below). Counting every
   entry point rather than every module: 275 of 321, 86%. Nothing has run on the Adreno.
 - **M3** — textures and samplers, each form with a test that renders a known image.
@@ -397,6 +409,29 @@ pipeline time (`nir_link_shader_functions`). The translator refuses them with
 failures. 21 of them call no `air.*` at all, which is why the intrinsic-free count (283) and the
 M2 count (262) differ.
 
+### 5a. Is there a path from a `nir_shader` to a draw on the phone? Yes.
+
+This was the open question, because nothing here had run. The answer is that the harness can ride
+the Mesa already on the phone rather than being built from nothing:
+
+- The port's Mesa **already creates a Gallium screen for the Adreno**:
+  `osmesa_create_gpu_screen()` in `tools/mesa/freedreno-darwin.patch` opens the kernel's `msm`
+  driver through `tools/mesa/redwood-drm` and calls `fd_drm_screen_create_renderonly()`. It also
+  already has `osmesa_surface_resource()`, which wraps an IOSurface as a `pipe_resource`. So the
+  Gallium layer is reachable inside the library CoreAnimation already draws iOS through.
+- **freedreno takes NIR natively** (`PIPE_SHADER_CAP_SUPPORTED_IRS` includes
+  `PIPE_SHADER_IR_NIR`; `ir3_gallium.c` handles `cso->ir_type == PIPE_SHADER_IR_NIR`), so nothing
+  has to go through GLSL on the way.
+- `air_run.c` is written against that interface and nothing else. Here it asks for a software
+  screen (`sw_screen_create(null_sw_create())`); on the phone it wants the screen
+  `osmesa_create_gpu_screen()` makes, and **no line below that changes**.
+
+What is left to do on the phone is therefore small and known: export that screen from the port's
+Mesa (one function, beside the `osmesa_surface_resource` the patch already exports), cross-build
+`air_run.c` with `userland/build.sh`, and run it. What is *not* known until it is tried is
+whether the kernel's GPU driver and the submit path behave for a draw that does not come from
+CoreAnimation; the GLES path is the only consumer of that Mesa today.
+
 ## 6. Running it
 
 ```
@@ -413,7 +448,9 @@ build/mesa-host/build/src/compiler/air/air2nir --eval FILE[.metallib] [FUNCTION]
 build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler \
         --chip-id 0x007506030500 FILE[.metallib] [FUNCTION]                      # Adreno code
 tools/air/cpuref.py --compare FILE[.metallib] [FUNCTION]   # ours against LLVM's own answer
-tools/air/cpuref.py --all FILE.metallib                    # every function of a library
+tools/air/cpuref.py --all --draw FILE.metallib             # every function: LLVM, folded, drawn
+build/mesa-host/build/src/gallium/drivers/freedreno/air_run \
+        FILE[.metallib] [FUNCTION]                         # draw with it, print the pixel
 ```
 
 `0x007506030500` is how freedreno names the redwood's Adreno 7c+ Gen 3 (A635); it has no

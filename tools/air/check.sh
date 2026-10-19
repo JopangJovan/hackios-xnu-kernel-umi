@@ -53,16 +53,19 @@ else
 fi
 
 echo
-echo "== against LLVM on the processor, shader by shader"
+echo "== against LLVM on the processor, and drawn, shader by shader"
 # The strongest check there is, and it needs no GPU: LLVM runs the same module
 # over the same buffer bytes, our NIR is folded over them, and the numbers are
 # compared. Only the class where this is decidable -- an entry point whose
 # arguments are all buffers and which returns its result -- is counted; the
-# rest say why not. See tools/air/cpuref.py.
+# rest say why not. --draw also puts each one through a Gallium driver and
+# compares the pixel that comes back, which is M1's acceptance test with
+# softpipe standing in for the Adreno. See tools/air/cpuref.py and air_run.c.
 cpu_rc=0
 for f in "${LIBS[@]}"; do
 	echo "$(basename "$(dirname "$f")")/$(basename "$f"):"
-	python3 "$ROOT/tools/air/cpuref.py" --all "$f" 2>&1 | tail -2 | sed 's/^/  /' || cpu_rc=1
+	python3 "$ROOT/tools/air/cpuref.py" --all --draw "$f" 2>&1 | tail -3 | sed 's/^/  /' ||
+		cpu_rc=1
 done
 
 exit $((reader_rc | cpu_rc))

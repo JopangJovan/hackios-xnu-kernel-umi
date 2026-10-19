@@ -38,6 +38,9 @@ import metallib  # noqa: E402
 
 AIR2NIR = os.environ.get(
     "AIR2NIR", os.path.join(ROOT, "build/mesa-host/build/src/compiler/air/air2nir"))
+AIR_RUN = os.environ.get(
+    "AIR_RUN",
+    os.path.join(ROOT, "build/mesa-host/build/src/gallium/drivers/freedreno/air_run"))
 
 # The pattern every buffer is filled with. Arbitrary, but fixed and not all
 # zeros: a shader that ignores its input and one that reads it must differ.
@@ -295,6 +298,8 @@ def main():
                     help="every function of the file, comparing each")
     ap.add_argument("--tolerance", type=float, default=0.0,
                     help="relative difference allowed (default: none, bit-exact)")
+    ap.add_argument("--draw", action="store_true",
+                    help="also draw with it (air_run) and compare the pixel")
     args = ap.parse_args()
     if args.all:
         return run_all(args)
@@ -349,6 +354,24 @@ def main():
     return 0
 
 
+def draw_ours(path, function):
+    """air_run: the same shader drawn by a Gallium driver, pixel read back."""
+    out = subprocess.run([AIR_RUN, path, function], capture_output=True, text=True)
+    if out.returncode:
+        return None, (out.stderr or out.stdout).strip().splitlines()[-1][:160] \
+            if (out.stderr or out.stdout).strip() else "air_run failed"
+    values, taking = [], False
+    for line in out.stdout.splitlines():
+        if line.startswith("air_run: the pixel"):
+            taking = True
+            continue
+        if taking and line.startswith("  "):
+            values.append(line.strip())
+        elif taking:
+            break
+    return (values, None) if values else (None, "air_run printed no pixel")
+
+
 def evaluate_ours(path, function):
     """air2nir --eval: the same shader folded over the same buffer bytes."""
     out = subprocess.run([AIR2NIR, "--eval", path, function],
@@ -388,7 +411,7 @@ def compare(theirs, ours, tol):
 def run_all(args):
     """Every function of a .metallib, with a count at the end."""
     b, header, funcs = metallib.parse(args.file)
-    agree = differ = skipped = with_air = 0
+    agree = differ = skipped = with_air = drawn = not_drawn = 0
     for f in funcs:
         name = f.get("name")
         if not name:
@@ -417,6 +440,22 @@ def run_all(args):
             skipped += 1
             continue
         bad = compare(theirs, ours, args.tolerance)
+        drawn_note = ""
+        if not bad and args.draw:
+            pixel, why = draw_ours(args.file, name)
+            if why:
+                drawn_note = "  (not drawn: %s)" % why
+                not_drawn += 1
+            else:
+                # the pixel is render target 0, which is the result's first
+                # field for every shader of this corpus
+                dbad = compare(theirs[:len(pixel)], pixel, args.tolerance)
+                if dbad:
+                    print("DRAWN DIFFERS %-38s %s" % (name, dbad))
+                    differ += 1
+                    continue
+                drawn += 1
+                drawn_note = "  drawn and matching"
         if bad:
             print("DIFFER %-44s %s" % (name, bad))
             differ += 1
@@ -424,7 +463,7 @@ def run_all(args):
             agree += 1
             if calls_air(b, header, f):
                 with_air += 1
-            print("agree  %-44s %s" % (name, " ".join(theirs[:4])))
+            print("agree  %-44s %s%s" % (name, " ".join(theirs[:4]), drawn_note))
     print("\ncpuref: %d agree with LLVM, %d differ, %d could not be compared (of %d)"
           % (agree, differ, skipped, len(funcs)))
     # Which part of the frontend this actually exercised. A shader that calls
@@ -433,6 +472,9 @@ def run_all(args):
     print("cpuref: of the %d that agree, %d call an air.* function; %d are plain LLVM IR, "
           "so they test the reader, the interface and the instructions but no intrinsic"
           % (agree, with_air, agree - with_air))
+    if args.draw:
+        print("cpuref: %d of them were also DRAWN by a Gallium driver and the pixel matched; "
+              "%d could not be drawn" % (drawn, not_drawn))
     return 1 if differ else 0
 
 

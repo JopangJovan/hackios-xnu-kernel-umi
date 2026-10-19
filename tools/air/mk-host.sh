@@ -14,6 +14,7 @@
 # What comes out, in build/mesa-host/build:
 #   src/compiler/air/air2nir                           the frontend alone
 #   src/gallium/drivers/freedreno/ir3_compiler         AIR -> NIR -> Adreno
+#   src/gallium/drivers/freedreno/air_run              AIR -> NIR -> drawn, pixel read back
 set -e
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
 VERSION=25.0.7
@@ -94,7 +95,9 @@ export PATH=$B/venv/bin:$PATH
 	-Dexpat=disabled > meson-setup.log
 
 ninja -C build src/compiler/air/air2nir \
-	src/gallium/drivers/freedreno/ir3_compiler > ninja.log
+	src/gallium/drivers/freedreno/ir3_compiler \
+	src/gallium/drivers/freedreno/air_run > ninja.log
 
 echo "mk-host.sh: $B/build/src/compiler/air/air2nir"
 echo "mk-host.sh: $B/build/src/gallium/drivers/freedreno/ir3_compiler"
+echo "mk-host.sh: $B/build/src/gallium/drivers/freedreno/air_run"
