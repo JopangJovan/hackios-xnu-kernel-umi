@@ -174,6 +174,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 				src/eagl.c src/gl_osmesa.c
 			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
 			cp $M/libOSMesa.8.dylib obj/
+			# air_run draws with a Metal shader translated by the AIR frontend
+			# and reads the pixels back (docs/air.md). It is built inside the
+			# Mesa build, because it needs Gallium itself and not the gl*
+			# entry points this library exports; AIR=1 tools/mk-mesa.sh makes
+			# it, and it is copied in when it is there.
+			[ -f $M/air_run ] && cp $M/air_run obj/air_run
 		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
@@ -210,6 +216,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -n "$GL" ]; then
 		cp obj/libOSMesa.8.dylib root/lib/
 		cp obj/gl_test root/bin/
+		[ -f obj/air_run ] && cp obj/air_run root/bin/
 		[ "$GL" = test ] || cp obj/libredwood-gl.dylib root/lib/
 	fi
 	# a program is not started with a library that is not there: it would not start at all

@@ -70,11 +70,11 @@ if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.air-patches" 2>/dev/null)" != "$PATCHES" ]
 		    open(p, 'w').write(s)
 	PY
 
-	# the frontend itself, as a link: no copy to forget to refresh
+	# the frontend itself, as a link: no copy to forget to refresh. The one
+	# line of meson that reaches it comes from tools/mesa/air-frontend.patch,
+	# applied above, so this build and the cross build get it the same way.
 	rm -rf "$SRC/src/compiler/air"
 	ln -s "$ROOT/tools/mesa/air" "$SRC/src/compiler/air"
-	grep -q "subdir('air')" "$SRC/src/compiler/meson.build" ||
-		sed -i "s|^subdir('spirv')|subdir('spirv')\nsubdir('air')|" "$SRC/src/compiler/meson.build"
 
 	echo "$PATCHES" > "$SRC/.air-patches"
 fi

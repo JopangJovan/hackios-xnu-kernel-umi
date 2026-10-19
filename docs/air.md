@@ -442,11 +442,24 @@ the Mesa already on the phone rather than being built from nothing:
   screen (`sw_screen_create(null_sw_create())`); on the phone it wants the screen
   `osmesa_create_gpu_screen()` makes, and **no line below that changes**.
 
-What is left to do on the phone is therefore small and known: export that screen from the port's
-Mesa (one function, beside the `osmesa_surface_resource` the patch already exports), cross-build
-`air_run.c` with `userland/build.sh`, and run it. What is *not* known until it is tried is
-whether the kernel's GPU driver and the submit path behave for a draw that does not come from
-CoreAnimation; the GLES path is the only consumer of that Mesa today.
+**That is now built and in the image, and no export was needed.** `air_run` is built *inside* the
+Mesa cross build (`AIR=1 tools/mk-mesa.sh`), so it links Gallium's own static libraries and opens
+the Adreno itself — `drmOpenWithType("msm", …)` through `tools/mesa/redwood-drm`, then
+`fd_drm_screen_create_renderonly()`, exactly as `osmesa_create_gpu_screen()` does. It needs
+nothing exported from `libOSMesa` and does not load it: a 9.8 MB arm64 Mach-O against libSystem,
+libz and IOKit alone. `userland/build.sh` puts it in `/redwood/bin`, and `rc.jobs.air` runs it.
+
+The same source takes the GPU where there is one and falls back to software where there is not,
+so it is the binary tested on this machine — not a variant of it. Its first line says which it
+got (`air_run: clearFragment01 on softpipe` here), and that line must be read before any number
+below it is believed. `AIR_RUN_SOFTWARE=1` forces software even on the phone, for comparing the
+two on the same device.
+
+What is *not* known until it is tried is whether the kernel's GPU driver and the submit path
+behave for a draw that does not come from CoreAnimation: the GLES path is that driver's only
+consumer today. `rc.jobs.air` asks with the GPU idle; `rc.jobs.air2` asks again after SpringBoard
+is up and holding it. A refusal is a finding the whole port needs, not just this frontend, so
+either answer is worth the run.
 
 ## 6. Running it
 
