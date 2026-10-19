@@ -12,6 +12,39 @@ collects those constraints in one list.
 Why this is worth doing at all, and what it costs, is argued in `docs/metal.md` section 9. This
 document assumes those measurements and records the decisions taken on top of them.
 
+## Where it stands, and what that does not mean
+
+Of the 456 modules of the device's system `.metallib` files (`tools/air/check.sh`, and
+`docs/air-report.md` for the breakdown):
+
+| | of 456 |
+| --- | --- |
+| read by our own bitcode reader, byte for byte as `llvm-dis` reads them | 456 |
+| translated to NIR, passing `nir_validate` | 313 |
+| compiled by ir3 into Adreno machine code | 313 |
+| numerically identical to LLVM's own execution, and drawn | 255 |
+| **run on the phone's GPU** | **7** |
+
+313 of 456 is 313 of 321 entry points — 97.5% — because 135 modules are `air.visible` library
+functions and not entry points at all.
+
+**What those numbers are not**, because they will be quoted without this paragraph otherwise:
+
+- **No `air.*` operation is verified numerically.** All 255 that agree with LLVM are plain LLVM IR
+  and call none; the seven that have run on the GPU call none either. Every one of the ~50
+  operations in `air_intrinsics.c` — the arithmetic, the atomics, the barrier — is unverified.
+  Their *identity* is settled against Apple's own compiler (section 3.2), which is a different and
+  weaker thing: it says `air.fast_round` is `round` and not `rint`, not that this code computes
+  `round` correctly.
+- **Nothing here tests Metal's own filtering or addressing.** The six texture shaders that drew on
+  the Adreno took their sampler from the API, which this harness chose: nearest, clamped, sampled
+  at a texel centre. That is evidence about binding, descriptors and ir3's texture instructions —
+  exactly what it was built to be — and silence about everything Metal's sampler state decides.
+  **The 64-bit `constexpr sampler` word is not decoded** (section 3.3). Two modules of the corpus
+  declare such a sampler; everywhere else the API supplies it.
+- **Compute is untouched by every runtime check.** `air_run` draws and does not dispatch, so the
+  47 kernels — including 24 that use textures — have been compiled and never run.
+
 ## 1. Where the frontend lives: inside Mesa, as `src/compiler/air`
 
 **Decision: a Mesa frontend in Mesa's tree, shaped like `src/compiler/spirv`.** Its entry point
@@ -146,7 +179,7 @@ key (of 456), so the order of work follows it.
 | `air.texture` + `air.sample`/`air.read` | 96 | `nir_tex_instr`, `texture_index` = `location_index` | sampled/read textures |
 | `air.texture` + `air.write`/`air.read_write` | | `image_store`/`image_load`, image index = `location_index` | storage images (7.3) |
 | `air.sampler` | 15 | `sampler_index` = `location_index` | |
-| `!air.sampler_states` (inline `constexpr sampler`) | 10 | inline sampler, index after the API ones | state word decoded at translation (M3) |
+| `!air.sampler_states` (inline `constexpr sampler`) | 10 | inline sampler, index after the API ones | **the state word is not decoded**: passed to the runtime verbatim (section 3.3) |
 | `!air.function_constants` | 11 | constant folded from the values given to `air_to_nir` | `!{ptr @g, type, name, index, i1}` |
 | `air.struct_type_info`, `air.arg_type_*` | | reflection only, not used for code | layout comes from the LLVM types |
 
@@ -260,6 +293,35 @@ Still unimplemented, and now known by name rather than by surprise: the inverse 
 trigonometry (`acos`, `asin`, `atan`, `acosh`, `asinh`, `atanh`, `cosh`, `sinh`, `tanh`),
 `sincos` (two results from one call), `hadd`, `rhadd`, `mad_hi`, `mad_sat`, `any_msb`/`all_msb`,
 the `gamma_*` conversions, `pack`/`unpack`, and `assert`.
+
+### 3.3 The sampler state word, which is not decoded
+
+Metal's `constexpr sampler` — a sampler the shader declares itself rather than one the API binds —
+arrives as a global holding one 64-bit word. **That word's layout is not worked out.** The
+frontend passes it to the runtime verbatim (`air_resource::sampler_state`), assigns the sampler an
+index after the API's, and says so rather than guessing: a wrong filter or wrap mode renders
+plausibly and wrongly, which is the failure that costs a week later instead of an hour now.
+
+What is known is only the shape. Three distinct words occur in the corpus:
+
+```
+0x807bff0000088049    0x807bff0000088a00    0x807bff0000088a49
+```
+
+They share everything above the low twelve bits, and the differences are `0x049`, `0xa00` and
+their union `0xa49` — which looks like three three-bit fields at bits 0, 3 and 6 (the s, t and r
+address modes) and two bits at 9 and 11 (the two filters). That is a guess from three samples and
+it is **not** used by anything.
+
+Unlike the operation vocabulary, Apple's compiler does not hand this over: `AGXCompilerCore`'s
+`sampler_words` is an identifier in a hand-written-assembly test harness, not the state format.
+So it needs a different kind of evidence — the driver that programs the hardware from it
+(`AGXMetalA11`) is where to look next.
+
+**How much it blocks: two modules.** Of the texture shaders in the corpus, 29 take no sampler at
+all (they fetch by integer coordinate), 9 take one as an API argument, and 2 declare their own. So
+this is a narrow gap and not a blocked family — but it is the reason no result here says anything
+about Apple's filtering.
 
 ## 4. How it is proven right
 
@@ -440,7 +502,8 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
   clear value — a number that means nothing and looks like an answer. `air_run` now checks that
   the attachment it reads is one the shader actually stores to, and refuses when it is not.
 
-  The sampler state is the gap that matters for correctness. Metal's `constexpr sampler` arrives
+  The sampler state is the gap that matters for correctness, and it has a section of its own
+  (3.3). In short: Metal's `constexpr sampler` arrives
   as a global holding one 64-bit word, and **that word's layout is not decoded**: the frontend
   reports it to the runtime verbatim (`air_resource::sampler_state`) and assigns the sampler an
   index after the API's. Until it is decoded, nothing knows whether a sample is meant to be
