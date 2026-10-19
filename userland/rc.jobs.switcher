@@ -17,3 +17,7 @@
 /redwood/bin/rwtouch tap 0.614 0.481 wait 20
 /redwood/bin/rwtouch drag 0.5 0.995 0.5 0.62 600 2500 wait 8
 /redwood/bin/rwtouch notify com.redwood.layers wait 30
+# And what the wallpaper left on the volume for the frosted materials to take their bottom layer
+# from: PaperBoardUI asks its source for a snapshot or a blurred copy, by image or by file name.
+/var/jb/usr/bin/find /var -maxdepth 7 -iname "*allpaper*" -ls
+/var/jb/usr/bin/find /var -maxdepth 7 -iname "*oster*" -ls

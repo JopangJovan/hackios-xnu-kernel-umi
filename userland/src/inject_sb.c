@@ -560,6 +560,38 @@ text_of(id object)
 	return text ? SEND(const char *, text, "UTF8String") : "-";
 }
 
+/*
+ * The switcher of running applications lays a wash of wallpaper over every card behind the front
+ * one, above the dimming: -[SBAppSwitcherPageView _createOrDestroyWallpaperOverlayView] makes it,
+ * PaperBoardUI fills it from the image provider of the wallpaper, and the result is drawn at about
+ * fifteen per cent (the layer tree: SBWallpaperEffectView at opacity 0.1497 -> PBUIFakeBlurView ->
+ * PBUIWallpaperView -> PBUISnapshotReplicaView -> a UIImageView).
+ *
+ * Here there is no picture of the wallpaper to put in it. The wallpaper itself is drawn live by
+ * PosterBoard, in another process, and hosted into SpringBoard's layer tree; SpringBoard has no
+ * bitmap of it, and nothing ever bakes one -- after three and a half minutes of an idle phone
+ * /var/mobile/Library holds sixty directories and not one of them is PaperBoard, PosterBoard or
+ * Wallpaper. So the provider hands over a placeholder: 846 x 1827 pixels of one colour,
+ * (179, 77, 179), which CoreAnimation compresses to ASTC and draws over the two cards on the left
+ * at 14.9 per cent. That is what made them purple instead of merely dimmed.
+ *
+ * The dimming itself is right and stays: two draws of a flat black at 11.4 per cent, which is the
+ * shadow one expects to see. Only the wash is left out, because a wash of a colour that is not the
+ * wallpaper's is worse than no wash at all. When something here can give PaperBoardUI a real
+ * picture of the wallpaper, this hook is what should go.
+ */
+static void (*original_switcher_wallpaper_overlay)(id self, SEL selector);
+
+static void
+switcher_wallpaper_overlay(__unused id self, __unused SEL selector)
+{
+	static unsigned told;
+
+	if (told++ == 0) {
+		say("redwood: the switcher's wash of wallpaper is left out: there is no picture of the wallpaper for it\n");
+	}
+}
+
 static void
 layer_filter(id filter, const char *what, int depth)
 {
@@ -603,7 +635,7 @@ layer_line(id layer, const char *role, int depth)
 	id compositing = SEND(id, layer, "compositingFilter"), sublayers = SEND(id, layer, "sublayers");
 	id background = SEND(id, layer, "backgroundFilters");
 	void *colour = SEND(void *, layer, "backgroundColor");
-	char more[512] = "";
+	char more[1024] = "";
 	size_t n = 0;
 
 	if (SEND(BOOL, layer, "isHidden")) {
@@ -611,8 +643,28 @@ layer_line(id layer, const char *role, int depth)
 	}
 	if (contents != NULL) {
 		id text = (id)CFCopyDescription((CFTypeRef)contents);
+		const char *from = text_of(text);
+		char flat[300];
+		size_t k = 0;
 
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " contents %.60s", text_of(text));
+		/*
+		 * What a CGImage says about itself runs over several lines -- its colour space, how big
+		 * it is, how its pixels are laid out -- and all of that is worth having on the one line,
+		 * because the size and the colour space are the first things to look at when a picture
+		 * comes out wrong. Every run of spaces and newlines becomes one space.
+		 */
+		while (from != NULL && *from != 0 && k + 1 < sizeof(flat)) {
+			if (*from == ' ' || *from == '\n' || *from == '\t' || *from == '\r') {
+				if (k > 0 && flat[k - 1] != ' ') {
+					flat[k++] = ' ';
+				}
+				from++;
+				continue;
+			}
+			flat[k++] = *from++;
+		}
+		flat[k] = 0;
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " contents %s", flat);
 		CFRelease((CFTypeRef)text);
 	}
 	if (contents != NULL && class_respondsToSelector(object_getClass(layer), sel_registerName("contentsMultiplyColor")) &&
@@ -666,6 +718,15 @@ layer_line(id layer, const char *role, int depth)
 		n += (size_t)snprintf(more + n, sizeof(more) - n, " HOST of context %#x%s%s", SEND(unsigned, layer, "contextId"),
 		    SEND(BOOL, layer, "inheritsSecurity") ? " (inherits security)" : "",
 		    SEND(BOOL, layer, "rendersAsynchronously") ? " (asynchronously)" : "");
+	}
+	{
+		/* the view a layer belongs to, which is the only thing that names a layer UIKit left
+		   unnamed -- and the switcher's wash of wallpaper is such a layer */
+		id delegate = SEND(id, layer, "delegate");
+
+		if (delegate != NULL) {
+			n += (size_t)snprintf(more + n, sizeof(more) - n, " of %s", object_getClassName(delegate));
+		}
 	}
 	{
 		id keys = SEND(id, layer, "animationKeys");
@@ -961,6 +1022,8 @@ redwood_springboard_init(void)
 	    (IMP)lock_long_press);
 	poster_switcher = replace_method("SBMainDisplayPolicyAggregator", "_allowsCapabilityPosterSwitcherWithExplanation:",
 	    0x1c507e0fcUL, (IMP)poster_switcher_allowed);
+	original_switcher_wallpaper_overlay = (void (*)(id, SEL))replace_method("SBAppSwitcherPageView",
+	    "_createOrDestroyWallpaperOverlayView", 0x1c4af7860UL, (IMP)switcher_wallpaper_overlay);
 	/*
 	 * Battery hooks on UIDevice: these are the methods every app and SpringBoard itself calls, so
 	 * hooking them here in the SpringBoard process covers both the status bar and any app that
