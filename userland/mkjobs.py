@@ -40,7 +40,11 @@ import os
 import plistlib
 import sys
 
-# substrings of labels. (mediaserverd is not among them, for all that there is neither sound nor a camera:
+# substrings of labels. (nsurlsessiond is not among them either, taken out in the sileo2 copy: it is the
+# daemon that carries out background URLSession downloads, and without it an application's download never
+# starts and never fails -- Sileo sits on "Queued" for ever. It matters here for a second reason, below:
+# cloudd spins on it when it is missing.
+# mediaserverd is not among them, for all that there is neither sound nor a camera:
 # it is where VideoToolbox decodes for every other process, a HEIC picture included; see src/inject_media.c.
 # apsd is not among them either: it was left out from the first day without ever being tried, and it is the
 # service the rest of the system misses most -- near a third of every "failed lookup" line in the run logs is
@@ -90,7 +94,7 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties', 'mobileactivationd',
         'installcoordinationd', 'purplebuddy', 'restore', 'usb', 'accessoryd',
-        'mobileassetd', 'nsurlsessiond', 'itunesstored', 'appstored', 'cloudd', 'bird',
+        'mobileassetd', 'itunesstored', 'appstored', 'cloudd', 'bird',
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # iOS 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
