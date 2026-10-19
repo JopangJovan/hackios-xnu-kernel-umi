@@ -110,12 +110,21 @@ import sys
 #   *** Terminating app due to uncaught exception 'NSInvalidArgumentException',
 #       reason: '*** -[NSURL initFileURLWithPath:isDirectory:]: nil string parameter'
 # -- it is building a file URL for a directory it was given as nil. The likely one is the SyncedPreferences
-# directory it asks for by name ("uncontainerizedSyncedPreferencesDirectoryURL"). That was tried --
-# build.sh can make an empty directory on the data volume with a d line in var.skel, as it does for
-# /var/root/.ssh -- and it is not the answer: with /private/var/mobile/Library/SyncedPreferences there and
-# created ("create the directories of the data volume" ok), syncdefaultsd aborts in exactly the same place
-# with exactly the same exception. So the nil comes from somewhere else, and the next guess should be the
-# container path for com.apple.security.cloudkeychainproxy3 rather than a directory of mobile's.
+# directory it asks for by name ("uncontainerizedSyncedPreferencesDirectoryURL"). Two candidates were
+# followed and both are ruled out, so nobody need follow them again.
+#   Not a missing directory of mobile's. build.sh can make an empty one with a d line in var.skel, as it
+#     does for /var/root/.ssh; with /private/var/mobile/Library/SyncedPreferences created at boot,
+#     syncdefaultsd aborts in the same place with the same exception.
+#   Not a container lookup either. Running with containermanagerd's own log on, syncdefaultsd never asks
+#     it anything: every request in the session comes from lsd. So _container_create_or_lookup_path is
+#     not where the nil is born.
+# What it looks like instead: the URL is per bundle, and it comes back nil for whichever bundle the
+# migration pass happens to reach. syncdefaultsd walks 686 of them ("Checking for plist URLs from bundle:
+# ..."), and the one it dies after is a different bundle every run -- com.apple.PaperBoard.LegacyPoster in
+# one, com.apple.exchangesyncexpress.framework.EASOAuthService in another -- so it is not one bad bundle.
+# It also aborts on the cloudkeychainproxy3 store registration with no bundle in hand at all. Whatever
+# supplies a bundle's SyncedPreferences path is empty here, for bundles at large; that is not two lines of
+# var.skel, and guessing directories is the wrong tool for it.
 # bird and duetexpertd were shipped as well and nothing ever asked for them in a bare boot (no spawn, no
 # lookup), so they are still untested rather than known good; they need a session with applications.
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'locationd', 'softwareupdate',
