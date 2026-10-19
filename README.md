@@ -1147,9 +1147,7 @@ keychain. Copying activation identity» → «Device is probably unactivated»).
 первых двух App Store просит, как только его открыть, — и с ними сеанс на телефоне чистый: 135 процессов,
 17 процессов виджетов и постеров, ни одной аварии. Сам App Store открывается и показывает свой «LOADING»
 с вертушкой, и на этом остаётся (`logs/app3-*.png`). Это **не** стена FairPlay и **не** вход в учётную
-запись: витрина вообще не открывает ни одного TCP-соединения (trustd, mDNSResponder, geod, nsurlsessiond
-открывают, а `appstored`, `itunesstored` и `AppStore` — нет), то есть всё кончается до сети. `appstored`
-сам говорит, где именно:
+запись. `appstored` говорит о себе так:
 
 ```
 [bag] AMSBagActiveAccountProvider: The local account doesn't have a storefront.
@@ -1159,21 +1157,44 @@ keychain. Copying activation identity» → «Device is probably unactivated»).
 ```
 
 Нет витрины (storefront) — нет «мешка» (bag, конфигурация Apple) — не загружается и главная страница.
-Storefront — это регион, и третьего пути к нему нет. Те две службы, которых `appstored` не находит при
-открытом магазине, и есть два способа, какими storefront попадает на устройство из коробки:
-`com.apple.commcenter.coretelephony.xpc` — страна из SIM через CommCenter, который здесь падает по кругу
-на двух отсутствующих драйверах IOKit, и `com.apple.mobileactivationd` — регион из записи активации
-(в этом двоичном файле есть `RegionCode`, `RegionInfo` и `subscriberCountryCodeDidChange:`), а она растёт
-из Secure Enclave, которого у этого телефона нет.
-Проверено и то, не в пропущенном ли ассистенте настройки дело — порт его отключает
+**Здесь ранее стоял вывод, что путей к витрине ровно два и оба закрыты. Вывод был неверен**, и то, как он
+получился, стоит помнить. Два способа действительно есть и действительно закрыты:
+`com.apple.commcenter.coretelephony.xpc` — страна из SIM через CommCenter, который падает по кругу на
+двух отсутствующих драйверах IOKit, и `com.apple.mobileactivationd` — регион из записи активации, растущей из Secure Enclave,
+которого у этого телефона нет. Но есть и третий, и именно им пользуется iPhone без SIM, в который никогда
+не входили: витрину выдаёт по HTTP сам сервер мешка. В AppleMediaServices лежат заголовок
+`X-Set-Apple-Store-Front`, строка «Attempting to load the bag again because the response had a
+x-set-apple-store-front header» и адрес `https://bag.itunes.apple.com/bag.xml`; мешок запрашивается **без**
+витрины, сервер выбирает её по адресу запроса, а `AMSBagDataSource _setStorefrontFromURLResponse:bagData:`
+записывает её в местную учётную запись. «The local account doesn't have a storefront» — сообщение отката, а
+не стена; в iTunesStore рядом лежит и «The account has no storefront, but the device does». Проверки
+активации в магазинном слое нет вообще нигде.
+
+Ошибка вышла из двух мест сразу. Первое: наблюдение «витрина не открывает ни одного TCP-соединения» верно,
+но означает не то — `appstored` и `itunesstored` ходят в сеть через `NSURLSession`, а она передаёт перенос
+`nsurlsessiond`; своих сокетов у них не бывает никогда.
+
+Второе и важное для всей дальнейшей работы: **`/dev/console` на телефоне теряет строки, и ни один вывод
+«в журнале этого нет» через него не доказателен.** В одном и том же сеансе видно, что шаги сценария
+выполнялись — `init` напечатал командную строку, напечатался и следующий за ними шаг, — а собственного
+вывода `net_test` у `resolve`, `reach` и двух `fetch` в журнале просто нет; в это же окно launchd сыплет
+«Last log repeated 2312 times» своих ненайденных обращений. Значит, отсутствие строк про мешок ничего не
+говорит о том, запрашивался ли мешок.
+
+А что консоль всё-таки донесла — обратное тому, что здесь стояло: **сеть на телефоне работает.** У `en0`
+адрес 192.168.9.243, `mDNSResponder` разрешает имена по TCP к 192.168.9.1:53 (четыре запроса, ответы 159,
+842, 200 и 107 байт), а `trustd`, `geod`, `maild`, `gamed`, `cloudd`, `StocksWidget` и `nsurlsessiond`
+открывают TLS к Apple и Akamai (17.248.214.x, 17.253.39.x, 2.16.56.93, 23.11.40.157, 95.100.176.233).
+Строка «net_test: en0: flags 0x8802» читалась через 0,1 с после начала пользовательского пространства, до
+того как configd настроил интерфейс: с `wifi=1` это делает само задание `com.redwood.wifi`, так что
+просить DHCP второй раз сценарию не нужно — довольно `waitaddr en0 60`.
+
+Следующее измерение надо делать по каналу, который не теряет: зайти на телефон по ssh (`rc.jobs.ssh`) и
+запросить мешок руками. Сценарий — `userland/rc.jobs.store`.
+Проверено заодно и то, не в пропущенном ли ассистенте настройки дело — порт его отключает
 (`src/inject_sb.c` обнуляет `-[SBSetupManager _setSetupRequiredReason:]`). Не в нём: файл
-`com.apple.purplebuddy.plist` с `SetupDone = True` мы и так кладём, MobileGestalt и так отвечает
-`RegionInfo = LL/A`, а регион — это не storefront. Подсунуть storefront через страну тоже нельзя: все
-селекторы `countryCode` в AppleMediaServices достают страну **из** мешка (`_countryCodeFromBag:`), а мешок
-без storefront не запросить — `AMSBagNetworkTask` принимает его аргументом; в `AMSDefaults` лежит
-`storefrontSuffixes`, а не storefront. То есть подделать это файлом нельзя: нужен либо работающий
-CommCenter, либо вход в учётную запись, а входить в настоящую учётную запись Apple здесь нельзя, и это
-решение не наше.
+`com.apple.purplebuddy.plist` с `SetupDone = True` мы и так кладём, а MobileGestalt и так отвечает
+`RegionInfo = LL/A`.
 
 **Телефония (`CommCenter`) — пробовали, не вышло.** Следующей по числу обращений была она: `com.apple.commcenter.xpc`
 SpringBoard спрашивает десять тысяч раз за все сеансы. iOS держит два задания с одним и тем же именем и выбирает

@@ -111,15 +111,36 @@ import sys
 #         localAccount = <ACAccount type = iTunesStore | username = local | storefront = (null)>
 #   [bag] AMSBagNetworkDataSource: Could not fetch initial cached storefront
 #   [Bag] Error creating snapshot of bag: Timed out while waiting for snapshot bag to load
-# No storefront -> no bag -> the front page never loads, and there is no third way to get one. The two
-# services appstored cannot find while the store is open ARE the two routes a stock iPhone has to a
-# storefront, and nothing else:
+# CAUTION, this paragraph's conclusion was wrong and is left here only so the mistake is not repeated.
+# There IS a third route to a storefront and it is the one a SIM-less, never-signed-in iPhone uses: the
+# bag server sets it over HTTP. AppleMediaServices holds "X-Set-Apple-Store-Front" and the line
+# "Attempting to load the bag again because the response had a x-set-apple-store-front header", plus
+# https://bag.itunes.apple.com/bag.xml; AMS fetches the bag with no storefront, the server picks one from
+# the request's address, and AMSBagDataSource _setStorefrontFromURLResponse:bagData: writes it onto the
+# local account. "The local account doesn't have a storefront" is a fallback message, not a wall, and
+# there is no activation gate anywhere in the store stack.
+# AND THE MEASUREMENT UNDER IT CANNOT CARRY A NEGATIVE AT ALL, which is the lesson worth keeping:
+# /dev/console on the phone DROPS LINES, and every "it never appears in the log" above rests on that
+# channel. In the same run the scenario's steps demonstrably ran -- init echoed the command line, the
+# step after them printed -- and net_test's own output for resolve, reach and two fetches is simply
+# absent, while launchd's "Last log repeated 2312 times" of failed lookups fills the window. So the
+# store's missing bag strings are not evidence that no bag was fetched; they are evidence of nothing.
+# What the console did carry, and what is therefore true, is the opposite of what was written here:
+# THE PHONE'S NETWORK WORKS. en0 is 192.168.9.243, mDNSResponder resolves over TCP to 192.168.9.1:53
+# (four queries, answers of 159, 842, 200 and 107 bytes), and trustd, geod, maild, gamed, cloudd,
+# StocksWidget and nsurlsessiond all open TLS to Apple and Akamai (17.248.214.x, 17.253.39.x,
+# 2.16.56.93, 23.11.40.157, 95.100.176.233). "net_test: en0: flags 0x8802" was read 0.1 s into user
+# space, before configd had configured it: com.redwood.wifi does that by itself with wifi=1, so a
+# scenario must not ask for DHCP again -- only "waitaddr en0 60".
+# The storefront question is therefore OPEN, and the next measurement has to be made over a channel
+# that does not drop: ssh to the phone (rc.jobs.ssh) and fetch the bag by hand.
+# What is true below is only that these two services are the ones appstored cannot find:
 #   com.apple.commcenter.coretelephony.xpc -- the SIM's country, through CommCenter, which crash-loops
 #     here (see above);
 #   com.apple.mobileactivationd -- the activation record's region. That binary carries RegionCode,
 #     RegionInfo and subscriberCountryCodeDidChange:, and it is rooted in a Secure Enclave this phone
 #     has not got.
-# It was worth checking whether the setup assistant is the missing piece, since this port refuses it
+# (Still worth knowing, and unaffected: the setup assistant is not the missing piece, since this port refuses it
 # (src/inject_sb.c forces -[SBSetupManager _setSetupRequiredReason:] to 0) -- it is not. We already ship
 # com.apple.purplebuddy.plist with SetupDone = True, MobileGestalt already answers RegionInfo = LL/A, and
 # a region is not a storefront. AMS has no country-to-storefront path to feed either: every countryCode
