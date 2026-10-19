@@ -250,6 +250,23 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# the prefix with the root on the flash, downloads every package and index there, and without it each
 	# download ended in "No such file or directory"
 	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
+	# A key of ours for root, when there is one: ssh/authorized_keys, never in the repository (like
+	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
+	# Wi-Fi, which saves rebuilding an image for every question one wants to ask a running iOS. It
+	# refuses a key whose directory anyone but its owner may write, hence the 700.
+	if [ -f ../ssh/authorized_keys ]; then
+		mkdir -p root/var/root/.ssh
+		printf 'd\t700\t0\t0\t/private/var/root/.ssh\n' >> root/etc/var.skel
+		# the key that lets us in, and the host's own key beside it: made here and not on the
+		# phone, because ssh-keygen asks the system who uid 0 is and gets "No user exists for
+		# uid 0" -- the job that answers that (com.apple.mobile.usermanagerd) is loaded into
+		# the user's domain, where a program of root's does not find it
+		for k in authorized_keys ssh_host_ed25519_key ssh_host_ed25519_key.pub; do
+			[ -f ../ssh/$k ] || continue
+			cp ../ssh/$k root/var/root/.ssh/$k
+			printf 'f\t600\t0\t0\t/private/var/root/.ssh/%s\t/var/root/.ssh/%s\n' $k $k >> root/etc/var.skel
+		done
+	fi
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand

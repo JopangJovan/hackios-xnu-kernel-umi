@@ -856,7 +856,7 @@ mount_writable(void)
 	    stat("/private/preboot/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/private/preboot/jb" : NULL;
 	if (ok && jb != NULL) {
 		const char *to = "/private/var/jb";
-		int dirs = 0, entries = 0, grafted;
+		int dirs = 0, entries = 0, grafted, users = 0;
 
 		/*
 		 * With the root on the flash, the prefix's writable copy goes into a memory filesystem of its own
@@ -896,7 +896,32 @@ mount_writable(void)
 			grafted = chown(mobiles[i], 501, 501) == 0 && grafted;
 		}
 		grafted = own_tree("/private/var/jb/var/mobile", 501) && grafted;
-		printf("  /var/jb from %s, in %s: %d directories, %d files and links\n", jb, to, dirs, entries);
+		/*
+		 * The prefix's own user database. Its programs do not ask iOS who a user is: they are
+		 * built against libiosexec, which carries an ie_getpwnam of its own and reads
+		 * /var/jb/etc/pwd.db -- a Berkeley database that pwd_mkdb makes from master.passwd and
+		 * that the bootstrap does not ship, only the text it is made from. Without it every
+		 * program of the prefix answers "no such user": an sshd from here refused every login
+		 * with "Invalid user root" while iOS's own /bin/ps resolved users perfectly. The
+		 * writable copy of the prefix is new at every boot, so the database is made at every
+		 * boot; it takes milliseconds.
+		 */
+		if (stat("/private/var/jb/usr/sbin/pwd_mkdb", &st) == 0) {
+			char *argv[] = { "/var/jb/usr/sbin/pwd_mkdb", "-p", "/var/jb/etc/master.passwd", NULL };
+			char *envp[] = { "PATH=/var/jb/usr/sbin:/var/jb/usr/bin:/usr/bin:/bin", NULL };
+			int status = 0;
+			pid_t pid = fork();
+
+			if (pid == 0) {
+				execve(argv[0], argv, envp);
+				_exit(127);
+			}
+			if (pid > 0 && wait4(pid, &status, 0, NULL) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+				users = 1;
+			}
+		}
+		printf("  /var/jb from %s, in %s: %d directories, %d files and links%s\n", jb, to, dirs, entries,
+		    users ? ", users resolvable" : "");
 		check(grafted, "graft the package manager's prefix onto the data volume");
 	}
 }

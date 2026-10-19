@@ -103,7 +103,12 @@ ln -s /var/jb/usr/lib/TweakInject "$OUT/root/var/jb/Library/MobileSubstrate/Dyna
 # apt on the phone would upgrade them, but only over the network and only after a boot, while what is
 # in the image is what a first boot has. PREINSTALL names them; mobilesubstrate is not among them
 # because there is no such package -- ElleKit above Provides it.
-PREINSTALL=${PREINSTALL-"debianutils launchctl preferenceloader"}
+# OpenSSH among them: with the phone's radio up (wifi=1) a shell on the running system costs
+# seconds instead of a rebuilt image and a six-minute boot, which changes how the rest of this
+# port can be worked on. Nothing starts it -- a scenario does (userland/rc.jobs.ssh) -- and the
+# key that lets anyone in is not in the repository. dropbear would have been smaller, but its
+# package here depends on libtomcrypt1 and libtommath1, which are in no suite of this repository.
+PREINSTALL=${PREINSTALL-"debianutils launchctl preferenceloader openssh-server openssh-client openssh-sftp-server libssl3 libmd0"}
 if [ -n "$PREINSTALL" ]; then
 	get "$MIRROR/dists/iphoneos-arm64-rootless/$SUITE/main/binary-iphoneos-arm64/Packages" Packages
 	MIRROR="$MIRROR" python3 "$ROOT/tools/jb-preinstall.py" "$OUT/root" "$OUT/debs/Packages" "$OUT/debs" $PREINSTALL
