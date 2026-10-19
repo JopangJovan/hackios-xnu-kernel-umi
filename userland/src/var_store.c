@@ -13,9 +13,23 @@
  *
  *   var_store save          pack /private/var into the store
  *   var_store load          unpack the newest good store into /private/var (init, at boot)
+ *   var_store watch [SECS]  stay and save by itself: when the kernel says the run is ending, and
+ *                           every SECS seconds besides (a launchd job of ours does this)
  *   var_store show          what the store holds, both slots
  *   var_store erase         forget both slots (the next boot starts empty again)
  *   var_store stamp PATH    write a line into PATH saying when: a marker for a run
+ *
+ * Nobody has to remember to save. `watch` registers with the kernel (kern.redwood.var_save), and
+ * on the orderly way back to the loader -- the run's time up, or "xl stop" -- the kernel asks it
+ * for the volume and waits, bounded, before it goes (bsd/dev/redwood_ufs.c,
+ * redwood_var_save_on_return). A save every SECS seconds is there as well but is not the default:
+ * one costs seconds of the run and a hundred-odd megabytes of flash, and while it runs the
+ * storage is read through the loader rather than through this kernel's own driver.
+ *
+ * One saver at a time: a write to the store is refused unless the writer holds the claim
+ * (kern.redwood.var_busy), so two of them cannot interleave into one slot. Even if they did, the
+ * slot being written is never the one holding the newest good archive, and a header is written
+ * last and over a zeroed one -- so the worst an interrupted or doubled save can do is lose itself.
  *
  * Two slots, written in turn: the one not holding the newest good archive is the one written, its
  * header first zeroed, the archive next, the header last. So a save that does not finish -- the
@@ -91,6 +105,81 @@ struct entry {
 	int64_t  mtime_sec;
 	uint64_t size;                  /* a file's contents, a link's target, a hard link's first name */
 };
+
+/* ---- the kernel's side of it: the boot-arg, the handshake, the claim ---- */
+
+#define VAR_SAVE_NONE   0
+#define VAR_SAVE_IDLE   1
+#define VAR_SAVE_WANTED 2
+#define VAR_SAVE_DONE   3
+
+/* Is NAME=VALUE among the kernel's arguments? (as init.c reads them) */
+static int
+boot_arg_is(const char *name, const char *value)
+{
+	static char args[1024];
+	size_t len = sizeof(args) - 1, n = strlen(name), v = strlen(value);
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return 0;
+	}
+	args[len < sizeof(args) ? len : sizeof(args) - 1] = 0;
+	for (char *p = args; *p;) {
+		while (*p == ' ') {
+			p++;
+		}
+		if (strncmp(p, name, n) == 0 && p[n] == '=' && strncmp(p + n + 1, value, v) == 0 &&
+		    (p[n + 1 + v] == 0 || p[n + 1 + v] == ' ')) {
+			return 1;
+		}
+		while (*p && *p != ' ') {
+			p++;
+		}
+	}
+	return 0;
+}
+
+static long
+parse_number(const char *text)
+{
+	long value = 0;
+
+	for (; *text >= '0' && *text <= '9'; text++) {
+		value = value * 10 + (*text - '0');
+	}
+	return value;
+}
+
+static int
+sysctl_int(const char *name, int *value)
+{
+	size_t len = sizeof(*value);
+
+	return sysctlbyname(name, value, &len, NULL, 0);
+}
+
+static int
+sysctl_set_int(const char *name, int value)
+{
+	return sysctlbyname(name, NULL, NULL, &value, sizeof(value));
+}
+
+/* The claim on the store: nothing may be written without it, and only one program may hold it. */
+static int
+claim(void)
+{
+	if (sysctl_set_int("kern.redwood.var_busy", 1) != 0) {
+		printf("var_store: the store is claimed by another saver (%s)\n", strerror(errno));
+		return 0;
+	}
+	return 1;
+}
+
+static void
+release(void)
+{
+	(void)sysctl_set_int("kern.redwood.var_busy", 0);
+}
 
 /* ---- checksum (the same one the loader reads a write back with) ---- */
 
@@ -658,6 +747,9 @@ save(void)
 	}
 	stream_start(slot, 0);
 	entries = 0;
+	/* a watcher saves more than once: nothing of the save before is carried into this one */
+	memset(links, 0, LINKS * sizeof(*links));
+	skipped_kinds = skipped_big = 0;
 	strcpy(path, ROOT);
 	if (!pack_tree("") || !out_flush(1)) {
 		return 0;
@@ -697,6 +789,16 @@ save(void)
 /* ---- unpacking ---- */
 
 static uint64_t made_dirs, made_files, made_links, made_bytes, short_files, lost_bytes;
+/*
+ * A belt, after the braces: the memory filesystem no longer answers ENOSPC for want of a page
+ * (bsd/miscfs/ramfs, ramfs_grow_slots now takes an array found without the mount lock), so a short
+ * write here means the volume really is full. Waiting a little and trying again still earns its
+ * place -- the pageout path cannot wait for an array either, and it may be what answered -- but
+ * the whole restore spends at most RETRY_MS on it, so a volume that is truly full does not turn
+ * the boot into a crawl.
+ */
+#define RETRY_MS        2000
+static uint64_t retry_ms_left = RETRY_MS;
 
 static int
 whole_path(const char *relative, uint32_t len)
@@ -824,14 +926,12 @@ unpack_one(int make)
 			 */
 			while (out_fd >= 0 && done < want) {
 				ssize_t wrote = write(out_fd, piece + done, (size_t)(want - done));
-				static int tries;
 
 				if (wrote > 0) {
 					done += (uint64_t)wrote;
-					tries = 0;
 					continue;
 				}
-				if (++tries > 200) {
+				if (retry_ms_left < 5) {
 					printf("var_store: %s: %llu of %llu bytes, no more would go in: %s\n",
 					    path, (unsigned long long)(in_file + done),
 					    (unsigned long long)e.size, strerror(errno));
@@ -839,10 +939,10 @@ unpack_one(int make)
 					lost_bytes += e.size - in_file - done;
 					close(out_fd);
 					out_fd = -1;
-					tries = 0;
 					break;
 				}
 				usleep(5000);
+				retry_ms_left -= 5;
 			}
 			in_file += done;
 			left -= want;
@@ -1032,6 +1132,84 @@ erase(void)
 	return 1;
 }
 
+/*
+ * Stay and save by itself. The kernel is told there is a saver, and then this waits: for the
+ * kernel to ask (the run is ending, and it waits for the answer before it goes), and, if seconds
+ * is given, for that long to pass between saves of its own accord. A save that fails is said so
+ * and the waiting goes on -- the one at the end of the run still gets its chance.
+ */
+static int
+save_once(void)
+{
+	int ok;
+
+	/*
+	 * The device is opened for the save and closed again, not held: while a write is in flight
+	 * this kernel's own transfer list is out of the controller, and it goes back in when the
+	 * device is closed (bsd/dev/redwood_ufs.c, ufs_cclose). A watcher that kept the device open
+	 * would leave iOS reading the flash through the loader for the rest of the run.
+	 */
+	fd = open(DEVICE, O_RDWR, 0);
+	if (fd < 0) {
+		printf("var_store: %s: %s\n", DEVICE, strerror(errno));
+		return 0;
+	}
+	ok = claim() && save();
+	release();
+	close(fd);
+	fd = -1;
+	return ok;
+}
+
+static int
+watch(int seconds)
+{
+	uint64_t last = 0;
+	int asked = 0;
+
+	fd = open(DEVICE, O_RDWR, 0);
+	if (fd < 0) {
+		printf("var_store: %s cannot be written (%s): nothing would be saved\n", DEVICE,
+		    strerror(errno));
+		return 0;
+	}
+	close(fd);
+	fd = -1;
+	if (sysctl_set_int("kern.redwood.var_save", VAR_SAVE_IDLE) != 0) {
+		printf("var_store: this kernel does not keep the data volume (%s)\n", strerror(errno));
+		return 0;
+	}
+	printf("var_store: watching: the volume is saved when the run ends%s\n",
+	    seconds > 0 ? ", and in between" : "");
+	{
+		struct timeval tv = { 0, 0 };
+
+		gettimeofday(&tv, NULL);
+		last = (uint64_t)tv.tv_sec;
+	}
+	for (;;) {
+		struct timeval tv = { 0, 0 };
+		int state = VAR_SAVE_NONE;
+
+		if (sysctl_int("kern.redwood.var_save", &state) == 0 && state == VAR_SAVE_WANTED) {
+			asked = 1;
+		}
+		gettimeofday(&tv, NULL);
+		if (asked || (seconds > 0 && (uint64_t)tv.tv_sec - last >= (uint64_t)seconds)) {
+			if (!save_once()) {
+				printf("var_store: this save came to nothing; the store keeps what it had\n");
+			}
+			last = (uint64_t)tv.tv_sec;
+			if (asked) {
+				/* the kernel is waiting on this to go back to the loader */
+				(void)sysctl_set_int("kern.redwood.var_save", VAR_SAVE_DONE);
+				return 1;
+			}
+		}
+		usleep(100000);
+	}
+}
+
 /* A line saying when, for a run to leave behind and the next one to find. */
 static int
 stamp(const char *where)
@@ -1091,6 +1269,13 @@ main(int argc, char **argv, char **envp)
 		printf("var_store: no memory for the buffers\n");
 		return 1;
 	}
+	if (strcmp(what, "watch") == 0) {
+		if (!boot_arg_is("var_store", "1")) {
+			printf("var_store: not asked to keep the data volume (var_store=1): nothing to watch\n");
+			return 0;
+		}
+		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
+	}
 	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
 	if (fd < 0) {
 		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", DEVICE,
@@ -1098,7 +1283,8 @@ main(int argc, char **argv, char **envp)
 		return 1;
 	}
 	if (strcmp(what, "save") == 0) {
-		ok = save();
+		ok = claim() && save();
+		release();
 	} else if (strcmp(what, "load") == 0) {
 		ok = load();
 	} else if (strcmp(what, "erase") == 0) {

@@ -172,6 +172,36 @@ static LCK_MTX_DECLARE(ufs_lock, &ufs_lck_grp);
 /* One writer at a time; never held while the mailbox is, nor while user memory is touched. */
 static LCK_MTX_DECLARE(ufs_write_mtx, &ufs_lck_grp);
 
+/*
+ * Saving the data volume without being asked (userland/src/var_store.c).
+ *
+ * The volume is packed and written by a program, not by this kernel, so the kernel's part is to
+ * say when and to let only one program at a time do it:
+ *
+ *   kern.redwood.var_save   the handshake. The saver writes VAR_SAVE_IDLE when it starts and is
+ *                           then the one that will be asked; on the orderly way back to the loader
+ *                           (loader_return_after expired, or "xl stop") the kernel writes
+ *                           VAR_SAVE_WANTED and waits, and the saver writes VAR_SAVE_DONE when the
+ *                           volume is in the flash. Nobody registered: nothing is asked and
+ *                           nothing waited for, so a run without a saver returns as it always did.
+ *                           A panic does not come this way at all -- there is no program left to
+ *                           ask -- and then the store simply keeps what it had.
+ *   kern.redwood.var_busy   the claim. A write to /dev/rufs_darwin is refused unless the writer
+ *                           holds it, so two savers cannot interleave into one slot. It is held by
+ *                           process number, and a claimant may take it from a process that is gone
+ *                           (a saver killed in the middle leaves no lock behind for the rest of the
+ *                           run). What the one that was killed half-wrote is not lost either: the
+ *                           slot it was writing is not the one holding the newest good archive.
+ */
+#define VAR_SAVE_NONE      0
+#define VAR_SAVE_IDLE      1
+#define VAR_SAVE_WANTED    2
+#define VAR_SAVE_DONE      3
+#define VAR_SAVE_MS        20000        /* at most this long on the way out (var_save_ms=N) */
+
+static volatile int ufs_var_save = VAR_SAVE_NONE;
+static int ufs_var_busy_pid;
+
 /* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
 static int ufs_write_part = -1;
 static volatile bool ufs_write_busy;            /* a write of ours has this kernel's list out: not a failure */
@@ -197,6 +227,71 @@ SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_errors, CTLFLAG_RD | CTLFLAG_LOCK
     "writes the loader refused or did not finish");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_refused,
     "writes refused here: not darwin, or not past what the build writes");
+
+/* The handshake: 1 to register as the saver, 3 to say the volume is in the flash. 2 is the kernel's. */
+static int
+ufs_sysctl_var_save(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = ufs_var_save, error;
+
+	error = sysctl_io_number(req, value, sizeof(value), &value, NULL);
+	if (error != 0 || req->newptr == 0) {
+		return error;
+	}
+	if (value == VAR_SAVE_IDLE && ufs_var_save != VAR_SAVE_WANTED) {
+		ufs_var_save = VAR_SAVE_IDLE;           /* a saver is there; it is the one that will be asked */
+	} else if (value == VAR_SAVE_DONE && ufs_var_save == VAR_SAVE_WANTED) {
+		ufs_var_save = VAR_SAVE_DONE;           /* and it has finished: the way out may go on */
+	} else if (value == VAR_SAVE_NONE) {
+		ufs_var_save = VAR_SAVE_NONE;
+	} else {
+		return EINVAL;
+	}
+	return 0;
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, var_save, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    ufs_sysctl_var_save, "I", "the data volume's saver: 1 registers, 2 is the kernel asking, 3 is done");
+
+/* The claim on the store: 1 takes it, 0 gives it back; reading says which process holds it. */
+static int
+ufs_sysctl_var_busy(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = ufs_var_busy_pid, error, me = proc_selfpid();
+
+	error = sysctl_io_number(req, value, sizeof(value), &value, NULL);
+	if (error != 0 || req->newptr == 0) {
+		return error;
+	}
+	lck_mtx_lock(&ufs_write_mtx);
+	if (value == 1) {
+		if (ufs_var_busy_pid != 0 && ufs_var_busy_pid != me) {
+			proc_t held = proc_find(ufs_var_busy_pid);
+
+			if (held != NULL) {
+				proc_rele(held);
+				lck_mtx_unlock(&ufs_write_mtx);
+				return EBUSY;   /* another saver has it and is alive: one at a time */
+			}
+			printf("var_store: the claim on the store was left by process %d, which is gone\n",
+			    ufs_var_busy_pid);
+		}
+		ufs_var_busy_pid = me;
+	} else if (value == 0) {
+		if (ufs_var_busy_pid == me || ufs_var_busy_pid == 0) {
+			ufs_var_busy_pid = 0;
+		} else {
+			error = EPERM;
+		}
+	} else {
+		error = EINVAL;
+	}
+	lck_mtx_unlock(&ufs_write_mtx);
+	return error;
+}
+
+SYSCTL_PROC(_kern_redwood, OID_AUTO, var_busy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    ufs_sysctl_var_busy, "I", "the claim a writer of /dev/rufs_darwin must hold: 1 takes it, 0 gives it back");
 
 /*
  * Native blocks [lba, lba + count) of partition part, one request of at most the buffer's size:
@@ -735,6 +830,11 @@ ufs_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
 	if (!ufs_ready || part >= ufs_parts || ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
 		return EROFS;
 	}
+	if (ufs_var_busy_pid != proc_selfpid()) {
+		/* one writer of the store at a time, and it says so first (kern.redwood.var_busy) */
+		ufs_write_refused++;
+		return EPERM;
+	}
 	nbs = ufs_page->part[part].block_size;
 	if (uio_offset(uio) < 0 || (uint64_t)uio_offset(uio) % nbs != 0 || (uint64_t)uio_resid(uio) % nbs != 0) {
 		return EINVAL;
@@ -790,6 +890,37 @@ static const struct cdevsw ufs_cdevsw = {
 	.d_reserved_2 = eno_putc,
 	.d_type       = D_DISK,
 };
+
+/*
+ * The orderly end of a run, from osfmk/arm64/loader_return.c, in the thread that is about to hand
+ * control back: ask the saver for the data volume and wait for it, so that a run need not have
+ * been told to save. Bounded, and only when a saver registered -- the loader goes on feeding the
+ * watchdog for a minute past the run's own budget, and the host waits a hundred seconds past it,
+ * so twenty seconds here is well inside both. Nothing else of the way out has happened yet: the
+ * GPU, the DSPs and this kernel's transfer list are still as the run had them.
+ */
+void
+redwood_var_save_on_return(void)
+{
+	uint32_t ms = VAR_SAVE_MS;
+	uint64_t waited = 0;
+
+	if (!ufs_ready || ufs_write_part < 0 || ufs_var_save != VAR_SAVE_IDLE) {
+		return;
+	}
+	PE_parse_boot_argn("var_save_ms", &ms, sizeof(ms));
+	printf("var_store: the run is ending: the data volume is asked for\n");
+	ufs_var_save = VAR_SAVE_WANTED;
+	while (ufs_var_save != VAR_SAVE_DONE && waited < ms) {
+		IOSleep(20);
+		waited += 20;
+	}
+	if (ufs_var_save == VAR_SAVE_DONE) {
+		printf("var_store: the data volume is in the flash (%llu ms)\n", waited);
+	} else {
+		printf("var_store: the saver did not answer in %u ms: the store keeps what it had\n", ms);
+	}
+}
 
 /* ---- the check: the partitions there are images of, hashed as the loader hashes them ---- */
 
