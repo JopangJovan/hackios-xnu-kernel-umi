@@ -455,11 +455,28 @@ got (`air_run: clearFragment01 on softpipe` here), and that line must be read be
 below it is believed. `AIR_RUN_SOFTWARE=1` forces software even on the phone, for comparing the
 two on the same device.
 
+**It runs on iOS, and the numbers are exact there.** In QEMU (`CMDLINE="cpus=4
+RC_JOBS=rc.jobs.air" qemu/run-ios.sh 420`, a clean boot: 72 `[ ok ]` lines, SpringBoard up),
+`air_run` translated `clearFragment01`, found no `msm` device, fell back to softpipe as designed,
+drew the quad and read back
+
+```
+2.10170319e-18  0.178894654  1.48687698e+16  1.21394141e+33
+```
+
+— the same four floats, bit for bit, that LLVM computes on a computer and that softpipe draws
+there. So the whole chain works on the target operating system: the container, the reader, the
+translation, Gallium, the draw and the readback. What is left is one substitution — softpipe for
+ir3 on the Adreno — and that needs the phone.
+
 What is *not* known until it is tried is whether the kernel's GPU driver and the submit path
 behave for a draw that does not come from CoreAnimation: the GLES path is that driver's only
 consumer today. `rc.jobs.air` asks with the GPU idle; `rc.jobs.air2` asks again after SpringBoard
 is up and holding it. A refusal is a finding the whole port needs, not just this frontend, so
 either answer is worth the run.
+
+(Counting anything out of a QEMU log here: `qemu/run-ios.sh` prints every line twice, and
+`sort -u` does not catch it because the pairs are separated by other output.)
 
 ## 6. Running it
 

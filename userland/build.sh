@@ -331,6 +331,10 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	rm -rf flashboot flashboot.os
 	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
 	cp obj/stage0 flashboot/sbin/launchd
+	# the OS cryptex, and the shared cache in it, only where this image will carry it:
+	# with CRYPTEXES=flash the cryptexes are read from the phone's flash and this tree is
+	# built and thrown away unused
+	if [ "$CRYPTEXES" != flash ]; then
 	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
 	# the audio DSP's firmware and the speaker amplifiers' configuration, as in the system image's /fw: the kernel
 	# reads the firmware as soon as there is a root (this image, adsp=1), the configuration maybe later -- by then
@@ -347,8 +351,10 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do
 		case "$f" in *.symbols) continue ;; esac
-		ln "$f" $D/
+		# -f: a cryptex fetched with the cache already in it would otherwise stop the build
+		ln -f "$f" $D/
 	done
+	fi
 	python3 ../tools/apfs/mkapfs.py -z --plain fw -o flashboot.boot.apfs Boot=flashboot | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh flashboot.boot.apfs Boot=flashboot
 	# the third container: Apple's App cryptex as it is (10 MB; fetch.sh), for the boot volume's Cryptexes/App
@@ -422,7 +428,8 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do
 		case "$f" in *.symbols) continue ;; esac     # symbolication data, never mapped
-		ln "$f" $D/
+		# -f: a cryptex fetched with the cache already in it would otherwise stop the build
+		ln -f "$f" $D/
 	done
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
