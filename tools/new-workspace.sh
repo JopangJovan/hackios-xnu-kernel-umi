@@ -41,7 +41,9 @@ cp -a --reflink=auto "$ROOT/xnu-deps/." xnu-deps/
 # there: a main copy that has not built its images yet has no system.apfs nor root.apfs, and
 # cryptex-app is unpacked only where somebody has needed it -- under "set -e" a copy of a file that
 # is not there used to end the script halfway, leaving a workspace without its QEMU instance number
-# and without a kernel.
+# and without a kernel. What a missing cryptex-app costs, when there is one to take: the images come
+# out with no /System/Cryptexes/App at all, and Safari's daemons and AuthenticationServicesAgent --
+# eight jobs -- then look to mkjobs.py like programs nobody has (build.sh at cryptex-app, present()).
 for d in rootfs cryptex cryptex-app "20F66__iPhone10,3_6"; do
 	if [ -e "$ROOT/ios165/$d" ]; then cp -al "$ROOT/ios165/$d" ios165/; fi
 done
@@ -51,16 +53,14 @@ done
 for f in rootfs.dmg rootfs.slt cryptex-app.dmg extracted; do
 	if [ -e "$ROOT/ios165/$f" ]; then ln -s "$ROOT/ios165/$f" ios165/; fi
 done
-for f in obj system.apfs root.apfs hello; do
-	if [ -e "$ROOT/userland/$f" ]; then cp -a --reflink=auto "$ROOT/userland/$f" userland/; fi
-done
-# The firmware the build puts into the images -- the radio's, the audio DSP's, the GPU's. It is not
-# in git and userland/build.sh takes it from beside the working copy rather than from inside it, so
-# a copy without it builds an image with no /fw and says nothing about it: the boot volume comes out
-# 4 MB instead of 21 and gpu=1 has nothing to load. Links, not copies: there is one set of these on
-# this computer and they are not small.
+# The firmware the build puts into the images -- the radio's, the audio DSP's, the GPU's. A copy
+# without them builds an image with no /fw and says nothing about it: gpu=1 then starts no GPU.
+# Links, not copies: there is one set of these on this computer and they are not small.
 for d in "$ROOT"/fw-*; do
 	if [ -d "$d" ]; then ln -s "$d" ./; fi
+done
+for f in obj system.apfs root.apfs hello; do
+	if [ -e "$ROOT/userland/$f" ]; then cp -a --reflink=auto "$ROOT/userland/$f" userland/; fi
 done
 [ -f "$ROOT/xnuloader/loader.efi" ] && cp -a "$ROOT/xnuloader/loader.efi" xnuloader/
 [ -f "$ROOT/qemu/kernel.syms" ] && cp -a "$ROOT/qemu/kernel.syms" qemu/
