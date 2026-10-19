@@ -10,8 +10,8 @@
 #
 # The kernel tree is copied as it is now, uncommitted work included, and that state is recorded
 # (refs/redwood/baseline in the copy's kernel tree): tools/kernel-delta.sh, run in the workspace,
-# prints what was changed in the kernel since. Files below ios165/rootfs and ios165/cryptex are
-# hard links to this copy's: replace them, never edit them in place.
+# prints what was changed in the kernel since. Files below ios165/rootfs, ios165/cryptex and
+# ios165/cryptex-app are hard links to this copy's: replace them, never edit them in place.
 # The phone is not part of a workspace: there is one, and ./xl belongs to the main copy.
 set -e
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
@@ -37,9 +37,14 @@ rm -rf $K/BUILD
 )
 # what the kernel build needs besides the tree
 cp -a --reflink=auto "$ROOT/xnu-deps/." xnu-deps/
-# the files of iOS and the system image made of them
+# the files of iOS and the system image made of them. The App cryptex goes along with the rest: without it
+# a workspace quietly builds images with no /System/Cryptexes/App at all, and Safari's daemons and
+# AuthenticationServicesAgent -- eight jobs -- then look to mkjobs.py like programs nobody has
+# (build.sh at cryptex-app, mkjobs.py present()).
 for d in rootfs cryptex "20F66__iPhone10,3_6"; do cp -al "$ROOT/ios165/$d" ios165/; done
-for f in system.files system.manifest var.skel .done-rootfs .done-cryptex a2s.json; do
+# (the App cryptex only if this copy has it: fetch.sh unpacks it, and not every copy has run that far)
+[ -d "$ROOT/ios165/cryptex-app" ] && cp -al "$ROOT/ios165/cryptex-app" ios165/
+for f in system.files system.manifest var.skel .done-rootfs .done-cryptex a2s.json cryptex-app.dmg; do
 	[ -e "$ROOT/ios165/$f" ] && cp -a "$ROOT/ios165/$f" ios165/
 done
 for f in rootfs.dmg rootfs.slt extracted; do

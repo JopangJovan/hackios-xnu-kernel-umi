@@ -224,9 +224,15 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	done >> root/etc/var.skel
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
-	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory)
+	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory).
+	# With FLASHBOOT=1 the root will be Apple's whole volume on the flash, not the part of it that fits in
+	# the system image, so mkjobs.py judges "is this daemon's program there" by the listing of the volume
+	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
+	# fairplayd among them).
 	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
-	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $IOS/rootfs root/LaunchDaemons $IOS_JOBS
+	VOLUME=""
+	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
+	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
 # (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/redwood_adreno.c, finds it in fw/
