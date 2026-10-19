@@ -80,8 +80,13 @@ import sys
 # the word is already gone: the sileo2 copy removed nsurlsessiond for Sileo's downloads and it is removed
 # here too. On its own it costs nothing -- that copy's phone session reaches 118 processes and 20 widgets
 # with nsurlsessiond in and cloudd still denied -- so cloudd deserves another try now that it is there.
-# Two measurements outstanding: mobileassetd alone (it is not the one spinning, 2 retries against cloudd's
-# 2351), and cloudd with nsurlsessiond actually present.
+# Measured: cloudd with nsurlsessiond actually present does NOT stall the boot. The storm is gone
+# altogether -- 0 retries against 406 -- and the home screen arrives: 100 processes and 12 widget and poster
+# processes, where the same image without nsurlsessiond reached 76-78 and never one at any point in the run.
+# So cloudd was never the problem; being made to wait on a daemon that was not there was. It is left in DENY
+# here only because this was measured in QEMU after the phone runs were done, and the phone is where it
+# matters -- one flash-root run with ALLOW="cloudd" and nsurlsessiond shipped should settle it for good.
+# (mobileassetd alone was not measured separately; it is not the one that spins, 2 retries against 2351.)
 # One thing still unexplained: ALLOW="syncdefaultsd appstored" loses the home screen the same way (77
 # processes, no widgets) with no retry storm at all -- a dozen nsurlsessiond lookups, nothing spinning. So
 # the stall has at least one other cause, and whoever picks this up should not assume nsurlsessiond is all of
