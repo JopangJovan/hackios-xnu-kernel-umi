@@ -287,9 +287,10 @@ Three references, each independent of the translator:
    and the instruction translation — and no statement at all about `air_intrinsics.c`. The
    shaders that do call `air.*` are exactly the ones this check cannot judge: the texture ones
    have a varying for a parameter, the math-heavy ones are compute kernels or `air.visible`
-   library functions. So **all ~50 operations in `air_intrinsics.c` are unverified**, including
-   two whose meaning is a guess and marked `UNVERIFIED` in the code (`air.fast_exp`: natural
-   `exp` or `exp2`? and `air.fast_round`: away from zero or to even?). What would settle them is
+   library functions. So **no operation in `air_intrinsics.c` is numerically verified**, even the
+   two whose *identity* section 3.2 has since settled against Apple's own compiler: knowing that
+   `air.fast_round` is `round` and not `rint` says nothing about whether this file computes
+   `round` correctly. What would settle that is
    a shader whose intrinsic result is observable through a device buffer, compared the same way
    — which needs the buffer-readback half of this tool, i.e. M4's acceptance test. Writing C
    implementations of the `air.*` functions for the CPU side would *not* settle them: those
