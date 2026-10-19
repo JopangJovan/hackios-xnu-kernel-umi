@@ -1,0 +1,19 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The data volume of iOS kept between boots (var_store=1 ufs_write=1; src/var_store.c): what the
+# store held when this boot began, the line every run before this one left in /private/var and the
+# names SpringBoard had made by then with the seconds they were written, then this run's own line;
+# and after two minutes of iOS left to itself -- long enough for the home screen, the snapshots and
+# whatever was touched -- the same names again and the whole of /private/var into the store.
+# Run it twice over, with ./xl reboot in between: the second run's output holds the first run's
+# line and the first run's seconds, which is the whole point.
+/redwood/bin/var_store show
+/redwood/bin/vol_ls cat /private/var/redwood-stamp 4096
+/redwood/bin/vol_ls ls /private/var/mobile/Library/SpringBoard
+/redwood/bin/var_store stamp /private/var/redwood-stamp
+sleep 120
+/redwood/bin/vol_ls ls /private/var/mobile/Library/SpringBoard
+/redwood/bin/vol_ls ls /private/var/mobile/Library
+/redwood/bin/vol_ls cat /private/var/redwood-stamp 4096
+/redwood/bin/var_store save
+/redwood/bin/var_store show
+/redwood/bin/vol_ls sysctl kern.redwood.ufs_writes kern.redwood.ufs_write_bytes kern.redwood.ufs_write_errors kern.redwood.ufs_write_refused

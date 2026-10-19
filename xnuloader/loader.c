@@ -1447,21 +1447,41 @@ ufs_survey(void)
  * with that driver's ReadBlocks into a buffer both can see. The kernel's side is
  * bsd/dev/redwood_ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
  *
- * Read only, by construction: this service calls read_blocks and nothing else, the kernel's side
- * refuses writes before they are asked for, and there is no field in the page that could ask for
- * one.
+ * Reads, and -- with ufs_write=1 on the command line -- writes into one partition and nowhere
+ * else: the port's own darwin, proved by its GPT entry (name, both GUIDs, first and last LBA, its
+ * logical unit), and in it only past everything the build writes from the computer, so that no
+ * answer to the kernel can reach Android's partitions, the iOS volume or the cryptexes. The
+ * refusals are here, in the kernel (bsd/dev/redwood_ufs.c) and in UEFI's own driver, which gives
+ * out a partition's BlockIo and bounds it: a request has to pass all three.
  *
  * Each side writes its own cache lines only: the kernel the request, core 0 the answer (and the
  * table, once, before the kernel starts). A line one side cleans out of its cache therefore never
- * carries a stale copy of what the other side wrote into it. Core 0 never writes into the data
- * buffer itself, so after the controller's DMA there is nothing of its own in its cache to write
- * back over the data.
+ * carries a stale copy of what the other side wrote into it. Into the data buffer core 0 writes
+ * only what it has read back after a write of its own, so after the controller's DMA there is
+ * nothing of its own in its cache to write back over the data; the kernel, which fills the buffer
+ * for a write, cleans its own lines of it before it asks.
  */
 #define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
-#define BLOCK_VERSION      3
+#define BLOCK_VERSION      4
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
+#define BLOCK_OP_READ      0u
+#define BLOCK_OP_WRITE     1u
+
+/*
+ * The one partition a write may reach, and from which of its blocks. darwin is the port's own
+ * 20 GiB at the end of logical unit 0 (README, "The port's partition"); what the build puts there
+ * from the computer (tools/darwin-write.py) is the iOS volume at its start and the two cryptexes
+ * behind it, and nothing of this port reads or writes the rest -- so the data of iOS lives there
+ * and a write is refused before that block. The identity is the whole of darwin-write.py's: the
+ * same partition, named the same, of the same size, in the same place, on logical unit 0.
+ */
+#define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
+#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
+#define BLOCK_DARWIN_LAST  30617594ULL
+#define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
+#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
 
 /*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
@@ -1491,6 +1511,8 @@ struct loader_block {
 		volatile uint32_t request;
 		uint32_t part;
 		uint64_t lba, count;           /* in the partition's own blocks */
+		uint32_t op;                   /* BLOCK_OP_READ, BLOCK_OP_WRITE */
+		uint32_t reserved;
 	} ask __attribute__((aligned(128)));
 	/* written by the loader: answered becomes request when the data is in the buffer */
 	struct {
@@ -1529,6 +1551,9 @@ static void block_io2_probe(efi_handle h, efi_block_io *bio);
 static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at block_start() */
 static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
+static int block_write_requested;       /* ufs_write=1 on the command line */
+static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
+static uint64_t block_writes, block_writes_refused, block_write_bytes;
 
 /* the bytes of a device path before its end node */
 static uint64_t
@@ -1774,6 +1799,45 @@ block_tables(void)
 	}
 }
 
+/*
+ * Is this partition the one a write may reach? Everything about it has to be what it was when the
+ * port was set up; one field out of place and nothing is written this run. The name UEFI reports
+ * is already in bp->name (ufs_name), in ASCII.
+ */
+static int
+block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
+{
+	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
+	static const char name[] = "darwin";
+	const char *why = NULL;
+
+	for (unsigned i = 0; i < sizeof(name); i++) {
+		if (bp->name[i] != name[i]) {
+			return 0;               /* another partition: nothing to say about it */
+		}
+	}
+	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
+		why = "its type GUID is not the one it had";
+	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
+		why = "its unique GUID is not the one it had";
+	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
+		why = "it does not begin and end where it did";
+	} else if (bp->lun != 0) {
+		why = "it is not on logical unit 0";
+	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_DARWIN_LAST - BLOCK_DARWIN_FIRST + 1) {
+		why = "its blocks are not what they were";
+	} else if (bio->media->read_only) {
+		why = "UEFI gives it out read only";
+	}
+	if (why != NULL) {
+		print("ufs: darwin: no write will be served: %s\n", why);
+		return 0;
+	}
+	print("ufs: darwin (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n",
+	    info->start_lba, info->end_lba, BLOCK_WRITE_FIRST);
+	return 1;
+}
+
 static void
 block_start(void)
 {
@@ -1843,6 +1907,9 @@ block_start(void)
 					bp->lun = units[u].lun;
 				}
 			}
+		}
+		if (block_write_requested && block_is_darwin(info, bio, bp)) {
+			block_write_part = (int)block_shared.parts;
 		}
 		block_bios[block_shared.parts++] = bio;
 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
@@ -1981,7 +2048,7 @@ static void
 block_poll(void)
 {
 	uint64_t ask = (uint64_t)(uintptr_t)&block_shared.ask;
-	uint32_t request, part;
+	uint32_t request, part, op;
 	uint64_t lba, count, bytes, started;
 	efi_status s = 0x8000000000000002ULL;     /* EFI_INVALID_PARAMETER: a request out of bounds */
 
@@ -1994,6 +2061,7 @@ block_poll(void)
 	part = block_shared.ask.part;
 	lba = block_shared.ask.lba;
 	count = block_shared.ask.count;
+	op = block_shared.ask.op;
 	started = READ_SYSREG(CNTVCT_EL0);
 	bytes = 0;
 	if (part < block_shared.parts && count != 0 && count <= BLOCK_BUFFER_SIZE / block_shared.part[part].block_size &&
@@ -2008,11 +2076,51 @@ block_poll(void)
 			}
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
-		} else {
+		} else if (op == BLOCK_OP_WRITE) {
+			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
+				/* not darwin, or not past what the build writes from the computer: never */
+				if (block_writes_refused++ < 8) {
+					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
+					    block_shared.part[part].name);
+				}
+				s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
+				bytes = 0;
+			} else {
+				/*
+				 * The kernel filled the buffer and cleaned its lines of it; drop whatever this
+				 * core holds, write, and read back -- the answer says the blocks hold what the
+				 * kernel gave, or the write is no good. The read back overwrites the buffer,
+				 * which the kernel does not need: it has the data.
+				 */
+				uint32_t want;
+
+				flush_dcache((uint64_t)(uintptr_t)block_buffer,
+				    (uint64_t)(uintptr_t)block_buffer + bytes);
+				want = ufs_crc32(block_buffer, bytes);
+				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+				if (!EFI_ERROR(s)) {
+					bio->flush_blocks(bio);
+					s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+					flush_dcache((uint64_t)(uintptr_t)block_buffer,
+					    (uint64_t)(uintptr_t)block_buffer + bytes);
+					if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
+						print("ufs: %d blocks from %d of darwin read back DIFFERENT\n",
+						    count, lba);
+						s = 0x800000000000000AULL;      /* EFI_VOLUME_CORRUPTED */
+					}
+				}
+				if (!EFI_ERROR(s)) {
+					block_writes++;
+					block_write_bytes += bytes;
+				}
+			}
+		} else if (op == BLOCK_OP_READ) {
 			s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+			/* what the controller wrote is in memory; drop whatever this core held of the buffer */
+			flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
+		} else {
+			bytes = 0;              /* an operation this loader does not know: nothing is touched */
 		}
-		/* what the controller wrote is in memory; drop whatever this core held of the buffer */
-		flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
 	}
 	block_shared.answer.status = (int64_t)s;
 	block_shared.answer.ticks += READ_SYSREG(CNTVCT_EL0) - started;
@@ -2728,6 +2836,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ufs_requested = c[4] - '0';
 		}
 		block_probe_requested |= starts_with(c, "ufs_probe=1") && (c == pi.cmdline || c[-1] == ' ');
+		block_write_requested |= starts_with(c, "ufs_write=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[11] == 0 || c[11] == ' ');
 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
 		    c[11] <= '9';
 	}
@@ -3195,6 +3305,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (uint64_t)(uintptr_t)&block_shared.kernel_native + sizeof(block_shared.kernel_native));
 		print("ufs: the kernel put its own list in %d times and took it out %d times\n",
 		    (uint64_t)block_shared.kernel_native.switched_in, (uint64_t)block_shared.kernel_native.switched_out);
+	}
+	if (block_write_requested) {
+		print("ufs: %d writes into darwin, %d bytes, read back the same; %d refused\n", block_writes,
+		    block_write_bytes, block_writes_refused);
 	}
 	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */
 	for (int i = 1; i < cpu_count; i++) {

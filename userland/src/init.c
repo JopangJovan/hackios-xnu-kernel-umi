@@ -645,6 +645,42 @@ mount_writable(void)
 	check(ok && made > 50, "create the directories of the data volume");
 }
 
+/*
+ * What the last boot left in /private/var, back out of the phone's flash (var_store=1): the
+ * memory filesystem is empty at every boot, so everything iOS writes -- the home screen's layout,
+ * the applications' own data, the snapshots and the baked wallpaper -- would otherwise be new
+ * again every time. userland/src/var_store.c keeps a copy in the partition darwin, past the iOS
+ * volume and the cryptexes, and puts it back here, over the skeleton: a name the skeleton has and
+ * the store has too comes out as the store has it. A store that is not there or does not check
+ * out leaves what the skeleton made, and the boot goes on either way -- so a bad store cannot
+ * keep the phone from starting.
+ */
+static void
+restore_var(void)
+{
+	const char *wanted = boot_arg("var_store");
+	char *argv[3];
+	int status = 0;
+	pid_t pid;
+
+	if (wanted == NULL || strcmp(wanted, "1") != 0) {
+		return;
+	}
+	printf("\n-- the data volume of the last boot --\n");
+	argv[0] = (char *)in_image("/bin/var_store");
+	argv[1] = (char *)"load";
+	argv[2] = NULL;
+	pid = fork();
+	if (pid == 0) {
+		execve(argv[0], argv, environ);
+		printf("  %s: %s\n", argv[0], strerror(errno));
+		_exit(127);
+	}
+	if (pid < 0 || wait4(pid, &status, 0, NULL) != pid || !WIFEXITED(status)) {
+		printf("  var_store did not run\n");
+	}
+}
+
 static int
 count_entries(const char *path)
 {
@@ -1063,6 +1099,7 @@ main(int argc, char **argv, char **envp)
 
 	show_system();
 	mount_writable();
+	restore_var();
 	test_files();
 	test_writable();
 	test_memory();

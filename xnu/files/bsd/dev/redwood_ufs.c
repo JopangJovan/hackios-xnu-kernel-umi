@@ -1,6 +1,7 @@
 /*
- * The phone's storage, read only: one block device and one character device for every GPT
- * partition of its UFS (/dev/ufs_NAME and /dev/rufs_NAME, NAME as the partition table has it).
+ * The phone's storage: one block device and one character device for every GPT partition of its
+ * UFS (/dev/ufs_NAME and /dev/rufs_NAME, NAME as the partition table has it). Read only, but for
+ * the one place the data of iOS lives (ufs_write=1, below).
  *
  * There is no UFS driver here, and none is needed. UEFI never exits on this port: Qualcomm's own
  * UFS driver (UFSDxe) has brought up the controller, its PHY, its clocks and power, and stays
@@ -11,9 +12,15 @@
  * driver's ReadBlocks into the buffer (xnuloader/loader.c, block_poll). Nothing in this kernel
  * touches the storage controller.
  *
- * Read only by construction: opening for writing is refused, a write that reaches the strategy
- * routine is refused, and the page has no field in which a write could be asked for -- the
- * loader's side calls ReadBlocks and nothing else.
+ * Read only wherever a write could do harm, by construction. The block devices never write: the
+ * strategy routine refuses, so no filesystem mounted from one can write, and opening one for
+ * writing is refused. With ufs_write=1 one character device alone takes writes -- /dev/rufs_darwin,
+ * the port's own partition -- and in it only whole blocks from UFS_WRITE_FIRST on, past the iOS
+ * volume and both cryptexes that the build writes from the computer (tools/darwin-write.py); that
+ * is where the data volume of iOS is kept between runs (userland/src/var_store.c). The partition
+ * has to be the one the port was set up with (its name, size, place and logical unit here; its
+ * GUIDs as well on the loader's side), and the loader refuses the same things over again and reads
+ * every write back before it answers. Without ufs_write=1 nothing writes at all.
  *
  * One request at a time (the page has one), so requests are serialized by a mutex and split into
  * pieces of the buffer's size. The kernel writes only the request's cache lines and core 0 only
@@ -42,6 +49,7 @@
 #include <sys/systm.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
+#include <sys/uio.h>
 #include <sys/redwood_input.h>
 #include <libkern/crc.h>
 #include <vm/memory_types.h>
@@ -54,10 +62,22 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 
 /* the page the loader publishes: the same layout as struct loader_block in xnuloader/loader.c */
 #define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
-#define BLOCK_VERSION      3
+#define BLOCK_VERSION      4
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* a whole logical unit, not a partition */
+#define BLOCK_OP_READ      0u
+#define BLOCK_OP_WRITE     1u
+
+/*
+ * Where a write may go, and nowhere else: darwin, the port's own 20 GiB at the end of logical
+ * unit 0, and in it only past what the build puts there from the computer -- the iOS volume
+ * (blocks 0..1374207) and the two cryptexes behind it (..2042367). The loader keeps the same
+ * bounds and the GUIDs of the partition besides (xnuloader/loader.c, BLOCK_WRITE_FIRST).
+ */
+#define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
+#define UFS_DARWIN_FIRST   25374720ULL                 /* its first LBA on the unit, as the GPT has it */
+#define UFS_DARWIN_BLOCKS  5242875ULL
 
 struct loader_block_part {
 	char name[36];
@@ -79,6 +99,8 @@ struct loader_block {
 		volatile uint32_t request;
 		uint32_t part;
 		uint64_t lba, count;
+		uint32_t op;                   /* BLOCK_OP_READ, BLOCK_OP_WRITE */
+		uint32_t reserved;
 	} ask __attribute__((aligned(128)));
 	struct {
 		volatile uint32_t answered;
@@ -108,7 +130,7 @@ struct loader_block {
 #define UFS_TIMEOUT_MS     20000        /* core 0 answers in well under a second; this is for a dead loader */
 
 static volatile struct loader_block *ufs_page;
-static const uint8_t *ufs_buffer;
+static uint8_t *ufs_buffer;             /* the loader's data buffer: filled by it for a read, here for a write */
 static uint32_t ufs_buffer_size, ufs_parts, ufs_seq;
 static uint32_t ufs_bsize[BLOCK_MAX_PARTS];   /* the block size each device is counted in (spec_open sets 512) */
 static int ufs_bmajor = -1, ufs_cmajor = -1;
@@ -134,6 +156,13 @@ static uint64_t ufs_native_fallbacks, ufs_mailbox_refused;
 
 static LCK_GRP_DECLARE(ufs_lck_grp, "redwood-ufs");
 static LCK_MTX_DECLARE(ufs_lock, &ufs_lck_grp);
+/* One writer at a time; never held while the mailbox is, nor while user memory is touched. */
+static LCK_MTX_DECLARE(ufs_write_mtx, &ufs_lck_grp);
+
+/* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
+static int ufs_write_part = -1;
+static volatile bool ufs_write_busy;            /* a write of ours has this kernel's list out: not a failure */
+static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
 
 SYSCTL_DECL(_kern_redwood);
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_requests, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_requests,
@@ -146,13 +175,21 @@ SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, &
     "microseconds spent waiting for core 0's answers");
 SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_copy_us,
     "microseconds spent copying out of the loader's buffer");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_writes,
+    "requests written into darwin and read back by the loader");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_bytes,
+    "bytes written into darwin");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_errors,
+    "writes the loader refused or did not finish");
+SYSCTL_QUAD(_kern_redwood, OID_AUTO, ufs_write_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_refused,
+    "writes refused here: not darwin, or not past what the build writes");
 
 /*
- * Native blocks [lba, lba + count) of partition part, into dst: one request of at most the
- * buffer's size. Called with ufs_lock held.
+ * Native blocks [lba, lba + count) of partition part, one request of at most the buffer's size:
+ * read into dst, or, with src, written from there. Called with ufs_lock held.
  */
 static int
-ufs_request(uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst)
+ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst, const uint8_t *src)
 {
 	uint64_t bytes = count * ufs_page->part[part].block_size, started, waited_ms = 0;
 	uint32_t seq = ++ufs_seq;
@@ -161,14 +198,25 @@ ufs_request(uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst)
 	if (ufs_dead) {
 		return EIO;
 	}
-	if (part == ufs_last_part && lba == ufs_last_end) {
-		ufs_sequential++;
+	if (op == BLOCK_OP_READ) {
+		if (part == ufs_last_part && lba == ufs_last_end) {
+			ufs_sequential++;
+		}
+		ufs_last_part = part;
+		ufs_last_end = lba + count;
+	} else {
+		/*
+		 * The data into the buffer and out of this core's cache before the request is raised:
+		 * core 0 drops its own lines of the buffer and hands it to UEFI's driver.
+		 */
+		memcpy(ufs_buffer, src, (size_t)bytes);
+		FlushPoC_DcacheRegion((vm_offset_t)ufs_buffer, (size_t)bytes);
+		ufs_last_part = ~0u;
 	}
-	ufs_last_part = part;
-	ufs_last_end = lba + count;
 	ufs_page->ask.part = part;
 	ufs_page->ask.lba = lba;
 	ufs_page->ask.count = count;
+	ufs_page->ask.op = op;
 	__asm__ volatile ("dmb sy" ::: "memory");
 	ufs_page->ask.request = seq;
 	__asm__ volatile ("dmb sy" ::: "memory");
@@ -204,17 +252,25 @@ ufs_request(uint32_t part, uint64_t lba, uint64_t count, uint8_t *dst)
 	}
 	status = ufs_page->answer.status;
 	if (status != 0) {
-		printf("ufs: %s: blocks %llu..%llu: the loader's read failed (status %llx)\n",
-		    ufs_page->part[part].name, lba, lba + count - 1, (uint64_t)status);
+		printf("ufs: %s: blocks %llu..%llu: the loader's %s failed (status %llx)\n",
+		    ufs_page->part[part].name, lba, lba + count - 1,
+		    op == BLOCK_OP_WRITE ? "write" : "read", (uint64_t)status);
 		ufs_errors++;
 		return EIO;
+	}
+	if (op == BLOCK_OP_WRITE) {
+		/* the loader has read the blocks back and found them the same */
+		ufs_writes++;
+		ufs_write_bytes += bytes;
+		return 0;
 	}
 	started = mach_absolute_time();
 	/*
 	 * The buffer is mapped cacheable here (copying out of an uncached mapping went at 870 MB/s,
-	 * as slow as the storage itself). This side never writes it, and core 0 cleans and
-	 * invalidates it after every read; whatever this core may still hold of an earlier read --
-	 * a line brought in by a prefetch, say -- goes before the copy.
+	 * as slow as the storage itself). Core 0 cleans and invalidates it after every read, and this
+	 * side only ever fills it for a write of its own and cleans its lines then; whatever this
+	 * core may still hold of an earlier request -- a line brought in by a prefetch, say -- goes
+	 * before the copy.
 	 */
 	FlushPoC_DcacheRegion((vm_offset_t)ufs_buffer, (size_t)bytes);
 	memcpy(dst, ufs_buffer, (size_t)bytes);
@@ -262,6 +318,17 @@ redwood_ufs_report(const char *when)
 	    "the one before), %llu errors, %llu bytes; waiting %llu ms, of it in ReadBlocks %llu ms; "
 	    "copying %llu ms\n", when, ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_sequential,
 	    ufs_errors, ufs_bytes, ufs_wait_us / 1000, loader_ns / 1000000, ufs_copy_us / 1000);
+	if (ufs_write_part >= 0 || ufs_writes != 0 || ufs_write_refused != 0) {
+		printf("ufs: %s: %llu writes into darwin, %llu bytes, read back by the loader; %llu did not "
+		    "finish, %llu refused here\n", when, ufs_writes, ufs_write_bytes, ufs_write_errors,
+		    ufs_write_refused);
+	}
+}
+
+static uint64_t
+ufs_part_bytes(uint32_t part)
+{
+	return ufs_page->part[part].blocks * ufs_page->part[part].block_size;
 }
 
 /*
@@ -304,9 +371,9 @@ ufs_read_mailbox(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 			take = len;
 		}
 		if (skip == 0 && take == count * nbs) {
-			error = ufs_request(part, first, count, dst);          /* whole blocks: straight in */
+			error = ufs_request(BLOCK_OP_READ, part, first, count, dst, NULL);   /* whole blocks: straight in */
 		} else {
-			error = ufs_request(part, first, count, bounce);
+			error = ufs_request(BLOCK_OP_READ, part, first, count, bounce, NULL);
 			if (error == 0) {
 				memcpy(dst, bounce + skip, (size_t)take);
 			}
@@ -363,6 +430,10 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 		if (error == 0) {
 			return 0;
 		}
+		if (ufs_write_busy) {
+			/* the list is out for a write of ours, not broken: this read goes the other way */
+			return ufs_read_mailbox(part, offset, dst, len);
+		}
 		if (ufs_native_on) {
 			ufs_native_on = false;
 			ufs_native_fallbacks++;
@@ -374,10 +445,75 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 	return ufs_read_mailbox(part, offset, dst, len);
 }
 
-static uint64_t
-ufs_part_bytes(uint32_t part)
+/*
+ * Whole blocks [offset, offset + len) of the one partition that takes writes, from src, through
+ * the loader. This kernel's own driver never writes -- its whitelist of commands has no write in
+ * it -- so for the length of a write its transfer list goes out and UEFI's driver, which the
+ * loader calls, has the controller again; reads meanwhile go through the loader too (ufs_read),
+ * which is slower and right. Nothing of iOS waits on this but the writer itself: the data volume
+ * is in memory (ramfs) and only its copy for the next boot is written here.
+ */
+static int
+ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 {
-	return ufs_page->part[part].blocks * ufs_page->part[part].block_size;
+	uint64_t nbs, per;
+	bool native;
+	int error = 0;
+
+	if (!ufs_ready || ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
+		ufs_write_refused++;
+		return EROFS;
+	}
+	nbs = ufs_page->part[part].block_size;
+	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
+		return EINVAL;          /* whole blocks only: nothing is read before a write */
+	}
+	if (offset / nbs < UFS_WRITE_FIRST || offset > ufs_part_bytes(part) ||
+	    len > ufs_part_bytes(part) - offset) {
+		/* the iOS volume, the cryptexes, and anything past the partition's end: never */
+		ufs_write_refused++;
+		return EROFS;
+	}
+	per = ufs_buffer_size / nbs;
+	lck_mtx_lock(&ufs_write_mtx);
+	/*
+	 * ufs_native_on goes first, so that a reader about to start sees it and goes the other way
+	 * of its own accord; one already inside this kernel's driver gets an error and is sent the
+	 * other way by ufs_write_busy.
+	 */
+	native = ufs_native_on;
+	ufs_write_busy = true;
+	if (native) {
+		ufs_native_on = false;
+		ufs_native_out("a write of the data volume");
+	}
+	while (len > 0 && error == 0) {
+		uint64_t count = len / nbs;
+
+		if (count > per) {
+			count = per;
+		}
+		lck_mtx_lock(&ufs_lock);
+		if (ufshc_list_in()) {
+			/* it did not go out after all: UEFI's driver must not be asked to ring */
+			error = EIO;
+		} else {
+			error = ufs_request(BLOCK_OP_WRITE, part, offset / nbs, count, NULL, src);
+		}
+		lck_mtx_unlock(&ufs_lock);
+		offset += count * nbs;
+		src += count * nbs;
+		len -= count * nbs;
+	}
+	if (native && ufs_native_in(false) == 0) {
+		ufs_native_on = true;
+	}
+	ufs_write_busy = false;
+	lck_mtx_unlock(&ufs_write_mtx);
+	if (error != 0) {
+		ufs_write_errors++;
+	}
+	return error;
 }
 
 /* ---- the devices ---- */
@@ -389,9 +525,19 @@ ufs_open(dev_t dev, int flags, __unused int devtype, __unused proc_t p)
 		return ENXIO;
 	}
 	if (flags & FWRITE) {
-		return EROFS;
+		return EROFS;           /* a block device of this driver never writes */
 	}
 	return 0;
+}
+
+/* The same, for the character devices: the one partition that takes writes may be opened for them. */
+static int
+ufs_copen(dev_t dev, int flags, int devtype, proc_t p)
+{
+	if ((flags & FWRITE) && ufs_write_part >= 0 && (uint32_t)minor(dev) == (uint32_t)ufs_write_part) {
+		flags &= ~FWRITE;
+	}
+	return ufs_open(dev, flags, devtype, p);
 }
 
 static int
@@ -469,7 +615,7 @@ ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc
 		*(uint64_t *)data = ufs_part_bytes(part) / ufs_bsize[part];
 		return 0;
 	case DKIOCISWRITABLE:
-		*(uint32_t *)data = 0;
+		*(uint32_t *)data = 0;  /* the block device, which is what a filesystem would ask */
 		return 0;
 	case DKIOCGETMAXBLOCKCOUNTREAD:
 		*(uint64_t *)data = ufs_buffer_size / ufs_bsize[part];
@@ -494,6 +640,51 @@ ufs_cread(dev_t dev, struct uio *uio, __unused int ioflag)
 	    ufs_bsize[minor(dev) < BLOCK_MAX_PARTS ? minor(dev) : 0]);
 }
 
+/*
+ * A write to /dev/rufs_darwin: whole blocks, out of user memory a bufferful at a time and into the
+ * partition. Nothing of this driver is held while user memory is touched -- a fault there can come
+ * back as a read of the storage -- so the bytes are taken first and written after.
+ */
+static int
+ufs_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	uint32_t part = (uint32_t)minor(dev);
+	uint64_t nbs;
+	uint8_t *bounce;
+	int error = 0;
+
+	if (!ufs_ready || part >= ufs_parts || ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
+		return EROFS;
+	}
+	nbs = ufs_page->part[part].block_size;
+	if (uio_offset(uio) < 0 || (uint64_t)uio_offset(uio) % nbs != 0 || (uint64_t)uio_resid(uio) % nbs != 0) {
+		return EINVAL;
+	}
+	bounce = kalloc_data(ufs_buffer_size, Z_WAITOK);
+	if (bounce == NULL) {
+		return ENOMEM;
+	}
+	while (error == 0 && uio_resid(uio) > 0) {
+		user_ssize_t want = uio_resid(uio);
+		off_t at = uio_offset(uio);
+
+		if (want > (user_ssize_t)ufs_buffer_size) {
+			want = (user_ssize_t)ufs_buffer_size;
+		}
+		error = uiomove((caddr_t)bounce, (int)want, uio);
+		if (error == 0) {
+			error = ufs_write(part, (uint64_t)at, bounce, (uint64_t)want);
+			if (error != 0) {
+				/* these bytes did not go in: the write is to say so, not to count them */
+				uio_setoffset(uio, at);
+				uio_setresid(uio, uio_resid(uio) + want);
+			}
+		}
+	}
+	kfree_data(bounce, ufs_buffer_size);
+	return error;
+}
+
 static const struct bdevsw ufs_bdevsw = {
 	.d_open     = ufs_open,
 	.d_close    = ufs_close,
@@ -505,10 +696,10 @@ static const struct bdevsw ufs_bdevsw = {
 };
 
 static const struct cdevsw ufs_cdevsw = {
-	.d_open       = ufs_open,
+	.d_open       = ufs_copen,
 	.d_close      = ufs_close,
 	.d_read       = ufs_cread,
-	.d_write      = eno_rdwrt,
+	.d_write      = ufs_cwrite,
 	.d_ioctl      = ufs_ioctl,
 	.d_stop       = eno_stop,
 	.d_reset      = eno_reset,
@@ -1088,6 +1279,45 @@ redwood_ufs_init(void)
 	ufs_ready = true;
 	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
+
+	/*
+	 * ufs_write=1: /dev/rufs_darwin takes writes, past the iOS volume and the cryptexes. darwin
+	 * has to be the partition the port was set up with, in everything the loader's table says of
+	 * it; the loader looks at its GUIDs besides, and refuses the same bounds of its own accord.
+	 */
+	check = 0;
+	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
+		for (uint32_t i = 0; i < ufs_parts; i++) {
+			const char *why = NULL;
+
+			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0) {
+				continue;
+			}
+			if (ufs_page->part[i].flags & BLOCK_PART_UNIT) {
+				why = "it is a whole logical unit, not the partition";
+			} else if (ufs_page->part[i].lun != 0) {
+				why = "it is not on logical unit 0";
+			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
+				why = "it does not begin where it did";
+			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
+				why = "it is not the size it was";
+			} else if (ufs_page->part[i].block_size != 4096) {
+				why = "its blocks are not 4096 bytes";
+			}
+			if (why != NULL) {
+				printf("ufs: darwin: no write will be asked for: %s\n", why);
+				continue;
+			}
+			ufs_write_part = (int)i;
+		}
+		if (ufs_write_part >= 0) {
+			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
+			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
+			    (UFS_DARWIN_BLOCKS - UFS_WRITE_FIRST) * 4096 >> 20);
+		} else {
+			printf("ufs: nothing takes writes: darwin is not among the partitions\n");
+		}
+	}
 
 	/*
 	 * ufs_native=1: through this kernel's own driver instead, its own transfer list in the

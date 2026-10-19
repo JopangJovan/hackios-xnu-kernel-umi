@@ -95,7 +95,7 @@ else
 	$CC $LD -o hello src/hello.c
 	$CC -Ilibmini -c libmini/mini.c -o obj/mini.o
 	$CC -c libmini/start.S -o obj/start.o
-	for prog in init child stage0; do
+	for prog in init child stage0 var_store; do
 		$CC -Ilibmini $LD -o obj/$prog.new src/$prog.c obj/mini.o obj/start.o
 		# keep the old file (and its time stamp) when nothing changed: system.apfs depends on stage0
 		cmp -s obj/$prog.new obj/$prog && rm obj/$prog.new || mv obj/$prog.new obj/$prog
@@ -107,6 +107,7 @@ rm -rf root
 mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
 cp obj/init root/sbin/init
 cp obj/child root/bin/child
+[ -f obj/var_store ] && cp obj/var_store root/bin/      # the data volume into the flash and back (src/var_store.c)
 echo "Darwin on redwood: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
