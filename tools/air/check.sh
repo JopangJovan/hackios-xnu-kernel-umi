@@ -101,4 +101,14 @@ echo "== the atomics, with a kernel written to make a lost update show"
 python3 "$ROOT/tools/air/atomiccheck.py" 2>&1 | tail -8
 atomic_rc=${PIPESTATUS[0]}
 
-exit $((reader_rc | cpu_rc | intrin_rc | run_rc | atomic_rc))
+echo
+echo "== the texture operations, on more than one texel"
+# texcheck.sh runs the corpus's own texture shaders, which all sample texel
+# (1, 1) because that is where air_run's vertex shader puts the coordinate: a
+# lowering that ignored the coordinate and always fetched (1, 1) would pass all
+# six of them. These ask for the corners too, so swapping x and y is caught on
+# the five asymmetric coordinates and correctly not on the symmetric ones.
+python3 "$ROOT/tools/air/texopcheck.py" 2>&1 | tail -6
+texop_rc=${PIPESTATUS[0]}
+
+exit $((reader_rc | cpu_rc | intrin_rc | run_rc | atomic_rc | texop_rc))

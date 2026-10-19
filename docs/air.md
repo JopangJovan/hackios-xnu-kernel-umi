@@ -33,7 +33,9 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | of those, exactly defined and agreeing on every case (45 607 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
 | of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
-| textures, atomics, barriers, derivatives and simd: no reference here | 41 |
+| the atomics and the barrier, against a kernel written for them (`atomiccheck.py`) | 10 |
+| texture operations checked exactly, on several texels each (`texopcheck.py`) | 6 |
+| texture operations with no check: integer-typed, multisample, write, depth | 25 |
 
 313 of 456 is 313 of 321 entry points — 97.5% — because 135 modules are `air.visible` library
 functions and not entry points at all.
@@ -61,10 +63,19 @@ functions and not entry points at all.
   however the lowering is written. That needs the phone. Two things are settled without running
   anything: every atomic in the corpus asks for `memory_order_relaxed`, and a stronger order is
   now refused by name instead of ignored, which is what the lowering used to do.
-- **Still unverified by anything: the derivatives and the simd reductions** — what they mean
-  depends on neighbouring fragments or on the width of a simdgroup, and a folded constant cannot
-  say it. The texture operations are covered differently and partly, by the six shaders that
-  returned the exact texel on the Adreno.
+- **Every one of the 119 declarations the corpus calls now has some numerical check**, which is
+  new as of tonight and is the first time that has been true: 78 arithmetic ones against C's own
+  functions, 10 atomics and the barrier against a kernel written for them, and 31 texture ones
+  partly — 6 declarations exactly, on several texels each (section 4, item 6), and the rest not,
+  for reasons given there. The derivatives and the simd reductions have no check either, and no
+  module of the corpus calls them: they are unexercised code, not untested behaviour, and saying
+  "unverified" of them would overstate what is at stake.
+- **The weakest of the three is the textures**, and the gap is not in the fetch but in everything
+  Metal's sampler state decides. The 64-bit `constexpr sampler` word is still not decoded
+  (section 3.3), every coordinate checked is a texel centre where nearest filtering has no
+  weights to round, and the integer-typed reads and samples are not checked at all because
+  `air_run` binds one float texture and a shader declaring an integer one against it is a type
+  mismatch whose answer would mean nothing.
 - **Nothing here tests Metal's own filtering or addressing.** The six texture shaders that drew on
   the Adreno took their sampler from the API, which this harness chose: nearest, clamped, sampled
   at a texel centre. That is evidence about binding, descriptors and ir3's texture instructions —
@@ -596,6 +607,43 @@ Three references, each independent of the translator:
    those stay untested because the names Apple would emit for them are a guess, and a test of a
    guessed name is a test of the guess.
 
+6. **The texture operations, on more than one texel.** `tools/air/texcheck.sh` runs the corpus's
+   own texture shaders and 6 of its 55 return the exact texel on the Adreno; 49 cannot be run,
+   most of them because they are `air.visible` library functions and not entry points. Two things
+   that leaves undone, and the second is the serious one:
+
+   - whole operations have no coverage from it at all — the texel fetch, the size queries;
+   - **every one of those six samples the same texel**, `(1, 1)`, because that is where
+     `air_run`'s vertex shader puts the coordinate. A lowering that ignored the coordinate
+     entirely and always fetched `(1, 1)` would pass all six of them.
+
+   `tools/air/texopcheck.py` generates a fragment shader per operation *and coordinate*, asking
+   for the corners as well as the middle. **All 17 calls return the exact texel**, covering six
+   declarations: `read_texture_2d` with 32- and with 16-bit coordinates, `get_width_texture_2d`,
+   `get_height_texture_2d`, `sample_texture_2d` and `sample_texture_3d`. The coordinates are
+   immediates here, unlike the arithmetic: a texture fetch is not constant-folded by NIR or by
+   ir3, so there is nothing for the compiler to answer in the shader's place and no buffer is
+   needed.
+
+   Made to fail: swapping the first two coordinate components is caught on all five asymmetric
+   coordinates and correctly *not* on the three symmetric ones, which is the difference between
+   this and `texcheck.sh` stated as a measurement rather than an argument.
+
+   **What it does not check**, and these are the texture half's real remaining gaps:
+
+   - Metal's own sampler state. The sampler is the API's — nearest, clamped — and every
+     coordinate is a texel centre, where nearest filtering has no weights to round and clamping
+     has no arithmetic. The 64-bit `constexpr sampler` word remains undecoded (section 3.3).
+   - The integer-typed reads and samples (`read_texture_2d.s.v4i16`,
+     `sample_texture_2d.u.v4i32` and the rest, 14 declarations). `air_run` binds one
+     `r32g32b32a32_float` texture, and a shader declaring an integer texture against it is a type
+     mismatch whose result would say nothing about the lowering. Binding a texture whose format
+     follows the declaration is a change to `air_run` that is not made.
+   - `write_texture_2d`, which needs the texture read back after the draw, and the multisample
+     reads, which need a multisample texture. Neither is bound.
+   - The depth sample: nothing binds a depth texture, and a shader reading an attachment nothing
+     stored to is one of the four tests this port has already had pass for the wrong reason.
+
 Where a shader has a known GLSL equivalent (AppleMetalGLRenderer's shaders *are* the GL
 pipeline's fixed functions), rendering both through the port's GLES and comparing images is a
 fourth check; it is not built yet.
@@ -927,6 +975,7 @@ tools/air/atomiccheck.py [--keep DIR]                      # the atomics, with i
 build/mesa-host/build/src/gallium/drivers/freedreno/air_run \
         FILE[.metallib] [FUNCTION]                         # draw with it, print the pixel
 tools/air/texcheck.sh [FILE.metallib ...]                  # every texture shader, the texel it returns
+tools/air/texopcheck.py [-v] [--keep DIR]                  # the texture calls, several texels each
 ```
 
 `intrincheck.py` with no argument checks every operation the corpus calls; with one or more names
