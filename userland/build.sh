@@ -107,7 +107,11 @@ rm -rf root
 mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
 cp obj/init root/sbin/init
 cp obj/child root/bin/child
-[ -f obj/var_store ] && cp obj/var_store root/bin/      # the data volume into the flash and back (src/var_store.c)
+# The data volume into the flash and back (src/var_store.c), and the job that saves it when a run
+# ends: the program and its job together, away from the iOS job list below, which several working
+# copies are editing at once.
+[ -f obj/var_store ] && cp obj/var_store root/bin/
+cp com.redwood.varstore.plist root/LaunchDaemons/
 echo "Darwin on redwood: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
@@ -226,7 +230,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
 	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory)
-	cp com.redwood.demo.plist com.redwood.wifi.plist com.redwood.varstore.plist root/LaunchDaemons/
+	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
