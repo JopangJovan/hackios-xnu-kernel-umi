@@ -10,10 +10,17 @@
 # App Store, Podcasts and the Weather widget for half a minute each, with `xl screenshot` from another
 # terminal while each is open. Icon places are the first home-screen page (docs/homescreen.jpg).
 #
-# Before the run, from this working copy: `./xl reload` (the loader has to be this copy's -- one left
-# resident by another copy may not put ufs_shared_pa= on the kernel's command line, and then the kernel's
-# UFS driver never comes up, /dev/ufs_darwin never appears, "mount /dev/ufs_darwin: No such file or
-# directory", and the boot falls back to /sbin/launchd.ios, which exists only in the RAM image), then
+# Before the run: do NOT reload the loader as a reflex. The persist copy's resident loader is the main
+# line's plus a window for writes into darwin, and it keeps the page's version and size so any kernel reads
+# it as its own -- reloading over it stops that copy's runs being able to save, and its note on the phone
+# asks you to say so there if you do. Reload only if you have changed xnuloader yourself.
+# That said, one boot here did need it and the reason is not settled: with a loader left resident by
+# another copy, the kernel got no ufs_shared_pa= on its command line, so its UFS driver never came up,
+# /dev/ufs_darwin never appeared ("mount /dev/ufs_darwin: No such file or directory") and the boot fell
+# back to /sbin/launchd.ios, which exists only in the RAM image. `./xl reload` with this copy's prebuilt
+# loader fixed it immediately. So either that particular resident loader was not the persist one, or the
+# "any kernel" claim does not hold for a prebuilt kernel. Check the command line in the log for
+# ufs_shared_pa= before reaching for reload. Then
 # `./xl ramdisk userland/flashboot.apfs`, then
 #   XL_CMDLINE="root_apfs=ufs_darwin ufs=2 ufs_native=1 bootcpu=7 cpus=8 cpufreq=1 touchscreen=1 gpu=1 \
 #               adsp=1 wifi=1" XL_SECS=260 ./xl run
