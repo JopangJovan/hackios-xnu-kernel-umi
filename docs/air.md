@@ -207,7 +207,7 @@ key (of 456), so the order of work follows it.
 | --- | --- |
 | `air.position` | `load_frag_coord`; `origin_upper_left`, half-integer centres (Metal's convention, and Adreno's natively); `.w` is 1/w as in GL |
 | `air.fragment_input "name"` | `shader_in`, `VARYING_SLOT_VAR0 + k` matched to the vertex output **by name** (7.5) |
-| `air.center` / `air.centroid` / `air.sample` | plain / `centroid` / `sample` on the variable |
+| `air.center` / `air.centroid` / `air.sample` | plain / `centroid` / `sample` on the variable (`air.center` is the default and is therefore read by not being looked for) |
 | `air.perspective` / `air.no_perspective` / `air.flat` | `INTERP_MODE_SMOOTH` / `NOPERSPECTIVE` / `FLAT` |
 | `air.front_facing` | `load_front_face` |
 | `air.sample_id`, `air.sample_mask` (input) | `load_sample_id`, `load_sample_mask_in` |
@@ -215,7 +215,7 @@ key (of 456), so the order of work follows it.
 | output `air.render_target i32 n, i32 idx` | `FRAG_RESULT_DATA0 + n`, dual-source index `idx` |
 | output `air.depth` + `air.depth_qualifier any/greater/less` | `FRAG_RESULT_DEPTH`, `info.fs.depth_layout` |
 | output `air.sample_mask` / `air.stencil` | `FRAG_RESULT_SAMPLE_MASK` / `FRAG_RESULT_STENCIL` |
-| `air.discard_fragment` | `demote` (Metal keeps the fragment alive for derivatives) |
+| `air.discard_fragment` | `demote` (Metal keeps the fragment alive for derivatives) — **not implemented**; no corpus module uses it, and a shader that did would fail with `intrinsic: air.discard_fragment` |
 
 **Compute stage**
 
@@ -767,6 +767,16 @@ Needed on this machine: meson, ninja, bison, flex, python3 with venv, and LLVM's
 
 ## 7. What this decides for the runtime (2) and the kernel ABI (3)
 
+**Read this as intent, not as design.** The runtime and the kernel ABI do not exist; nothing below
+has been built against, and none of it is a measurement. What each item *is* is the consequence
+that this frontend's choices force on whoever writes those parts — so an item can be wrong in two
+ways: the consequence may be mis-stated, or the frontend may have changed since. Where the
+frontend already does its half, the item says so; where it does not, the item is a promise nobody
+has kept yet. The one thing here that has been exercised at all is item 2's buffer binding, and
+only through `air_run`, which is not a Metal runtime and binds by the same indices the frontend
+reports.
+
+
 1. **Compilation happens at pipeline creation, not at `newLibraryWithData:`.** Function constants
    (`newFunctionWithName:constantValues:`), vertex/fragment varying linking and visible-function
    linking are only known then. The library step can translate eagerly and cache NIR; the ir3
@@ -774,6 +784,9 @@ Needed on this machine: meson, ninja, bison, flex, python3 with venv, and LLVM's
    `MTLCompilerService`; whether this runtime does the same is a decision for (2), and NIR
    serialization — `nir_serialize` — makes either possible.)
 2. **Buffers are bound per stage by index, as UBOs (constant) and SSBOs (device).**
+   *(The frontend's half is done: it emits `load_ubo`/`load_ssbo` at Metal's own index and reports
+   the kind per index in `air_shader_info`. `air_run` binds by those indices and the results come
+   back right, which is the only thing that has tested this.)*
    `setVertexBuffer:offset:atIndex:` maps to the UBO or SSBO slot `index` of that stage; the
    frontend reports which kind each index is. Adreno's UBO and SSBO base addresses have alignment
    rules Metal's offsets do not (Metal allows 4-byte offsets for constant buffers); the runtime
@@ -791,8 +804,13 @@ Needed on this machine: meson, ninja, bison, flex, python3 with venv, and LLVM's
    not by location: a pipeline-time link step assigns the same `VARYING_SLOT_VAR*` to the same
    name on both sides. Visible functions (CoreImage's 135 stitchable kernels are all of this
    kind) are linked into the calling shader by name with `nir_link_shader_functions`.
-6. **Clip space and the framebuffer are Metal's:** NDC depth is [0, 1] (`clip_halfz`), the
+6. *(Half done: the frontend sets `origin_upper_left` on the fragment shader. `clip_halfz` is
+   rasterizer state and nothing sets it — `air_run` never needed it, because its quad is already
+   in clip space.)* **Clip space and the framebuffer are Metal's:** NDC depth is [0, 1] (`clip_halfz`), the
    framebuffer origin is the top-left; the frontend emits no flips, the runtime's viewport and
    rasterizer state must say this.
 7. **Inline samplers** (`constexpr sampler` in the source, `!air.sampler_states`) are created by
-   the runtime from the state the frontend decodes and bound after the API's samplers.
+   the runtime and bound after the API's samplers. *(Half done, and the half that is missing is
+   the important one: the frontend assigns the index and passes the state word through, but it
+   does **not** decode it — section 3.3. The earlier wording here said "from the state the
+   frontend decodes", which was never true.)*
