@@ -68,11 +68,31 @@
  * something that never arrives, which is why no header is ever added, no session asked for, no task
  * made and nothing resumed. The anisette guess is ruled out with the other three: none is entered.
  *
- * Where to look next: name the code that waits. The fault reporter here already walks frame pointers
- * (say_the_fault), and the same walk at thenWithBlock: for the request's promise would print unslid
- * return addresses that "ipsw dyld a2s" turns into the function that built the chain. The input
- * promise is in the log too, created a moment before the request's (0x101709240 above), and it is
- * never finished either.
+ * AND THE THREADS SAY WHY, which is a bigger thing than the bag. All eleven threads of the daemon
+ * are waiting (run state 3; one idle libdispatch worker in __workq_kernreturn, so the queues are not
+ * starved of threads), and four of them are in the same place:
+ *   -[AMSBagValue valueWithError:] -> -[AMSPromise resultWithError:] -> resultBeforeDate:error:
+ *   -> -[NSConditionLock lockWhenCondition:beforeDate:] -> -[NSCondition waitUntilDate:]
+ * -- a thread blocked until the bag loads. Walking every thread's frames and giving them to
+ * "ipsw dyld a2s" names the circle:
+ *   -[AMSBagNetworkTask performFetch]_block_invoke
+ *     -> -[AMSBagActiveAccountProvider bagStorefrontForAccountMediaType:]
+ *       -> _bagAccountForAccountMediaType:mustContainStorefront:
+ *         -> -[ACAccountStore _ams_localiTunesAccountAfterUpdatingStorefront:]
+ *           -> -[AMSPromise resultWithError:], for ever
+ * while the promise it waits on is finished by the continuation of
+ * _fetchLocaliTunesAccountForAccountType:shouldUpdateStorefront: running
+ * _updateStorefrontInLocalAccount:, which is blocked in resultWithError: on another thread. The
+ * thread that would fetch the bag waits on an account update that waits on the bag.
+ * (The same walk explains an earlier puzzle: the cookies are added by the FOUR-argument
+ * ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:, inside
+ * -[AMSURLRequestEncoder requestByEncodingRequest:parameters:], which is why a hook on the
+ * three-argument one was never entered.)
+ * Answering _ams_localiTunesAccountAfterUpdatingStorefront: at once (above) does cut that wait --
+ * _bagAccountForAccountMediaType: goes from blocked to 3 entered 3 returned -- and the bag still
+ * does not load: four threads are still blocked in resultBeforeDate:error: elsewhere. So the stall
+ * is not one method; AMS's promises in this daemon are not being completed at all, and the bag is
+ * only the one we were watching. That is the next thing to take apart.
  *
  * Two things this library learned about itself, for whoever writes the next one:
  *   - class_getInstanceMethod walks up the chain, so replacing what a class only INHERITS replaces it
@@ -82,6 +102,8 @@
  *     memory signals says nothing at all about the usual way a replacement of ours kills a daemon.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach.h>
+#include <mach/thread_act.h>
 #include <mach-o/dyld.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -127,7 +149,8 @@ enum {
 	COUNT_performRequestBlock, COUNT_resume, COUNT_resumeLocal, COUNT_createRequest, COUNT_sessionPromise,
 	COUNT_dataTaskPromise, COUNT_dataTask, COUNT_addCookies, COUNT_addStorefrontHeader, COUNT_addAnisette,
 	COUNT_prepareRequest, COUNT_finishWithResult, COUNT_finishWithError, COUNT_finishFunnel,
-	COUNT_finishResultError, COUNT_thenWithBlock, COUNT_continueWithBlock, COUNT_last
+	COUNT_finishResultError, COUNT_thenWithBlock, COUNT_continueWithBlock, COUNT_bagValue,
+	COUNT_resultBefore, COUNT_afterUpdating, COUNT_last
 };
 static const char *const counted[COUNT_last] = {
 	"-[ACAccount ams_storefront]", "-[AMSBagNetworkDataSource cachedStorefront]",
@@ -145,7 +168,10 @@ static const char *const counted[COUNT_last] = {
 	"-[AMSURLSession _prepareRequest:properties:error:]", "-[AMSMutablePromise finishWithResult:]",
 	"-[AMSMutablePromise finishWithError:]", "-[AMSMutablePromise _finishWithResult:error:logDuplicateFinishes:]",
 	"-[AMSMutablePromise finishWithResult:error:]", "-[AMSMutablePromise thenWithBlock:]",
-	"-[AMSMutablePromise continueWithBlock:]",
+	"-[AMSMutablePromise continueWithBlock:]", "-[AMSBagValue valueWithError:]",
+	"-[AMSPromise resultBeforeDate:error:]",
+	"-[AMSBagValue valueWithError:]", "-[AMSPromise resultBeforeDate:error:]",
+	"-[ACAccountStore _ams_localiTunesAccountAfterUpdatingStorefront:]",
 };
 static unsigned long entered[COUNT_last];
 /*
@@ -213,28 +239,89 @@ step_out(int which, unsigned n, bool got_something)
  * "Failed to send exception EXC_CORPSE_NOTIFY" and nothing else, so a fault in here would be a
  * silent exit. This turns one into an address, unslid, which "ipsw dyld a2s" turns into a name.
  */
+/*
+ * Up the frame pointers: on arm64 each frame holds the previous one at [fp] and its return address
+ * at [fp + 8]. Unslid, so that "ipsw dyld a2s" turns each into a name.
+ */
+static void
+frames_from(uintptr_t fp, char *text, size_t size)
+{
+	size_t used = 0;
+
+	text[0] = 0;
+	for (unsigned i = 0; i < 10 && fp != 0 && (fp & 7) == 0 && used + 20 < size; i++) {
+		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+		if (ret == 0) {
+			break;
+		}
+		used += (size_t)snprintf(text + used, size - used, " %#lx", ret - slide);
+		fp = next > fp ? next : 0;      /* the chain only ever goes up the stack */
+	}
+}
+
+/*
+ * Every thread of the daemon, where it is and how it got there. Seventeen continuations are attached
+ * to promises in a session and exactly one promise is ever finished, which is not a fact about the
+ * bag: a promise completes when something runs its continuation, and continuations run on dispatch
+ * queues, so a queue that is never serviced stops everything behind it. This says what each thread is
+ * doing -- waiting in mach_msg for a reply that never comes, parked in __ulock_wait, or not there at
+ * all -- and the run state and suspend count tell "blocked" from "never started", which are
+ * different problems with different fixes. Nothing is suspended to read it: a snapshot taken by
+ * stopping threads could stop one inside the write() this very line needs.
+ */
+static void
+dump_threads(void)
+{
+	thread_act_array_t threads = NULL;
+	mach_msg_type_number_t count = 0;
+	mach_port_t me = mach_task_self();
+
+	if (task_threads(me, &threads, &count) != KERN_SUCCESS) {
+		say("redwood: appstored: task_threads() refused\n");
+		return;
+	}
+	say("redwood: appstored: %u threads\n", count);
+	for (unsigned i = 0; i < count; i++) {
+		arm_thread_state64_t state;
+		mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+		struct thread_basic_info basic;
+		mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
+		char text[10 * 20 + 1] = "";
+		int run_state = -1, suspend = -1;
+
+		if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&basic, &basic_count) == KERN_SUCCESS) {
+			run_state = basic.run_state;
+			suspend = basic.suspend_count;
+		}
+		if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&state, &state_count) != KERN_SUCCESS) {
+			say("redwood: appstored: thread %u: no state (run %d)\n", i, run_state);
+			continue;
+		}
+		frames_from((uintptr_t)arm_thread_state64_get_fp(state), text, sizeof(text));
+		say("redwood: appstored: thread %u: run %d suspend %d pc %#lx lr %#lx from%s\n", i, run_state, suspend,
+		    (uintptr_t)arm_thread_state64_get_pc(state) - slide,
+		    (uintptr_t)arm_thread_state64_get_lr(state) - slide, text);
+	}
+	for (unsigned i = 0; i < count; i++) {
+		mach_port_deallocate(me, threads[i]);
+	}
+	vm_deallocate(me, (vm_address_t)threads, count * sizeof(threads[0]));
+}
+
 static void
 say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 {
 	ucontext_t *context = context_in;
 	uintptr_t pc = 0, lr = 0, fp = 0;
-	char frames[8 * 20 + 1] = "";
-	size_t used = 0;
+	char frames[10 * 20 + 1] = "";
 
 	if (context != NULL && context->uc_mcontext != NULL) {
 		pc = (uintptr_t)context->uc_mcontext->__ss.__pc;
 		lr = (uintptr_t)context->uc_mcontext->__ss.__lr;
 		fp = (uintptr_t)context->uc_mcontext->__ss.__fp;
 	}
-	for (unsigned i = 0; i < 8 && fp != 0 && (fp & 7) == 0; i++) {
-		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
-
-		if (ret == 0) {
-			break;
-		}
-		used += (size_t)snprintf(frames + used, sizeof(frames) - used, " %#lx", ret - slide);
-		fp = next > fp ? next : 0;      /* the chain only ever goes up the stack */
-	}
+	frames_from(fp, frames, sizeof(frames));
 	say("redwood: appstored: signal %d at %p, pc %#lx, lr %#lx, called from%s (unslid)\n", signal_number,
 	    info != NULL ? info->si_addr : NULL, pc - slide, lr - slide, frames);
 	signal(signal_number, SIG_DFL);
@@ -486,6 +573,7 @@ late_report(__unused void *ignored)
 		say("redwood: appstored: entered %4lu returned %4lu %s%s\n", entered[i], returned[i], counted[i],
 		    entered[i] > returned[i] ? "   <-- STILL IN IT" : "");
 	}
+	dump_threads();
 	dump_selectors("AMSURLSession", "equest");
 	dump_selectors("AMSMutablePromise", NULL);
 	dump_selectors("AMSBagNetworkTask", " queryItems");
@@ -619,6 +707,76 @@ new_##name(id self, SEL cmd, void *a, void *b, void *c) \
 }
 
 /* the funnel every finished promise goes through, and the two ways of waiting on one */
+/*
+ * THE WAIT THAT MATTERS, and the one thing this library changes besides answering a storefront.
+ * Resolved from the threads' own frames:
+ *   -[AMSBagNetworkTask performFetch]_block_invoke
+ *     -> -[AMSBagActiveAccountProvider bagStorefrontForAccountMediaType:]
+ *       -> -[AMSBagActiveAccountProvider _bagAccountForAccountMediaType:mustContainStorefront:]
+ *         -> -[ACAccountStore(AppleMediaServices_Project) _ams_localiTunesAccountAfterUpdatingStorefront:]
+ *           -> -[AMSPromise resultWithError:] -> NSConditionLock -> waits for ever
+ * and the promise it waits for would be finished by the continuation of
+ * _fetchLocaliTunesAccountForAccountType:shouldUpdateStorefront:, which runs
+ * _updateStorefrontInLocalAccount: -- itself blocked in resultWithError: on another thread. The
+ * local account has no storefront to update and nothing can give it one without the bag, so the
+ * thread that would fetch the bag waits for an account update that waits for the bag.
+ * So this answers it at once, with the local account as it is: no update, no promise, no wait. The
+ * storefront that account answers with is ours, from the getter above.
+ */
+static id (*old_afterUpdating)(id, SEL, void *);
+static id
+new_afterUpdating(id self, SEL cmd, void *storefront)
+{
+	id account;
+
+	(void)storefront;
+	entered[COUNT_afterUpdating]++;
+	account = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("ams_localiTunesAccount"));
+	returned[COUNT_afterUpdating]++;
+	say("redwood: appstored: _ams_localiTunesAccountAfterUpdatingStorefront: answered at once, %s\n",
+	    account != NULL ? "with the local account" : "with nothing");
+	return account;
+}
+
+/*
+ * The synchronous wait itself. Four of the daemon's eleven threads sit in
+ * -[AMSBagValue valueWithError:] -> -[AMSPromise resultWithError:] -> resultBeforeDate:error: ->
+ * NSConditionLock, which is a thread blocked until the bag loads. Who does that, and whether one of
+ * them is on the bag's own load path, is the difference between "the store is waiting" and "the bag
+ * load is waiting on the bag". These are entered and not left on purpose, so entered > returned here
+ * is the measurement, not a fault.
+ */
+static void *(*old_bagValue)(id, SEL, void *);
+static void *
+new_bagValue(id self, SEL cmd, void *error)
+{
+	char frames[10 * 20 + 1] = "";
+	void *result;
+
+	entered[COUNT_bagValue]++;
+	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
+	say("redwood: appstored: WAIT -[AMSBagValue valueWithError:] from%s\n", frames);
+	result = old_bagValue(self, cmd, error);
+	returned[COUNT_bagValue]++;
+	say("redwood: appstored: WAIT -[AMSBagValue valueWithError:] came back %s\n", result ? "with a value" : "empty");
+	return result;
+}
+
+static void *(*old_resultBefore)(id, SEL, void *, void *);
+static void *
+new_resultBefore(id self, SEL cmd, void *date, void *error)
+{
+	char frames[10 * 20 + 1] = "";
+	void *result;
+
+	entered[COUNT_resultBefore]++;
+	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
+	say("redwood: appstored: WAIT promise %p resultBeforeDate: from%s\n", (void *)self, frames);
+	result = old_resultBefore(self, cmd, date, error);
+	returned[COUNT_resultBefore]++;
+	return result;
+}
+
 /* this one says which promise, because one promise in seventeen is finished and we want its name */
 static void *(*old_finishFunnel)(id, SEL, void *, void *, void *);
 static void *
@@ -639,8 +797,11 @@ new_thenWithBlock(id self, SEL cmd, void *a)
 {
 	void *result;
 
+	char frames[10 * 20 + 1] = "";
+
 	entered[COUNT_thenWithBlock]++;
-	say("redwood: appstored: PROMISE %p waited on (then)\n", (void *)self);
+	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
+	say("redwood: appstored: PROMISE %p waited on (then) from%s\n", (void *)self, frames);
 	result = old_thenWithBlock(self, cmd, a);
 	returned[COUNT_thenWithBlock]++;
 	return result;
@@ -651,8 +812,11 @@ new_continueWithBlock(id self, SEL cmd, void *a)
 {
 	void *result;
 
+	char frames[10 * 20 + 1] = "";
+
 	entered[COUNT_continueWithBlock]++;
-	say("redwood: appstored: PROMISE %p waited on (continue)\n", (void *)self);
+	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
+	say("redwood: appstored: PROMISE %p waited on (continue) from%s\n", (void *)self, frames);
 	result = old_continueWithBlock(self, cmd, a);
 	returned[COUNT_continueWithBlock]++;
 	return result;
@@ -710,6 +874,10 @@ static struct replacement replacements[] = {
 	{ "AMSMutablePromise", "thenWithBlock:", false, (IMP)new_thenWithBlock, (IMP *)&old_thenWithBlock, false },
 	{ "AMSMutablePromise", "continueWithBlock:", false, (IMP)new_continueWithBlock, (IMP *)&old_continueWithBlock,
 	  false },
+	{ "ACAccountStore", "_ams_localiTunesAccountAfterUpdatingStorefront:", false, (IMP)new_afterUpdating,
+	  (IMP *)&old_afterUpdating, false },
+	{ "AMSBagValue", "valueWithError:", false, (IMP)new_bagValue, (IMP *)&old_bagValue, false },
+	{ "AMSPromise", "resultBeforeDate:error:", false, (IMP)new_resultBefore, (IMP *)&old_resultBefore, false },
 	{ "NSURLSessionTask", "resume", false, (IMP)new_resume_base, (IMP *)&old_resume_base, false },
 	{ "__NSCFLocalSessionTask", "resume", false, (IMP)new_resume_local, (IMP *)&old_resume_local, false },
 };

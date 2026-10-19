@@ -1805,10 +1805,42 @@ PROMISE 0x101414370 finished          <- единственный, и друго
 приходит, — оттого и ни одного добавленного заголовка, ни запрошенной сессии, ни задачи, ни `resume`.
 Догадка про anisette не подтвердилась вместе с остальными тремя: ни один из четырёх шагов не вызывается.
 
-Следующий шаг — назвать того, кто ждёт. Сторож аварий в этой же библиотеке уже умеет ходить по кадрам
-стека; та же прогулка в `thenWithBlock:` для промиса запроса напечатает несмещённые адреса возврата,
-которые `ipsw dyld a2s` превращает в имя функции. Входной промис тоже виден в журнале (0x101709240,
-создан мгновением раньше) и тоже не завершается никогда.
+**И потоки объясняют почему — это больше, чем история про мешок.** Та же прогулка по кадрам стека, что
+у сторожа аварий, но по **всем** потокам демона (`task_threads` + `thread_get_state`), на 150-й секунде:
+все одиннадцать потоков ждут (состояние 3), причём один — простаивающий рабочий `libdispatch`
+(`__workq_kernreturn`), так что потоков очередям хватает. Четыре стоят в одном и том же месте:
+
+```
+-[AMSBagValue valueWithError:] -> -[AMSPromise resultWithError:] -> resultBeforeDate:error:
+  -> -[NSConditionLock lockWhenCondition:beforeDate:] -> -[NSCondition waitUntilDate:]
+```
+
+то есть поток, заблокированный до загрузки мешка. Адреса через `ipsw dyld a2s` называют круг:
+
+```
+-[AMSBagNetworkTask performFetch]_block_invoke
+  -> -[AMSBagActiveAccountProvider bagStorefrontForAccountMediaType:]
+    -> _bagAccountForAccountMediaType:mustContainStorefront:
+      -> -[ACAccountStore _ams_localiTunesAccountAfterUpdatingStorefront:]
+        -> -[AMSPromise resultWithError:], навсегда
+```
+
+а промис, которого он ждёт, завершается продолжением
+`_fetchLocaliTunesAccountForAccountType:shouldUpdateStorefront:`, выполняющим
+`_updateStorefrontInLocalAccount:`, — и оно само заблокировано в `resultWithError:` на другом потоке.
+**Поток, который загрузил бы мешок, ждёт обновления учётной записи, которое ждёт мешка.**
+
+Та же прогулка разъяснила и загадку помельче: куки добавляет **четырёхаргументный**
+`ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:` внутри
+`-[AMSURLRequestEncoder requestByEncodingRequest:parameters:]`, поэтому перехват трёхаргументного
+никогда и не срабатывал.
+
+Если отвечать на `_ams_localiTunesAccountAfterUpdatingStorefront:` сразу (библиотека так и делает), это
+ожидание снимается — `_bagAccountForAccountMediaType:` становится «3 входа, 3 выхода» вместо
+заблокированного, — но мешок всё равно не грузится: четыре потока по-прежнему стоят в
+`resultBeforeDate:error:` в других местах. Значит, дело не в одном методе: промисы AMS в этом демоне не
+завершаются вообще, а мешок — просто тот, за которым мы наблюдали. Это и есть следующее, что надо
+разбирать.
 
 Две вещи, которые стоили по прогону и которые стоит знать тому, кто будет писать следующую такую
 библиотеку. `class_getInstanceMethod` идёт вверх по цепочке, и подмена метода, который класс только
