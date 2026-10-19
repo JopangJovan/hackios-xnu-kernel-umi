@@ -17,7 +17,11 @@ left out as too big really is absent. With the iOS volume on the phone's flash a
 FLASHBOOT=1), the root is Apple's whole volume: --root-volume names the technical listing of its image
 (ios165/rootfs.slt) and a program counts as there if Apple ships it. Seven jobs turn on that --
 fairplayd, identityservicesd, passd, assistantd, callservicesd, lskdd, searchpartyd -- and were being
-refused on a flash boot for a reason true only of the thinned copy here. Eight more, Safari's and
+refused on a flash boot for a reason true only of the thinned copy here. (fairplayd now runs on the phone
+and is never missed from a lookup again, but it does not stay: it exits 0 the moment it starts, says nothing,
+and KeepAlive brings it back every ten seconds -- 22 times in a session, not one signal. It wants the IOKit
+user client com_apple_driver_FairPlayIOKitUserClient, which this kernel has not got. The empty App Store and
+Weather were never its doing: see the network section of README.md.) Eight more, Safari's and
 AuthenticationServicesAgent, hang on the App cryptex being unpacked beside it at all (see CRYPTEXES
 below); a workspace used to lose those silently, which tools/new-workspace.sh no longer does.
 
