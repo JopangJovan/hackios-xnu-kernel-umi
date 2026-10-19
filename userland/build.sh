@@ -17,6 +17,8 @@
 #                                   (default: src/inject.c in backboardd, src/inject_sb.c in SpringBoard,
 #                                   src/inject_media.c in mediaserverd);
 #                                   init hands the list to the kernel (etc/inject.conf -> sysctl kern.exec_inject)
+#                      STOREFRONT=1 ... and src/inject_store.c inside appstored: the storefront answered,
+#                                   and a bag request watched for (an experiment; see that file)
 #                      EXTRA="..."  more programs for /redwood/bin (files on this machine): one-off
 #                                   diagnostics, which a file given as RC_JOBS can then run
 #                      RC_JOBS=<file> what the job com.redwood.demo runs: rc.jobs (default), or
@@ -100,6 +102,13 @@ INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd cont
 /redwood/lib/libredwood-media.dylib mediaserverd
 /redwood/lib/libredwood-app.dylib Sileo
 /redwood/lib/libredwood-tweaks.dylib Preferences"}
+# STOREFRONT=1: and a library of ours inside appstored as well (src/inject_store.c). It is not in the
+# list above because it changes what the daemon believes: AMS's account is made to answer with the
+# storefront Apple's bag server returned for this device, which is how the App Store is asked whether
+# a storefront is the only thing it is missing. It also writes down whether a bag request is ever
+# built at all. For an experiment, not for an image anybody else boots.
+[ -n "$STOREFRONT" ] && INJECT="$INJECT
+/redwood/lib/libredwood-store.dylib appstored"
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -190,6 +199,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libredwood-media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
+		# ... and inside appstored (STOREFRONT=1), which answers with a storefront and watches for a bag
+		# request being built (src/inject_store.c)
+		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-store.dylib -framework CoreFoundation -lobjc \
+			-o obj/libredwood-store.dylib src/inject_store.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
 		$DYN -bundle -framework CoreFoundation -o obj/RedwoodAudio src/audio_plugin.c
 		if [ -n "$GL" ]; then
@@ -232,6 +245,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
+	[ -f obj/libredwood-store.dylib ] && cp obj/libredwood-store.dylib root/lib/
 	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
 	[ -f obj/libredwood-tweaks.dylib ] && cp obj/libredwood-tweaks.dylib root/lib/
 	if [ -f obj/RedwoodAudio ]; then

@@ -43,10 +43,11 @@
 /redwood/bin/rwtouch wait 55 swipe 0.5 0.985 0.5 0.3 250 wait 20
 /redwood/bin/net_test waitaddr en0 60
 /redwood/bin/net_test fetch https://bag.itunes.apple.com/bag.xml
-# the account as it stands, then the number the bag server gave THIS device, by AMS's own setter.
-# (Answered, and the answer is no: the value sets in memory and does not keep, because AMS's local
-# account is made fresh every boot and accountsd has no iTunes account at all. See src/store_test.m.)
-/redwood/bin/store_test user 501 set 143469-2,8
+# the account as it stands (setting it from here was tried and cannot work: the value does not keep,
+# AMS's local account being made fresh every boot and accountsd holding no iTunes account at all --
+# see src/store_test.m). The storefront is answered inside appstored instead, by the library
+# src/inject_store.c, which a build with STOREFRONT=1 puts there.
+/redwood/bin/store_test user 501 show
 # and only then the store, open long enough to time out (30 s) and try again
 /redwood/bin/rwtouch tap 0.615 0.59 wait 95
 /bin/ps -A

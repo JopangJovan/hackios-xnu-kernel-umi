@@ -1705,6 +1705,42 @@ store_test: after: ams_localiTunesAccount: STOREFRONT (null)
 `src/inject_sb.c` и соседние). Она и положила бы витрину на ту самую учётную запись, которой
 пользуется AMS, и заодно показала бы, строится ли запрос мешка вообще.
 
+**Внутри `appstored`: витрина отвечена, запрос мешка строится, переносом не становится.** Раз снаружи
+витрину не отдать, её отвечают изнутри: `userland/src/inject_store.c` — библиотека, которую сборка с
+`STOREFRONT=1` подсаживает в `appstored` (тот же механизм `INJECT`, что и для SpringBoard). Она ничего не
+записывает: она подменяет *геттеры*, через которые AMS спрашивает витрину (`-[ACAccount ams_storefront]`
+и соседей), и заодно считает входы в шаги запроса. За 150 с после старта демона, уже после начального
+потока на консоли:
+
+```
+entered    3 -[ACAccount ams_storefront]                            (было (nil), стало 143469-2,8)
+entered    3 -[AMSBagActiveAccountProvider _bagAccountForAccountMediaType:mustContainStorefront:]
+entered    1 -[AMSBagNetworkTask _performFetchWithAttemptedCount:account:storefront:]
+entered    1 -[AMSBagNetworkTask _createRequestWithQueryItems:]  ->  <AMSMutablePromise: ...>
+entered    0 -[AMSBagNetworkTask URLSessionPromise]
+entered    0 -[AMSURLSession dataTaskPromiseWithRequest:]
+entered    0 -[AMSURLSession dataTaskWithRequest:]
+entered    0 -[NSURLSessionTask resume]
+```
+
+То есть **витрина и была воротами: с ней AMS запрос мешка строит** («BAG FETCH attempt 0, storefront
+143469-2,8, account local (…)»). И переносом этот запрос не становится: он собирается в
+`AMSMutablePromise`, который никто не разрешает, поэтому сессия не запрашивается, задача не создаётся и
+`resume` не зовётся ни разу — ни для мешка, ни вообще, за весь шестиминутный сеанс. Отсюда и пустота в
+журнале соединений ядра. Магазин по-прежнему показывает «LOADING»: мешок не загрузился.
+
+Следующий шаг — на шаг глубже: чего ждёт этот промис запроса. Это кодировщик запроса и заголовки, которые
+AMS добавляет перед отправкой (`ams_addCookiesForAccount:clientInfo:bag:`,
+`ams_addStoreFrontHeaderForAccount:client:withBag:`, `ams_addAnisetteHeadersForAccount:type:bag:`,
+`-[AMSURLSession _prepareRequest:properties:error:]`). Что-то из этого не возвращается.
+
+Две вещи, которые стоили по прогону и которые стоит знать тому, кто будет писать следующую такую
+библиотеку. `class_getInstanceMethod` идёт вверх по цепочке, и подмена метода, который класс только
+**наследует**, подменяет его всем остальным наследникам: подмена категории `NSObject` перезапустила
+`appstored` 31 раз за прогон. И исключение Objective-C кончается `abort()`, а не `SIGSEGV`, так что
+сторож аварий, который слушает только сигналы памяти, о такой смерти не скажет ничего (теперь слушает
+`SIGABRT`, `SIGILL` и `SIGTRAP` тоже).
+
 **`mobileactivationd` — ещё одна служба из списка «никогда не пробовали».** Её спрашивал как раз
 `appstored` (четыре ненайденных обращения за сеанс и двадцать строк «[HRNSupport] Failed to copy activation
 record ... MobileActivation.ErrorDomain Code=-1 "IPC Error"» из каждого потока, который трогает мешок).
