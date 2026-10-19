@@ -578,17 +578,32 @@ text_of(id object)
  * The dimming itself is right and stays: two draws of a flat black at 11.4 per cent, which is the
  * shadow one expects to see. Only the wash is left out, because a wash of a colour that is not the
  * wallpaper's is worse than no wash at all. When something here can give PaperBoardUI a real
- * picture of the wallpaper, this hook is what should go.
+ * picture of the wallpaper, this hook is what should go -- and until then switcher_wallpaper=1
+ * among the boot-args puts it back as iOS asks for it, so that whoever works on the wallpaper can
+ * see at once whether their picture arrives, without rebuilding an image to find out.
  */
 static void (*original_switcher_wallpaper_overlay)(id self, SEL selector);
 
 static void
-switcher_wallpaper_overlay(__unused id self, __unused SEL selector)
+switcher_wallpaper_overlay(id self, SEL selector)
 {
+	static int wanted = -1;         /* boot-arg switcher_wallpaper=1: have it back, placeholder and all */
 	static unsigned told;
 
+	if (wanted < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		wanted = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
+		    (at = strstr(args, "switcher_wallpaper=1")) != NULL && (at == args || at[-1] == ' ');
+	}
 	if (told++ == 0) {
-		say("redwood: the switcher's wash of wallpaper is left out: there is no picture of the wallpaper for it\n");
+		say("redwood: the switcher's wash of wallpaper is %s\n", wanted ?
+		    "drawn as iOS asks (switcher_wallpaper=1)" : "left out: there is no picture of the wallpaper for it");
+	}
+	if (wanted) {
+		original_switcher_wallpaper_overlay(self, selector);
 	}
 }
 
