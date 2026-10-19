@@ -61,8 +61,8 @@ echo "== against LLVM on the processor, shader by shader"
 # rest say why not. See tools/air/cpuref.py.
 cpu_rc=0
 for f in "${LIBS[@]}"; do
-	printf '%-52s ' "$(basename "$(dirname "$f")")/$(basename "$f")"
-	python3 "$ROOT/tools/air/cpuref.py" --all "$f" 2>&1 | tail -1 || cpu_rc=1
+	echo "$(basename "$(dirname "$f")")/$(basename "$f"):"
+	python3 "$ROOT/tools/air/cpuref.py" --all "$f" 2>&1 | tail -2 | sed 's/^/  /' || cpu_rc=1
 done
 
 exit $((reader_rc | cpu_rc))
