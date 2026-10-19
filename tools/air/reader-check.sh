@@ -23,20 +23,23 @@ trap 'rm -rf "$WORK"' EXIT
 # What both sides are reduced to: the semantics the reader keeps. Attributes,
 # the module identification, and the symbol-table order are not kept, so they
 # are dropped from both sides rather than silently differing.
+# -a throughout: a module whose string constants print a raw NUL would make GNU
+# grep treat its own input as binary, and `grep -v` would then drop every line --
+# a reader check that silently compares nothing against nothing and passes.
 filter() {
-	grep -v '^;' |
-		grep -v '^attributes #' |
-		grep -v '^source_filename' |
+	grep -av '^;' |
+		grep -av '^attributes #' |
+		grep -av '^source_filename' |
 		sed -E -e 's/ #[0-9]+//g' -e 's/^(define|declare) (dso_local |dllexport |hidden |protected )*/\1 /' -e 's/(captures|dereferenceable|dereferenceable_or_null|align|range|elementtype|byval|byref|sret|inalloca|preallocated|alignstack|allocsize)\([^)]*\)//g' -e 's/\b(noalias|readonly|readnone|writeonly|writable|nocapture|nonnull|immarg|zeroext|signext|noundef|nofree|nosync|nest|returned|inreg|initializes|allocalign|allocptr|dead_on_unwind|nocallback|willreturn|norecurse|nounwind|speculatable|mustprogress)\b//g' -e 's/ align [0-9]+ (%|@)/ \1/g' -e 's/  +/ /g; s/ +$//; s/\( /(/g; s/ \)/)/g; s/ ,/,/g; s/\(,/(/g' |
-		grep -v '^ *$'
+		grep -av '^ *$'
 }
 
 # Declarations carry no order in LLVM IR, and llvm-as/llvm-dis does not keep
 # the one it was given, so both sides put them last and sorted.
 sort_declares() {
 	cat > "$WORK/c.ll"
-	grep -v '^declare ' "$WORK/c.ll"
-	grep '^declare ' "$WORK/c.ll" | sort
+	grep -av '^declare ' "$WORK/c.ll"
+	grep -a '^declare ' "$WORK/c.ll" | sort
 }
 
 canon() { # stdin: .ll -> canonical .ll on stdout, or nothing and rc != 0

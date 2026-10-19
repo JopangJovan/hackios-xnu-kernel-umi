@@ -56,8 +56,10 @@ for lib in "${LIBS[@]}"; do
 		if [ -z "$got" ]; then
 			# the reason, not the first line: air_run says why on stderr, and
 			# "<name> on softpipe" is only which screen it got
+			# -a: a fault dump can carry a NUL, and a binary verdict here would
+			# lose the reason and leave "refused" with nothing said about why
 			why=$(printf '%s\n' "$out" |
-				grep -E 'this harness|is a .* shader|Assertion|stage: |error|no gallium|does not bind|stores nothing' |
+				grep -aE 'this harness|is a .* shader|Assertion|stage: |error|no gallium|does not bind|stores nothing' |
 				head -1)
 			[ -n "$why" ] || why=$(printf '%s\n' "$out" | tail -1)
 			printf 'refused %-44s %s\n' "$fn" "${why:0:90}"
