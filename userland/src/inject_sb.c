@@ -27,6 +27,7 @@
  *   - Darwin notifications as a remote control, for scripts (rwtouch notify NAME):
  *       com.redwood.unlock      what the lock screen does after "swipe up to open"
  *       com.redwood.layers      write down the layers SpringBoard has on the screen: see layers()
+ *       com.redwood.switcher    open the switcher of running applications: see switcher()
  *     In any other program given this library (INJECT in build.sh) only the last of them is
  *     answered, with that program's layers.
  */
@@ -766,6 +767,56 @@ layers(void)
 }
 
 /*
+ * The switcher of running applications, on the notification com.redwood.switcher (rwtouch notify).
+ * A drag up from the bottom edge is the way to it on a phone, but the touches a script puts in do
+ * not reach iOS's system gestures -- nothing comes of such a drag, not even going home -- and two
+ * presses of the home button only go home (there is no home button on a phone of this shape, and
+ * what is sent as one goes home and no more). SpringBoard opens it itself for anything that is
+ * not a gesture (a hardware keyboard, accessibility): SBMainSwitcherControllerCoordinator, which
+ * is one for the whole program, takes "activate the main switcher not interactively, from this
+ * source". The source is an analytics label; zero is "none", which is what the ones that have no
+ * gesture behind them pass.
+ * As it stands this is not enough: with three applications running it answers that it took the
+ * request (source 0, animated and not animated alike) and the screen does not change -- the
+ * application in front stays, and SpringBoard says nothing more. So the switcher still cannot be
+ * reached from a script; what is left to try is the transition with a window scene
+ * (_activateSwitcherValidatorWithEventLabel:animated:windowScene:), which is what its own
+ * gestures use.
+ */
+static void
+switcher(void)
+{
+	Class coordinator = objc_getClass("SBMainSwitcherControllerCoordinator");
+	SEL activate = sel_registerName("activateMainSwitcherNoninteractivelyWithSource:animated:");
+	id shared = coordinator != NULL ? SEND(id, coordinator, "sharedInstance") : NULL;
+	Method method = shared != NULL ? class_getInstanceMethod(object_getClass(shared), activate) : NULL;
+
+	if (method == NULL) {
+		say("redwood: the switcher: %s has no %s\n",
+		    coordinator != NULL ? "SBMainSwitcherControllerCoordinator" : "nothing", sel_getName(activate));
+		return;
+	}
+	say("redwood: the switcher: opening it (%s, %s)\n", object_getClassName(shared),
+	    method_getTypeEncoding(method) != NULL ? method_getTypeEncoding(method) : "?");
+	/*
+	 * It answers whether it took the request. The source is an analytics label and not every one
+	 * of them is allowed from every state, so they are tried in turn until one is taken.
+	 */
+	/*
+	 * Not animated: the animated one is taken and then nothing comes of it -- the transition it
+	 * starts is the gesture's to carry, and there is no gesture here.
+	 */
+	for (long source = 0; source < 10; source++) {
+		BOOL taken = ((BOOL (*)(id, SEL, long, BOOL))objc_msgSend)(shared, activate, source, NO);
+
+		say("redwood: the switcher: from source %ld: %s\n", source, taken ? "taken" : "refused");
+		if (taken) {
+			return;
+		}
+	}
+}
+
+/*
  * Control Center's glyphs whole from its first frames. Its modules and their parts fade in as it
  * comes down: opacity animations, mostly springs that take up to a second to settle at 1. While a
  * layer's opacity is below 1, the window server's OpenGL ES renderer draws the vibrant glyphs in it
@@ -987,6 +1038,9 @@ redwood_springboard_init(void)
 	});
 	notify_register_dispatch("com.redwood.layers", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		layers();
+	});
+	notify_register_dispatch("com.redwood.switcher", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		switcher();
 	});
 	/*
 	 * Belt-and-suspenders unlock. The user can always swipe up to open the home screen -- that
