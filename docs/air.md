@@ -25,17 +25,32 @@ Of the 456 modules of the device's system `.metallib` files (`tools/air/check.sh
 | numerically identical to LLVM's own execution, and drawn | 255 |
 | **run on the phone's GPU** | **7** |
 
+And of the 119 distinct `air.*` operations those modules call (`tools/air/intrincheck.py`):
+
+| | of 119 |
+| --- | --- |
+| checked numerically, one operation at a time, against a reference outside this tree | 78 |
+| of those, exactly defined and agreeing on every case (44 028 cases) | 71 |
+| of those, approximate, so measured against libm and nothing concluded | 7 |
+| textures, atomics, barriers, derivatives and simd: no reference here | 41 |
+
 313 of 456 is 313 of 321 entry points — 97.5% — because 135 modules are `air.visible` library
 functions and not entry points at all.
 
 **What those numbers are not**, because they will be quoted without this paragraph otherwise:
 
-- **No `air.*` operation is verified numerically.** All 255 that agree with LLVM are plain LLVM IR
-  and call none; the seven that have run on the GPU call none either. Every one of the ~50
-  operations in `air_intrinsics.c` — the arithmetic, the atomics, the barrier — is unverified.
-  Their *identity* is settled against Apple's own compiler (section 3.2), which is a different and
-  weaker thing: it says `air.fast_round` is `round` and not `rint`, not that this code computes
-  `round` correctly.
+- **The arithmetic operations are now checked; the reference is not the Adreno.** 71 of the
+  corpus's declarations agree with C's own functions on every one of 44 028 cases, which is a real
+  answer to what used to be the largest hole here (section 4, item 4). But what is folded is NIR's
+  constant expression for each opcode, on this machine — so an opcode whose Adreno instruction
+  differs from what `nir_opt_constant_folding` computes would be invisible to all 44 028 of them.
+  Nothing in this table's bottom row calls an `air.*` function: **no operation has been run on the
+  GPU.**
+- **Still unverified by anything: the atomics, the barrier, the derivatives and the simd
+  reductions** — 41 declarations with no reference in `intrincheck.py`, because what they mean
+  depends on more than one thread or on neighbouring fragments and a folded constant cannot say
+  it. The texture operations among them are covered differently and partly, by the six shaders
+  that returned the exact texel on the Adreno.
 - **Nothing here tests Metal's own filtering or addressing.** The six texture shaders that drew on
   the Adreno took their sampler from the API, which this harness chose: nearest, clamped, sampled
   at a texel centre. That is evidence about binding, descriptors and ir3's texture instructions —
@@ -375,22 +390,18 @@ Three references, each independent of the translator:
    and the instruction translation — and no statement at all about `air_intrinsics.c`. The
    shaders that do call `air.*` are exactly the ones this check cannot judge: the texture ones
    have a varying for a parameter, the math-heavy ones are compute kernels or `air.visible`
-   library functions. So **no operation in `air_intrinsics.c` is numerically verified**, even the
-   two whose *identity* section 3.2 has since settled against Apple's own compiler: knowing that
-   `air.fast_round` is `round` and not `rint` says nothing about whether this file computes
-   `round` correctly. What would settle that is
-   a shader whose intrinsic result is observable through a device buffer, compared the same way
-   — which needs the buffer-readback half of this tool, i.e. M4's acceptance test. Writing C
-   implementations of the `air.*` functions for the CPU side would *not* settle them: those
-   implementations would encode the same beliefs as the translator, and a reference that agrees
-   with you by construction is not a reference.
+   library functions. So this check says nothing about `air_intrinsics.c`; item 4 below is what
+   does, and the paragraph that used to stand here — that nothing but M4's buffer readback could —
+   was wrong about the reference being necessarily circular. The objection it raised is answered
+   there rather than dropped, because it is the right objection.
 
-   There is one oracle for the intrinsics that needs no hardware and is not circular, and
-   section 3.2 is it: **Apple's own compiler, which knows what each name means because it
-   compiles it.** Its vocabulary settled the two guesses and found one of them wrong. What that
-   oracle gives is each operation's *identity*, not its numerical result, so it decides
-   `round` against `rint` and `exp` against `exp2` and cannot decide how many ULP Apple's
-   `fast_sin` is allowed to be out by. For that, M4's buffer readback is still the test.
+   The first oracle for the intrinsics that needs no hardware is section 3.2: **Apple's own
+   compiler, which knows what each name means because it compiles it.** Its vocabulary settled
+   the two guesses and found one of them wrong. What that oracle gives is each operation's
+   *identity*, not its numerical result, so it decides `round` against `rint` and `exp` against
+   `exp2` and cannot decide how many ULP Apple's `fast_sin` is allowed to be out by. The second
+   is item 4, which takes that identity and checks the arithmetic against C's own function; what
+   neither can do is tell you what the Adreno computes.
 
    What it cannot decide, and says so rather than passing: a shader with a non-buffer argument —
    a varying, `air.position`, a thread id — because what is in it is the GPU's business (19 in
@@ -415,6 +426,66 @@ Three references, each independent of the translator:
    actually writes.
 3. **NIR's own checks:** `nir_validate` after every pass (the translator runs with validation
    on), and unit tests on Mesa's `nir_tests` framework for the translator's building blocks.
+4. **Each `air.*` operation on its own, against C's own functions.** `tools/air/intrincheck.py`
+   takes the declarations the corpus actually uses — `air2nir --ll` over the 456 modules gives
+   119 of them — and for each one generates a fragment shader that calls it on constant
+   arguments and returns the result, assembles that with `llvm-as`, and folds it with `air2nir
+   --eval`. The reference is the C library's own `roundf`, `floorf`, `fmaxf`, `ldexpf` and the
+   IEEE definitions, evaluated at the operation's own precision.
+
+   **71 exactly defined operations agree on every one of 44 028 cases; none differ.** Seven are
+   approximate (`fast_sin`, `fast_cos`, `fast_exp`, `fast_pow`, `fast_atan2`) and are reported
+   with their worst distance from libm and counted as nothing — see below.
+
+   **Why this is not the circular reference rejected under item 1,** which it looks like at first
+   and which is the objection that kept it unwritten for a week. Writing C implementations of the
+   `air.*` *operations* would be circular: they would encode the same belief as the lowering, by
+   the same author, and agree by construction. What this does instead is split the claim in two,
+   and each half has an oracle that is not this tree:
+
+   - *which function each name is* — settled by Apple's own compiler, section 3.2. That is where
+     `air.fast_round` was found to be `round` and not `rint`.
+   - *whether the lowering computes that function* — settled by the C library, which implements
+     `round` because the C standard says what `round` is, and has never heard of this port.
+
+   Neither half alone is enough and together they are not circular. What makes it work is that
+   Metal's math functions are OpenCL's, which are C's: there is a specification outside both
+   Apple and Mesa for almost every one of them.
+
+   **What it does not reach.** For the seven approximate operations NIR's folder calls the same
+   libm this script does, so `0 ulp` there carries no information beyond section 3.2 — it says
+   the lowering picked `sinf` and not that the Adreno's `sin` instruction agrees with `sinf`,
+   which it certainly does not to the last bit. Metal's `fast_` prefix permits that. And for all
+   71 of the exact ones, what is folded is NIR's constant expression for each opcode on this
+   machine: an opcode whose Adreno instruction differs from what `nir_opt_constant_folding`
+   computes is invisible here. That gap closes only on the phone.
+
+   **What it found.** Two things, in opposite directions:
+
+   - `air.fast_atan2` was wrong at the origin. Mesa's `nir_atan2` returns 3π/4 for `atan2(0, 0)`,
+     and its own comment says why: GLSL licenses an implementation to deviate from IEEE there, so
+     it pretends 0/0 = 1. Metal's `atan2` is OpenCL's and keeps the IEEE values — `atan2(±0, x>0)`
+     is `±0`, `atan2(±0, x<0)` is `±π`. A shader taking the angle of a vector that happens to be
+     zero got 135° instead of 0°, which is not the kind of deviation `fast_` permits.
+     `air_intrinsics.c` now handles the origin itself and leaves the rest to Mesa. Mesa's
+     deviation is confined to the origin: the four `(±0, ±0)` cases, and no other.
+   - NIR's `ldexp` loses an overflow, and that one is Mesa's. Its constant expression is
+     `dst = ldexpf(src0, src1); /* flush denormals to zero. */ if (!isnormal(dst)) dst =
+     copysignf(0.0f, src0);` — and `!isnormal` is true of an infinity as well as of a denormal, so
+     `ldexp(0.5, 32767)` folds to `0` where Metal, OpenCL and C all say `+inf`. The comment names
+     denormals; the condition catches more than it means to. Found in Mesa 25.0.7, which is what
+     this port pins. **Not checked against Mesa main** — freedesktop's GitLab is behind bot
+     protection from here, so neither the file nor the 2020 merge request that looks like its
+     origin could be read. Worth reporting upstream by someone who can open the page; not worked
+     around here, because the frontend's `nir_ldexp` is the right opcode.
+
+   **The check can fail,** which is the first thing to establish about any check in this
+   repository, after four that passed for the wrong reason. Reinstating the `fast_round` bug —
+   `nir_fround_even` in place of the trunc-and-step — is caught at `0.5`, `-0.5`, `±2.5` and in
+   each component of the vector form separately; dropping the last component of `air.dot` is
+   caught on 83 of 100 cases. Every component of a vector result is compared, and every component
+   of a vector argument is given a *different* value, because with the same value in all of them a
+   lowering that swizzled or dropped a component returns the right answer for the wrong reason.
 
 Where a shader has a known GLSL equivalent (AppleMetalGLRenderer's shaders *are* the GL
 pipeline's fixed functions), rendering both through the port's GLES and comparing images is a
@@ -726,7 +797,7 @@ more.
 
 ```
 tools/air/mk-host.sh            # Mesa for this machine (x86-64): the frontend, ir3, softpipe
-tools/air/check.sh              # the reader against llvm-dis, the corpus report, and LLVM
+tools/air/check.sh              # the reader against llvm-dis, the corpus report, LLVM, the operations
 ```
 
 and on one shader:
@@ -739,15 +810,21 @@ build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler \
         --chip-id 0x007506030500 FILE[.metallib] [FUNCTION]                      # Adreno code
 tools/air/cpuref.py --compare FILE[.metallib] [FUNCTION]   # ours against LLVM's own answer
 tools/air/cpuref.py --all --draw FILE.metallib             # every function: LLVM, folded, drawn
+tools/air/intrincheck.py [-v] [OP ...]                     # one air.* operation at a time
 build/mesa-host/build/src/gallium/drivers/freedreno/air_run \
         FILE[.metallib] [FUNCTION]                         # draw with it, print the pixel
+tools/air/texcheck.sh [FILE.metallib ...]                  # every texture shader, the texel it returns
 ```
+
+`intrincheck.py` with no argument checks every operation the corpus calls; with one or more names
+it checks only those, which is how it is used while changing a lowering:
+`tools/air/intrincheck.py atan2`.
 
 `0x007506030500` is how freedreno names the redwood's Adreno 7c+ Gen 3 (A635); it has no
 `gpu-id`, which is why `tools/mesa/air-ir3.patch` adds `--chip-id` to that tool.
 
 There is no hosted CI: the corpus is Apple's code and stays out of the repository (and out of
-GitHub). `check.sh` is the CI; it takes 20 seconds, so it runs before every commit that touches
+GitHub). `check.sh` is the CI; it takes about four minutes, most of it the per-operation check, so it runs before every commit that touches
 the frontend, and the report it writes is committed as `docs/air-report.md` with the numbers of
 that commit.
 
