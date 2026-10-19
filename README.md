@@ -405,7 +405,10 @@ P3 поверхности кадров копировались, и этого �
 Его и не предполагается: почему — разобрано в `docs/metal.md`. Коротко: граница, которую пришлось бы
 реализовать, — это одно имя класса в реестре IOKit (`IOAcceleratorES`) и бандл в
 `/System/Library/Extensions` с подклассом приватного `_MTLDevice`, а за ней не драйвер, а компилятор
-AIR (промежуточного языка шейдеров Metal), которого нет ни в Mesa, ни где-либо ещё. Службу
+AIR (промежуточного языка шейдеров Metal), готового читателя которого в мире нет — хотя сам формат
+оказался покладистым: это обычный битовый код LLVM, и все 456 модулей системных `.metallib` читает
+готовый `llvm-dis` (`tools/metallib.py`, раздел 9 `docs/metal.md`; там же, почему «игры на Metal» —
+всё равно нет, а «системный шейдер на нашем GPU» — достижимо). Службу
 `IOAcceleratorES` ядро порта как раз публикует — пустую, нарочно, чтобы CoreAnimation не ждал
 полминуты и прошёл мимо (`iokit/Kernel/MiniIOMobileFramebuffer.cpp`), — так что
 `MTLCreateSystemDefaultDevice()` возвращает `nil` молча, без строки в журнале. Adreno же отдаётся
@@ -439,10 +442,13 @@ Metal загружают 153 библиотеки системы, но поль�
 самом `Espresso`). Порт уже умеет то, чего CoreImage хочет от библиотеки OpenGL ES: точка входа
 `texImageIOSurface:…` написана в `src/eagl.c`.
 
-Но вход туда ровно один, и это проверено: `+[CIContext contextWithOptions:]` на этом порте **падает
-с SIGSEGV** — и с `nil`, и с `kCIContextUseSoftwareRenderer`. То есть «Фото» и камера без Metal не
-деградируют, а уносят процесс; дорога к рабочему пути начинается с `contextWithEAGLContext:`, а не с
-контекста по умолчанию. Разбор по каждому из шести мест — раздел 7 `docs/metal.md`.
+**И у CoreImage это уже работает.** Вход ровно один: `+[CIContext contextWithOptions:]` падает с
+SIGSEGV (и с `nil`, и с `kCIContextUseSoftwareRenderer`) — он идёт в `CI::GLContext::init()`, которому
+никто не дал контекста OpenGL ES. А `+[CIContext contextWithEAGLContext:]` с нашим `EAGLContext`
+работает: не хватало одного метода, `-sharegroup`, которого в `src/eagl.c` не было, потому что
+CoreAnimation о нём не спрашивает. С ним CoreImage создаёт контекст (`backend: OpenGL ES
+(CI::GLContext)`, `device: nil`), компилирует ядро фильтра и считает его — на Mesa, без всякого
+Metal. Разбор по каждому из шести мест — раздел 7 `docs/metal.md`.
 
 Что система думает про Metal, печатает `bin/metal_test` (`src/metal_test.m`,
 `RC_JOBS=rc.jobs.metal`): службы, которых Metal не находит, GPU, который есть под другим именем,
