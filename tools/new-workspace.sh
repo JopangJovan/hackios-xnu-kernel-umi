@@ -10,8 +10,8 @@
 #
 # The kernel tree is copied as it is now, uncommitted work included, and that state is recorded
 # (refs/redwood/baseline in the copy's kernel tree): tools/kernel-delta.sh, run in the workspace,
-# prints what was changed in the kernel since. Files below ios165/rootfs and ios165/cryptex are
-# hard links to this copy's: replace them, never edit them in place.
+# prints what was changed in the kernel since. Files below ios165/rootfs, ios165/cryptex and
+# ios165/cryptex-app are hard links to this copy's: replace them, never edit them in place.
 # The phone is not part of a workspace: there is one, and ./xl belongs to the main copy.
 set -e
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
@@ -53,6 +53,13 @@ for f in rootfs.dmg rootfs.slt cryptex-app.dmg extracted; do
 done
 for f in obj system.apfs root.apfs hello; do
 	if [ -e "$ROOT/userland/$f" ]; then cp -a --reflink=auto "$ROOT/userland/$f" userland/; fi
+done
+# The firmware somebody has pulled out of the phone's Android, which is not in git and which
+# userland/build.sh takes from beside the working copy, not from inside it: a workspace without it
+# builds images that look right and have no firmware in them -- without fw-gpu the boot volume comes
+# out 4 MB instead of 21 and gpu=1 has nothing to load. Hard links, as the files of iOS are.
+for d in fw fw-gpu fw-wifi fw-audio fw-haptic fw-camera; do
+	if [ -e "$ROOT/$d" ] && [ ! -e "$d" ]; then cp -al "$ROOT/$d" .; fi
 done
 [ -f "$ROOT/xnuloader/loader.efi" ] && cp -a "$ROOT/xnuloader/loader.efi" xnuloader/
 [ -f "$ROOT/qemu/kernel.syms" ] && cp -a "$ROOT/qemu/kernel.syms" qemu/
