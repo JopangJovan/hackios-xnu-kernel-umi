@@ -1290,7 +1290,8 @@ main(int argc, char **argv, char **envp)
 	} else if (strcmp(what, "load") == 0) {
 		ok = load();
 	} else if (strcmp(what, "erase") == 0) {
-		ok = erase();
+		ok = claim() && erase();        /* a write like any other: the claim first */
+		release();
 	} else {
 		show();
 		ok = 1;
