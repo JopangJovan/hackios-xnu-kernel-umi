@@ -1641,8 +1641,49 @@ x-set-apple-store-front header» и адрес `https://bag.itunes.apple.com/bag
 того как configd настроил интерфейс: с `wifi=1` это делает само задание `com.redwood.wifi`, так что
 просить DHCP второй раз сценарию не нужно — довольно `waitaddr en0 60`.
 
-Следующее измерение надо делать по каналу, который не теряет: зайти на телефон по ssh (`rc.jobs.ssh`) и
-запросить мешок руками. Сценарий — `userland/rc.jobs.store`.
+Измерение переделали по каналу, который теряет меньше: шаги сценария ждут, пока утихнет начальный поток
+(launchd поднимает две сотни процессов), и каждый `fetch` — отдельная команда. Тогда на телефоне, с корнем
+на флеше и присоединённым радио:
+
+```
+net_test: waitaddr en0: an address after 0.0 s
+net_test: en0: flags 0x8843 up running ... inet 192.168.9.243 netmask 255.255.255.0
+net_test: resolve bag.itunes.apple.com, 0.02 s: 17.253.39.138 17.253.39.140 ...
+net_test: fetch https://www.apple.com/library/test/success.html: status 200, 68 bytes in 0.32 s
+net_test: fetch https://bag.itunes.apple.com/bag.xml: status 200, 56219 bytes in 0.53 s
+net_test: fetch https://bag.itunes.apple.com/bag.xml: x-set-apple-store-front: 143469-2,8
+net_test: fetch https://init.itunes.apple.com/bag.xml: status 200, 56219 bytes in 0.36 s
+net_test: fetch https://init.itunes.apple.com/bag.xml: x-set-apple-store-front: 143469-2,8
+```
+
+**То есть третий путь открыт: без учётной записи, без SIM и без активации Apple сама говорит, в какой
+витрине это устройство** — выбирает её по адресу, с которого пришёл запрос, и отдаёт заголовком. Мешок —
+56 КБ XML, за полсекунды; DNS, TLS и хранилище доверия работают.
+
+**И магазин этим не пользуется.** В том же сеансе App Store открыт и крутит вертушку, `appstored` поднят и
+сам пишет «[Network] Network available (interface = wifi)» — и не открывает ни одного сокета: в журнале
+соединений ядра за этот сеанс есть `net_test`, `trustd`, `akd`, `cloudd`, `passd`, `coreidvd`, `gamed`,
+`geod`, `maild`, `promotedcontentd`, `familycircled`, `StocksWidget`, `mDNSResponder` — и нет ни
+`appstored`, ни `nsurlsessiond`. AMS за первые 40 мс жизни демона читает пустой кеш («Could not fetch
+initial cached storefront. error = (null)») и на этом останавливается, а через 30 с клиент получает
+«Timed out while waiting for snapshot bag to load». Стена — внутри AppleMediaServices, не в сети и не у
+Apple.
+
+Куда смотреть дальше, по строкам самой AMS (`AMSCore::LoadNetworkBagTask`): `perform()` прежде всего
+зовёт `getAccount()`, и рядом лежат «Attempted a bag load but an account wasn't provided» и «Failed to
+fetch local account. This will prevent initial bag requests from specifying storefront». В журнале их не
+видно — они ниже уровня, который печатает `OS_ACTIVITY_DT_MODE`. При этом `amsaccountsd` работает и
+отвечает: в журнале видно и подключение `appstored` к нему, и его транзакции `AMSDCookieService.getCookies`.
+Сценарий — `userland/rc.jobs.store`.
+
+**`mobileactivationd` — ещё одна служба из списка «никогда не пробовали».** Её спрашивал как раз
+`appstored` (четыре ненайденных обращения за сеанс и двадцать строк «[HRNSupport] Failed to copy activation
+record ... MobileActivation.ErrorDomain Code=-1 "IPC Error"» из каждого потока, который трогает мешок).
+Теперь она в образе по требованию: ненайденных обращений нет ни одного, демон поднимается один раз за
+сеанс и не падает (199–200 процессов против 198 без неё), а учётный слой получает вместо обрыва связи
+настоящий ответ — Code=-8 «Device is not activated: Unactivated». Дальше этого здесь не пройти: сам демон
+пишет «Failed to bump UIK: 0xe00002c7», потому что цепочка активации растёт из Secure Enclave, которого у
+этого телефона нет. Магазин это **не** открывает: мешок с ней по-прежнему не запрашивается.
 Проверено заодно и то, не в пропущенном ли ассистенте настройки дело — порт его отключает
 (`src/inject_sb.c` обнуляет `-[SBSetupManager _setSetupRequiredReason:]`). Не в нём: файл
 `com.apple.purplebuddy.plist` с `SetupDone = True` мы и так кладём, а MobileGestalt и так отвечает

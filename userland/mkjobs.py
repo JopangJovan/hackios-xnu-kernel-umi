@@ -134,7 +134,27 @@ import sys
 # scenario must not ask for DHCP again -- only "waitaddr en0 60".
 # The storefront question is therefore OPEN, and the next measurement has to be made over a channel
 # that does not drop: ssh to the phone (rc.jobs.ssh) and fetch the bag by hand.
-# What is true below is only that these two services are the ones appstored cannot find:
+# What was measured afterwards, over a channel that does not drop (net_test, waiting out the start):
+# THE BAG IS FETCHED FROM THIS PHONE AND THE SERVER DOES HAND OVER A STOREFRONT.
+#   fetch https://bag.itunes.apple.com/bag.xml: status 200, 56219 bytes in 0.53 s
+#   fetch https://bag.itunes.apple.com/bag.xml: x-set-apple-store-front: 143469-2,8
+# (init.itunes.apple.com answers the same.) So the third route is open: no account, no SIM, no
+# activation, and Apple still says which storefront this device is in, picked from the address the
+# request came from. What does not happen is the store asking: while the App Store is open and
+# spinning, appstored opens NO socket at all -- the kernel's connection log for that session names
+# net_test, trustd, akd, cloudd, passd, coreidvd, gamed, geod, maild, promotedcontentd,
+# familycircled, StocksWidget and mDNSResponder, and neither appstored nor nsurlsessiond. AMS reads
+# an empty cache ("Could not fetch initial cached storefront. error = (null)") in the daemon's first
+# 40 ms and then stops; 30 s later the client gets "Timed out while waiting for snapshot bag to
+# load". The wall is inside AppleMediaServices, not at Apple and not in the network.
+# Where to look next, from AMS's own strings (AMSCore::LoadNetworkBagTask): perform() calls
+# getAccount() before anything goes out, and the failure strings around it are "Attempted a bag load
+# but an account wasn't provided" and "Failed to fetch local account. This will prevent initial bag
+# requests from specifying storefront". Those lines are below the level that OS_ACTIVITY_DT_MODE
+# prints, which is why nothing is seen; amsaccountsd is up and serving (it logs appstored's XPC
+# connection and its AMSDCookieService.getCookies transactions), so the account layer answers at
+# least that much.
+# The two services below are still the ones appstored cannot find, but they are no longer the story:
 #   com.apple.commcenter.coretelephony.xpc -- the SIM's country, through CommCenter, which crash-loops
 #     here (see above);
 #   com.apple.mobileactivationd -- the activation record's region. That binary carries RegionCode,
@@ -178,6 +198,15 @@ import sys
 # var.skel, and guessing directories is the wrong tool for it.
 # bird and duetexpertd were shipped as well and nothing ever asked for them in a bare boot (no spawn, no
 # lookup), so they are still untested rather than known good; they need a session with applications.
+# mobileactivationd came out of this tuple the same way apsd did: it had been denied since the first day
+# and never tried, and appstored was the one asking (four failed lookups a session, and "[HRNSupport]
+# Failed to copy activation record ... MobileActivation.ErrorDomain Code=-1 IPC Error" twenty times from
+# every thread that touches a bag). With it in, started on demand: no failed lookups at all, no crash and
+# no loop (one spawn a session, 199-200 processes against 198 without it), and the account layer gets an
+# answer instead of a broken pipe -- Code=-8 "Device is not activated: Unactivated". That is as far as it
+# can go here: the daemon says "Failed to bump UIK: 0xe00002c7" because the activation chain wants a
+# Secure Enclave this phone has not got. It does NOT unblock the store: with it in, the bag is still
+# never fetched. It is worth keeping for the answer, not for the store.
 # (nsurlsessiond is not among them either, for all that it belongs to the same family of Apple's own
 # services: it is the daemon that carries out background URLSession downloads,
 # and without it an application's download never starts and never fails -- Sileo sits on "Queued"
@@ -187,7 +216,7 @@ import sys
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'locationd', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
-        'osanalytics', 'lockdown', 'audio', 'jetsamproperties', 'mobileactivationd',
+        'osanalytics', 'lockdown', 'audio', 'jetsamproperties',
         'purplebuddy', 'restore', 'usb', 'accessoryd',
         'mobileassetd', 'bird',
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
