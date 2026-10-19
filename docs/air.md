@@ -469,6 +469,22 @@ there. So the whole chain works on the target operating system: the container, t
 translation, Gallium, the draw and the readback. What is left is one substitution — softpipe for
 ir3 on the Adreno — and that needs the phone.
 
+**On the phone, with the root on the flash, it runs and is exact — and it ran on softpipe.** The
+first run of it (19 October, `logs/232842-run.log`) booted the flash-root recipe properly (both
+`[ ok ] mount the iOS volume read only` and `[ ok ] the iOS volume is the root, the RAM part of
+the boot on /private/preboot`), translated `clearFragment01` and read back the same four exact
+floats as everywhere else. But its first line said `on softpipe`, and the kernel said why:
+
+```
+adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin
+        (the phone's /vendor/firmware/a660_gmu.bin goes into fw-gpu/)
+```
+
+The GPU driver had not started at all, because this working copy had no `fw-gpu/` — the phone's
+own firmware, which is not in the repository. **Not the driver refusing work: no driver.** This is
+exactly what that first line is for: the pixel was right, and reporting it as a result on the
+Adreno would have been false. Read the line before the numbers.
+
 What is *not* known until it is tried is whether the kernel's GPU driver and the submit path
 behave for a draw that does not come from CoreAnimation: the GLES path is that driver's only
 consumer today. `rc.jobs.air` asks with the GPU idle; `rc.jobs.air2` asks again after SpringBoard
@@ -532,6 +548,11 @@ Gallium interface (`screen->context_create`, `create_fs_state`, `draw_vbo`), whi
 drivers and the port's own Mesa are built on. The durable way to get the `ir3` number after an
 upgrade is `air_run` against a freedreno screen, which means on the phone, because freedreno
 needs a real `msm` device and this machine has none.
+
+A working copy also needs the phone's own firmware for the GPU to start at all: `fw-gpu/`
+(`a660_gmu.bin`, `a660_sqe.fw`, the `a660_zap.*` pieces), which is not in the repository and which
+`tools/new-workspace.sh` does not copy. Without it the kernel says so plainly and the system falls
+back to software, so a run that looks fine can be a run on no GPU.
 
 Needed on this machine: meson, ninja, bison, flex, python3 with venv, and LLVM's `llvm-as` /
 `llvm-dis` for the reader check (22.1.8 here). The host build also patches Mesa 25.0's
