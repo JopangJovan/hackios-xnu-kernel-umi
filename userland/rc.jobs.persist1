@@ -13,7 +13,7 @@
 /redwood/bin/vol_ls ls /private/var/mobile/Containers/Data/Application
 /redwood/bin/vol_ls ls /private/var/mobile/Containers/Shared/AppGroup
 /redwood/bin/var_store stamp /private/var/redwood-stamp
-/redwood/bin/rwtouch wait 55 drag ICONX ICONY DROPX ICONY 800 600 900
+/redwood/bin/rwtouch wait 55 drag 0.151 0.358 0.847 0.710 900 700 900
 /redwood/bin/rwtouch wait 3 button home
 sleep 55
 /bin/ps -A

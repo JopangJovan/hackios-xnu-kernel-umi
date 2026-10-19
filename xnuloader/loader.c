@@ -1968,6 +1968,9 @@ block_start(void)
 	}
 	hc_refused_reads = 0;
 	hc_log_skips = 0;
+	/* per run, like the two above: this loader stays resident across runs, and a tally carried
+	 * over from the run before is read as this one's */
+	block_writes = block_writes_refused = block_write_bytes = 0;
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
 		block_shared.write_first = BLOCK_WRITE_FIRST;
