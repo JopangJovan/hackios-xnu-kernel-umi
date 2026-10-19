@@ -1146,8 +1146,8 @@ Qualcomm, так что за драйвером нет и того, к чему 
 цена, скорее всего, никакая — но там этого ещё никто не мерил, а QEMU — то, в чём всё это чаще всего и
 запускают. Один замер на телефоне — и их можно включать: `ALLOW="cloudd mobileassetd"`.
 `syncdefaultsd` (`com.apple.kvsd`) падает сам по себе: отдаёт cloudkeychainproxy3 его хранилище и аварийно
-завершается внутри `changeTokenForStoreWithConfiguration:reply:` — «`-[NSURL initFileURLWithPath:isDirectory:]:
-nil string parameter`», то есть строит файловый URL из пути, который ему дали пустым. Вероятнее всего это
+завершается внутри `changeTokenForStoreWithConfiguration:reply:` — «`-[NSURL initFileURLWithPath:isDirectory:]: nil string parameter`»,
+то есть строит файловый URL из пути, который ему дали пустым. Вероятнее всего это
 каталог `SyncedPreferences`, который он запрашивает по имени и которого здесь никто не создаёт
 (`/private/var/mobile/Library/SyncedPreferences` нет в `ios165/var.skel`); это стоит попробовать первым — не
 железа не хватает, а каталога. `bird` и `duetexpertd` собрались в образ без происшествий, но за пустую загрузку
