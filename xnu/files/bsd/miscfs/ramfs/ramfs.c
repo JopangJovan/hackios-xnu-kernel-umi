@@ -45,6 +45,7 @@
 #include <sys/xattr.h>
 #include <uuid/uuid.h>
 #include <vfs/vfs_support.h>
+#include <vm/vm_kern.h>
 
 #define RAMFS_MAX_NAME          255
 #define RAMFS_MAX_XATTR         (16u * 1024 * 1024)
@@ -98,6 +99,9 @@ struct ramfs_node {
 	/* symlink */
 	char               *rn_target;
 
+	struct ramfs_node  *rn_hnext;           /* the next node in rm_hash's chain */
+	bool                rn_hashed;
+
 	TAILQ_HEAD(, ramfs_xattr) rn_xattrs;
 };
 #define RAMFS_N_CREATING        0x1         /* a thread is in vnode_create() for this node */
@@ -111,7 +115,10 @@ struct ramfs_mount {
 	uint64_t            rm_nodes;
 	uint64_t            rm_pages;           /* file pages in use */
 	uint64_t            rm_max_pages;
+	struct ramfs_node **rm_hash;            /* every node by its number, for vfs_vget */
 };
+
+#define RAMFS_HASH_SIZE         4096u       /* chains, a power of two */
 
 /* file pages in use on all the mounts together (each mount has its own lock): for the kernel's memory report */
 _Atomic uint64_t ramfs_pages_in_use;
@@ -178,13 +185,80 @@ ramfs_node_alloc(struct ramfs_mount *rm, enum vtype type, struct vnode_attr *vap
 	return node;
 }
 
+/*
+ * A page of a file's contents, and giving it back. Not from a kalloc zone, as it once was: all the
+ * kernel's zones share one ceiling, and a few hundred MB of files in data.kalloc.16384 met it --
+ * first writes failing with ENOSPC ("there isn't enough space" while most of this filesystem's own
+ * allowance was free: dpkg's database could not be written), then, on an allocation that may not
+ * fail, the kernel panicked with the zone map exhausted. Straight from the VM instead, a wired page
+ * of kernel_map each, as the contents of a RAM disk are. wait=false: never wait for memory (the
+ * page-out path, which may be the pageout daemon looking for some).
+ */
+static void *
+ramfs_page_alloc(bool wait)
+{
+	vm_offset_t addr = 0;
+	kma_flags_t flags = KMA_KOBJECT | KMA_DATA | KMA_ZERO | (wait ? KMA_NONE : KMA_NOPAGEWAIT);
+
+	return kmem_alloc(kernel_map, &addr, PAGE_SIZE, flags, VM_KERN_MEMORY_FILE) == KERN_SUCCESS ?
+	       (void *)addr : NULL;
+}
+
+static void
+ramfs_page_free(void *page)
+{
+	kmem_free(kernel_map, (vm_offset_t)page, PAGE_SIZE);
+}
+
+/*
+ * Make the page array big enough for page `index`, before the mount lock is taken: under it the
+ * array can only grow by an allocation that does not wait (ramfs_grow_slots), and one that failed
+ * under memory pressure failed the write with ENOSPC. Nothing is promised: ramfs_store looks again.
+ */
+static void
+ramfs_reserve_slots(struct ramfs_mount *rm, struct ramfs_node *node, uint64_t index)
+{
+	for (int tries = 0; tries < 4; tries++) {
+		uint64_t have, want;
+		void **slots;
+
+		lck_mtx_lock(&rm->rm_lock);
+		have = node->rn_nslots;
+		lck_mtx_unlock(&rm->rm_lock);
+		if (index < have) {
+			return;
+		}
+		for (want = have ? have : 4; want <= index; want *= 2) {
+		}
+		slots = kalloc_type(void *, want, Z_WAITOK | Z_ZERO);
+		if (slots == NULL) {
+			return;
+		}
+		lck_mtx_lock(&rm->rm_lock);
+		if (node->rn_nslots == have) {
+			if (node->rn_pages != NULL) {
+				memcpy(slots, node->rn_pages, have * sizeof(void *));
+				kfree_type(void *, have, node->rn_pages);
+			}
+			node->rn_pages = slots;
+			node->rn_nslots = want;
+			slots = NULL;
+		}
+		lck_mtx_unlock(&rm->rm_lock);
+		if (slots == NULL) {
+			return;
+		}
+		kfree_type(void *, want, slots);        /* it grew meanwhile: look again */
+	}
+}
+
 /* Drop file pages from slot `from` on. The mount lock is held. */
 static void
 ramfs_free_pages(struct ramfs_node *node, uint64_t from)
 {
 	for (uint64_t i = from; i < node->rn_nslots; i++) {
 		if (node->rn_pages[i] != NULL) {
-			kfree_data(node->rn_pages[i], PAGE_SIZE);
+			ramfs_page_free(node->rn_pages[i]);
 			node->rn_pages[i] = NULL;
 			node->rn_nalloc--;
 			node->rn_mount->rm_pages--;
@@ -203,11 +277,46 @@ ramfs_xattr_free(struct ramfs_xattr *xa)
 	kfree_type(struct ramfs_xattr, xa);
 }
 
+/*
+ * Nodes by their number. What asks for a file by number rather than by name -- fsgetpath(), and through
+ * it LaunchServices, which keeps an application as its volume and file number and finds the path again
+ * from them -- comes to vfs_vget, which this filesystem did not have: an application in /private/var
+ * (the package manager's prefix, /var/jb/Applications) could not be registered at all ("Unable to
+ * register"), while one on an APFS volume could. The mount lock is held.
+ */
+static void
+ramfs_hash_insert(struct ramfs_mount *rm, struct ramfs_node *node)
+{
+	struct ramfs_node **chain = &rm->rm_hash[node->rn_ino & (RAMFS_HASH_SIZE - 1)];
+
+	node->rn_hnext = *chain;
+	*chain = node;
+	node->rn_hashed = true;
+}
+
+static void
+ramfs_hash_remove(struct ramfs_mount *rm, struct ramfs_node *node)
+{
+	struct ramfs_node **link = &rm->rm_hash[node->rn_ino & (RAMFS_HASH_SIZE - 1)];
+
+	while (*link != NULL && *link != node) {
+		link = &(*link)->rn_hnext;
+	}
+	if (*link == node) {
+		*link = node->rn_hnext;
+	}
+	node->rn_hashed = false;
+}
+
 /* The node is named by nothing and has no vnode. The mount lock is held. */
 static void
 ramfs_node_free(struct ramfs_node *node)
 {
 	struct ramfs_xattr *xa;
+
+	if (node->rn_hashed) {
+		ramfs_hash_remove(node->rn_mount, node);
+	}
 
 	assert(TAILQ_EMPTY(&node->rn_entries));
 	while ((xa = TAILQ_FIRST(&node->rn_xattrs)) != NULL) {
@@ -358,70 +467,43 @@ ramfs_vget_locked(struct ramfs_mount *rm, struct ramfs_node *node, vnode_t dvp, 
 /* ------------------------------------------------------------------------ */
 /* File contents                                                            */
 
-/* How many slots an array needs to hold page `index` of a file that has `have` of them. */
-static uint64_t
-ramfs_slots_wanted(uint64_t have, uint64_t index)
-{
-	uint64_t want = have ? have : 4;
-
-	while (want <= index) {
-		want *= 2;
-	}
-	return want;
-}
-
-/*
- * Make sure the page array has a slot for page `index`. The mount lock is held, and nothing waits
- * for memory under it -- a wait could end in the pageout daemon, which comes back here for the
- * lock. So the array is the caller's to find room for, without the lock: *slots of *nslots
- * entries, used and consumed when it is big enough. EAGAIN means only that: bring one of
- * ramfs_slots_wanted() entries and come again; it is not ENOSPC, and a caller that turns it into
- * one says a volume with room to spare is full. A caller that cannot wait either -- the pageout
- * path -- brings none, and then this tries without waiting, as it always did.
- */
+/* Make sure the page array has a slot for page `index`. The mount lock is held. */
 static int
-ramfs_grow_slots(struct ramfs_node *node, uint64_t index, void ***slots, uint64_t *nslots)
+ramfs_grow_slots(struct ramfs_node *node, uint64_t index)
 {
-	void **grown;
-	uint64_t grown_n;
+	uint64_t want = node->rn_nslots ? node->rn_nslots : 4;
+	void **slots;
 
 	if (index < node->rn_nslots) {
 		return 0;
 	}
-	if (*slots != NULL && *nslots > index && *nslots >= node->rn_nslots) {
-		grown = *slots;
-		grown_n = *nslots;
-		*slots = NULL;
-	} else {
-		grown_n = ramfs_slots_wanted(node->rn_nslots, index);
-		grown = kalloc_type(void *, grown_n, Z_NOWAIT | Z_ZERO);
-		if (grown == NULL) {
-			return EAGAIN;
-		}
+	while (want <= index) {
+		want *= 2;
+	}
+	slots = kalloc_type(void *, want, Z_NOWAIT | Z_ZERO);
+	if (slots == NULL) {
+		return ENOSPC;
 	}
 	if (node->rn_pages != NULL) {
-		memcpy(grown, node->rn_pages, node->rn_nslots * sizeof(void *));
+		memcpy(slots, node->rn_pages, node->rn_nslots * sizeof(void *));
 		kfree_type(void *, node->rn_nslots, node->rn_pages);
 	}
-	node->rn_pages = grown;
-	node->rn_nslots = grown_n;
+	node->rn_pages = slots;
+	node->rn_nslots = want;
 	return 0;
 }
 
 /*
  * Copy len bytes (within one page) into the file at offset off, extending
  * the file if needed. *spare is a zeroed page the caller allocated without
- * the lock; it is consumed if the slot was empty. *slots is the page array
- * the caller allocated the same way (see ramfs_grow_slots). The mount lock
- * is held.
+ * the lock; it is consumed if the slot was empty. The mount lock is held.
  */
 static int
-ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, void **spare,
-    void ***slots, uint64_t *nslots)
+ramfs_store(struct ramfs_node *node, uint64_t off, const void *src, size_t len, void **spare)
 {
 	struct ramfs_mount *rm = node->rn_mount;
 	uint64_t index = off / PAGE_SIZE;
-	int error = ramfs_grow_slots(node, index, slots, nslots);
+	int error = ramfs_grow_slots(node, index);
 
 	if (error) {
 		return error;
@@ -618,6 +700,7 @@ ramfs_make(vnode_t dvp, vnode_t *vpp, struct componentname *cnp, struct vnode_at
 		return error;
 	}
 	node->rn_ino = rm->rm_next_ino++;
+	ramfs_hash_insert(rm, node);
 	if (type == VDIR) {
 		node->rn_nlink = 2;
 		node->rn_parent = dir;
@@ -897,6 +980,21 @@ ramfs_getattr(struct vnop_getattr_args *ap)
 	VATTR_RETURN(vap, va_gen, 0);
 	if (node->rn_type == VDIR && node->rn_parent != NULL) {
 		VATTR_RETURN(vap, va_parentid, node->rn_parent->rn_ino);
+		/*
+		 * And its name, from its entry in the parent: what the kernel asks for to make a path out of a
+		 * number alone (fsgetpath() of a vnode vfs_vget made, which has no name of its own).
+		 */
+		if (VATTR_IS_ACTIVE(vap, va_name) && vap->va_name != NULL && node != rm->rm_root) {
+			struct ramfs_dirent *de;
+
+			TAILQ_FOREACH(de, &node->rn_parent->rn_entries, rd_link) {
+				if (de->rd_node == node) {
+					strlcpy(vap->va_name, de->rd_name, MAXPATHLEN);
+					VATTR_SET_SUPPORTED(vap, va_name);
+					break;
+				}
+			}
+		}
 	}
 	lck_mtx_unlock(&rm->rm_lock);
 	return 0;
@@ -1017,8 +1115,7 @@ ramfs_write(struct vnop_write_args *ap)
 	struct uio *uio = ap->a_uio;
 	struct ramfs_node *node = RAMFS_NODE(vp);
 	struct ramfs_mount *rm = node->rn_mount;
-	void *spare = NULL, **slots = NULL;
-	uint64_t nslots = 0;
+	void *spare = NULL;
 	char *bounce;
 	uint64_t start, old_size;
 	int error = 0;
@@ -1052,34 +1149,12 @@ ramfs_write(struct vnop_write_args *ap)
 			break;
 		}
 		if (spare == NULL) {
-			spare = kalloc_data(PAGE_SIZE, Z_WAITOK | Z_ZERO);
+			spare = ramfs_page_alloc(true);
 		}
-		/*
-		 * EAGAIN says the page array has to grow and that room for it is this side's to find,
-		 * which is done here, where waiting is allowed. rn_nslots is read without the lock as a
-		 * hint only; another writer growing the same file at the same time makes the hint too
-		 * small, and then this asks again with a fresh one.
-		 */
-		for (int again = 0; again < 4; again++) {
-			lck_mtx_lock(&rm->rm_lock);
-			error = ramfs_store(node, off, bounce, len, &spare, &slots, &nslots);
-			lck_mtx_unlock(&rm->rm_lock);
-			if (error != EAGAIN) {
-				break;
-			}
-			if (slots != NULL) {
-				kfree_type(void *, nslots, slots);
-			}
-			nslots = ramfs_slots_wanted(node->rn_nslots, off / PAGE_SIZE);
-			slots = kalloc_type(void *, nslots, Z_WAITOK | Z_ZERO);
-			if (slots == NULL) {
-				nslots = 0;
-				break;
-			}
-		}
-		if (error == EAGAIN) {
-			error = ENOSPC;         /* it never got the array: out of memory, not out of volume */
-		}
+		ramfs_reserve_slots(rm, node, off / PAGE_SIZE);
+		lck_mtx_lock(&rm->rm_lock);
+		error = ramfs_store(node, off, bounce, len, &spare);
+		lck_mtx_unlock(&rm->rm_lock);
 		if (error) {
 			/* nothing of this piece was stored: hand it back to the caller's count */
 			uio_setoffset(uio, (off_t)off);
@@ -1089,10 +1164,7 @@ ramfs_write(struct vnop_write_args *ap)
 	}
 	kfree_data(bounce, PAGE_SIZE);
 	if (spare != NULL) {
-		kfree_data(spare, PAGE_SIZE);
-	}
-	if (slots != NULL) {
-		kfree_type(void *, nslots, slots);
+		ramfs_page_free(spare);
 	}
 
 	if ((uint64_t)uio_offset(uio) > start) {
@@ -1371,16 +1443,13 @@ ramfs_pageout(struct vnop_pageout_args *ap)
 	lck_mtx_lock(&rm->rm_lock);
 	for (upl_size_t done = 0; done < size && off + done < node->rn_size && !error; done += PAGE_SIZE) {
 		size_t len = (size_t)MIN((uint64_t)PAGE_SIZE, node->rn_size - (off + done));
+		uint64_t index = (off + done) / PAGE_SIZE;
 		/* this may be the pageout daemon looking for memory: never wait for more of it here */
-		void *spare = kalloc_data(PAGE_SIZE, Z_NOWAIT | Z_ZERO), **slots = NULL;
-		uint64_t nslots = 0;
+		void *spare = index < node->rn_nslots && node->rn_pages[index] != NULL ? NULL : ramfs_page_alloc(false);
 
-		error = ramfs_store(node, off + done, (const void *)(addr + done), len, &spare, &slots, &nslots);
-		if (error == EAGAIN) {
-			error = ENOSPC;         /* nothing here may wait for the array either: the pages stay dirty */
-		}
+		error = ramfs_store(node, off + done, (const void *)(addr + done), len, &spare);
 		if (spare != NULL) {
-			kfree_data(spare, PAGE_SIZE);
+			ramfs_page_free(spare);
 		}
 	}
 	if (!error) {
@@ -1661,8 +1730,10 @@ ramfs_mount(mount_t mp, __unused vnode_t devvp, __unused user_addr_t data, __unu
 	/* a runaway writer must not be able to take the whole machine: a quarter of memory at most */
 	rm->rm_max_pages = (max_mem / 4) / PAGE_SIZE;
 
+	rm->rm_hash = kalloc_type(struct ramfs_node *, RAMFS_HASH_SIZE, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 	rm->rm_root = ramfs_node_alloc(rm, VDIR, NULL);
 	rm->rm_root->rn_ino = RAMFS_ROOT_INO;
+	ramfs_hash_insert(rm, rm->rm_root);
 	rm->rm_root->rn_nlink = 2;
 	rm->rm_root->rn_parent = rm->rm_root;
 	rm->rm_nodes = 1;
@@ -1722,6 +1793,7 @@ ramfs_unmount(mount_t mp, int mntflags, __unused vfs_context_t ctx)
 
 	vfs_setfsprivate(mp, NULL);
 	lck_mtx_destroy(&rm->rm_lock, &ramfs_lck_grp);
+	kfree_type(struct ramfs_node *, RAMFS_HASH_SIZE, rm->rm_hash);
 	kfree_type(struct ramfs_mount, rm);
 	return 0;
 }
@@ -1735,6 +1807,29 @@ ramfs_root(mount_t mp, vnode_t *vpp, __unused vfs_context_t ctx)
 	do {
 		lck_mtx_lock(&rm->rm_lock);
 		error = ramfs_vget_locked(rm, rm->rm_root, NULLVP, NULL, vpp);
+	} while (error == EAGAIN);
+	return error;
+}
+
+/* A node by its number (fsgetpath, and whoever else asks by file ID): see ramfs_hash_insert(). */
+static int
+ramfs_vfs_vget(mount_t mp, ino64_t ino, vnode_t *vpp, __unused vfs_context_t ctx)
+{
+	struct ramfs_mount *rm = RAMFS_MP(mp);
+	int error;
+
+	do {
+		struct ramfs_node *node;
+
+		lck_mtx_lock(&rm->rm_lock);
+		for (node = rm->rm_hash[ino & (RAMFS_HASH_SIZE - 1)]; node != NULL && node->rn_ino != ino;
+		    node = node->rn_hnext) {
+		}
+		if (node == NULL || node->rn_nlink == 0) {
+			lck_mtx_unlock(&rm->rm_lock);
+			return ENOENT;
+		}
+		error = ramfs_vget_locked(rm, node, NULLVP, NULL, vpp);
 	} while (error == EAGAIN);
 	return error;
 }
@@ -1771,7 +1866,15 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 		    VOL_CAP_FMT_CASE_SENSITIVE |
 		    VOL_CAP_FMT_CASE_PRESERVING |
 		    VOL_CAP_FMT_FAST_STATFS |
-		    VOL_CAP_FMT_2TB_FILESIZE;
+		    VOL_CAP_FMT_2TB_FILESIZE |
+		    /*
+		     * A file keeps its number for as long as it exists (the life of the mount, a boot), a node is
+		     * found by it (vfs_vget) and a path made from it (fsgetpath): LaunchServices keeps an
+		     * application by number, and takes none from a volume that does not say so -- everything a
+		     * package installed under the prefix was "Unable to register", with nothing tried on its files.
+		     */
+		    VOL_CAP_FMT_PERSISTENTOBJECTIDS |
+		    VOL_CAP_FMT_PATH_FROM_ID;
 		cap->capabilities[VOL_CAPABILITIES_INTERFACES] =
 		    VOL_CAP_INT_ADVLOCK |
 		    VOL_CAP_INT_FLOCK |
@@ -1888,6 +1991,7 @@ struct vfsops ramfs_vfsops = {
 	.vfs_mount = ramfs_mount,
 	.vfs_unmount = ramfs_unmount,
 	.vfs_root = ramfs_root,
+	.vfs_vget = ramfs_vfs_vget,
 	.vfs_getattr = ramfs_vfs_getattr,
 	.vfs_sync = ramfs_sync,
 	.vfs_init = ramfs_init,
