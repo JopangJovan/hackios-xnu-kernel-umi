@@ -287,7 +287,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
 	# Wi-Fi, which saves rebuilding an image for every question one wants to ask a running iOS. It
 	# refuses a key whose directory anyone but its owner may write, hence the 700.
-	if [ -f ../ssh/authorized_keys ]; then
+	# SHARE=1: no keys in an image that is going to somebody else. ssh_host_ed25519_key is a
+	# private key, and it would be leaving this machine inside a 2.5 GB container
+	if [ -z "$SHARE" ] && [ -f ../ssh/authorized_keys ]; then
 		mkdir -p root/var/root/.ssh
 		printf 'd\t700\t0\t0\t/private/var/root/.ssh\n' >> root/etc/var.skel
 		# the key that lets us in, and the host's own key beside it: made here and not on the
@@ -366,11 +368,16 @@ for d in gpu wifi haptic camera audio; do
 	if [ -d ../fw-$d ]; then fwhave="$fwhave $d"; else fwnone="$fwnone $d"; fi
 done
 echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${fwhave:- none present}${fwnone:+, absent:$fwnone}"
-# an image carrying fw/network carries the name and passphrase of your network, and the images are
-# what somebody would be handed to run this on a second phone
-if [ -f root/fw/network ]; then
-	echo "build.sh: and fw/network -- the name and passphrase of your Wi-Fi. Do not pass this image on;"
-	echo "build.sh: SHARE=1 builds the same image without it."
+# The images are what somebody would be handed to run this on a second phone, and two of the things
+# build.sh puts in them are secrets: the Wi-Fi network's name and passphrase, and the host's own
+# private key for ssh. Both are one small file inside 2.5 GB, and nobody would notice either leave.
+secrets=
+[ -f root/fw/network ] && secrets="$secrets fw/network (the name and passphrase of your Wi-Fi)"
+[ -f root/var/root/.ssh/ssh_host_ed25519_key ] &&
+	secrets="$secrets /var/root/.ssh/ssh_host_ed25519_key (a private key)"
+if [ -n "$secrets" ]; then
+	echo "build.sh: this image carries:$secrets"
+	echo "build.sh: do not pass it on as it is; SHARE=1 builds the same image without them."
 fi
 # When the iOS volume on the phone's flash is to become the root (boot-arg root_apfs=ufs_darwin,
 # with flashboot.apfs resident; src/init.c, flash_root): an empty directory to hide iOS's
