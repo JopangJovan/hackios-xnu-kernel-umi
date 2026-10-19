@@ -42,8 +42,12 @@ functions and not entry points at all.
   exactly what it was built to be — and silence about everything Metal's sampler state decides.
   **The 64-bit `constexpr sampler` word is not decoded** (section 3.3). Two modules of the corpus
   declare such a sampler; everywhere else the API supplies it.
-- **Compute is untouched by every runtime check.** `air_run` draws and does not dispatch, so the
-  47 kernels — including 24 that use textures — have been compiled and never run.
+- **Compute has just started being checked, and atomics are not among it.** `air_run` can now
+  dispatch a kernel and read its device buffers back (section 5b); the first one agrees with its
+  NIR exactly. But 17 of the 40 kernels that translate use a global atomic, and *a total written
+  by threads that never raced looks exactly like one written by threads that did* — so nothing
+  here is evidence about atomicity. The 24 kernels that use textures are not dispatched at all
+  yet: the harness binds textures for a draw and not for a dispatch.
 
 ## 1. Where the frontend lives: inside Mesa, as `src/compiler/air`
 
@@ -662,6 +666,39 @@ either answer is worth the run.
 
 (Counting anything out of a QEMU log here: `qemu/run-ios.sh` prints every line twice, and
 `sort -u` does not catch it because the pairs are separated by other output.)
+
+### 5b. Dispatching a kernel
+
+`air_run` dispatches a 4×4 workgroup, binds every buffer the kernel declares — constant ones as
+UBOs, device ones as writable SSBOs, all filled with the same `(i * 7 + 13) & 0xff` pattern — and
+prints the device buffers afterwards. `MetalFaceMask_InitMinMax` is the first kernel through it:
+
+```
+  [ 0] 0x7fffffff   [ 1] 0x7fffffff   [ 2] 0x7fffffff
+  [ 3] 0x80000000   [ 4] 0x80000000   [ 5] 0x80000000
+  [ 6] 0xcac3bcb5   <- still the input pattern
+```
+
+which is exactly its NIR: six `store_ssbo`s, `INT_MAX` at offsets 0, 4, 8 and `INT_MIN` at 0xc,
+0x10, 0x14. Six words written, nothing beyond them touched, and the name means what it does — a
+min/max table initialised to the extremes.
+
+**Two things that only showed because the input was a distinctive pattern**, and would have been
+invisible against a zeroed buffer:
+
+- the first dispatch ran **zero threads** and the buffer came back untouched. Metal's threadgroup
+  size is a dispatch argument, so the frontend rightly leaves `workgroup_size_variable` set
+  (section 7.4) — but softpipe reads the block size from `TGSI_PROPERTY_CS_FIXED_BLOCK_*`, which
+  is then zero. Whoever dispatches has to fix the size; `air_run` now does. A kernel called
+  `InitMinMax` writing zeros to a zeroed buffer would have looked like a pass.
+- word 6 holding the pattern is what says the kernel wrote *only* its own 24 bytes.
+
+**What this does not test: atomicity.** Seventeen of the forty kernels that translate use a global
+atomic, and a sum written by threads that never raced is identical to one written by threads that
+did. A test that could fail needs a kernel whose arithmetic is known — one written for the purpose
+rather than one of Apple's — with the thread's own identity in what it writes. Until that exists,
+a kernel that uses atomics and produces sensible numbers here has been shown to *run*, and nothing
+more.
 
 ## 6. Running it
 
