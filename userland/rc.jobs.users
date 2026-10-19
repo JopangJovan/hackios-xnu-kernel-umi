@@ -1,0 +1,10 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The user database (RC_JOBS=rc.jobs.users). iOS has no flat-file user lookup left: getpwuid and
+# getpwnam go over Mach to com.apple.system.libinfo.muser, which usermanagerd serves, and a program
+# that cannot reach it sees every user as missing ("No user exists for uid 0" is what OpenSSH says).
+# ps is the probe already in the image: it calls getpwuid for every process and prints the bare uid
+# when there is no answer, and `ps -U NAME` is a getpwnam that fails loudly.
+/sbin/mount
+/bin/ps -A -o user,uid,pid,comm
+/bin/ps -U root -o user,uid,pid,comm
+/bin/ps -U mobile -o user,uid,pid,comm
