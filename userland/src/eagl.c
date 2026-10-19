@@ -3851,6 +3851,29 @@ my_API(id self, SEL selector)
 	return e ? e->api : 0;
 }
 
+/*
+ * -[EAGLContext sharegroup]. CoreAnimation never asks for it, but CoreImage does: a CIContext made
+ * over an EAGLContext goes +[CIContext contextWithEAGLContext:] -> internalContextWithEAGLContext:
+ * -> CI::GLContext::GLContext -> wrapEAGLContextCreate -> -[EAGLContext sharegroup], and iOS's own
+ * accessor reads ivars of an EAGLContext that my_initWithAPI never filled in (it keeps its state in
+ * `struct eagl` beside the object and does not call through to Apple's init). On the phone that
+ * crashed in -[EAGLContext sharegroup]+4 touching address 0x8. Nothing here shares a context with
+ * anybody, so the honest answer is none; what CoreImage then does is the next thing to find out.
+ */
+static id
+my_sharegroup(id self, SEL selector)
+{
+	static int said;
+
+	(void)self;
+	(void)selector;
+	if (!said) {
+		said = 1;
+		say("redwood-gl: -sharegroup asked for: none (nothing here shares a context)\n");
+	}
+	return nil;
+}
+
 static unsigned long
 my_setParameter(id self, SEL selector, unsigned parameter, const int32_t *values)
 {
@@ -4037,6 +4060,7 @@ install(void)
 	} methods[] = {
 		{ "initWithAPI:properties:", (IMP)my_initWithAPI },
 		{ "API", (IMP)my_API },
+		{ "sharegroup", (IMP)my_sharegroup },
 		{ "setParameter:to:", (IMP)my_setParameter },
 		{ "getMacroContextPrivate", (IMP)my_getMacroContextPrivate },
 		{ "texImageIOSurface:target:internalFormat:width:height:format:type:plane:invert:", (IMP)my_texImageIOSurface },

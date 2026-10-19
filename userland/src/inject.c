@@ -290,6 +290,12 @@ watch_for_faults(void)
 	action.sa_flags = SA_SIGINFO | SA_RESETHAND;
 	sigaction(SIGSEGV, &action, NULL);
 	sigaction(SIGBUS, &action, NULL);
+	/* An Objective-C exception that nobody catches ends in abort(), not in a fault, and a program
+	   that dies that way says nothing at all here -- a run that restarted a daemon 31 times was
+	   silent until these three were watched as well. */
+	sigaction(SIGABRT, &action, NULL);
+	sigaction(SIGILL, &action, NULL);
+	sigaction(SIGTRAP, &action, NULL);
 }
 
 /*

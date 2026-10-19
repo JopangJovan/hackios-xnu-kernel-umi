@@ -67,6 +67,18 @@ LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
 DYN="xnu-clang -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1"
 IOS=../ios165
 CACHE=$IOS/20F66__iPhone10,3_6
+# ios165/rootfs and ios165/cryptex must be this copy's own directories of hard links, the way
+# tools/new-workspace.sh makes them. A symlink to another copy's tree makes sysroot a symlink too, because
+# cp -a does not follow one, and then every rm -rf and mv below edits the shared extraction in place. That
+# happened on 19 October 2026: 491 LaunchDaemons, NanoLaunchDaemons, LaunchAngels, xpc/launchd.plist and
+# private/var went out of the main copy's tree, and only the hard links in the other copies still held them.
+for d in rootfs cryptex cryptex-app; do
+	[ -L $IOS/$d ] || continue
+	echo "build.sh: ios165/$d is a symlink to $(readlink $IOS/$d)" >&2
+	echo "build.sh: it has to be a directory of this copy's own: rm it and cp -al the original over," >&2
+	echo "build.sh: as tools/new-workspace.sh does. Building against a link damages the shared tree." >&2
+	exit 1
+done
 # The stock iOS jobs given to launchd, roughly in the order they were brought up.
 IOS_JOBS=${JOBS-"
 	com.apple.notifyd com.apple.cfprefsd.xpc.daemon com.apple.cfprefsd.xpc.daemon.system com.apple.logd
@@ -162,6 +174,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -o obj/cpu_test src/cpu_test.c
 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework IOSurface -o obj/cg_test src/cg_test.c
+		# what iOS here believes about Metal, and what CoreImage does without it (src/metal_test.m);
+		# OpenGLES for the CIContext made over an EAGLContext, which is deprecated and the point
+		$DYN -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics \
+			-framework CoreImage -framework IOKit -framework Metal -framework OpenGLES \
+			-lMobileGestalt -o obj/metal_test src/metal_test.m
 		$DYN -o obj/shm_test src/shm_test.c
 		$DYN -o obj/apfs_mmap_test src/apfs_mmap_test.c
 		$DYN -o obj/vol_ls src/vol_ls.c
@@ -217,6 +234,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 				src/eagl.c src/gl_osmesa.c
 			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
 			cp $M/libOSMesa.8.dylib obj/
+			# air_run draws with a Metal shader translated by the AIR frontend
+			# and reads the pixels back (docs/air.md). It is built inside the
+			# Mesa build, because it needs Gallium itself and not the gl*
+			# entry points this library exports; AIR=1 tools/mk-mesa.sh makes
+			# it, and it is copied in when it is there.
+			[ -f $M/air_run ] && cp $M/air_run obj/air_run
 		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
@@ -228,6 +251,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/vol_ls ] && cp obj/vol_ls root/bin/
 	[ -f obj/snap_test ] && cp obj/snap_test root/bin/
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
+	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
 	[ -f obj/store_test ] && cp obj/store_test root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
@@ -256,6 +280,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -n "$GL" ]; then
 		cp obj/libOSMesa.8.dylib root/lib/
 		cp obj/gl_test root/bin/
+		[ -f obj/air_run ] && cp obj/air_run root/bin/
 		[ "$GL" = test ] || cp obj/libredwood-gl.dylib root/lib/
 	fi
 	# a program is not started with a library that is not there: it would not start at all
@@ -264,7 +289,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# in /var/jb) as it is, since it lives on the prefix and is there at run time
 		case "$library" in
 		"") ;;
-		/redwood/lib/*) [ -f "root/lib/${library#/redwood/lib/}" ] && echo "$library $names" ;;
+		# an "if" and not "&& echo": a last line whose library is absent would make the loop,
+		# and with it the pipeline and the whole build under set -e, fail -- which is what a tree
+		# with only prebuilt/userland in it does, since not every injection library is shipped there
+		/redwood/lib/*) if [ -f "root/lib/${library#/redwood/lib/}" ]; then echo "$library $names"; fi ;;
 		*) echo "$library $names" ;;
 		esac
 	done > root/etc/inject.conf
@@ -289,7 +317,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
 	# Wi-Fi, which saves rebuilding an image for every question one wants to ask a running iOS. It
 	# refuses a key whose directory anyone but its owner may write, hence the 700.
-	if [ -f ../ssh/authorized_keys ]; then
+	# SHARE=1: no keys in an image that is going to somebody else. ssh_host_ed25519_key is a
+	# private key, and it would be leaving this machine inside a 2.5 GB container
+	if [ -z "$SHARE" ] && [ -f ../ssh/authorized_keys ]; then
 		mkdir -p root/var/root/.ssh
 		printf 'd\t700\t0\t0\t/private/var/root/.ssh\n' >> root/etc/var.skel
 		# the key that lets us in, and the host's own key beside it: made here and not on the
@@ -338,7 +368,8 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# the network the radio is to join: its name on the first line, its passphrase on the second. Yours, and
 	# so not in the repository; it goes where the firmware goes and the kernel reads it there (wifi_join=1)
 	rm -f root/fw/network
-	[ -f ../fw-wifi/network ] && install -m 0600 ../fw-wifi/network root/fw/network
+	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
+	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/redwood_haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
@@ -362,6 +393,27 @@ done
 if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
+fi
+# Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
+# device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
+# slot on 19 October 2026. It is the vendor's and never in the repository, so a copy made with bare
+# git worktree add has none of it, and neither has one whose tools/new-workspace.sh predates the fw-*
+# loop there. Say what went in and what was not there to go in; what each one is for is above.
+fwhave= fwnone=
+for d in gpu wifi haptic camera audio; do
+	if [ -d ../fw-$d ]; then fwhave="$fwhave $d"; else fwnone="$fwnone $d"; fi
+done
+echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${fwhave:- none present}${fwnone:+, absent:$fwnone}"
+# The images are what somebody would be handed to run this on a second phone, and two of the things
+# build.sh puts in them are secrets: the Wi-Fi network's name and passphrase, and the host's own
+# private key for ssh. Both are one small file inside 2.5 GB, and nobody would notice either leave.
+secrets=
+[ -f root/fw/network ] && secrets="$secrets fw/network (the name and passphrase of your Wi-Fi)"
+[ -f root/var/root/.ssh/ssh_host_ed25519_key ] &&
+	secrets="$secrets /var/root/.ssh/ssh_host_ed25519_key (a private key)"
+if [ -n "$secrets" ]; then
+	echo "build.sh: this image carries:$secrets"
+	echo "build.sh: do not pass it on as it is; SHARE=1 builds the same image without them."
 fi
 # When the iOS volume on the phone's flash is to become the root (boot-arg root_apfs=ufs_darwin,
 # with flashboot.apfs resident; src/init.c, flash_root): an empty directory to hide iOS's
@@ -398,7 +450,20 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	rm -rf flashboot flashboot.os
 	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
 	cp obj/stage0 flashboot/sbin/launchd
-	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
+	# the OS cryptex, and the shared cache in it, only where this image will carry it:
+	# with CRYPTEXES=flash the cryptexes are read from the phone's flash and this tree is
+	# built and thrown away unused. The guard ends with the cache: everything after it goes
+	# into the boot volume, which every recipe carries, flash cryptexes included
+	if [ "$CRYPTEXES" != flash ]; then
+		if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
+		D=flashboot.os/System/Library/Caches/com.apple.dyld
+		mkdir -p $D
+		for f in $CACHE/dyld_shared_cache_arm64*; do
+			case "$f" in *.symbols) continue ;; esac
+			# -f: a cryptex fetched with the cache already in it would otherwise stop the build
+			ln -f "$f" $D/
+		done
+	fi
 	# the audio DSP's firmware and the speaker amplifiers' configuration, as in the system image's /fw: the kernel
 	# reads the firmware as soon as there is a root (this image, adsp=1), the configuration maybe later -- by then
 	# from the iOS volume's /fw, which src/init.c (flash_root) binds to this
@@ -423,12 +488,6 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 		done
 		echo "  the package manager's prefix: $(du -sh flashboot/jb | cut -f1) as /jb of the boot volume"
 	fi
-	D=flashboot.os/System/Library/Caches/com.apple.dyld
-	mkdir -p $D
-	for f in $CACHE/dyld_shared_cache_arm64*; do
-		case "$f" in *.symbols) continue ;; esac
-		ln "$f" $D/
-	done
 	python3 ../tools/apfs/mkapfs.py -z --plain fw -o flashboot.boot.apfs Boot=flashboot | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh flashboot.boot.apfs Boot=flashboot
 	# the third container: Apple's App cryptex as it is (10 MB; fetch.sh), for the boot volume's Cryptexes/App
@@ -522,7 +581,8 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do
 		case "$f" in *.symbols) continue ;; esac     # symbolication data, never mapped
-		ln "$f" $D/
+		# -f: a cryptex fetched with the cache already in it would otherwise stop the build
+		ln -f "$f" $D/
 	done
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
