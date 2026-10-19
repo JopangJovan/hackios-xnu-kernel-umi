@@ -18,4 +18,7 @@
 # No wait for SpringBoard: this draws for itself and wants the GPU idle rather than busy with
 # the window server. With gpu=1 the window server has it too, which is worth knowing about on
 # purpose -- but the first run should be the simple one.
-/redwood/bin/air_run /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib clearFragment01
+# --disasm makes ir3 print the Adreno instructions it generated. The screen's name proves
+# fd_screen_create won; only ir3's own disassembly proves the shader went through ir3 and not
+# some later software path, and the four floats look identical either way.
+/redwood/bin/air_run --disasm /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib clearFragment01

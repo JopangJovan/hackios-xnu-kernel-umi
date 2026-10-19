@@ -376,7 +376,8 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
   **Done**, and further than stated: all 456 also pass *reader*, our own reader agreeing with
   `llvm-dis` on every one.
 - **M1** — `clearFragment01` reaches *adreno*: translated, compiled by ir3, rendered on the
-  Adreno, framebuffer equal to the colour in its constant buffer.
+  Adreno, framebuffer equal to the colour in its constant buffer. **Done** (20 October, section
+  5a).
   **Done except for the Adreno itself.** It is `nir_load_ubo` + a store to `FRAG_RESULT_DATA0`
   as predicted, and ir3 turns it into five Adreno instructions (four `mov`s out of the constant
   file, where ir3 promoted the UBO load). Over a buffer of known bytes, LLVM's own execution of
@@ -515,8 +516,47 @@ Without the fault handler there would have been nothing at all to go on: iOS ans
 with "Failed to send exception EXC_CORPSE_NOTIFY" and no report. Four lines of borrowed code
 turned a silent exit into an exact address.
 
-What is *still* not known is whether the kernel's GPU driver and the submit path behave for a draw
-that does not come from CoreAnimation: the GLES path is that driver's only consumer today. `rc.jobs.air` asks with the GPU idle; `rc.jobs.air2` asks again after SpringBoard
+### It drew on the Adreno. M1 is finished.
+
+20 October, `logs/000338-run.log`, with the config bug fixed:
+
+```
+air_run: clearFragment01 on Adreno 7c+ Gen 3 (the GPU, through the kernel's msm device)
+...
+air_run: read back from Adreno 7c+ Gen 3 (the GPU, through the kernel's msm device),
+         ir3's instructions are above
+air_run: the pixel at (0, 0) of render target 0 came back as:
+  2.10170319e-18
+  0.178894654
+  1.48687698e+16
+  1.21394141e+33
+```
+
+**A shader Apple compiled for Metal, translated here, compiled by ir3, run on the phone's GPU,
+giving the colour out of its constant buffer bit for bit.** Four independent references now agree
+on those four floats: LLVM's own execution of the module on a computer, our NIR folded over the
+same bytes, softpipe, and the Adreno.
+
+Three things had to be asserted rather than assumed, because the pixel looks identical whichever
+path produced it:
+
+- **which screen was created** — the first line, which is what caught the earlier run where the
+  GPU driver had never started;
+- **which screen the pixel came out of** — the same name printed again beside the numbers;
+- **that the shader went through ir3 at all** — `--disasm`, which puts ir3's own output in the
+  log. It is `; FRAG prog 1/1: 5 instr, 0 nops, 5 non-nops, 4 mov` and four `mov.u32u32 r0.x,
+  c0.x`: the same five instructions, mov for mov, that `ir3_compiler` produced for this shader on
+  the host months of work earlier. The constant file holds the Metal buffer, which is where ir3
+  promoted the `nir_load_ubo` to.
+
+### And the driver takes work that is not the window server's
+
+`logs/000739-run.log`, `rc.jobs.air2`: the same draw after SpringBoard is up — 287 mentions of it
+in the log, the ringer sounding at 29 s, the window server holding the GPU and drawing iOS through
+`src/eagl.c`. `air_run` still got `Adreno 7c+ Gen 3` and still read back the same four floats.
+
+So the kernel's GPU driver serves a second process while CoreAnimation is drawing. That question
+was owed to the whole port rather than to this frontend, and the answer is yes. `rc.jobs.air` asks with the GPU idle; `rc.jobs.air2` asks again after SpringBoard
 is up and holding it. A refusal is a finding the whole port needs, not just this frontend, so
 either answer is worth the run.
 
