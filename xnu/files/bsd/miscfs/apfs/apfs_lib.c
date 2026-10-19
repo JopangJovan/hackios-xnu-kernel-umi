@@ -2345,8 +2345,9 @@ apfs_extent_at(struct apfs_vol *vol, uint64_t stream_id, uint64_t off,
 		if (error) {
 			return error;
 		}
-		if (length == 0 || (length % vol->nx->block_size) != 0) {
-			return EIO;
+		if (length == 0 || (length % vol->nx->block_size) != 0 ||
+		    (logical % vol->nx->block_size) != 0) {
+			return EIO;     /* an extent of APFS begins and ends on a block */
 		}
 		if (off < logical) {
 			return ENOENT;          /* a gap in the records: not a hole, damage */

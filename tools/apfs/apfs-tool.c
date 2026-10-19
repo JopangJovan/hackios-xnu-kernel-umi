@@ -16,8 +16,9 @@
  *        apfs-tool census IMAGE [PATH] [--meta]   (--meta: do not read contents)
  *        apfs-tool lookups IMAGE    (every name looked up by name; see cmd_lookups)
  *        apfs-tool writable IMAGE   (may the volume be written in place, and why not)
- *        apfs-tool write  IMAGE PATH OFFSET FILE|- [--fail-after N]
- *                                   (the kernel's apfs_write.c; --fail-after is a power failure)
+ *        apfs-tool write  IMAGE PATH OFFSET FILE|- [--fail-after N | --corrupt-after N]
+ *                                   (the kernel's apfs_write.c; --fail-after is a power failure,
+ *                                    --corrupt-after a device that lies about the write)
  */
 
 /* pread(2) and clock_gettime(2) come with -D_DEFAULT_SOURCE, set by build-tool.sh */
@@ -156,6 +157,7 @@ static void op_end(void);
  */
 static bool want_write;
 static bool write_fails;                /* --fail-after was given; 0 of them is a failure too */
+static bool write_corrupts;             /* --corrupt-after: a device that lies about a write */
 static uint64_t write_fail_after;
 static uint64_t writes_done;
 
@@ -165,20 +167,38 @@ file_write(void *ctx, uint64_t off, const void *buf, size_t len)
 	int fd = (int)(intptr_t)ctx;
 	const uint8_t *p = buf;
 
+	uint8_t *copy = NULL;
+
 	if (write_fails && writes_done >= write_fail_after) {
 		return EIO;
+	}
+	if (write_corrupts && writes_done >= write_fail_after) {
+		/*
+		 * A device that says the write went through and puts something else on the
+		 * platter: the one failure no checking before the write can catch, and what the
+		 * read-back comparison in apfs_write.c is there for.
+		 */
+		copy = malloc(len);
+		if (copy == NULL) {
+			return EIO;
+		}
+		memcpy(copy, p, len);
+		copy[0] ^= 0xff;
+		p = copy;
 	}
 	writes_done++;
 	while (len > 0) {
 		ssize_t n = pwrite(fd, p, len, (off_t)off);
 
 		if (n <= 0) {
+			free(copy);
 			return EIO;
 		}
 		p += n;
 		off += (uint64_t)n;
 		len -= (size_t)n;
 	}
+	free(copy);
 	return 0;
 }
 
@@ -1511,9 +1531,14 @@ main(int argc, char **argv)
 	int i;
 
 	for (i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--fail-after") == 0 && i + 1 < argc) {
+		if ((strcmp(argv[i], "--fail-after") == 0 ||
+		    strcmp(argv[i], "--corrupt-after") == 0) && i + 1 < argc) {
 			write_fail_after = strtoull(argv[i + 1], NULL, 0);
-			write_fails = true;
+			if (argv[i][2] == 'f') {
+				write_fails = true;
+			} else {
+				write_corrupts = true;
+			}
 			memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 2) * sizeof(*argv));
 			argc -= 2;
 			i--;
@@ -1526,7 +1551,7 @@ main(int argc, char **argv)
 		    "       apfs-tool stat   IMAGE PATH\n"
 		    "       apfs-tool cat    IMAGE PATH\n"
 		    "       apfs-tool census IMAGE [PATH] [--meta]\n"
-		    "       apfs-tool write  IMAGE PATH OFFSET FILE|- [--fail-after N]\n"
+		    "       apfs-tool write  IMAGE PATH OFFSET FILE|- [--fail-after N | --corrupt-after N]\n"
 		    "       apfs-tool writable IMAGE\n"
 		    "       apfs-tool lookups IMAGE\n"
 		    "       apfs-tool cfrace IMAGE [THREADS [ROUNDS]]\n"

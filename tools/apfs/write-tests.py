@@ -262,11 +262,13 @@ def find_record(image, bno, key):
 
 # ---------------------------------------------------------------- the tests
 
-def write(image, path, at, data, fail_after=None):
+def write(image, path, at, data, fail_after=None, corrupt_after=None):
     """apfs-tool write: the kernel's apfs_write.c on this image."""
     argv = [TOOL, 'write', image, path, str(at), '-']
     if fail_after is not None:
         argv += ['--fail-after', str(fail_after)]
+    if corrupt_after is not None:
+        argv += ['--corrupt-after', str(corrupt_after)]
     p = subprocess.run(argv, input=data, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     return p.returncode, p.stdout.decode('utf-8', 'replace')
 
@@ -459,6 +461,23 @@ def test_extent_gates():
         say(False, 'could not find the extent-reference record to give away')
 
 
+def test_lying_device():
+    """The last of the four bounds: a device that says the write went through and puts something
+    else there.  Nothing read before the write can catch that, which is why every block is read
+    back and compared before the next one goes out."""
+    base, img = fresh('lying')
+    data = b'\x33' * (4 * BS)
+    rc, out = write(img, '/big', 0, data, corrupt_after=2)
+    say(rc != 0 and 'read back' in out.lower(),
+        'refused: a device that wrote something other than what it was given' +
+        ('' if rc != 0 else ':\n' + out.strip()))
+    diff = set(changed_blocks(base, img))
+    target = blocks_of(base, '/big')
+    say(diff <= target and len(diff) == 3,
+        '  and it stopped at that block: %d of the file\'s own blocks changed, none other'
+        % len(diff))
+
+
 def test_power_failure():
     """The power out in the middle of a write, at every block in turn.  What must hold after
     each: the container is clean, the volume mounts, every other file is byte for byte what it
@@ -612,6 +631,7 @@ TESTS = {
     'refusals': test_refusals,
     'volume-gates': test_volume_gates,
     'extent-gates': test_extent_gates,
+    'lying-device': test_lying_device,
     'power-failure': test_power_failure,
     'real-images': test_real_images,
 }

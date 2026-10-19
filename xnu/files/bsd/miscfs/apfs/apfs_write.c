@@ -347,6 +347,11 @@ apfs_write_in_place(struct apfs_vol *vol, uint64_t obj_id, uint64_t off, const v
 		goto refuse;
 	}
 
+	/*
+	 * An extent at a time.  Looking one up walks the stream's extents from the front, so a
+	 * write across a badly fragmented file costs more than it looks -- which is fine for what
+	 * this is for (a file of a few extents written whole) and would not be for a filesystem.
+	 */
 	while (left > 0) {
 		struct apfs_extent ext;
 		uint64_t ext_blocks, piece;
