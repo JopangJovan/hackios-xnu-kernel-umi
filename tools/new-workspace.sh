@@ -10,8 +10,8 @@
 #
 # The kernel tree is copied as it is now, uncommitted work included, and that state is recorded
 # (refs/redwood/baseline in the copy's kernel tree): tools/kernel-delta.sh, run in the workspace,
-# prints what was changed in the kernel since. Files below ios165/rootfs and ios165/cryptex are
-# hard links to this copy's: replace them, never edit them in place.
+# prints what was changed in the kernel since. Files below ios165/rootfs, ios165/cryptex and
+# ios165/cryptex-app are hard links to this copy's: replace them, never edit them in place.
 # The phone is not part of a workspace: there is one, and ./xl belongs to the main copy.
 set -e
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
@@ -41,7 +41,9 @@ cp -a --reflink=auto "$ROOT/xnu-deps/." xnu-deps/
 # there: a main copy that has not built its images yet has no system.apfs nor root.apfs, and
 # cryptex-app is unpacked only where somebody has needed it -- under "set -e" a copy of a file that
 # is not there used to end the script halfway, leaving a workspace without its QEMU instance number
-# and without a kernel.
+# and without a kernel. What a missing cryptex-app costs, when there is one to take: the images come
+# out with no /System/Cryptexes/App at all, and Safari's daemons and AuthenticationServicesAgent --
+# eight jobs -- then look to mkjobs.py like programs nobody has (build.sh at cryptex-app, present()).
 for d in rootfs cryptex cryptex-app "20F66__iPhone10,3_6"; do
 	if [ -e "$ROOT/ios165/$d" ]; then cp -al "$ROOT/ios165/$d" ios165/; fi
 done
