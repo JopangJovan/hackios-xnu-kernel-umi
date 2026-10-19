@@ -1196,14 +1196,16 @@ watch(int seconds)
 		}
 		gettimeofday(&tv, NULL);
 		if (asked || (seconds > 0 && (uint64_t)tv.tv_sec - last >= (uint64_t)seconds)) {
-			if (!save_once()) {
+			int ok = save_once();
+
+			if (!ok) {
 				printf("var_store: this save came to nothing; the store keeps what it had\n");
 			}
 			last = (uint64_t)tv.tv_sec;
 			if (asked) {
-				/* the kernel is waiting on this to go back to the loader */
+				/* answered either way: the kernel is waiting on this to go back to the loader */
 				(void)sysctl_set_int("kern.redwood.var_save", VAR_SAVE_DONE);
-				return 1;
+				return ok;
 			}
 		}
 		usleep(100000);

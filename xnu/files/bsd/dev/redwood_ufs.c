@@ -916,7 +916,8 @@ redwood_var_save_on_return(void)
 		waited += 20;
 	}
 	if (ufs_var_save == VAR_SAVE_DONE) {
-		printf("var_store: the data volume is in the flash (%llu ms)\n", waited);
+		/* what it made of it is in its own lines: this only says it answered */
+		printf("var_store: the saver has finished after %llu ms\n", waited);
 	} else {
 		printf("var_store: the saver did not answer in %u ms: the store keeps what it had\n", ms);
 	}
