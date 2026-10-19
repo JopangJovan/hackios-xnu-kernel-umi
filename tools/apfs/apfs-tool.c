@@ -17,6 +17,8 @@
  *        apfs-tool lookups IMAGE    (every name looked up by name; see cmd_lookups)
  *        apfs-tool writable IMAGE   (may the volume be written in place, and why not)
  *        apfs-tool write  IMAGE PATH OFFSET FILE|- [--fail-after N | --corrupt-after N]
+ *        apfs-tool store  info IMAGE | save IMAGE FILE|- | load IMAGE FILE|-
+ *                                   (the store of fixed-length slot files: bsd/miscfs/apfs/apfs_store.c)
  *                                   (the kernel's apfs_write.c; --fail-after is a power failure,
  *                                    --corrupt-after a device that lies about the write)
  */
@@ -33,6 +35,7 @@
 
 #include "apfs_lib.h"
 #include "apfs_write.h"
+#include "apfs_store.h"
 
 /* ---- the image as a device ---- */
 
@@ -1525,6 +1528,180 @@ cmd_writable(const char *path)
 	return error == 0 ? 0 : 1;
 }
 
+
+/* ---- the store of fixed-length slot files (bsd/miscfs/apfs/apfs_store.c) ---- */
+
+#define STORE_SCRATCH (1u << 20)
+
+static int
+store_open(const char *path, struct apfs_nx *nx, struct apfs_vol *vol, struct apfs_store *st,
+    bool for_writing)
+{
+	const char *why = NULL;
+
+	want_write = for_writing;
+	if (open_image(path, nx, vol) != 0) {
+		return 1;
+	}
+	if (apfs_store_open(vol, st, &why) != 0) {
+		fprintf(stderr, "apfs-tool: %s is not a store: %s\n", path,
+		    why != NULL ? why : "no reason given");
+		return 1;
+	}
+	return 0;
+}
+
+static int
+cmd_store_info(const char *path)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	struct apfs_store st;
+	struct apfs_store_head h;
+	uint8_t *scratch;
+	int slot, best;
+
+	if (store_open(path, &nx, &vol, &st, false) != 0) {
+		return 1;
+	}
+	{
+		const char *why = NULL;
+
+		printf("%s: store on volume %s: %d slots of %" PRIu64 " bytes, %" PRIu64
+		    " of payload; a save here: %s\n", path, vol.name, APFS_STORE_SLOTS,
+		    st.slot_bytes, st.payload_max,
+		    apfs_store_writable(&st, &why) == 0 ? "would go through" : why);
+	}
+	for (slot = 0; slot < APFS_STORE_SLOTS; slot++) {
+		if (apfs_store_head(&st, slot, &h) != 0) {
+			printf("  slot %d (inode %" PRIu64 "): nothing good\n", slot,
+			    st.slot_id[slot]);
+			continue;
+		}
+		printf("  slot %d (inode %" PRIu64 "): generation %" PRIu64 ", %" PRIu64
+		    " bytes, sum %016" PRIx64 ", note %" PRIu64 ", at %" PRIu64 "\n", slot,
+		    st.slot_id[slot], h.generation, h.bytes, h.sum, h.note, h.seconds);
+	}
+	scratch = malloc(STORE_SCRATCH);
+	best = scratch == NULL ? -1 : apfs_store_newest(&st, scratch, STORE_SCRATCH, &h);
+	free(scratch);
+	if (best < 0) {
+		printf("  the newest good slot: none\n");
+	} else {
+		printf("  the newest good slot: %d, generation %" PRIu64 ", %" PRIu64 " bytes\n",
+		    best, h.generation, h.bytes);
+	}
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+static int
+cmd_store_save(const char *path, const char *from, uint64_t note)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	struct apfs_store st;
+	struct apfs_store_write w;
+	uint8_t *data = NULL, *scratch;
+	size_t len = 0, cap = 0;
+	FILE *f = strcmp(from, "-") == 0 ? stdin : fopen(from, "rb");
+	int error;
+
+	if (f == NULL) {
+		perror(from);
+		return 1;
+	}
+	for (;;) {
+		size_t n;
+
+		if (len == cap) {
+			cap = cap ? cap * 2 : (1u << 16);
+			data = realloc(data, cap);
+			if (data == NULL) {
+				fprintf(stderr, "apfs-tool: out of memory\n");
+				return 1;
+			}
+		}
+		n = fread(data + len, 1, cap - len, f);
+		len += n;
+		if (n == 0) {
+			break;
+		}
+	}
+	if (f != stdin) {
+		fclose(f);
+	}
+	if (store_open(path, &nx, &vol, &st, true) != 0) {
+		return 1;
+	}
+	scratch = malloc(STORE_SCRATCH);
+	if (scratch == NULL) {
+		fprintf(stderr, "apfs-tool: out of memory\n");
+		return 1;
+	}
+	error = apfs_store_save(&st, data, len, 0, note, scratch, STORE_SCRATCH, &w);
+	printf("%s: %zu bytes into slot %d as generation %" PRIu64 ": %s; %" PRIu64 " blocks\n",
+	    path, len, w.slot, w.generation, error == 0 ? "saved" : strerror(error), w.blocks);
+	free(scratch);
+	free(data);
+	apfs_nx_close(&nx);
+	return error == 0 ? 0 : 1;
+}
+
+static int
+cmd_store_load(const char *path, const char *to)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	struct apfs_store st;
+	struct apfs_store_head h;
+	uint8_t *scratch, *buf;
+	FILE *f;
+	int best, error;
+
+	if (store_open(path, &nx, &vol, &st, false) != 0) {
+		return 1;
+	}
+	scratch = malloc(STORE_SCRATCH);
+	if (scratch == NULL) {
+		fprintf(stderr, "apfs-tool: out of memory\n");
+		return 1;
+	}
+	best = apfs_store_newest(&st, scratch, STORE_SCRATCH, &h);
+	free(scratch);
+	if (best < 0) {
+		fprintf(stderr, "apfs-tool: %s: no slot holds anything good\n", path);
+		return 1;
+	}
+	buf = malloc(h.bytes ? (size_t)h.bytes : 1);
+	if (buf == NULL) {
+		fprintf(stderr, "apfs-tool: out of memory\n");
+		return 1;
+	}
+	error = h.bytes == 0 ? 0 : apfs_store_read(&st, best, 0, buf, (size_t)h.bytes);
+	if (error) {
+		fprintf(stderr, "apfs-tool: slot %d will not read: %s\n", best, strerror(error));
+		return 1;
+	}
+	f = strcmp(to, "-") == 0 ? stdout : fopen(to, "wb");
+	if (f == NULL) {
+		perror(to);
+		return 1;
+	}
+	if (h.bytes != 0 && fwrite(buf, 1, (size_t)h.bytes, f) != h.bytes) {
+		perror(to);
+		return 1;
+	}
+	if (f != stdout) {
+		fclose(f);
+	}
+	fprintf(stderr, "%s: slot %d, generation %" PRIu64 ", %" PRIu64 " bytes, note %" PRIu64
+	    "\n", path, best, h.generation, h.bytes, h.note);
+	free(buf);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1553,6 +1730,7 @@ main(int argc, char **argv)
 		    "       apfs-tool census IMAGE [PATH] [--meta]\n"
 		    "       apfs-tool write  IMAGE PATH OFFSET FILE|- [--fail-after N | --corrupt-after N]\n"
 		    "       apfs-tool writable IMAGE\n"
+		    "       apfs-tool store  info IMAGE | save IMAGE FILE|- [NOTE] | load IMAGE FILE|-\n"
 		    "       apfs-tool lookups IMAGE\n"
 		    "       apfs-tool cfrace IMAGE [THREADS [ROUNDS]]\n"
 		    "       apfs-tool namehash IMAGE [OUT]\n"
@@ -1580,6 +1758,20 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[1], "writable") == 0) {
 		return cmd_writable(argv[2]);
+	}
+	if (strcmp(argv[1], "store") == 0 && argc > 3) {
+		if (strcmp(argv[2], "info") == 0) {
+			return cmd_store_info(argv[3]);
+		}
+		if (strcmp(argv[2], "save") == 0 && argc > 4) {
+			return cmd_store_save(argv[3], argv[4],
+			    argc > 5 ? strtoull(argv[5], NULL, 0) : 0);
+		}
+		if (strcmp(argv[2], "load") == 0 && argc > 4) {
+			return cmd_store_load(argv[3], argv[4]);
+		}
+		fprintf(stderr, "apfs-tool: store: info, save or load\n");
+		return 2;
 	}
 	if (strcmp(argv[1], "lookups") == 0) {
 		return cmd_lookups(argv[2]);

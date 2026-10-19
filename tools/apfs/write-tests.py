@@ -260,6 +260,276 @@ def find_record(image, bno, key):
     return None, None
 
 
+
+# ---------------------------------------------------------------- the store, read independently
+
+#: a second reading of the store's format, from bsd/miscfs/apfs/apfs_store.h and nothing else, so
+#: that what the C writes is never checked only by the C that wrote it
+STORE_MAGIC = b'RDWSTOR\x00'
+STORE_PAYLOAD = 4096
+FNV_INIT = 0xcbf29ce484222325
+FNV_PRIME = 0x100000001b3
+
+
+def fnv1a(data, h=FNV_INIT):
+    for b in data:
+        h = ((h ^ b) * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def store_slot_bytes(image, slot):
+    """A whole slot file, read by apfs.py."""
+    return read_py_bytes(image, '/slot%d' % slot)
+
+
+def store_head_py(image, slot, payload_max):
+    """The header of a slot, or None when it holds nothing good. Checks what apfs_store.c checks:
+    the magic, its own sum, the version, that the slot says which slot it is, and the length."""
+    blk = store_slot_bytes(image, slot)
+    if blk is None or len(blk) < STORE_PAYLOAD or blk[:8] != STORE_MAGIC:
+        return None
+    (version, which) = struct.unpack_from('<II', blk, 8)
+    (generation, nbytes, seconds, note, summ, head_sum) = struct.unpack_from('<QQQQQQ', blk, 16)
+    if head_sum != fnv1a(blk[:56]):
+        return None
+    if version != 1 or which != slot or generation == 0 or nbytes > payload_max:
+        return None
+    return dict(slot=slot, generation=generation, bytes=nbytes, seconds=seconds, note=note,
+                sum=summ)
+
+
+def store_newest_py(image, payload_max):
+    """The newest good slot and its payload, by this reader alone: the header sums right and the
+    payload sums to what the header says."""
+    best = None
+    for slot in (0, 1):
+        h = store_head_py(image, slot, payload_max)
+        if h is None:
+            continue
+        whole = store_slot_bytes(image, slot)
+        payload = whole[STORE_PAYLOAD:STORE_PAYLOAD + h['bytes']]
+        if len(payload) != h['bytes'] or fnv1a(payload) != h['sum']:
+            continue
+        if best is None or h['generation'] > best[0]['generation']:
+            best = (h, payload)
+    return best
+
+
+def store_image(name, slot_bytes='64K', slots=2):
+    out = os.path.join(WORK, name + '.apfs')
+    rc, out_text = run(sys.executable, os.path.join(HERE, 'mkstore.py'), '-o', out,
+                       '--slot-bytes', slot_bytes, '--slots', str(slots))
+    if rc != 0:
+        raise SystemExit('write-tests.py: mkstore.py failed:\n' + out_text)
+    return out
+
+
+def store_payload_max(image):
+    c = apfs.Container(image)
+    try:
+        vol = c.volumes()[0]
+        oid, _t = vol.lookup('/slot0')
+        return vol.inode(oid).size - STORE_PAYLOAD
+    finally:
+        c.close()
+
+
+def store_save(image, data, note=0, fail_after=None):
+    argv = [TOOL, 'store', 'save', image, '-', str(note)]
+    if fail_after is not None:
+        argv += ['--fail-after', str(fail_after)]
+    p = subprocess.run(argv, input=data, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return p.returncode, p.stdout.decode('utf-8', 'replace')
+
+
+def store_load(image):
+    p = subprocess.run([TOOL, 'store', 'load', image, '-'], stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL)
+    return None if p.returncode != 0 else p.stdout
+
+
+def store_blocks(image):
+    return blocks_of(image, '/slot0') | blocks_of(image, '/slot1')
+
+
+def test_store():
+    """The store of fixed-length slot files: saves alternate between the slots, a load takes the
+    newest, and nothing outside the slot files is ever written."""
+    img = store_image('store')
+    payload_max = store_payload_max(img)
+    pristine = os.path.join(WORK, 'store-pristine.apfs')
+    shutil.copyfile(img, pristine)
+    ok, ck = read_apfsck(img)
+    say(ok, 'the fresh store volume is clean to apfsck' + ('' if ok else ':\n' + ck))
+    say(store_newest_py(img, payload_max) is None and store_load(img) is None,
+        'a fresh store holds nothing good, by either reader')
+
+    slots_seen, good = [], True
+    want = None
+    for i in range(5):
+        data = bytes(((i + 3) * 37 + j) & 0xff for j in range(1000 + i * 4000))
+        rc, out = store_save(img, data, note=100 + i)
+        if rc != 0:
+            good = say(False, '  save %d failed:\n%s' % (i, out))
+            break
+        slots_seen.append(int(out.split('into slot ')[1].split()[0]))
+        want = data
+        # the C's own load, the independent Python reader, and apfsck, after every save
+        got = store_load(img)
+        py = store_newest_py(img, payload_max)
+        ck_ok, ck = read_apfsck(img)
+        if got != want:
+            good = say(False, '  save %d: the C reads back something else' % i)
+            break
+        if py is None or py[1] != want or py[0]['generation'] != i + 1 or py[0]['note'] != 100 + i:
+            good = say(False, '  save %d: the Python reader disagrees (%s)'
+                       % (i, 'nothing good' if py is None else py[0]))
+            break
+        if not ck_ok:
+            good = say(False, '  save %d: apfsck is unhappy:\n%s' % (i, ck))
+            break
+    say(good, 'five saves in turn: both readers agree every time and apfsck stays clean')
+    say(slots_seen == [0, 1, 0, 1, 0],
+        'and they alternate between the slots: %s' % slots_seen)
+    diff = set(changed_blocks(pristine, img))
+    target = store_blocks(pristine)
+    say(diff <= target, 'of the whole volume only the slot files changed (%d blocks of their %d)'
+        % (len(diff), len(target)) if diff <= target else
+        'blocks outside the slots changed: %s' % sorted(diff - target)[:8])
+
+
+def test_store_refusals():
+    """What the store refuses, and each is a way of being pointed at the wrong thing."""
+    # a volume that is not the store: the name is the gate
+    base, img = fresh('store-notstore')
+    rc, out = store_save(img, b'x' * 100)
+    say(rc != 0 and 'not named' in out, 'refused: a volume that is not named RedwoodStore' +
+        ('' if rc != 0 else ':\n' + out.strip()))
+    say(changed_blocks(base, img) == [], '  and nothing in it was written')
+
+    # a payload longer than a slot will hold
+    img = store_image('store-full', slot_bytes='8K')
+    payload_max = store_payload_max(img)
+    rc, out = store_save(img, b'y' * (payload_max + 1))
+    say(rc != 0 and 'will hold' in out, 'refused: a payload longer than the slot' +
+        ('' if rc != 0 else ':\n' + out.strip()))
+    say(store_newest_py(img, payload_max) is None,
+        '  and the slot it was going into holds nothing good afterwards')
+
+    # exactly as much as it will hold goes in
+    rc, out = store_save(img, b'z' * payload_max)
+    py = store_newest_py(img, payload_max)
+    say(rc == 0 and py is not None and py[1] == b'z' * payload_max,
+        'a payload of exactly the slot\'s length goes in and reads back')
+
+    # a volume shaped wrongly: slots of different lengths, a slot missing, a slot compressed.
+    # Built as such rather than poked into being such, so the refusal is for the stated reason.
+    for what, sizes, compress, expect in (
+            ('slots that are not the same length', {'slot0': 65536, 'slot1': 32768}, False,
+             'not the same length'),
+            ('a store with only one slot', {'slot0': 65536}, False, 'no such slot file'),
+            ('a slot too short to hold a header', {'slot0': 4096, 'slot1': 4096}, False,
+             'too short'),
+            ('a slot the volume stored compressed', {'slot0': 65536, 'slot1': 65536}, True,
+             'compressed')):
+        tree = os.path.join(WORK, 'oddtree')
+        shutil.rmtree(tree, ignore_errors=True)
+        os.makedirs(tree)
+        for name, size in sizes.items():
+            with open(os.path.join(tree, name), 'wb') as f:
+                f.truncate(size)        # all zeros, so -z stores it compressed
+        img = os.path.join(WORK, 'odd.apfs')
+        argv = [sys.executable, os.path.join(HERE, 'mkapfs.py'), '-o', img]
+        if compress:
+            argv.append('-z')
+        argv.append('RedwoodStore=' + tree)
+        rc, out = run(*argv)
+        if rc != 0:
+            say(False, '%s: the image could not be made:\n%s' % (what, out))
+            continue
+        before = open(img, 'rb').read()
+        rc, out = store_save(img, b'q' * 100)
+        unchanged = open(img, 'rb').read() == before
+        say(rc != 0 and expect in out and unchanged, 'refused: %s' % what +
+            ('' if rc != 0 else ': it was NOT refused') +
+            ('' if expect in out else ': for the wrong reason -- %s' % out.strip()) +
+            ('' if unchanged else ' -- and the image changed'))
+
+def test_store_power_failure():
+    """The power out at every block of a save.  A save is: the slot's header zeroed, the payload,
+    then the header -- so at every moment either the slot being written says nothing good (and the
+    other slot's generation is what a reader takes), or the save has finished.  Never a mixture."""
+    img = store_image('store-pf', slot_bytes='64K')
+    payload_max = store_payload_max(img)
+    first = bytes((j * 11 + 5) & 0xff for j in range(20000))
+    rc, out = store_save(img, first, note=1)
+    if not say(rc == 0, 'a first save to fail over' + ('' if rc == 0 else ':\n' + out)):
+        return
+    base = os.path.join(WORK, 'store-pf-base.apfs')
+    shutil.copyfile(img, base)
+    second = bytes((j * 7 + 200) & 0xff for j in range(40000))
+    rc, out = store_save(img, second, note=2)
+    total = int(out.split('; ')[1].split()[0])
+    good = True
+    for k in range(total + 1):
+        part = os.path.join(WORK, 'store-pf-%d.apfs' % k)
+        shutil.copyfile(base, part)
+        rc, out = store_save(part, second, note=2, fail_after=k)
+        ck_ok, ck = read_apfsck(part)
+        if not ck_ok:
+            good = say(False, '  stopped after %d blocks: apfsck is unhappy:\n%s' % (k, ck))
+            continue
+        diff = set(changed_blocks(base, part))
+        if not diff <= store_blocks(base):
+            good = say(False, '  stopped after %d blocks: blocks outside the slots changed: %s'
+                       % (k, sorted(diff - store_blocks(base))[:6]))
+            continue
+        # what both readers see now must be one of exactly two things
+        py = store_newest_py(part, payload_max)
+        c_bytes = store_load(part)
+        if py is None:
+            good = say(False, '  stopped after %d blocks: no slot holds anything good' % k)
+            continue
+        if py[1] != c_bytes:
+            good = say(False, '  stopped after %d blocks: the two readers disagree' % k)
+            continue
+        if rc == 0:
+            if py[1] != second or py[0]['generation'] != 2:
+                good = say(False, '  stopped after %d blocks: it reported success but the new '
+                           'payload is not what reads back' % k)
+            continue
+        if py[1] != first or py[0]['generation'] != 1 or py[0]['note'] != 1:
+            good = say(False, '  stopped after %d blocks: the save did not finish, yet what '
+                       'reads back is neither the old payload nor the new' % k)
+            continue
+    say(good, 'the power out after each of the %d blocks of a save: the volume is sound every '
+        'time, and what reads back is either the save before it or this one, never a mixture'
+        % total)
+
+    # and the cold case: the very first save into an empty store, stopped partway.  There is no
+    # slot before it to fall back on, so a reader must say plainly that there is nothing, which
+    # is what init needs to hear to leave /private/var as it made it.
+    cold = store_image('store-cold', slot_bytes='64K')
+    cold_base = os.path.join(WORK, 'store-cold-base.apfs')
+    shutil.copyfile(cold, cold_base)
+    good = True
+    for k in range(total):
+        part = os.path.join(WORK, 'store-cold-%d.apfs' % k)
+        shutil.copyfile(cold_base, part)
+        rc, out = store_save(part, second, note=9, fail_after=k)
+        ck_ok, ck = read_apfsck(part)
+        if not ck_ok:
+            good = say(False, '  cold, stopped after %d blocks: apfsck is unhappy:\n%s' % (k, ck))
+            continue
+        if rc == 0:
+            continue                    # it finished; the full sweep above covers that
+        if store_newest_py(part, payload_max) is not None or store_load(part) is not None:
+            good = say(False, '  cold, stopped after %d blocks: a reader thinks there is '
+                       'something good in there' % k)
+    say(good, 'the first save into an empty store, stopped at each of its blocks: both readers '
+        'say there is nothing rather than something half written')
+
+
 # ---------------------------------------------------------------- the tests
 
 def write(image, path, at, data, fail_after=None, corrupt_after=None):
@@ -633,6 +903,9 @@ TESTS = {
     'extent-gates': test_extent_gates,
     'lying-device': test_lying_device,
     'power-failure': test_power_failure,
+    'store': test_store,
+    'store-refusals': test_store_refusals,
+    'store-power': test_store_power_failure,
     'real-images': test_real_images,
 }
 
