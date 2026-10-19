@@ -59,6 +59,25 @@ import sys
 # Stubbing the first driver is the kind of work RedwoodBattery already is, but the second is an Apple
 # baseband on PCIe, and this phone's modem is on the SoC and speaks QMI to a Qualcomm subsystem -- so what
 # is behind the driver is missing too, not just the driver.
+# cloudd and mobileassetd were tried too, and they behave: no crash in a seven-minute session, each spawned
+# once on demand and stayed, and between them 42 failed lookups a session go away (com.apple.cloudd 26,
+# com.apple.mobileassetd.v2 16). They are out all the same, for now, because of what they cost in QEMU: with
+# the two of them in, the boot reaches 76 processes against 119 in 420 s and 84 in 700 s, and the home screen
+# never arrives at all -- not one widget or poster process starts, where the same image without them has
+# Spotlight, PosterBoard and a dozen widgets up inside 420 s. Nothing is wrong with the daemons; an emulated
+# CPU cannot carry CloudKit and asset downloads and still draw a home screen. On the phone, with eight real
+# cores, the cost is probably nothing -- but nobody has measured it there yet, and QEMU is how this is mostly
+# run. Measure it on the phone and they can come straight in: ALLOW="cloudd mobileassetd".
+# syncdefaultsd (com.apple.kvsd) is out on its own merits. It serves cloudkeychainproxy3 its store, then
+# aborts inside changeTokenForStoreWithConfiguration:reply: with
+#   *** Terminating app due to uncaught exception 'NSInvalidArgumentException',
+#       reason: '*** -[NSURL initFileURLWithPath:isDirectory:]: nil string parameter'
+# -- it is building a file URL for a directory it was given as nil. The likely one is the SyncedPreferences
+# directory it asks for by name ("uncontainerizedSyncedPreferencesDirectoryURL"), which nothing creates here:
+# ios165/var.skel has no /private/var/mobile/Library/SyncedPreferences. That is worth trying before anything
+# cleverer -- it would be a missing directory, not missing hardware.
+# bird and duetexpertd were shipped as well and nothing ever asked for them in a bare boot (no spawn, no
+# lookup), so they are still untested rather than known good; they need a session with applications.
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'locationd', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
