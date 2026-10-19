@@ -393,15 +393,37 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
   `air.visible` library functions, which are not entry points at all (below). Counting every
   entry point rather than every module: 275 of 321, 86%. Nothing has run on the Adreno.
 - **M3** — textures and samplers, each form with a test that renders a known image.
-  **Translated and compiled, not yet rendered.** The family took the corpus from 275 modules to
+  **Translated, compiled, and six of them rendered and checked.** The family took the corpus from 275 modules to
   313, and all 313 compile for the Adreno. What is *not* done is M3's acceptance test: not one
-  texture operation has been run, because `air_run` binds no textures yet and the CPU reference
-  cannot judge a shader whose coordinate comes from a varying. The forms written are 2D, 3D, 1D,
+  texture operation had been run until `air_run` learned to bind one. The forms written are 2D, 3D, 1D,
   cube and their array and multisample variants, for sampling (plain, explicit level, bias,
   minimum-level clamp), gathering, fetching by integer coordinate, writing, and the queries
   (width, height, depth, array size, level count, sample count). Refused with a named error, not
   guessed at: compare sampling (`sample_compare`, `gather_compare`), texture buffers, and a depth
   texture whose aspect selector is not 1.
+
+  **Six texture shaders have now been run and return the exact texel**
+  (`tools/air/texcheck.sh`). `air_run` binds a texture whose texel is
+  `(100+x, 200+y, 300+x+y+z, 400)` — 4×4 for a 2D sampler, 4×4×4 for a 3D one — a nearest
+  sampler with clamped addressing, and a coordinate at the centre of texel (1, 1). A single
+  sample or fetch must then return that texel *exactly*: nearest filtering at a texel centre has
+  no weights to round and clamping has no arithmetic. 2D and 3D, in float, int and uint, all six
+  return it; **none returns anything else**.
+
+  Binding the matching target mattered more than it looks: with a 2D texture bound for a 3D
+  sampler the three 3D shaders also "passed", by accident. With a real 4×4×4 texture they return
+  `101 201 303 400` — the 3D texel — and only then are they evidence.
+
+  Of 55 texture shaders, 49 are not run, and the reasons are the honest part: 24 are compute
+  kernels (`air_run` draws, it does not dispatch); 11 are `air.visible` library functions; 4
+  sample a multisample texture the harness does not bind; 1 writes only depth; 1 hits an
+  assertion in softpipe's own NIR-to-TGSI; 8 are other translation refusals. **Not one returns a
+  wrong number** — the failures are all a refusal to run, which is the shape of failure to want.
+
+  `texturedFragment3DDepth` is worth naming because it cost a wrong-looking result: it returns
+  `{undef, depth}` and stores *nothing* to its colour attachment, so reading the colour gave the
+  clear value — a number that means nothing and looks like an answer. `air_run` now checks that
+  the attachment it reads is one the shader actually stores to, and refuses when it is not.
 
   The sampler state is the gap that matters for correctness. Metal's `constexpr sampler` arrives
   as a global holding one 64-bit word, and **that word's layout is not decoded**: the frontend
