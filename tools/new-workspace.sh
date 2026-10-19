@@ -51,6 +51,12 @@ done
 for f in rootfs.dmg rootfs.slt cryptex-app.dmg extracted; do
 	if [ -e "$ROOT/ios165/$f" ]; then ln -s "$ROOT/ios165/$f" ios165/; fi
 done
+# The firmware the build puts into the images -- the radio's, the audio DSP's, the GPU's. A copy
+# without them builds an image with no /fw and says nothing about it: gpu=1 then starts no GPU.
+# Links, not copies: there is one set of these on this computer and they are not small.
+for d in "$ROOT"/fw-*; do
+	if [ -d "$d" ]; then ln -s "$d" ./; fi
+done
 for f in obj system.apfs root.apfs hello; do
 	if [ -e "$ROOT/userland/$f" ]; then cp -a --reflink=auto "$ROOT/userland/$f" userland/; fi
 done
