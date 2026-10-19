@@ -89,9 +89,17 @@ IOS_JOBS=${JOBS-"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is
 # libredwood-media.dylib).
+# What Sileo runs from /bin (see the package manager's prefix below): the system image's /bin, or the
+# boot volume's bin, bound over the iOS volume's /bin when that is the root (src/init.c, flash_root).
+SILEO_BIN="chmod cp mkdir mv rm"
+# (libredwood-tweaks is the tweak loader of the package manager's prefix, src/inject_tweaks.c: in
+# SpringBoard the library above opens it, here it is named for the programs that have no library of
+# ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
 INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libredwood-sb.dylib SpringBoard
-/redwood/lib/libredwood-media.dylib mediaserverd"}
+/redwood/lib/libredwood-media.dylib mediaserverd
+/redwood/lib/libredwood-app.dylib Sileo
+/redwood/lib/libredwood-tweaks.dylib Preferences"}
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -106,7 +114,7 @@ else
 	$CC $LD -o hello src/hello.c
 	$CC -Ilibmini -c libmini/mini.c -o obj/mini.o
 	$CC -c libmini/start.S -o obj/start.o
-	for prog in init child stage0; do
+	for prog in init child stage0 var_store; do
 		$CC -Ilibmini $LD -o obj/$prog.new src/$prog.c obj/mini.o obj/start.o
 		# keep the old file (and its time stamp) when nothing changed: system.apfs depends on stage0
 		cmp -s obj/$prog.new obj/$prog && rm obj/$prog.new || mv obj/$prog.new obj/$prog
@@ -118,6 +126,11 @@ rm -rf root
 mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
 cp obj/init root/sbin/init
 cp obj/child root/bin/child
+# The data volume into the flash and back (src/var_store.c), and the job that saves it when a run
+# ends: the program and its job together, away from the iOS job list below, which several working
+# copies are editing at once.
+[ -f obj/var_store ] && cp obj/var_store root/bin/
+cp com.redwood.varstore.plist root/LaunchDaemons/
 echo "Darwin on redwood: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
@@ -163,6 +176,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood.dylib src/inject.c
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libredwood-sb.dylib src/inject_sb.c
+		# ... the tweak loader of the package manager's prefix (src/inject_tweaks.c): it goes into a
+		# program either as the one library the kernel inserts or opened by a library of ours
+		$DYN -dynamiclib -install_name /redwood/lib/libredwood-tweaks.dylib -framework CoreFoundation -lobjc \
+			-o obj/libredwood-tweaks.dylib src/inject_tweaks.c
+		# ... and inside an application, to say what killed it (src/inject_app.c)
+		$DYN -dynamiclib -install_name /redwood/lib/libredwood-app.dylib -lobjc \
+			-o obj/libredwood-app.dylib src/inject_app.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libredwood-media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -207,6 +227,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
+	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
+	[ -f obj/libredwood-tweaks.dylib ] && cp obj/libredwood-tweaks.dylib root/lib/
 	if [ -f obj/RedwoodAudio ]; then
 		mkdir -p root/lib/RedwoodAudio.driver
 		cp obj/RedwoodAudio root/lib/RedwoodAudio.driver/
@@ -219,7 +241,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	fi
 	# a program is not started with a library that is not there: it would not start at all
 	echo "$INJECT" | while read -r library names; do
-		[ -z "$library" ] || [ ! -f "root/lib/${library#/redwood/lib/}" ] || echo "$library $names"
+		# a /redwood/lib library only if it was actually built; any other path (e.g. a tweak loader
+		# in /var/jb) as it is, since it lives on the prefix and is there at run time
+		case "$library" in
+		"") ;;
+		/redwood/lib/*) [ -f "root/lib/${library#/redwood/lib/}" ] && echo "$library $names" ;;
+		*) echo "$library $names" ;;
+		esac
 	done > root/etc/inject.conf
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
@@ -233,8 +261,36 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"
 	done >> root/etc/var.skel
+	# mobile's own temporary directory, $HOME/tmp, which iOS's template does not have: an application of
+	# mobile's without a data container of its own keeps its temporary files there -- Sileo, registered from
+	# the prefix with the root on the flash, downloads every package and index there, and without it each
+	# download ended in "No such file or directory"
+	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
+	# A key of ours for root, when there is one: ssh/authorized_keys, never in the repository (like
+	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
+	# Wi-Fi, which saves rebuilding an image for every question one wants to ask a running iOS. It
+	# refuses a key whose directory anyone but its owner may write, hence the 700.
+	if [ -f ../ssh/authorized_keys ]; then
+		mkdir -p root/var/root/.ssh
+		printf 'd\t700\t0\t0\t/private/var/root/.ssh\n' >> root/etc/var.skel
+		# the key that lets us in, and the host's own key beside it: made here and not on the
+		# phone, because ssh-keygen asks who uid 0 is and gets "No user exists for uid 0" --
+		# it asks through libiosexec, which reads a database the bootstrap does not ship (see
+		# init.c, where it is now built at every boot); the key is made here all the same,
+		# since nothing should depend on the order of those two
+		for k in authorized_keys ssh_host_ed25519_key ssh_host_ed25519_key.pub; do
+			[ -f ../ssh/$k ] || continue
+			cp ../ssh/$k root/var/root/.ssh/$k
+			printf 'f\t600\t0\t0\t/private/var/root/.ssh/%s\t/var/root/.ssh/%s\n' $k $k >> root/etc/var.skel
+		done
+	fi
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
+	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
+	# lines about its own business in the first minutes and pushes everything else out of the
+	# kernel's log; the daemons keep their own standard error on the console all the same.
+	rm -f root/etc/quiet
+	[ -n "$QUIET" ] && : > root/etc/quiet
 	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory).
 	# With FLASHBOOT=1 the root will be Apple's whole volume on the flash, not the part of it that fits in
 	# the system image, so mkjobs.py judges "is this daemon's program there" by the listing of the volume
@@ -335,6 +391,19 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 		mkdir -p flashboot/fw
 		cp ../fw-audio/aw882xx_acf.bin flashboot/fw/
 	fi
+	# the package manager's prefix, when tools/mk-jb.sh has fetched one: /jb of the boot volume, which is
+	# /private/preboot/jb once the iOS volume is the root -- the volume where a rootless jailbreak keeps its
+	# Procursus on an iPhone as well; init grafts it onto /var/jb (src/init.c, mount_writable)
+	if [ -d ../jb/root/var/jb ]; then
+		cp -a ../jb/root/var/jb flashboot/jb
+		mkdir -p flashboot/jb-rw        # where init mounts the prefix's writable copy (src/init.c)
+		# and what Sileo runs from /bin, for init to put over the iOS volume's /bin (see the system image below)
+		mkdir -p flashboot/jb-bin
+		for c in $SILEO_BIN; do
+			ln -s /var/jb/usr/bin/$c flashboot/jb-bin/$c
+		done
+		echo "  the package manager's prefix: $(du -sh flashboot/jb | cut -f1) as /jb of the boot volume"
+	fi
 	D=flashboot.os/System/Library/Caches/com.apple.dyld
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do
@@ -399,6 +468,26 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	if [ -f ../fw-audio/aw882xx_acf.bin ]; then
 		mkdir -p sysroot/fw
 		cp ../fw-audio/aw882xx_acf.bin sysroot/fw/
+	fi
+	# the package manager's prefix, when tools/mk-jb.sh has fetched one: the Procursus bootstrap with
+	# Sileo in it, as /jb. It cannot live at /var/jb in the image -- /private/var is a memory
+	# filesystem made afresh at every boot -- so init copies it there (src/init.c, copy_tree).
+	if [ -d ../jb/root/var/jb ]; then
+		rm -rf sysroot/jb
+		cp -a ../jb/root/var/jb sysroot/jb
+		# the applications of the prefix are system applications here: LaunchServices builds its
+		# database afresh at every boot by walking /Applications, which is how their icons appear
+		for app in sysroot/jb/Applications/*.app; do
+			[ -d "$app" ] && cp -a "$app" sysroot/Applications/
+		done
+		# Sileo moves, copies and removes files as root with /bin/mv, /bin/cp, /bin/rm, /bin/mkdir and
+		# /bin/chmod -- where a jailbreak with a writable root keeps them -- and iOS's /bin has df and ps
+		# alone: every one of those spawns failed with nothing said, and the package it had downloaded never
+		# reached apt's archives ("Unable to fetch some archives"). The prefix's own programs, by those names.
+		for c in $SILEO_BIN; do
+			ln -sf /var/jb/usr/bin/$c sysroot/bin/$c
+		done
+		echo "  the package manager's prefix: $(du -sh sysroot/jb | cut -f1) as /jb (init puts it at /var/jb)"
 	fi
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
