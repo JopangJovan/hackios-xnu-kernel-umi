@@ -68,4 +68,14 @@ for f in "${LIBS[@]}"; do
 		cpu_rc=1
 done
 
-exit $((reader_rc | cpu_rc))
+echo
+echo "== the air.* operations, one at a time"
+# The section above ends with "0 call an air.* function", which is the whole
+# reason this one exists: a module that agrees with LLVM proves the reader and
+# the instructions, and says nothing about the intrinsics, because LLVM cannot
+# evaluate a call it has no body for. So each operation is called on its own
+# here, on inputs chosen to break it, against a reference in the script.
+python3 "$ROOT/tools/air/intrincheck.py" 2>&1 | tail -8
+intrin_rc=${PIPESTATUS[0]}
+
+exit $((reader_rc | cpu_rc | intrin_rc))
