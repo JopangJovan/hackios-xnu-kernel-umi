@@ -10,7 +10,7 @@
 #                                   after init's checks; rc.ios runs a few iOS programs and halts
 #                      JOBS="..."   labels of the stock iOS launchd jobs to load (default: IOS_JOBS)
 #                      REST=1       ... and the rest of them, started only when asked for (see mkjobs.py)
-#                      WIFID=1      ... and wifid, iOS's Wi-Fi daemon (see below at IOS_JOBS)
+#                      WIFID=0      without wifid, iOS's Wi-Fi daemon, which is in by default (see below)
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
@@ -75,10 +75,15 @@ IOS_JOBS=${JOBS-"
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
 	com.apple.SpringBoard
 "}
-# WIFID=1: iOS's own Wi-Fi daemon as well, for Settings to have a Wi-Fi to show: the kernel answers it in
+# iOS's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
 # bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
 # networks the radio hears. NOT FINISHED: a network cannot be joined from Settings yet.
-[ -n "$WIFID" ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
+# It is in by default now, because it costs nothing where there is no radio at all: in QEMU it comes up, talks
+# to itself about country codes and sits there -- 228 processes started against 228 without it, no crash -- and
+# it answers what the rest of the system keeps asking for anyway. com.apple.wifi.manager, which wifid registers
+# itself rather than declaring in its plist, fell from 60 failed lookups a session to 6, com.apple.private.corewifi*
+# from 6 to none, and the session's whole failed-lookup count from 659 to 605. WIFID=0 leaves it out.
+[ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is
 # libredwood-media.dylib).

@@ -44,6 +44,12 @@ cp -a --reflink=auto "$ROOT/xnu-deps/." xnu-deps/
 for d in rootfs cryptex "20F66__iPhone10,3_6"; do cp -al "$ROOT/ios165/$d" ios165/; done
 # (the App cryptex only if this copy has it: fetch.sh unpacks it, and not every copy has run that far)
 [ -d "$ROOT/ios165/cryptex-app" ] && cp -al "$ROOT/ios165/cryptex-app" ios165/
+# The phone's own firmware, which somebody pulled out of its Android and which is in no repository: without
+# it build.sh quietly makes images with no GPU, no Wi-Fi and no audio DSP, and a workspace cannot produce a
+# phone image that works at all. Hard links, so carrying it costs nothing.
+for d in fw-gpu fw-wifi fw-audio fw-camera fw-haptic; do
+	[ -d "$ROOT/$d" ] && cp -al "$ROOT/$d" .
+done
 for f in system.files system.manifest var.skel .done-rootfs .done-cryptex a2s.json cryptex-app.dmg; do
 	[ -e "$ROOT/ios165/$f" ] && cp -a "$ROOT/ios165/$f" ios165/
 done
