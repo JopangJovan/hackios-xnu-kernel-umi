@@ -94,12 +94,18 @@ apfs_ticks(void)
  * -- so it must be safe on several threads at once and touch nothing apfs_lib keeps.
  * NULL: read() is used for those too (still without the lock, so read() must then be safe
  * that way as well).
+ *
+ * write() is for apfs_write.c and nothing else: whole blocks, and only ever blocks that
+ * hold the contents of one file (apfs_write_in_place).  A device that leaves it NULL -- as
+ * every mount of this driver does -- cannot be written to at all, which is what it was
+ * before this field existed.
  */
 struct apfs_dev {
 	void     *ctx;
 	uint64_t  size;                 /* bytes, 0 if not known */
 	int     (*read)(void *ctx, uint64_t off, void *buf, size_t len);
 	int     (*read_data)(void *ctx, uint64_t off, void *buf, size_t len);
+	int     (*write)(void *ctx, uint64_t off, const void *buf, size_t len);
 };
 
 /* A cached block's memory, given up while somebody may still be reading it (nx->retired) */
@@ -182,6 +188,14 @@ struct apfs_nx {
 	uint32_t          fs_count;
 	uint8_t           uuid[16];
 	struct apfs_omap  omap;         /* resolves volume superblocks */
+	/*
+	 * The checkpoint rings, as the live superblock names them.  The read path does not
+	 * need the data ring at all and reads the descriptor ring only at open; they are kept
+	 * so that apfs_write.c can refuse outright a write that would land in either of them
+	 * -- the one bound that does not depend on having read any tree correctly.
+	 */
+	uint64_t          xp_desc_base, xp_data_base;
+	uint32_t          xp_desc_blocks, xp_data_blocks;
 	/*
 	 * The caller's lock round this container, which apfs_lib may let go of while it
 	 * does work that touches nothing shared -- reading a file's contents off the device
@@ -294,6 +308,18 @@ struct apfs_vol {
 	 */
 	struct apfs_btree fext;
 	bool              has_fext;
+	/*
+	 * The extent-reference tree: which stream owns a run of physical blocks and how many
+	 * references there are to it.  The read path has no use for it -- a file's own extent
+	 * records say where its bytes are -- but it is the only place that says whether those
+	 * blocks are shared with a clone, so apfs_write.c will not write a block without it.
+	 * Only the identifier is kept here, and the tree is opened into the caller's own memory
+	 * (apfs_extentref_open): a whole struct apfs_btree more in every mount would put
+	 * struct apfs_mount over the 16 KB a mount is allowed (apfs_vfsops.c).
+	 */
+	apfs_oid_t        extentref_oid;        /* a block address: the tree is physical; 0 if none */
+	uint64_t          num_snapshots;        /* a snapshot shares blocks with the live tree */
+	apfs_oid_t        integrity_meta_oid;   /* a sealed volume: hashes of the files' contents */
 	uint64_t          num_files;
 	uint64_t          num_dirs;
 	uint64_t          num_symlinks;
@@ -518,6 +544,21 @@ int apfs_readlink(struct apfs_vol *vol, uint64_t obj_id, char *buf, size_t len,
  */
 int apfs_read_stream(struct apfs_vol *vol, uint64_t stream_id, uint64_t stream_size,
     uint64_t off, void *buf, size_t len, size_t *out);
+
+/*
+ * The extent of a data stream that covers logical offset `off`: where it begins, how long
+ * it is, and the block it starts at (0 for a hole).  ENOENT past the last extent.  A
+ * reader of contents has no use for this -- apfs_read_stream walks the extents itself --
+ * but a writer has to know exactly which blocks are the file's own.
+ */
+int apfs_extent_at(struct apfs_vol *vol, uint64_t stream_id, uint64_t off,
+    struct apfs_extent *ext);
+
+/*
+ * Open the volume's extent-reference tree into `tree`, which is the caller's to keep for as
+ * long as the volume is open.  ENOENT when the volume has none.
+ */
+int apfs_extentref_open(struct apfs_vol *vol, struct apfs_btree *tree);
 
 /*
  * Work out how a file's contents are stored and read in whatever is worth reading once.
