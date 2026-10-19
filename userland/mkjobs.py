@@ -81,26 +81,22 @@ import sys
 # Stubbing the first driver is the kind of work RedwoodBattery already is, but the second is an Apple
 # baseband on PCIe, and this phone's modem is on the SoC and speaks QMI to a Qualcomm subsystem -- so what
 # is behind the driver is missing too, not just the driver.
-# cloudd is out, and the reason is not what it first looked like. Neither daemon crashes, and between them
-# 42 failed lookups a session go away (com.apple.cloudd 26, com.apple.mobileassetd.v2 16) -- but with the two
-# of them in, the home screen never arrives: the boot reaches 76-78 processes against 119, and not one widget
-# or poster process starts, where the same image without them has Spotlight, PosterBoard and a dozen widgets
-# inside 420 s. I first put that down to the emulated CPU and guessed the phone would not care. The phone was
-# measured and cares more: the same recipe, the same four and a half minutes, 42 processes against 128, no
-# home screen, and the applications the scenario taps never open at all.
-# What it actually is: cloudd retries com.apple.nsurlsessiond without ever stopping -- 2351 times on the
-# phone, 120 to 406 in QEMU, against a dozen in a session without it -- because nsurlsessiond was itself in
-# this tuple until a few lines above took it out. So this is two daemons' problem with a one-word fix, and
-# the word is already gone: the sileo2 copy removed nsurlsessiond for Sileo's downloads and it is removed
-# here too. On its own it costs nothing -- that copy's phone session reaches 118 processes and 20 widgets
-# with nsurlsessiond in and cloudd still denied -- so cloudd deserves another try now that it is there.
-# Measured: cloudd with nsurlsessiond actually present does NOT stall the boot. The storm is gone
-# altogether -- 0 retries against 406 -- and the home screen arrives: 100 processes and 12 widget and poster
-# processes, where the same image without nsurlsessiond reached 76-78 and never one at any point in the run.
-# So cloudd was never the problem; being made to wait on a daemon that was not there was. It is left in DENY
-# here only because this was measured in QEMU after the phone runs were done, and the phone is where it
-# matters -- one flash-root run with ALLOW="cloudd" and nsurlsessiond shipped should settle it for good.
-# (mobileassetd alone was not measured separately; it is not the one that spins, 2 retries against 2351.)
+# cloudd and appstored are IN, and getting there was the most instructive thing in this file.
+# They looked like daemons that cost the home screen: with them the boot reached 76-78 processes against
+# 119 and not one widget or poster started, and on the phone it was worse still -- 42 processes against
+# 128, no home screen, the scenario's applications never opening. The cause was neither of them. cloudd
+# was retrying com.apple.nsurlsessiond without ever stopping -- 2351 times in that phone session -- because
+# nsurlsessiond was itself in this tuple. With nsurlsessiond shipped, the phone run with both of them in
+# reaches 130 processes and 20 widget and poster processes with no crash, against the baseline's 128 and 19:
+# better than the image without them. Zero nsurlsessiond retries.
+# What each one is actually shown to do, which is less than "it works":
+#   appstored -- confirmed. It spawns, and com.apple.appstored.xpc.request, the one service the App Store
+#     could not find when it was opened by hand, is answered: 0 failed lookups against 1.
+#   cloudd -- the harm is gone, the use is not shown. In that phone session nothing asked for it at all
+#     (0 requestor lines against 2352 when it was spinning), so all that is proved is that shipping it no
+#     longer costs the boot. In QEMU it does start and behaves: 0 retries, 100 processes, 12 widgets.
+# Taking 'cloudd' out of the tuple also lets com.apple.itunescloudd through, which has never been asked
+# for in any session measured here.
 # The one stall that looked like a second cause was the same cause. ALLOW="syncdefaultsd appstored" lost the
 # home screen too (77 processes, no widgets) with no retry storm at all, which seemed to rule nsurlsessiond
 # out -- but that run was built before nsurlsessiond came out of this tuple. Built again with it there, the
@@ -127,7 +123,7 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties', 'mobileactivationd',
         'installcoordinationd', 'purplebuddy', 'restore', 'usb', 'accessoryd',
-        'mobileassetd', 'itunesstored', 'appstored', 'cloudd', 'bird',
+        'mobileassetd', 'itunesstored', 'bird',
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # iOS 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
