@@ -387,12 +387,28 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
 - **M2** — the 283 modules with no `air.*` call: a stated fraction reach *ir3*, a growing subset
   *softpipe*/*adreno*.
   **262 of the 283 reach ir3**, 255 of them agree with LLVM numerically, and those same 255 draw
-  a matching pixel. The other 21 are
+  a matching pixel. (With textures done the whole corpus is at 313 of 456; this milestone's own
+  count is the intrinsic-free subset.) The other 21 are
   `air.visible` library functions, which are not entry points at all (below). Counting every
   entry point rather than every module: 275 of 321, 86%. Nothing has run on the Adreno.
 - **M3** — textures and samplers, each form with a test that renders a known image.
-  Not started, and it is what nearly everything left is waiting for: 46 modules stop at a texture
-  call, including all 11 of AV1SW's.
+  **Translated and compiled, not yet rendered.** The family took the corpus from 275 modules to
+  313, and all 313 compile for the Adreno. What is *not* done is M3's acceptance test: not one
+  texture operation has been run, because `air_run` binds no textures yet and the CPU reference
+  cannot judge a shader whose coordinate comes from a varying. The forms written are 2D, 3D, 1D,
+  cube and their array and multisample variants, for sampling (plain, explicit level, bias,
+  minimum-level clamp), gathering, fetching by integer coordinate, writing, and the queries
+  (width, height, depth, array size, level count, sample count). Refused with a named error, not
+  guessed at: compare sampling (`sample_compare`, `gather_compare`), texture buffers, and a depth
+  texture whose aspect selector is not 1.
+
+  The sampler state is the gap that matters for correctness. Metal's `constexpr sampler` arrives
+  as a global holding one 64-bit word, and **that word's layout is not decoded**: the frontend
+  reports it to the runtime verbatim (`air_resource::sampler_state`) and assigns the sampler an
+  index after the API's. Until it is decoded, nothing knows whether a sample is meant to be
+  nearest or linear, clamped or repeated — which is exactly the sort of thing that renders
+  plausibly and wrongly. `AGXCompilerCore` has a `sampler_words` symbol, so the layout is
+  discoverable the same way the vocabulary was.
 - **M4** — atomics, barriers, threadgroup memory, compute against the CPU reference.
   Atomics, the barrier and threadgroup memory are written (`air_intrinsics.c`) and 16 kernels
   compile through ir3 with them; none has been *run*, so M4's acceptance test is untouched.

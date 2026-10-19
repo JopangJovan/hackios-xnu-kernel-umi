@@ -11,15 +11,15 @@ correct**: correctness needs the CPU reference and a run on the GPU.
 | --- | --- | --- |
 | container | 456 | 100% |
 | reader | 456 | 100% |
-| translate | 275 | 60% |
-| ir3 | 275 | 60% |
+| translate | 313 | 69% |
+| ir3 | 313 | 69% |
 
 ## By stage of the shader
 
 | what the module is | modules | translate | ir3 |
 | --- | --- | --- | --- |
-| fragment | 271 | 256 | 256 |
-| kernel | 47 | 16 | 16 |
+| fragment | 271 | 270 | 270 |
+| kernel | 47 | 40 | 40 |
 | vertex | 3 | 3 | 3 |
 | visible | 135 | 0 | 0 |
 
@@ -29,10 +29,10 @@ The container's TYPE tag agrees with the module's own metadata on 456 of 456; 0 
 
 | library | modules | translate | ir3 |
 | --- | --- | --- | --- |
-| AppleMetalGLRenderer.bundle/default.metallib | 274 | 259 | 259 |
-| PortraitFilters.cifilter/default.metallib | 36 | 16 | 16 |
+| AppleMetalGLRenderer.bundle/default.metallib | 274 | 273 | 273 |
+| PortraitFilters.cifilter/default.metallib | 36 | 34 | 34 |
 | PortraitFilters.cifilter/portrait_filters.metallib | 135 | 0 | 0 |
-| VideoDecoders/AV1SW.metallib | 11 | 0 | 0 |
+| VideoDecoders/AV1SW.metallib | 11 | 6 | 6 |
 
 ## Modules that call no `air.*` at all
 
@@ -43,16 +43,11 @@ The container's TYPE tag agrees with the module's own metadata on 456 of 456; 0 
 | modules | where it stops |
 | --- | --- |
 | 135 | stage: air.visible, a library function (not yet) |
-| 13 | intrinsic: air.get_width_texture_2d |
-| 10 | intrinsic: air.sample_texture_3d |
-| 7 | intrinsic: air.read_texture_2d |
-| 5 | intrinsic: air.sample_texture_2d |
-| 4 | intrinsic: air.get_num_samples_texture_2d_ms |
-| 3 | intrinsic: air.write_texture_2d |
-| 1 | intrinsic: air.sample_depth_2d |
-| 1 | intrinsic: air.read_depth_2d_ms |
-| 1 | intrinsic: air.read_texture_2d_ms |
-| 1 | intrinsic: air.gather_texture_2d |
+| 2 | instruction: a shuffle mask that is not constant |
+| 2 | intrinsic: a call of _ZL13FilmGrainLumaN5metal9texture2dItLNS_6accessE1EvEES2_NS0_IsLS1_1EvEERU11MTLconstantK15FilmGrainParamsPU11MTLconstantKhDv2_j, a function in the module |
+| 2 | intrinsic: a call of _ZL15FilmGrainChromaN5metal9texture2dItLNS_6accessE1EvEES2_NS0_IsLS1_1EvEES2_S2_RU11MTLconstantK15FilmGrainParamsPU11MTLconstantKhS8_Dv2_j, a function in the module |
+| 1 | intrinsic: a call of ___metal_fract_v2float, a function in the module |
+| 1 | intrinsic: a call of ___metal_fract_v4float, a function in the module |
 
 ## The `air.*` functions the corpus calls
 
