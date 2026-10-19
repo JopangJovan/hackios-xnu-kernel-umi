@@ -104,7 +104,14 @@ import sys
 # One thing still unexplained: ALLOW="syncdefaultsd appstored" loses the home screen the same way (77
 # processes, no widgets) with no retry storm at all -- a dozen nsurlsessiond lookups, nothing spinning. So
 # the stall has at least one other cause, and whoever picks this up should not assume nsurlsessiond is all of
-# it.
+# it. What is known about it so far, to save repeating the work:
+#   - it is not memory: the guest has 430 MB free and two memorystatus lines, against 260 in a good run;
+#   - SpringBoard is not asking for anything and failing -- it makes zero failed lookups, where a good run
+#     has it asking 138 times for commcenter.xpc alone, so it never reaches the stage that asks;
+#   - the widget stage is gated late. PosterBoard starts 266 s into a good 420 s run, so there is only about
+#     150 s of margin, and a long enough delay would look exactly like a block. A 700 s run tells the two
+#     apart -- it was done for cloudd+mobileassetd+syncdefaultsd (84 processes, still no widgets, so that
+#     one is a block) but not yet for syncdefaultsd+appstored alone.
 # syncdefaultsd (com.apple.kvsd) is out on its own merits. It serves cloudkeychainproxy3 its store, then
 # aborts inside changeTokenForStoreWithConfiguration:reply: with
 #   *** Terminating app due to uncaught exception 'NSInvalidArgumentException',
