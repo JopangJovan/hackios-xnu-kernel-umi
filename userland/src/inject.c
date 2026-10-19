@@ -42,6 +42,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <signal.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 
 #include "redwood_gl.h"
@@ -237,7 +239,120 @@ static int (*orig_function_supported)(void *context);
  * entry of the same table. Until then it is told the truth, and what needs that function is not
  * drawn -- the shadow under a card of the switcher of running applications.
  */
+/*
+ * Where the window server died. Its crash reports never arrive here -- the kernel says "Failed to
+ * send exception EXC_CORPSE_NOTIFY" and that is the end of it -- so a SIGSEGV in CoreAnimation has
+ * been a silent restart every half a minute with nothing to go on. This turns one into a line: the
+ * address it touched and where it was, both as they would be in the shared cache as built, which
+ * "ipsw dyld a2s" turns into a name. Then the signal is let through to kill the process as before.
+ */
+static void
+say_the_fault(int signal_number, siginfo_t *info, void *context_in)
+{
+	ucontext_t *context = context_in;
+	uintptr_t pc = 0, lr = 0;
+
+	if (context != NULL && context->uc_mcontext != NULL) {
+		pc = (uintptr_t)context->uc_mcontext->__ss.__pc;
+		lr = (uintptr_t)context->uc_mcontext->__ss.__lr;
+	}
+	/*
+	 * And who called, by walking the frame pointers: on arm64 each frame holds the previous one
+	 * at [fp] and its return address at [fp + 8]. The crash itself is usually in a library
+	 * function -- strdup of a null name, say -- and the frame that matters is two or three up.
+	 */
+	char frames[8 * 20 + 1] = "";
+	size_t used = 0;
+	uintptr_t fp = context != NULL && context->uc_mcontext != NULL ? (uintptr_t)context->uc_mcontext->__ss.__fp : 0;
+
+	for (unsigned i = 0; i < 8 && fp != 0 && (fp & 7) == 0; i++) {
+		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+		if (ret == 0) {
+			break;
+		}
+		used += (size_t)snprintf(frames + used, sizeof(frames) - used, " %#lx", ret - slide);
+		fp = next > fp ? next : 0;      /* the chain only ever goes up the stack */
+	}
+	say("redwood: signal %d at %p, pc %#lx, lr %#lx, called from%s (unslid)\n", signal_number,
+	    info != NULL ? info->si_addr : NULL, pc - slide, lr - slide, frames);
+	signal(signal_number, SIG_DFL);
+	raise(signal_number);
+}
+
+static void
+watch_for_faults(void)
+{
+	struct sigaction action;
+
+	memset(&action, 0, sizeof(action));
+	action.sa_sigaction = say_the_fault;
+	action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sigaction(SIGSEGV, &action, NULL);
+	sigaction(SIGBUS, &action, NULL);
+}
+
+/*
+ * CoreAnimation's OpenGL ES renderer keeps the source of one fragment shader per function in a
+ * table of its own -- unslid 0x1d5b54790, indexed by the function's number -- and the functions it
+ * has no shader for are null entries there. That is the whole of "the renderer has no function
+ * 40": GLContext::create_shader takes the source from that table, and function_supported answers
+ * from the same place. Made to answer yes without the entry, create_shader hands the null to
+ * strdup and the window server dies in strlen, which is what glyes=40 did for a whole afternoon.
+ *
+ * So the way to give the renderer a function is to give it a source. "sb3" (40) is the single
+ * pass of a blur -- GaussianBlurFilter::render -> Context::blur_surface ->
+ * BlurState::single_pass_blur -- the one that lays the shadow under a card of the switcher of
+ * running applications. It is given the same four places as "ds4" (26) and has no weights of its
+ * own, so this is ds4's own shader with the weights taken out, in the dialect the others are
+ * written in (sampler2DRect, varying, gl_FragData -- the preamble is added by the renderer).
+ *
+ * Where this stands: with the entry filled the window server no longer dies -- thirty-odd crashes
+ * a run become none, with glyes=40 as well -- but the shadow is still not drawn, and the picture
+ * is identical to the pixel. So the fragment source is not the only thing missing. The four places
+ * reach the shader as varyings that a *vertex* shader computes (one of CoreAnimation's own reads
+ * "uniform highp vec2 offset[4]" and sets texcoord0..3 = t0 + offset[i], which is where the two
+ * groups of four numbers function_uniform delivers end up), and that side is chosen by something
+ * other than this table -- it is not in the three hundred entries after it. That is the next
+ * thing to find, and it is now a small question rather than a mystery.
+ */
+#define CA_SHADER_TABLE         0x1d5b54790UL
+
+static const char shadow_blur_source[] =
+    "uniform lowp sampler2DRect texture0;\n"
+    "varying highp vec2 texcoord0, texcoord1, texcoord2, texcoord3;\n"
+    "void main () {\n"
+    "  lowp vec4 q0, q1, q2, q3;\n"
+    "  q0 = texture2DRect(texture0, texcoord0);\n"
+    "  q1 = texture2DRect(texture0, texcoord1);\n"
+    "  q2 = texture2DRect(texture0, texcoord2);\n"
+    "  q3 = texture2DRect(texture0, texcoord3);\n"
+    "  gl_FragData[0] = (q0 + q1 + q2 + q3) * 0.25;\n"
+    "}\n";
+
+static void
+give_the_renderer_a_shader(unsigned function, const char *source)
+{
+	uintptr_t *entry = (uintptr_t *)(CA_SHADER_TABLE + slide + 8 * (uintptr_t)function);
+	vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
+
+	if (*entry != 0) {
+		say("redwood: CoreAnimation's function %u has a shader of its own; left alone\n", function);
+		return;
+	}
+	/* the table is read-only memory shared by every process: a private writable copy of the page */
+	if (vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+		say("redwood: CoreAnimation's function %u: cannot make the table of shaders writable\n", function);
+		return;
+	}
+	*entry = (uintptr_t)source;
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
+	say("redwood: CoreAnimation's function %u (\"sb3\") is given a shader of ours\n", function);
+}
+
 static uint8_t say_yes[90];
+static int compile_shaders_said;                /* boot-arg glcompile=1: write down every shader source */
 
 static void
 functions_said_yes(const char *arguments)
@@ -267,6 +382,39 @@ functions_said_yes(const char *arguments)
 		}
 		argument = *argument == ',' ? argument + 1 : NULL;
 	}
+}
+
+/*
+ * CA::OGL::Context::compile_shader(const char *) -- slot 0x060 of the same table. The OpenGL ES
+ * renderer does not carry its shaders ready-made: it assembles the text of each from a preamble
+ * (GLESContext::shader_preamble, slot 0x400) and pieces chosen by what the draw needs, and
+ * compiles it here. That makes this the place where it looks for a program, and therefore the
+ * place where one can be handed to it for a function it has no pieces for ("sb3", 40: the four
+ * samples of a shadow's blur, missing under the cards of the switcher). This writes down what it
+ * is asked to compile, so that a run with glyes=40 says whether a source is assembled at all
+ * before the window server dies, and what it looks like if so.
+ */
+static uintptr_t (*orig_compile_shader)(void *context, const char *source);
+
+static uintptr_t
+my_compile_shader(void *context, const char *source)
+{
+	static unsigned told, seen;
+
+	/* that it is called at all is worth one line, because a renderer that compiles nothing here
+	   would mean the text is assembled and compiled somewhere this table does not reach */
+	if (seen++ == 0) {
+		say("redwood: CoreAnimation compiles its shaders through the table (the first of them, %zu characters)\n",
+		    source != NULL ? strlen(source) : 0);
+	}
+	if (compile_shaders_said && told < 24) {
+		told++;
+		say("redwood: CoreAnimation compiles a shader, %zu characters:\n", source != NULL ? strlen(source) : 0);
+		for (size_t at = 0, length = source != NULL ? strlen(source) : 0; at < length; at += 700) {
+			say("redwood:  %.700s\n", source + at);
+		}
+	}
+	return orig_compile_shader(context, source);
 }
 
 static int
@@ -311,8 +459,29 @@ static void (*gl_function_values)(void *context, unsigned function, unsigned ind
 static void
 my_function_uniform(void *context, unsigned index, size_t components, size_t count, const float *values)
 {
+	uint8_t function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
+
+	/*
+	 * Who is calling. Told yes for a function it has no shader for (glyes=40), CoreAnimation gets
+	 * this far -- it hands the function its numbers -- and then dies in whatever comes next, which
+	 * is where it takes the program for the function out of a table of its own. These addresses,
+	 * unslid, name that caller for "ipsw dyld a2s", and it is the only thread to pull: nothing is
+	 * ever compiled for the function (no shader arrives at our library), and the compiler is not
+	 * reached through the renderer's table either.
+	 */
+	if (say_yes[function < 90 ? function : 0]) {
+		static uint8_t told[90];
+
+		if (function < 90 && !told[function]) {
+			told[function] = 1;
+			say("redwood: function %u takes its numbers from %#lx %#lx %#lx\n", function,
+			    (uintptr_t)__builtin_return_address(0) - slide,
+			    (uintptr_t)__builtin_return_address(1) - slide,
+			    (uintptr_t)__builtin_return_address(2) - slide);
+		}
+	}
 	if (gl_function_values != NULL) {
-		gl_function_values(context, *(*(uint8_t **)((char *)context + 0x10) + 0x10), index, components, count, values);
+		gl_function_values(context, function, index, components, count, values);
 	}
 	orig_function_uniform(context, index, components, count, values);
 }
@@ -336,6 +505,21 @@ window_server_fixes(void)
 		if (gl_function_values != NULL) {
 			orig_function_uniform = replace_virtual("function_uniform", VSLOT(VT_GLES_CONTEXT, 0x388), 0x1884a9350UL,
 			    my_function_uniform);
+		}
+		/* always, because the boot-args are read in another place than this and the order of the
+		   two is not ours to rely on; the hook writes nothing unless glcompile=1 */
+		orig_compile_shader = (uintptr_t (*)(void *, const char *))replace_virtual("compile_shader",
+		    VSLOT(VT_GLES_CONTEXT, 0x060), 0x1883fc808UL, my_compile_shader);
+		say("redwood: the shader compiler of CoreAnimation is %s\n", orig_compile_shader ? "watched" : "NOT watched");
+		watch_for_faults();
+		{
+			char arguments[1024] = "";
+			size_t size = sizeof(arguments) - 1;
+
+			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+			    strstr(arguments, "glsb3=1") != NULL) {
+				give_the_renderer_a_shader(40, shadow_blur_source);
+			}
 		}
 	}
 	say("redwood: window server hooks %s\n", orig_is_ready && orig_ignore_update_p && orig_begin_update &&
@@ -849,6 +1033,7 @@ opengl_es(void)
 	}
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
 		functions_said_yes(arguments);
+		compile_shaders_said = strstr(arguments, "glcompile=1") != NULL;
 		for (argument = arguments; (argument = strstr(argument, "gl=")) != NULL; argument += 3) {
 			if (argument == arguments || argument[-1] == ' ') {
 				wanted = argument[3] != '0';
