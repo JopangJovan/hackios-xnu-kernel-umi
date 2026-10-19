@@ -1159,11 +1159,21 @@ keychain. Copying activation identity» → «Device is probably unactivated»).
 ```
 
 Нет витрины (storefront) — нет «мешка» (bag, конфигурация Apple) — не загружается и главная страница.
-Storefront — это регион, и на настоящем устройстве он берётся либо из учётной записи, в которую вошли,
-либо из SIM через CoreTelephony. Единственное, чего `appstored` не находит при открытом магазине кроме
-этого, — `com.apple.commcenter.coretelephony.xpc`, то есть CommCenter, который здесь падает по кругу на
-двух отсутствующих драйверах IOKit. Так что пустой магазин и телефония — это одна и та же находка дважды.
-Входить в настоящую учётную запись Apple здесь нельзя, и это решение не наше.
+Storefront — это регион, и третьего пути к нему нет. Те две службы, которых `appstored` не находит при
+открытом магазине, и есть два способа, какими storefront попадает на устройство из коробки:
+`com.apple.commcenter.coretelephony.xpc` — страна из SIM через CommCenter, который здесь падает по кругу
+на двух отсутствующих драйверах IOKit, и `com.apple.mobileactivationd` — регион из записи активации
+(в этом двоичном файле есть `RegionCode`, `RegionInfo` и `subscriberCountryCodeDidChange:`), а она растёт
+из Secure Enclave, которого у этого телефона нет.
+Проверено и то, не в пропущенном ли ассистенте настройки дело — порт его отключает
+(`src/inject_sb.c` обнуляет `-[SBSetupManager _setSetupRequiredReason:]`). Не в нём: файл
+`com.apple.purplebuddy.plist` с `SetupDone = True` мы и так кладём, MobileGestalt и так отвечает
+`RegionInfo = LL/A`, а регион — это не storefront. Подсунуть storefront через страну тоже нельзя: все
+селекторы `countryCode` в AppleMediaServices достают страну **из** мешка (`_countryCodeFromBag:`), а мешок
+без storefront не запросить — `AMSBagNetworkTask` принимает его аргументом; в `AMSDefaults` лежит
+`storefrontSuffixes`, а не storefront. То есть подделать это файлом нельзя: нужен либо работающий
+CommCenter, либо вход в учётную запись, а входить в настоящую учётную запись Apple здесь нельзя, и это
+решение не наше.
 
 **Телефония (`CommCenter`) — пробовали, не вышло.** Следующей по числу обращений была она: `com.apple.commcenter.xpc`
 SpringBoard спрашивает десять тысяч раз за все сеансы. iOS держит два задания с одним и тем же именем и выбирает

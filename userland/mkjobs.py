@@ -72,9 +72,13 @@ import sys
 # pick it. It then gets a long way: it answers com.apple.commcenter.xpc and .coretelephony.xpc (85 and 18
 # failed lookups in a session become none), serves geod its policy, loads the network-extension
 # configurations. And then it dies, every time, on one of two IOKit drivers of the cellular path that this
-# kernel has not got: "Could not find AppleIPAppender service" (matched by name, user client
-# ApplePDPHelperInterface -- PDP contexts, traffic-class flows, dedicated bearers) and SIGSEGV 50 ms later,
-# or "Unable to communicate with AppleBaseband driver" (com.apple.driver.AppleBasebandPCI) and SIGABRT.
+# kernel has not got, and each has its own signal. With CommCenter's own log on, the split is clean over
+# 20 crashes: 11 SIGSEGV every one of them right after "Could not find AppleIPAppender service" (matched
+# by name; user client ApplePDPHelperInterface -- PDP contexts, traffic-class flows, dedicated bearers),
+# and 9 SIGABRT every one of them right after "Unable to communicate with AppleBaseband driver"
+# (com.apple.driver.AppleBasebandPCI). That answers the obvious question before anyone spends a week on
+# it: stubbing AppleIPAppender alone would remove the SIGSEGV half and leave the SIGABRT half, so it is
+# not enough on its own -- and AppleBasebandPCI is an Apple modem on PCIe, which this phone has not got.
 # It respawns and does it again: 18 crashes in a seven-minute session where the same image without it has
 # none. The boot is not held up -- it reaches the same 118 processes against 119 -- so the trade is 103
 # failed lookups a session against a process dying every fifteen seconds for ever, which is a bad one.
@@ -107,11 +111,22 @@ import sys
 #         localAccount = <ACAccount type = iTunesStore | username = local | storefront = (null)>
 #   [bag] AMSBagNetworkDataSource: Could not fetch initial cached storefront
 #   [Bag] Error creating snapshot of bag: Timed out while waiting for snapshot bag to load
-# No storefront -> no bag -> the front page never loads. A storefront is a region, and on a real device
-# it comes from the signed-in account or from the SIM through CoreTelephony; appstored's only other
-# failed lookup while the store is open is com.apple.commcenter.coretelephony.xpc, which is CommCenter,
-# which crash-loops here on two missing IOKit drivers. So the empty store and the telephony finding are
-# the same finding twice. Signing in is not an option that may be taken here.
+# No storefront -> no bag -> the front page never loads, and there is no third way to get one. The two
+# services appstored cannot find while the store is open ARE the two routes a stock iPhone has to a
+# storefront, and nothing else:
+#   com.apple.commcenter.coretelephony.xpc -- the SIM's country, through CommCenter, which crash-loops
+#     here (see above);
+#   com.apple.mobileactivationd -- the activation record's region. That binary carries RegionCode,
+#     RegionInfo and subscriberCountryCodeDidChange:, and it is rooted in a Secure Enclave this phone
+#     has not got.
+# It was worth checking whether the setup assistant is the missing piece, since this port refuses it
+# (src/inject_sb.c forces -[SBSetupManager _setSetupRequiredReason:] to 0) -- it is not. We already ship
+# com.apple.purplebuddy.plist with SetupDone = True, MobileGestalt already answers RegionInfo = LL/A, and
+# a region is not a storefront. AMS has no country-to-storefront path to feed either: every countryCode
+# selector in AppleMediaServices derives the country FROM the bag (_countryCodeFromBag:), and the bag
+# cannot be fetched without a storefront -- AMSBagNetworkTask takes one as an argument. AMSDefaults holds
+# storefrontSuffixes, not a storefront. So there is no file that can be shipped to fake this: it needs
+# CommCenter working or an account signed in, and signing in is not a decision to be taken here.
 # The one stall that looked like a second cause was the same cause. ALLOW="syncdefaultsd appstored" lost the
 # home screen too (77 processes, no widgets) with no retry storm at all, which seemed to rule nsurlsessiond
 # out -- but that run was built before nsurlsessiond came out of this tuple. Built again with it there, the
