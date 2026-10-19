@@ -77,9 +77,12 @@ import sys
 #   *** Terminating app due to uncaught exception 'NSInvalidArgumentException',
 #       reason: '*** -[NSURL initFileURLWithPath:isDirectory:]: nil string parameter'
 # -- it is building a file URL for a directory it was given as nil. The likely one is the SyncedPreferences
-# directory it asks for by name ("uncontainerizedSyncedPreferencesDirectoryURL"), which nothing creates here:
-# ios165/var.skel has no /private/var/mobile/Library/SyncedPreferences. That is worth trying before anything
-# cleverer -- it would be a missing directory, not missing hardware.
+# directory it asks for by name ("uncontainerizedSyncedPreferencesDirectoryURL"). That was tried --
+# build.sh can make an empty directory on the data volume with a d line in var.skel, as it does for
+# /var/root/.ssh -- and it is not the answer: with /private/var/mobile/Library/SyncedPreferences there and
+# created ("create the directories of the data volume" ok), syncdefaultsd aborts in exactly the same place
+# with exactly the same exception. So the nil comes from somewhere else, and the next guess should be the
+# container path for com.apple.security.cloudkeychainproxy3 rather than a directory of mobile's.
 # bird and duetexpertd were shipped as well and nothing ever asked for them in a bare boot (no spawn, no
 # lookup), so they are still untested rather than known good; they need a session with applications.
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'locationd', 'softwareupdate',
