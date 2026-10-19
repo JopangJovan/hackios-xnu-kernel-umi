@@ -1037,10 +1037,12 @@ def _print_one(v, name, fid):
 
 def _modestr(mode):
     s = ""
-    for who in (6, 3, 0):
+    for who, special, mark in ((6, 0o4000, "s"), (3, 0o2000, "s"), (0, 0o1000, "t")):
         s += "r" if mode & (0o4 << who) else "-"
         s += "w" if mode & (0o2 << who) else "-"
-        s += "x" if mode & (0o1 << who) else "-"
+        x = mode & (0o1 << who)
+        # set-user-ID, set-group-ID and sticky, as ls shows them (upper case without the x under them)
+        s += (mark if x else mark.upper()) if mode & special else ("x" if x else "-")
     return s
 
 

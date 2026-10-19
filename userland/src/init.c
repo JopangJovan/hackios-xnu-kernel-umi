@@ -202,6 +202,19 @@ flash_root(const char *dev)
 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
 		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");
 	}
+	if (stat("/jb-bin", &fw_st) == 0) {
+		/*
+		 * The package manager's prefix is in the boot volume (/jb), and Sileo runs mv, cp, rm, mkdir
+		 * and chmod from /bin, where iOS has df and ps alone (userland/build.sh, SILEO_BIN): the boot
+		 * volume's jb-bin -- those five, links into the prefix -- over the volume's /bin as a union
+		 * mount, through which what it does not have is found in the /bin below.
+		 */
+		ok = mount("bindfs", "/flash/bin", MNT_RDONLY | MNT_UNION, (void *)"/jb-bin") == 0;
+		if (!ok) {
+			printf("  bindfs /jb-bin on /flash/bin, union: %s\n", strerror(errno));
+		}
+		check(ok, "Sileo's programs in /bin, over the volume's own");
+	}
 
 	fd = open("/flash/private/var/staged_system_apps", O_RDONLY | O_DIRECTORY, 0);
 	while (fd >= 0 && (n = getdirentries(fd, buf, sizeof(buf), &pos)) > 0) {
@@ -579,6 +592,193 @@ copy_file(const char *from, const char *to, int mode, int uid, int gid)
 	return ok;
 }
 
+/*
+ * Everything under a directory to one owner: the user's corner of the prefix belongs to mobile, and
+ * what an application of the prefix makes there later (caches, databases) must belong to it too.
+ */
+static int
+own_tree(const char *path, int uid)
+{
+	char buf[4096], child[512];
+	struct stat st;
+	off_t position = 0;
+	ssize_t n;
+	int ok, fd;
+
+	/*
+	 * A link is left alone: there is no lchown here, and the only links in a grafted tree point
+	 * into the image, which is read only (the user's corner is copied for real, GRAFT_COPY).
+	 */
+	if (lstat(path, &st) != 0 || (st.st_mode & S_IFMT) == S_IFLNK) {
+		return 1;
+	}
+	ok = chown(path, uid, uid) == 0;
+	if ((st.st_mode & S_IFMT) != S_IFDIR) {
+		return ok;
+	}
+	if ((fd = open(path, O_RDONLY | O_DIRECTORY, 0)) < 0) {
+		return ok;
+	}
+	while ((n = getdirentries(fd, buf, sizeof(buf), &position)) > 0) {
+		for (ssize_t at = 0; at < n; at += ((struct dirent *)(buf + at))->d_reclen) {
+			const char *name = ((struct dirent *)(buf + at))->d_name;
+
+			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+				continue;
+			}
+			if (strlen(path) + strlen(name) + 2 > sizeof(child)) {
+				continue;
+			}
+			strcpy(child, path);
+			strcpy(child + strlen(child), "/");
+			strcpy(child + strlen(child), name);
+			ok = own_tree(child, uid) && ok;
+		}
+	}
+	close(fd);
+	return ok;
+}
+
+/*
+ * The rootless prefix of a package manager, /var/jb: the Procursus bootstrap with Sileo in it
+ * (tools/mk-jb.sh) rides in the system image as /jb (or in the boot volume, /private/preboot/jb,
+ * with the root on the flash), an APFS image that cannot be written to, while dpkg and apt must be
+ * able to write anywhere in their own prefix.
+ *
+ * Copying all 124 MB of it into the memory filesystem is more than this machine has to spare (the
+ * system image is already 2.8 GB of its 4.3 GB), so the prefix is grafted instead: every directory
+ * is made for real, and every file and link in it becomes a symbolic link to its twin in /jb. The
+ * directories are then writable -- a package that puts a file in /var/jb/usr/bin puts it in memory,
+ * next to the links -- while the 114 MB of programs and libraries stay where they are, read only
+ * and shared. What dpkg and apt write over rather than beside (their databases and settings) is
+ * copied for real: GRAFT_COPY below.
+ */
+static int
+copy_tree(const char *from, const char *to, int *files)
+{
+	char buf[4096], f[512], t[512], target[512];
+	struct stat st;
+	off_t position = 0;
+	ssize_t n;
+	int ok = 1, fd, mode;
+
+	/* The mode of this directory, kept aside: st is used for its entries below. */
+	if (lstat(from, &st) != 0) {
+		return 0;
+	}
+	mode = st.st_mode & 07777;
+	if (mkdir(to, mode) != 0 || chown(to, 0, 0) != 0) {
+		return 0;
+	}
+	if ((fd = open(from, O_RDONLY | O_DIRECTORY, 0)) < 0) {
+		return 0;
+	}
+	while (ok && (n = getdirentries(fd, buf, sizeof(buf), &position)) > 0) {
+		for (ssize_t at = 0; ok && at < n; at += ((struct dirent *)(buf + at))->d_reclen) {
+			const char *name = ((struct dirent *)(buf + at))->d_name;
+
+			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+				continue;
+			}
+			if (strlen(from) + strlen(name) + 2 > sizeof(f) || strlen(to) + strlen(name) + 2 > sizeof(t)) {
+				printf("  %s/%s: the path is too long\n", from, name);
+				ok = 0;
+				break;
+			}
+			strcpy(f, from);
+			strcpy(f + strlen(f), "/");
+			strcpy(f + strlen(f), name);
+			strcpy(t, to);
+			strcpy(t + strlen(t), "/");
+			strcpy(t + strlen(t), name);
+			if (lstat(f, &st) != 0) {
+				ok = 0;
+			} else if ((st.st_mode & S_IFMT) == S_IFDIR) {
+				ok = copy_tree(f, t, files);
+			} else if ((st.st_mode & S_IFMT) == S_IFLNK) {
+				ssize_t length = readlink(f, target, sizeof(target) - 1);
+
+				target[length > 0 ? length : 0] = 0;
+				ok = length > 0 && symlink(target, t) == 0;
+				(*files)++;
+			} else {
+				ok = copy_file(f, t, st.st_mode & 07777, 0, 0);
+				(*files)++;
+			}
+			if (!ok) {
+				printf("  %s: %s\n", f, strerror(errno));
+			}
+		}
+	}
+	close(fd);
+	return ok && chmod(to, mode) == 0;
+}
+
+/* The parts of the prefix that are written over, not just added to, and so are copied for real. */
+static const char *const graft_copy[] = { "Library", "etc", "var", "tmp" };
+
+static int
+graft_tree(const char *from, const char *to, int top, int *made, int *linked)
+{
+	char buf[4096], f[512], t[512];
+	struct stat st;
+	off_t position = 0;
+	ssize_t n;
+	int ok = 1, fd, mode;
+
+	/* The mode of this directory, kept aside: st is used for its entries below. */
+	if (lstat(from, &st) != 0) {
+		return 0;
+	}
+	mode = st.st_mode & 07777;
+	if (mkdir(to, mode) != 0 || chown(to, 0, 0) != 0) {
+		return 0;
+	}
+	(*made)++;
+	if ((fd = open(from, O_RDONLY | O_DIRECTORY, 0)) < 0) {
+		return 0;
+	}
+	while (ok && (n = getdirentries(fd, buf, sizeof(buf), &position)) > 0) {
+		for (ssize_t at = 0; ok && at < n; at += ((struct dirent *)(buf + at))->d_reclen) {
+			const char *name = ((struct dirent *)(buf + at))->d_name;
+			int copy_it = 0;
+
+			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+				continue;
+			}
+			if (strlen(from) + strlen(name) + 2 > sizeof(f) || strlen(to) + strlen(name) + 2 > sizeof(t)) {
+				printf("  %s/%s: the path is too long\n", from, name);
+				ok = 0;
+				break;
+			}
+			strcpy(f, from);
+			strcpy(f + strlen(f), "/");
+			strcpy(f + strlen(f), name);
+			strcpy(t, to);
+			strcpy(t + strlen(t), "/");
+			strcpy(t + strlen(t), name);
+			for (unsigned i = 0; top && i < sizeof(graft_copy) / sizeof(graft_copy[0]); i++) {
+				copy_it = copy_it || strcmp(name, graft_copy[i]) == 0;
+			}
+			if (lstat(f, &st) != 0) {
+				ok = 0;
+			} else if (copy_it) {
+				ok = copy_tree(f, t, linked);
+			} else if ((st.st_mode & S_IFMT) == S_IFDIR) {
+				ok = graft_tree(f, t, 0, made, linked);
+			} else {
+				ok = symlink(f, t) == 0;
+				(*linked)++;
+			}
+			if (!ok) {
+				printf("  %s: %s\n", f, strerror(errno));
+			}
+		}
+	}
+	close(fd);
+	return ok && chmod(to, mode) == 0;
+}
+
 static void
 mount_writable(void)
 {
@@ -586,6 +786,8 @@ mount_writable(void)
 	static const char *const markers[] = { "/private/var/db/diagnostics/.migrated",
 		                               "/private/var/db/diagnostics/timesync/.migrated", "/private/var/db/uuidtext/.migrated" };
 	int ok, fd, made = 0, files = 0;
+	const char *jb;
+	struct stat st;
 	ssize_t n;
 
 	printf("\n-- writable filesystem --\n");
@@ -643,6 +845,87 @@ mount_writable(void)
 	}
 	printf("  %d directories, %d files\n", made, files);
 	check(ok && made > 50, "create the directories of the data volume");
+
+	/*
+	 * and the package manager's prefix, when the image was built with one (tools/mk-jb.sh): /jb of
+	 * the system image in RAM, or, with the iOS volume on the flash as the root, /private/preboot/jb
+	 * -- the boot volume, where a rootless jailbreak on an iPhone keeps its Procursus too
+	 * (/var/jb leads into /private/preboot there)
+	 */
+	jb = stat("/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/jb" :
+	    stat("/private/preboot/jb", &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR ? "/private/preboot/jb" : NULL;
+	if (ok && jb != NULL) {
+		const char *to = "/private/var/jb";
+		int dirs = 0, entries = 0, grafted, users = 0;
+
+		/*
+		 * With the root on the flash, the prefix's writable copy goes into a memory filesystem of its own
+		 * on the boot volume's jb-rw, as procursus, and /var/jb is a link to it: where /var/jb leads on
+		 * an iPhone with a rootless jailbreak, into /private/preboot. LaunchServices registers an
+		 * application from there, and from /private/var not at all -- everything a package put in
+		 * /var/jb/Applications was "Unable to register", with nothing on the files even looked at.
+		 */
+		if (strcmp(jb, "/private/preboot/jb") == 0 && stat("/private/preboot/jb-rw", &st) == 0) {
+			if (mount("ramfs", "/private/preboot/jb-rw", 0, NULL) == 0 &&
+			    symlink("/private/preboot/jb-rw/procursus", "/private/var/jb") == 0) {
+				to = "/private/preboot/jb-rw/procursus";
+			} else {
+				printf("  the prefix on /private/preboot/jb-rw: %s\n", strerror(errno));
+			}
+		}
+		grafted = graft_tree(jb, to, 1, &dirs, &entries);
+
+		/*
+		 * All of it belongs to root, as it does on a phone, but for the user's corner of it: an
+		 * application of the prefix runs as mobile and keeps its data there (Sileo's database).
+		 */
+		static const char *const mobiles[] = { "/private/var/jb/var/mobile", "/private/var/jb/var/mobile/Library",
+			                               "/private/var/jb/var/mobile/Library/Caches",
+			                               "/private/var/jb/var/mobile/Library/Preferences",
+			                               "/private/var/jb/var/mobile/Documents",
+			                               /*
+			                                * Sileo keeps the indexes of its repositories apart from
+			                                * apt's own (it runs apt with -oDir::State::lists=
+			                                * sileolists/), and it is mobile who writes them.
+			                                */
+			                               "/private/var/jb/var/lib/apt/sileolists",
+			                               "/private/var/jb/var/lib/apt/sileolists/partial" };
+
+		for (unsigned i = 0; i < sizeof(mobiles) / sizeof(mobiles[0]); i++) {
+			mkdir(mobiles[i], 0755);
+			grafted = chown(mobiles[i], 501, 501) == 0 && grafted;
+		}
+		grafted = own_tree("/private/var/jb/var/mobile", 501) && grafted;
+		/*
+		 * The prefix's own user database. Its programs do not ask iOS who a user is: they are
+		 * built against libiosexec, which carries an ie_getpwnam of its own and reads
+		 * /var/jb/etc/pwd.db -- a Berkeley database that pwd_mkdb makes from master.passwd and
+		 * that the bootstrap does not ship, only the text it is made from. Without it every
+		 * program of the prefix answers "no such user": an sshd from here refused every login
+		 * with "Invalid user root" while iOS's own /bin/ps resolved users perfectly -- and the
+		 * asymmetry is exactly this, not anything about iOS's own database or the launchd domain
+		 * its server sits in, because a program of the prefix never asks iOS at all. The
+		 * writable copy of the prefix is new at every boot, so the database is made at every
+		 * boot; it takes milliseconds.
+		 */
+		if (stat("/private/var/jb/usr/sbin/pwd_mkdb", &st) == 0) {
+			char *argv[] = { "/var/jb/usr/sbin/pwd_mkdb", "-p", "/var/jb/etc/master.passwd", NULL };
+			char *envp[] = { "PATH=/var/jb/usr/sbin:/var/jb/usr/bin:/usr/bin:/bin", NULL };
+			int status = 0;
+			pid_t pid = fork();
+
+			if (pid == 0) {
+				execve(argv[0], argv, envp);
+				_exit(127);
+			}
+			if (pid > 0 && wait4(pid, &status, 0, NULL) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+				users = 1;
+			}
+		}
+		printf("  /var/jb from %s, in %s: %d directories, %d files and links%s\n", jb, to, dirs, entries,
+		    users ? ", users resolvable" : "");
+		check(grafted, "graft the package manager's prefix onto the data volume");
+	}
 }
 
 /*
@@ -831,9 +1114,12 @@ static void
 run_command(char *line)
 {
 	char *argv[64];
-	char *envp[] = { "PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/", "TERM=dumb", NULL };
+	/* /var/jb/... first: a package manager's own programs call one another by name (dpkg, dpkg-query) */
+	char *envp[] = { "PATH=/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/bin:/sbin:/usr/bin:/usr/sbin",
+		         "HOME=/var/mobile", "TERM=dumb", NULL };
 	const char *append_to = NULL;
 	int argc = 0, status = 0, background = 0;
+	struct stat st;
 	pid_t pid;
 
 	for (char *p = line; *p && argc < 63;) {
@@ -884,6 +1170,21 @@ run_command(char *line)
 
 	/* "exec program args": become that program, keeping process number 1 */
 	if (strcmp(argv[0], "exec") == 0 && argc > 1) {
+		/*
+		 * With etc/quiet in our image (build.sh QUIET=1), what this program says on its
+		 * standard error is dropped. It is meant for launchd, which says a few thousand lines
+		 * about its own business in a couple of minutes and pushes everything else out of the
+		 * kernel's log; the daemons it starts keep their own standard error on the console
+		 * (mkjobs.py sets it), and so does everything the job runner runs.
+		 */
+		if (stat(in_image("/etc/quiet"), &st) == 0) {
+			int null = open("/dev/null", O_WRONLY, 0);
+
+			if (null >= 0) {
+				dup2(null, 2);
+				close(null);
+			}
+		}
 		if (flash_root_mode && strcmp(argv[1], "/sbin/launchd.ios") == 0) {
 			argv[1] = "/sbin/launchd";      /* the root is iOS's own volume: its launchd is that */
 		}
