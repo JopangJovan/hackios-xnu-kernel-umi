@@ -464,11 +464,28 @@ that commit.
 The frontend lives in `tools/mesa/air/` and `mk-host.sh` links it into the pinned Mesa as
 `src/compiler/air` — a link, not a copy, so there is no stale copy to build by mistake (a trap
 this project has already fallen into once with `tools/mk-mesa.sh` and the freedreno patches).
-`tools/mesa/air-ir3.patch` is the two-file change that teaches `ir3_compiler` to read AIR;
-it also removes a call of `ir3_nir_lower_variant` that tool makes itself, which is a bug of
-the tool — `ir3_context_init` already calls it on its own clone, and the const-state setup
-inside asserts the second time. It shows on every vertex shader and on anything with image
-dimensions, and hid on everything else, which is presumably how it survived.
+`tools/mesa/air-ir3.patch` is the two-file change that teaches `ir3_compiler` to read AIR and
+declares `air_run` beside it; it also removes a call of `ir3_nir_lower_variant` that tool makes
+itself, which is a bug of the tool — `ir3_context_init` already calls it on its own clone, and
+the const-state setup inside asserts the second time. It shows on every vertex shader and on
+anything with image dimensions, and hid on everything else.
+
+**That bug cannot be sent upstream, because the file is gone: `ir3_cmdline` was deleted from
+Mesa on 2025-07-23** ("freedreno: remove ir3_cmdline — Nobody is using it anymore", 986530d2,
+MR 36313). It is real in the 25.0.7 this port pins, and in every release before the deletion,
+and in nothing that upstream still carries. The other half of it is untouched in main
+(`ir3_context.c` still calls `ir3_nir_lower_variant`), and with no second caller there is
+nothing wrong there. So there is no report to file; checking before writing one saved a
+maintainer the time.
+
+It leaves a consequence worth being plain about: **the `ir3` column of the corpus report rests on
+a tool upstream has deleted.** While the port stays on Mesa 25.0.7 that is fine — the tool is in
+the tarball and the patch applies — but it is not a route that survives a Mesa upgrade, and it
+could never have been upstreamed. `air_run` does not share the problem: it uses the ordinary
+Gallium interface (`screen->context_create`, `create_fs_state`, `draw_vbo`), which is what the
+drivers and the port's own Mesa are built on. The durable way to get the `ir3` number after an
+upgrade is `air_run` against a freedreno screen, which means on the phone, because freedreno
+needs a real `msm` device and this machine has none.
 
 Needed on this machine: meson, ninja, bison, flex, python3 with venv, and LLVM's `llvm-as` /
 `llvm-dis` for the reader check (22.1.8 here). The host build also patches Mesa 25.0's
