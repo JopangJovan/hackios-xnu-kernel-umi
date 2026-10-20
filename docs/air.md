@@ -205,6 +205,20 @@ functions and not entry points at all.
   and `ushort` (2). **There is no `half4` among them.** The token does occur once somewhere in the
   shared cache, which makes the spelling plausible and attests nothing about this use of it.
 
+  **And there is a second half to the f16 question that no harness can settle, because nothing is
+  required.** One F16 path through that `create_cov` branch is `pack_half_2x16`, and
+  `nir_lower_mediump.c` says of it, in Mesa's own words, "pack_half rounding is undefined". Where
+  the specification requires nothing, a truncating `packHalf2x16` is a permitted choice and not a
+  fault, so a measurement of it would be an observation about an implementation rather than an
+  argument about conformance — and the patch's header now scopes its case to the destinations where
+  a mode *is* required, integer to float, naming the `pack_half` path as a reviewer's question
+  instead of leaving it to be found. A peer session had planned to reach the F16 branch through
+  `packHalf2x16` for exactly that reason and dropped it on this, which is the better call: the
+  experiment would have answered our internal question and been useless for the report.
+
+  So the f16 question is two questions. For integer-to-half, round-to-nearest-even is required and
+  this instrument cannot ask. For `pack_half`, nothing is required and there is nothing to ask.
+
   And the spelling is the smaller problem. A `half` render target appears in **no** module of the
   corpus, so a shader built around one would exercise a path through this frontend that Apple's own
   shaders never take and that nothing else here tests. A disagreement would then sit between two
