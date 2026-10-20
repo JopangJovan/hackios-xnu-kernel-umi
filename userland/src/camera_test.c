@@ -128,7 +128,7 @@ cycle(int frames)
 			failures++;
 			continue;
 		}
-		isp_measure(f, buffer + f->header_bytes, &s);
+		isp_measure(NULL, f, buffer + f->header_bytes, &s);
 		printf("camera_test: the %s camera (sensor %u): %ux%u, stride %u, Bayer %u; the first frame %.0f ms after it was asked "
 		    "for; %d frames of %llu in %.2f s (%.1f a second); R %.1f G %.1f B %.1f above black\n", sensor_names[n], f->sensor,
 		    f->width, f->height, f->stride, f->bayer, changed_ms, got, last_seq - first_seq + 1, ticks_ms(f->time - first) / 1000,
@@ -336,7 +336,7 @@ raw(int frames, bool ae, bool awb, bool keep_raw, bool full, int sensor)
 
 		got++;
 		first_seq = first_seq ? first_seq : f->sequence;
-		isp_measure(f, raw, &s);
+		isp_measure(&isp, f, raw, &s);
 		if (awb) {
 			isp_awb(&isp, &s);
 		}

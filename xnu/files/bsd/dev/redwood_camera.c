@@ -198,7 +198,7 @@ struct sensor_hw {
 	unsigned        csiphy;
 	uint32_t        phy_cbcr, timer_cmd, timer_cbcr;
 	uint8_t         regs;           /* the exposure registers: REGS_OV_PAGED, REGS_SMIA or REGS_OV16 */
-	uint8_t         bayer;          /* the picture's order as it comes here (camraw.py's codes: 0 RGGB, 2 GBRG) */
+	uint8_t         bayer;          /* the picture's order as it comes here (camraw.py's codes: 1 GRBG, 3 BGGR) */
 	uint8_t         pattern_bayer;  /* ... and its own colour bars' (its module file's "tpgon") */
 	const char *    chip;           /* for the frames' header */
 	uint16_t        gain_unity, gain_max;   /* the analog gain register's 1x, and the most it is given */
@@ -213,7 +213,7 @@ static const struct sensor_hw sensors[] = {
 		.name = "macro (OV02B10)", .tab = "camera-ov02b10.tab", .bus_name = "CCI 1 master 0", .sda = 73, .scl = 74, .reset = 77,
 		.mclk_cmd = 0xe038, .mclk_cbcr = 0xe050, .mclk_pin = 66,
 		.vana = { SUPPLY_LDO, 7, 2800, 0, 0 }, .vdig = { SUPPLY_LDO, 6, 1800, 0, 0 }, .vio = { SUPPLY_NONE, 0, 0, 0, 0 },
-		.csiphy = 2, .phy_cbcr = 0xe110, .timer_cmd = 0xe0f4, .timer_cbcr = 0xe10c, .regs = REGS_OV_PAGED, .bayer = 0,
+		.csiphy = 2, .phy_cbcr = 0xe110, .timer_cmd = 0xe0f4, .timer_cbcr = 0xe10c, .regs = REGS_OV_PAGED, .bayer = 3,
 		.pattern_bayer = 2, .chip = "OV02B10", .gain_unity = 16, .gain_max = 0xf8,
 	},
 	{       /* cam-sensor0: S5KHM2SD, CCI 0 master 1 (GPIO 71/72), reset GPIO 21, MCLK1 (GPIO 65), csiphy 1;
@@ -221,14 +221,14 @@ static const struct sensor_hw sensors[] = {
 		.name = "wide (S5KHM2SD)", .tab = "camera-s5khm2sd.tab", .bus_name = "CCI 0 master 1", .sda = 71, .scl = 72, .reset = 21,
 		.mclk_cmd = 0xe01c, .mclk_cbcr = 0xe034, .mclk_pin = 65,
 		.vana = { SUPPLY_GPIO, 0, 2800, 106, 135 }, .vdig = { SUPPLY_LDO, 1, 1000, 0, 0 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
-		.csiphy = 1, .phy_cbcr = 0xe0ec, .timer_cmd = 0xe0d0, .timer_cbcr = 0xe0e8, .regs = REGS_SMIA, .bayer = 2,
+		.csiphy = 1, .phy_cbcr = 0xe0ec, .timer_cmd = 0xe0d0, .timer_cbcr = 0xe0e8, .regs = REGS_SMIA, .bayer = 1,
 		.pattern_bayer = 2, .chip = "S5KHM2SD", .gain_unity = 32, .gain_max = 0x800,
 	},
 	{       /* cam-sensor1: OV16A1Q, CCI 0 master 0 (GPIO 69/70), reset GPIO 20, MCLK0 (GPIO 64), csiphy 0 */
 		.name = "front (OV16A1Q)", .tab = "camera-ov16a1q.tab", .bus_name = "CCI 0 master 0", .sda = 69, .scl = 70, .reset = 20,
 		.mclk_cmd = 0xe000, .mclk_cbcr = 0xe018, .mclk_pin = 64,
 		.vana = { SUPPLY_LDO, 3, 2800, 0, 0 }, .vdig = { SUPPLY_LDO, 2, 1200, 0, 0 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
-		.csiphy = 0, .phy_cbcr = 0xe0c8, .timer_cmd = 0xe0ac, .timer_cbcr = 0xe0c4, .regs = REGS_OV16, .bayer = 0,
+		.csiphy = 0, .phy_cbcr = 0xe0c8, .timer_cmd = 0xe0ac, .timer_cbcr = 0xe0c4, .regs = REGS_OV16, .bayer = 3,
 		.pattern_bayer = 0, .chip = "OV16A1Q", .gain_unity = 0x100, .gain_max = 0xf80,
 	},
 	{       /* cam-sensor3: S5K4H7, CCI 1 master 1 (GPIO 75/76), reset GPIO 78, MCLK3 (GPIO 67, 24 MHz: camcc's PLL2), csiphy 3;
@@ -236,7 +236,7 @@ static const struct sensor_hw sensors[] = {
 		.name = "ultra-wide (S5K4H7)", .tab = "camera-s5k4h7.tab", .bus_name = "CCI 1 master 1", .sda = 75, .scl = 76, .reset = 78,
 		.mclk_cmd = 0xe054, .mclk_cbcr = 0xe06c, .mclk_pin = 67,
 		.vana = { SUPPLY_LDO, 4, 2800, 0, 0 }, .vdig = { SUPPLY_GPIO, 0, 1200, 108, 135 }, .vio = { SUPPLY_LDO, 5, 1800, 0, 0 },
-		.csiphy = 3, .phy_cbcr = 0xe138, .timer_cmd = 0xe11c, .timer_cbcr = 0xe134, .regs = REGS_SMIA, .bayer = 2,
+		.csiphy = 3, .phy_cbcr = 0xe138, .timer_cmd = 0xe11c, .timer_cbcr = 0xe134, .regs = REGS_SMIA, .bayer = 1,
 		.pattern_bayer = 2, .chip = "S5K4H7", .gain_unity = 32, .gain_max = 0x200,
 	},
 };
@@ -372,6 +372,32 @@ bus_give_back(struct bus *b)
 	wr(GPIO_CFG(b->scl), b->cfg[1]);
 }
 
+/*
+ * A sensor stopped in the middle of a byte -- the camera switched away from it between frames, its
+ * digital rail left on because the driver found it on -- goes on holding the data line down, and the
+ * bus never comes to rest again however long one waits for it. The way out is the one Linux's
+ * bit-banged master takes (i2c_generic_scl_recovery): clock the line that is free until the sensor has
+ * finished that byte and lets the data line go, then a stop. Nine clocks are a byte and the
+ * acknowledgement after it. This is what kept the wide camera's bus (CCI 0 master 1) for the rest of a
+ * session once Camera.app had switched to the front camera and back.
+ */
+static bool
+bus_unwedge(struct bus *b)
+{
+	for (unsigned clocks = 1; clocks <= 9; clocks++) {
+		line(b->scl, false);
+		half_bit();
+		line(b->scl, true);
+		half_bit();
+		if (level_of(b->sda)) {
+			i2c_stop(b);
+			say("camera: %s: the data line was held down and came back after %u clock(s)\n", b->name, clocks);
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool
 bus_take(struct bus *b)
 {
@@ -382,14 +408,20 @@ bus_take(struct bus *b)
 	line(b->sda, true);
 	line(b->scl, true);
 	half_bit();
-	if (!level_of(b->sda) || !level_of(b->scl)) {
+	if (level_of(b->sda) && level_of(b->scl)) {
+		return true;
+	}
+	/* the data line alone held down is a sensor that did not finish a byte: clock it out (see above) */
+	if (level_of(b->scl) && !level_of(b->sda) && bus_unwedge(b) && level_of(b->scl)) {
+		return true;
+	}
+	{
 		bool sda = level_of(b->sda), scl = level_of(b->scl);
 
 		bus_give_back(b);
 		say("camera: %s is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n", b->name, b->sda, sda, b->scl, scl);
-		return false;
 	}
-	return true;
+	return false;
 }
 
 /*
@@ -620,12 +652,31 @@ sensor_ldo(unsigned n, unsigned mv)
 	return false;
 }
 
+/*
+ * The PM8008i's I2C is bit-banged, on a bus whose lines the phone's own firmware holds as well, and
+ * a transfer now and then goes unanswered -- more often the longer the run, and most often right
+ * after the camera has been switched off and on again. Taken for a fault the first time, the camera
+ * was gone for the rest of the run (give_up: nothing more is written); asked again, the chip
+ * answers. The number of goes that were needed is said at the end of the run.
+ */
+#define PM8008_GOES             4
+
+static uint64_t pm8008_retries;
+
 static bool
 pm8008_get(uint8_t address, uint16_t reg, uint8_t *values, unsigned count)
 {
 	uint8_t where[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
 
-	return i2c_transfer(&pmic_bus, address, where, 2, values, count);
+	for (unsigned go = 0; go < PM8008_GOES; go++) {
+		if (i2c_transfer(&pmic_bus, address, where, 2, values, count)) {
+			pm8008_retries += go;
+			return true;
+		}
+		wait_ms(1);
+	}
+	pm8008_retries += PM8008_GOES;
+	return false;
 }
 
 /* The registers the PM8008i may be written in: the chip enable, and the set point, mode and enable of the sensor's LDOs. */
@@ -642,13 +693,17 @@ pm8008_put(uint8_t address, uint16_t reg, uint8_t value, bool force)
 		give_up(allowed ? "a write to the PM8008i after a fault" : "a PM8008i register that is not to be written");
 		return false;
 	}
-	if (!i2c_transfer(&pmic_bus, address, out, 3, NULL, 0) || !pm8008_get(address, reg, &back, 1) || back != value) {
-		say("camera: PM8008i %#04x:%#06x <- %#04x: %s (reads %#04x)\n", address, reg, value, back == 0xff ? "no answer" :
-		    "does not read back", back);
-		give_up("a write to the PM8008i that failed");
-		return false;
+	for (unsigned go = 0; go < PM8008_GOES; go++) {
+		if (i2c_transfer(&pmic_bus, address, out, 3, NULL, 0) && pm8008_get(address, reg, &back, 1) && back == value) {
+			pm8008_retries += go;
+			return true;
+		}
+		wait_ms(1);
 	}
-	return true;
+	say("camera: PM8008i %#04x:%#06x <- %#04x: %s (reads %#04x), %u goes\n", address, reg, value, back == 0xff ? "no answer" :
+	    "does not read back", back, PM8008_GOES);
+	give_up("a write to the PM8008i that failed");
+	return false;
 }
 
 static void
@@ -703,16 +758,38 @@ ldo_on(unsigned n, unsigned mv)
 	if (!pm8008_put(PM8008_REGULATORS, (uint16_t)(base + LDO_ENABLE), (uint8_t)(enable | 0x80), false)) {
 		return false;
 	}
-	for (int tries = 0; tries < 10; tries++) {
+	for (int tries = 0, allones = 0; tries < 10; tries++) {
 		spin_us(20 + mv * 1000 / 38400 + 1);   /* the driver's wait: 20 us and the set point at the stepper's 38.4 mV/us */
 		if (!pm8008_get(PM8008_REGULATORS, (uint16_t)(base + LDO_STATUS1), &status, 1)) {
 			give_up("a PM8008i that does not answer");
 			return false;
 		}
+		/*
+		 * A byte with every bit set is not a status: a good one reads 0x87, and the bits between
+		 * "ready" and the mode are not used. It is what this bus reads when the PM8008i has not
+		 * answered properly, as it does for a few goes right after the front camera's rails have
+		 * gone down -- and it was read as an over-current, which switched the camera off for the
+		 * rest of the run just as Camera.app went back to the wide camera. Ask again.
+		 */
+		if (status == 0xff) {
+			if (allones++ == 0) {
+				say("camera: PM8008i LDO%u: a status of all ones, which is no answer: asking again\n", n);
+			}
+			continue;
+		}
 		if (status & 0x20) {
-			say("camera: PM8008i LDO%u reports over-current (status %#04x)\n", n, status);
-			give_up("an LDO over its current");
-			return false;
+			uint8_t again = 0;
+
+			/* as healthy() does while it runs: an over-current counts when it is still there */
+			wait_ms(2);
+			if (pm8008_get(PM8008_REGULATORS, (uint16_t)(base + LDO_STATUS1), &again, 1) && !(again & 0x20)) {
+				say("camera: PM8008i LDO%u: status %#04x, and %#04x when asked again\n", n, status, again);
+				status = again;
+			} else {
+				say("camera: PM8008i LDO%u reports over-current (status %#04x)\n", n, status);
+				give_up("an LDO over its current");
+				return false;
+			}
 		}
 		if (status & 0x80) {
 			say("camera: PM8008i LDO%u on at %u mV (status %#04x)\n", n, mv, status);
@@ -720,7 +797,7 @@ ldo_on(unsigned n, unsigned mv)
 		}
 	}
 	say("camera: PM8008i LDO%u not ready (status %#04x)\n", n, status);
-	give_up("an LDO that is not ready");
+	give_up(status == 0xff ? "a PM8008i whose status is all ones" : "an LDO that is not ready");
 	return false;
 }
 
@@ -1221,7 +1298,15 @@ power_down(void)
 	supply_off(&hw->vana);
 	supply_off(&hw->vdig);
 	gdsc_off();
-	if (chip_enable_switched) {
+	/*
+	 * The PM8008i itself stays as it is between one use of the camera and the next: out of reset and
+	 * enabled, with its LDOs off (they are switched above). Put back into reset it does come out
+	 * again -- it answers for its revision at 0x08 -- but its regulators are deaf from then on (a
+	 * write to 0x09 reads back 0xff), and the camera is gone for the rest of the run. It is put back
+	 * as it was found when the kernel leaves (redwood_camera_quiesce), which is where Android gets
+	 * the phone back.
+	 */
+	if (leaving && chip_enable_switched) {
 		uint8_t enable = 0;
 
 		if (pm8008_get(PM8008_CHIP, MISC_CHIP_ENABLE, &enable, 1) &&
@@ -1232,7 +1317,7 @@ power_down(void)
 		}
 		chip_enable_switched = false;
 	}
-	if (pgpio_changed) {
+	if (leaving && pgpio_changed) {
 		uint8_t now[5];
 		bool all = pgpio_read_all(now);
 
@@ -1250,7 +1335,11 @@ power_down(void)
 		reset_driven = false;
 	}
 	powered = false;
-	say("camera: powered down\n");
+	if (pm8008_retries != 0) {
+		say("camera: powered down (the PM8008i needed %llu more goes on its I2C)\n", pm8008_retries);
+	} else {
+		say("camera: powered down\n");
+	}
 }
 
 /* The PM8008i out of reset (its reset pin as Android drives it) and enabled. */
@@ -1263,7 +1352,9 @@ pm8008_up(void)
 		give_up("the PM8350C's GPIO 3 cannot be read");
 		return false;
 	}
-	memcpy(pgpio_found_regs, regs, sizeof(regs));
+	if (!pgpio_changed) {           /* (as Android left it, which is what the run's end puts back) */
+		memcpy(pgpio_found_regs, regs, sizeof(regs));
+	}
 	if (!pgpio_active(regs)) {
 		uint8_t want[5] = { (uint8_t)(regs[0] & ~7), (uint8_t)((regs[1] & ~7) | 5), (uint8_t)((regs[2] & ~3) | 1), 0x80,
 			            (uint8_t)(regs[4] | 0x80) };
@@ -1329,9 +1420,27 @@ read_chip_id(void)
 	unsigned out = ctab->address_bytes == 2 ? 2 : 1, in = ctab->data_bytes >= 1 && ctab->data_bytes <= 4 ? ctab->data_bytes : 2;
 	uint32_t chip = 0;
 
-	if (!i2c_transfer(&cci_bus, sensor_address(), out == 2 ? where : where + 1, out, id, in)) {
+	/*
+	 * The first word asked of the sensor after its supplies have come up. Powered up again within a
+	 * run -- the capture graph stops and starts the stream as the application reconfigures its
+	 * session -- it is not always ready by the time the power sequence's own waits are over, and one
+	 * unanswered transfer used to end the camera for the rest of the run. It is asked again, for as
+	 * long as the sensor's own data sheet would have it waiting.
+	 */
+	unsigned go;
+
+	for (go = 0; go < 20; go++) {
+		if (i2c_transfer(&cci_bus, sensor_address(), out == 2 ? where : where + 1, out, id, in)) {
+			break;
+		}
+		wait_ms(2);
+	}
+	if (go == 20) {
 		say("camera: the %s sensor does not answer at %#04x\n", hw->name, sensor_address());
 		return false;
+	}
+	if (go != 0) {
+		say("camera: the %s sensor answered at %#04x after %u more goes (%u ms)\n", hw->name, sensor_address(), go, go * 2);
 	}
 	for (unsigned i = 0; i < in; i++) {
 		chip = chip << 8 | id[i];
@@ -1341,15 +1450,34 @@ read_chip_id(void)
 	return (chip & ctab->id_mask) == (ctab->id & ctab->id_mask);
 }
 
-/* While powered up: the LDOs switched on still ready and not over their current. */
+/*
+ * While powered up: the LDOs switched on still ready and not over their current. An over-current is
+ * asked again 2 ms on before it counts: the lens motor's moves show one on LDO5 for an instant (at a
+ * move of a few hundred steps, now and then), and the camera went on as before every time it was not
+ * looked at then.
+ */
 static bool
 healthy(void)
 {
 	for (unsigned n = 1; n <= 7; n++) {
 		uint8_t status = 0;
 
-		if (ldo_switched[n] && (!pm8008_get(PM8008_REGULATORS, (uint16_t)(LDO_BASE(n) + LDO_STATUS1), &status, 1) ||
-		    !(status & 0x80) || (status & 0x20))) {
+		if (!ldo_switched[n]) {
+			continue;
+		}
+		for (int look = 0; look < 2; look++) {
+			if (!pm8008_get(PM8008_REGULATORS, (uint16_t)(LDO_BASE(n) + LDO_STATUS1), &status, 1) || !(status & 0x80)) {
+				break;
+			}
+			if (!(status & 0x20)) {
+				break;
+			}
+			if (look == 0) {
+				say("camera: PM8008i LDO%u: status %#04x, asked again\n", n, status);
+				wait_ms(2);
+			}
+		}
+		if (!(status & 0x80) || (status & 0x20)) {
 			say("camera: PM8008i LDO%u: status %#04x\n", n, status);
 			give_up("an LDO that is no longer well");
 			return false;
@@ -1642,13 +1770,56 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 	return -1;
 }
 
+/* Up to three writes to RPMh's resources through the camera's TCS, waited for. True: RPMh has said done. */
+static bool
+rpmh_write(unsigned n, const uint32_t *addresses, const uint32_t *values)
+{
+	vm_offset_t tcs = rsc + RSC_TCS(CAMERA_TCS);
+	uint32_t done = 0, all = (1u << n) - 1;
+
+	if (rd(tcs + TCS_STATUS) == 0) {
+		say("camera: TCS %u of the sequencer is busy (control %#x)\n", CAMERA_TCS, rd(tcs + TCS_CONTROL));
+		return false;
+	}
+	wr(rsc + RSC_IRQ_CLEAR, 1u << CAMERA_TCS);
+	for (unsigned r = 0; r < n; r++) {
+		wr(tcs + TCS_COMMAND(r), MSGID_WRITE_WAITED);
+		wr(tcs + TCS_COMMAND(r) + 4, addresses[r]);
+		wr(tcs + TCS_COMMAND(r) + 8, values[r]);
+	}
+	wr(tcs + TCS_WAIT_FOR_DONE, all);
+	wr(tcs + TCS_ENABLED, all);
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~TCS_TRIGGER);
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) | TCS_ACTIVE_MODE);
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) | TCS_TRIGGER);
+	/* (each command's status: [8] issued, [16] completed -- the TCS's interrupt may not be enabled for this one) */
+	for (unsigned waited = 0; waited < 100000 && !done; waited += 50) {
+		unsigned completed = 0;
+
+		for (unsigned r = 0; r < n; r++) {
+			completed += (rd(tcs + TCS_COMMAND(r) + 12) >> 16) & 1;
+		}
+		done = (rd(rsc + RSC_IRQ_STATUS) & (1u << CAMERA_TCS)) || completed == n;
+		if (!done) {
+			spin_us(50);
+		}
+	}
+	say("camera: RPMh's TCS %u: interrupt status %#x (enabled %#x), the commands' status %#x %#x %#x\n", CAMERA_TCS,
+	    rd(rsc + RSC_IRQ_STATUS), rd(rsc + RSC_TCS_BASE), rd(tcs + TCS_COMMAND(0) + 12), n > 1 ? rd(tcs + TCS_COMMAND(1) + 12) : 0,
+	    n > 2 ? rd(tcs + TCS_COMMAND(2) + 12) : 0);
+	wr(rsc + RSC_IRQ_CLEAR, 1u << CAMERA_TCS);
+	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
+	wr(tcs + TCS_ENABLED, 0);
+	return done != 0;
+}
+
 /* CX and MX at the camera's levels, or given back (`on' false). True: RPMh has said done. */
 static bool
 rails(bool on)
 {
-	uint32_t addresses[2], values[2], done = 0;
+	uint32_t addresses[2], values[2];
 	int cx = rail_position("cx.lvl", CX_LEVEL, &addresses[0]), mx = rail_position("mx.lvl", MX_LEVEL, &addresses[1]);
-	vm_offset_t tcs = rsc + RSC_TCS(CAMERA_TCS);
+	bool done;
 
 	if (cx < 0 || mx < 0) {
 		say("camera: RPMh has no position for CX %u or MX %u\n", CX_LEVEL, MX_LEVEL);
@@ -1656,38 +1827,11 @@ rails(bool on)
 	}
 	values[0] = on ? (uint32_t)cx : 0;
 	values[1] = on ? (uint32_t)mx : 0;
-	if (rd(tcs + TCS_STATUS) == 0) {
-		say("camera: TCS %u of the sequencer is busy (control %#x)\n", CAMERA_TCS, rd(tcs + TCS_CONTROL));
-		return false;
-	}
-	wr(rsc + RSC_IRQ_CLEAR, 1u << CAMERA_TCS);
-	for (unsigned r = 0; r < 2; r++) {
-		wr(tcs + TCS_COMMAND(r), MSGID_WRITE_WAITED);
-		wr(tcs + TCS_COMMAND(r) + 4, addresses[r]);
-		wr(tcs + TCS_COMMAND(r) + 8, values[r]);
-	}
-	wr(tcs + TCS_WAIT_FOR_DONE, 3);
-	wr(tcs + TCS_ENABLED, 3);
-	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~TCS_TRIGGER);
-	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) | TCS_ACTIVE_MODE);
-	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) | TCS_TRIGGER);
 	rails_voted |= on;
-	/* (each command's status: [8] issued, [16] completed -- the TCS's interrupt may not be enabled for this one) */
-	for (unsigned waited = 0; waited < 100000 && !done; waited += 50) {
-		done = (rd(rsc + RSC_IRQ_STATUS) & (1u << CAMERA_TCS)) ||
-		    ((rd(tcs + TCS_COMMAND(0) + 12) & 1u << 16) && (rd(tcs + TCS_COMMAND(1) + 12) & 1u << 16));
-		if (!done) {
-			spin_us(50);
-		}
-	}
-	say("camera: RPMh's TCS %u: interrupt status %#x (enabled %#x), the commands' status %#x %#x\n", CAMERA_TCS,
-	    rd(rsc + RSC_IRQ_STATUS), rd(rsc + RSC_TCS_BASE), rd(tcs + TCS_COMMAND(0) + 12), rd(tcs + TCS_COMMAND(1) + 12));
-	wr(rsc + RSC_IRQ_CLEAR, 1u << CAMERA_TCS);
-	wr(tcs + TCS_CONTROL, rd(tcs + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
-	wr(tcs + TCS_ENABLED, 0);
+	done = rpmh_write(2, addresses, values);
 	say("camera: RPMh %s CX (%#x) position %u and MX (%#x) position %u%s\n", done ? "took" : "DID NOT SAY IT TOOK", addresses[0],
 	    values[0], addresses[1], values[1], on ? "" : " (given back)");
-	return done != 0;
+	return done;
 }
 
 /* camcc's PLL0 (Lucid): the registers of clk-alpha-pll.c's Lucid layout */
@@ -2768,6 +2912,162 @@ sensor_write(uint16_t address, uint16_t value, bool sixteen)
 	       i2c_transfer(&cci_bus, sensor_address(), (uint8_t[]){ out[0], out[1], out[3] }, 3, NULL, 0);
 }
 
+/*
+ * The wide camera's lens: a voice-coil motor driven by a Dongwoon DW9800 on the sensor's own I2C at
+ * 0x0c (the module file's actuatorDriver, "redwood_sunny_s5khm2sd_dw9800_wide"), powered by the
+ * PM8350C's L9 (the device tree's actuator0: cam_vaf at 2.8 V, a regulator the SD card's slot has as
+ * its vdd too; RPMh's "ldoc9"). The module file's initialisation, as it is: 0x02 = 0x01 (power down),
+ * 0x02 = 0x00 and 1 ms, 0x02 = 0x02 (ring control), 0x06 = 0x40 (SAC3), 0x07 = 0x07 (its timing), the
+ * position 0x190 and 20 ms, then 0x12c. The position is ten bits, 0x03 (the high two) and 0x04 written
+ * together (its registerParam). Those registers only are written. The other three cameras' lenses
+ * are fixed. When the motor does not answer, L9 is switched on (and back off at the end) and it is
+ * asked again; at the end the lens is let down to 0 and the chip powered down.
+ */
+#define AF_ADDRESS              0x0c
+#define AF_CONTROL              0x02            /* [0] power down, [1] ring control */
+#define AF_POSITION             0x03            /* and 0x04: ten bits */
+#define AF_MODE                 0x06
+#define AF_TIMING               0x07
+#define VAF_MV                  2800
+#define VRM_VOLTAGE             0x0             /* an RPMh VRM resource's registers (rpmh-regulator.c) */
+#define VRM_ENABLE              0x4
+#define VRM_MODE                0x8
+#define VRM_MODE_HPM            7               /* a PMIC5 LDO's high power mode */
+
+static bool vaf_voted;
+static uint32_t af_position = REDWOOD_CAMERA_NO_FOCUS;
+
+/* (a look, for now: what the LDOs say after the motor does something; said only when not all is well) */
+static void
+af_look(const char *when)
+{
+	for (unsigned n = 1; n <= 7; n++) {
+		uint8_t status = 0;
+
+		if (ldo_switched[n] && pm8008_get(PM8008_REGULATORS, (uint16_t)(LDO_BASE(n) + LDO_STATUS1), &status, 1) &&
+		    (status & 0xb8) != 0x80) {
+			say("camera: %s: PM8008i LDO%u status %#04x\n", when, n, status);
+		}
+	}
+}
+
+static bool
+af_write(uint8_t reg, uint16_t value)
+{
+	uint8_t out[3] = { reg, (uint8_t)value, 0 };
+
+	if (reg != AF_CONTROL && reg != AF_POSITION && reg != AF_MODE && reg != AF_TIMING) {
+		return false;
+	}
+	if (reg == AF_POSITION) {
+		out[1] = (uint8_t)(value >> 8 & 3);
+		out[2] = (uint8_t)value;
+	}
+	return i2c_transfer(&cci_bus, AF_ADDRESS, out, reg == AF_POSITION ? 3 : 2, NULL, 0);
+}
+
+/* L9C at 2.8 V in high power mode, or given back. True: RPMh has said done. */
+static bool
+vaf(bool on)
+{
+	uint16_t levels[1];
+	unsigned count;
+	uint32_t base = rpmh_resource("ldoc9", levels, 1, &count), addresses[3], values[3];
+	bool done;
+
+	if (base == 0) {
+		say("camera: RPMh has no ldoc9 (the lens motor's supply)\n");
+		return false;
+	}
+	addresses[0] = base + VRM_VOLTAGE;
+	values[0] = VAF_MV;
+	addresses[1] = base + VRM_MODE;
+	values[1] = VRM_MODE_HPM;
+	addresses[2] = base + VRM_ENABLE;
+	values[2] = on;
+	done = on ? rpmh_write(3, addresses, values) : rpmh_write(1, &addresses[2], &values[2]);
+	vaf_voted = on && done;
+	say("camera: RPMh %s L9C (%#x) %s\n", done ? "took" : "DID NOT SAY IT TOOK", base, on ? "on at 2800 mV" : "off");
+	return done;
+}
+
+static void
+af_up(bool sensor_frames)
+{
+	af_position = REDWOOD_CAMERA_NO_FOCUS;
+	if (hw != &sensors[1] || !sensor_frames) {
+		return;
+	}
+	if (!af_write(AF_CONTROL, 0x01)) {
+		say("camera: the lens motor (DW9800 at 0x0c) does not answer: its supply on\n");
+		if (!vaf(true)) {
+			return;
+		}
+		wait_ms(2);
+		af_look("the lens motor's supply on");
+		if (!af_write(AF_CONTROL, 0x01)) {
+			say("camera: the lens motor does not answer with its supply on either: no focus in this session\n");
+			(void)vaf(false);
+			return;
+		}
+	}
+	if (!af_write(AF_CONTROL, 0x00)) {
+		goto failed;
+	}
+	wait_ms(1);
+	if (!af_write(AF_CONTROL, 0x02) || !af_write(AF_MODE, 0x40) || !af_write(AF_TIMING, 0x07) || !af_write(AF_POSITION, 0x190)) {
+		goto failed;
+	}
+	wait_ms(20);
+	if (!af_write(AF_POSITION, 0x12c)) {
+		goto failed;
+	}
+	af_position = 0x12c;
+	af_look("the lens motor initialised");
+	say("camera: the lens motor (DW9800) is up, the lens at %u\n", af_position);
+	return;
+failed:
+	say("camera: the lens motor stopped answering during its initialisation: no focus in this session\n");
+}
+
+static void
+af_move(uint32_t position)
+{
+	if (af_position == REDWOOD_CAMERA_NO_FOCUS) {
+		return;
+	}
+	position = position > 1023 ? 1023 : position;
+	if (position != af_position && af_write(AF_POSITION, (uint16_t)position)) {
+		char when[48];
+
+		snprintf(when, sizeof(when), "the lens from %u to %u", af_position, position);
+		af_position = position;
+		af_look(when);
+	}
+}
+
+static void
+af_down(void)
+{
+	if (af_position != REDWOOD_CAMERA_NO_FOCUS) {
+		/* down in steps, not to knock the lens against its stop */
+		while (af_position > 0) {
+			uint32_t was = af_position;
+
+			af_move(af_position > 48 ? af_position - 48 : 0);
+			if (af_position == was) {
+				break;
+			}
+			wait_ms(10);
+		}
+		(void)af_write(AF_CONTROL, 0x01);
+		af_position = REDWOOD_CAMERA_NO_FOCUS;
+	}
+	if (vaf_voted) {
+		(void)vaf(false);
+	}
+}
+
 static bool
 exposure(const struct ctab_mode *mode)
 {
@@ -2868,11 +3168,16 @@ capture_sensor(void)
 	h = (struct cam_header *)frames;
 	(void)PE_parse_boot_argn("cam_pattern", &pattern, sizeof(pattern));
 	/*
-	 * In a picture of a room the two sites of a 2x2 cell that track each other are the greens: the
-	 * OV02B10's second and third, the S5KHM2SD's first and fourth; red against blue by the two
-	 * cameras' raw levels under the same warm light (red the higher of the two). The OV02B10's own
-	 * colour bars (cam_pattern=1) come a line off its picture: GBRG. A sensor whose module file has
-	 * no colour bars (the wide one's and the ultra-wide's have none) gives its picture instead.
+	 * The picture's order is the one each sensor's module file gives its modes (resolutionData's
+	 * colorFilterArrangement, in CamX's order: 0 BGGR, 1 GBRG, 2 GRBG, 3 RGGB -- camera.qcom.so's
+	 * TranslateColorFilterArrangement turns it into Android's by the table 3, 2, 1, 0): the OV02B10's
+	 * and the OV16A1Q's BGGR, the S5KHM2SD's and the S5K4H7's GRBG (tools/camsensor.py lists it).
+	 * Their greens are where a picture of a room has them (the sites of a cell that track each
+	 * other); red against blue had been guessed from raw levels under a warm light, the other way
+	 * round, and every picture had the two swapped. The OV02B10's own colour bars (cam_pattern=1)
+	 * are still taken for GBRG, as before: the module file says nothing of them. A sensor whose
+	 * module file has no colour bars (the wide one's and the ultra-wide's have none) gives its
+	 * picture instead.
 	 */
 	uint32_t tpg_count = 0;
 	const struct ctab_entry *tpgon = ctab_find("tpgon", &tpg_count);
@@ -2973,7 +3278,7 @@ static const struct ctab_mode *ios_mode;
 static uint32_t ios_mode_n, ios_line_ns;
 static volatile bool ios_open, ios_streaming, ios_wanted;  /* open; frames coming; a read wants them */
 static uint64_t ios_last_read, ios_given, ios_frames_done, ios_writes_late;
-static struct { uint32_t lines, gain, frame_lines; bool pending; } ios_ask;
+static struct { uint32_t lines, gain, frame_lines; bool pending; uint32_t focus; bool focus_pending; } ios_ask;
 static struct { uint32_t lines, gain, frame_lines; uint64_t from; } ios_now, ios_next;
 /*
  * What the frames are (boot-arg cam_pattern): 0 the sensor's picture; 1 colour bars -- the sensor's own,
@@ -3105,7 +3410,11 @@ ios_stop(const char *why)
 	if (!broken && ios_source != SOURCE_CSID_TPG) {
 		(void)sensor_table("off");
 	}
-	show_paths("at the end");
+	af_down();
+	/* (only when the paths were set up: a start that failed before them -- a PMIC that did not answer -- has no CSID mapped) */
+	if (csid_running || ife_running) {
+		show_paths("at the end");
+	}
 	smmu_faults();
 	csiphy_down();
 	titan_down();
@@ -3172,6 +3481,7 @@ ios_start(void)
 	if (!sensor_table("on") || !exposure_write(lines, gain, frame_lines)) {
 		return false;
 	}
+	af_up(ios_source == SOURCE_SENSOR);
 	ios_now.lines = ios_next.lines = lines;
 	ios_now.gain = ios_next.gain = gain;
 	ios_now.frame_lines = ios_next.frame_lines = frame_lines;
@@ -3265,11 +3575,15 @@ ios_session(void)
 				blk_put(ife, "IFE", IFE_REG_UPDATE, 0x2, false);
 			}
 		}
-		bool ask = (bus & WM0_DONE) && ios_ask.pending;
-		uint32_t lines = ios_ask.lines, gain = ios_ask.gain, frame_lines = ios_ask.frame_lines;
+		bool ask = (bus & WM0_DONE) && ios_ask.pending, focus = (bus & WM0_DONE) && ios_ask.focus_pending;
+		uint32_t lines = ios_ask.lines, gain = ios_ask.gain, frame_lines = ios_ask.frame_lines, position = ios_ask.focus;
 
 		ios_ask.pending = ios_ask.pending && !ask;
+		ios_ask.focus_pending = ios_ask.focus_pending && !focus;
 		lck_mtx_unlock(&ios_lock);
+		if (focus) {
+			af_move(position);
+		}
 		if (bus & WM0_DONE) {
 			wakeup(&ios_frames_done);
 		}
@@ -3302,6 +3616,158 @@ ios_session(void)
 		}
 	}
 	ios_stop(broken ? "a fault" : !ios_open ? "closed" : ios_switch_to != 0 ? "another sensor asked for" : "nobody reads");
+}
+
+/*
+ * cam_fake=1 (with cam=5; for QEMU): /dev/redwood-camera without the phone's camera. The sessions,
+ * sensors, modes and frame headers are cam=5's, from the same tables in fw/, but nothing of the phone
+ * is touched: the frames are a colour chart made here -- eight bars (white, beige, red, yellow, green,
+ * cyan, blue, 18 % grey) over a grey ramp -- in RAW10 in the sensor's own Bayer order, as bright as the
+ * exposure asked for makes them, so that everything above the kernel (the ISP of camera_test and of
+ * the media library, the capture graph, Camera.app) runs as it does on the phone and has a known
+ * picture to show. cam_fake_fps: frames a second (default 5: QEMU's processor is slow).
+ */
+static bool fake;
+
+/* the bars' linear reflectance, R, G, B in thousandths */
+static const uint16_t fake_bars[8][3] = {
+	{ 900, 900, 900 }, { 730, 550, 300 }, { 600, 50, 50 }, { 750, 650, 50 },
+	{ 80, 450, 100 }, { 50, 500, 600 }, { 50, 100, 550 }, { 180, 180, 180 },
+};
+
+/* one line of the chart, RAW10: `ramp' the grey ramp's, else the bars'; `odd' the second line of the cells */
+static void
+fake_line(uint8_t *out, uint32_t width, bool odd, bool ramp, uint64_t light)
+{
+	static const int red[4] = { 0, 1, 2, 3 }, blue[4] = { 3, 2, 1, 0 };
+	int r = red[hw->bayer & 3], b = blue[hw->bayer & 3];
+	uint32_t v[4];
+
+	for (uint32_t x = 0; x < width; x += 4) {
+		for (int i = 0; i < 4; i++) {
+			uint32_t px = x + (uint32_t)i, site = (odd ? 2u : 0u) + (px & 1), c = site == (uint32_t)r ? 0 : site == (uint32_t)b ? 2 : 1;
+			uint64_t refl = ramp ? (uint64_t)px * 1000 / width : fake_bars[px * 8 / width][c];
+			/* (2/15 of a 10-bit step per thousandth of reflectance and line at 1x: 18 % grey at AE's 15 % of white near 6000) */
+			uint64_t level = 64 + refl * light * 2 / 15000;
+
+			v[i] = level > 1023 ? 1023 : (uint32_t)level;
+		}
+		uint8_t *g = out + (x / 4) * 5;
+
+		g[0] = (uint8_t)(v[0] >> 2);
+		g[1] = (uint8_t)(v[1] >> 2);
+		g[2] = (uint8_t)(v[2] >> 2);
+		g[3] = (uint8_t)(v[3] >> 2);
+		g[4] = (uint8_t)((v[0] & 3) | (v[1] & 3) << 2 | (v[2] & 3) << 4 | (v[3] & 3) << 6);
+	}
+}
+
+/* place p filled with the chart as an exposure of `lines' at `gain' shows it */
+static void
+fake_fill(int p, uint32_t lines, uint32_t gain)
+{
+	uint8_t *at = (uint8_t *)(ring + (uint64_t)p * ring_place_bytes);
+	uint32_t width = ios_mode->width, height = ios_mode->height, stride = RAW10_STRIDE(width), ramp_from = height * 3 / 4 & ~1u;
+	uint64_t light = (uint64_t)lines * gain / GAIN_UNITY;
+
+	fake_line(at, width, false, false, light);
+	fake_line(at + stride, width, true, false, light);
+	fake_line(at + (uint64_t)ramp_from * stride, width, false, true, light);
+	fake_line(at + (uint64_t)(ramp_from + 1) * stride, width, true, true, light);
+	for (uint32_t y = 2; y < height; y++) {
+		if (y != ramp_from && y != ramp_from + 1) {
+			memcpy(at + (uint64_t)y * stride, at + (uint64_t)((y & 1) + (y >= ramp_from ? ramp_from : 0)) * stride, stride);
+		}
+	}
+}
+
+/* a session of cam_fake: ios_session()'s, with the chart for the sensor and a timer for its frames */
+static void
+fake_session(void)
+{
+	uint32_t fps = 5, lines, gain, frame_lines, filled_lines[RING] = { 0 }, filled_gain[RING] = { 0 };
+
+	(void)PE_parse_boot_argn("cam_fake_fps", &fps, sizeof(fps));
+	fps = fps < 1 ? 1 : fps > 30 ? 30 : fps;
+	ios_frames_done = ios_given = ios_writes_late = 0;
+	if (!ring_alloc(RAW10_STRIDE(ios_mode->width) * ios_mode->height)) {
+		return;
+	}
+	lck_mtx_lock(&ios_lock);
+	for (int i = 0; i < RING; i++) {
+		place[i].state = PLACE_FREE;
+		place[i].sequence = 0;
+	}
+	lines = ios_ask.lines;
+	gain = ios_ask.gain;
+	frame_lines = ios_ask.frame_lines;
+	ios_ask.pending = false;
+	exposure_limits(&lines, &gain, &frame_lines);
+	ios_now.lines = lines;
+	ios_now.gain = gain;
+	ios_now.frame_lines = frame_lines;
+	ios_streaming = true;
+	ios_last_read = ios_ms();
+	lck_mtx_unlock(&ios_lock);
+	say("camera: the frames for iOS: cam_fake's colour chart, %ux%u in %s's order, %u a second\n", ios_mode->width, ios_mode->height,
+	    hw->chip, fps);
+	while (ios_open && ios_switch_to == 0) {
+		int p = -1;
+
+		wait_ms(1000 / fps);
+		lck_mtx_lock(&ios_lock);
+		if (ios_ms() - ios_last_read > IDLE_MS) {
+			lck_mtx_unlock(&ios_lock);
+			break;
+		}
+		if (ios_ask.pending) {
+			lines = ios_ask.lines;
+			gain = ios_ask.gain;
+			frame_lines = ios_ask.frame_lines;
+			ios_ask.pending = false;
+			exposure_limits(&lines, &gain, &frame_lines);
+			ios_now.lines = lines;
+			ios_now.gain = gain;
+			ios_now.frame_lines = frame_lines;
+		}
+		for (int i = 0; i < RING; i++) {
+			if (place[i].state != PLACE_READING && (p < 0 || place[i].sequence < place[p].sequence)) {
+				p = i;
+			}
+		}
+		if (p >= 0) {
+			place[p].state = PLACE_WRITING;
+		}
+		lck_mtx_unlock(&ios_lock);
+		if (p < 0) {
+			ios_writes_late++;
+			continue;
+		}
+		if (filled_lines[p] != ios_now.lines || filled_gain[p] != ios_now.gain) {
+			fake_fill(p, ios_now.lines, ios_now.gain);
+			filled_lines[p] = ios_now.lines;
+			filled_gain[p] = ios_now.gain;
+		}
+		lck_mtx_lock(&ios_lock);
+		place[p].state = PLACE_READY;
+		place[p].sequence = ++ios_frames_done;
+		place[p].time = mach_absolute_time();
+		place[p].exposure_lines = ios_now.lines;
+		place[p].gain = ios_now.gain;
+		place[p].frame_lines = ios_now.frame_lines;
+		lck_mtx_unlock(&ios_lock);
+		wakeup(&ios_frames_done);
+	}
+	lck_mtx_lock(&ios_lock);
+	ios_streaming = false;
+	for (int i = 0; i < RING; i++) {
+		place[i].state = PLACE_FREE;
+	}
+	lck_mtx_unlock(&ios_lock);
+	wakeup(&ios_frames_done);
+	ring_free();
+	say("camera: the frames for iOS stopped (%s): %llu done, %llu given\n", !ios_open ? "closed" : ios_switch_to != 0 ?
+	    "another sensor asked for" : "nobody reads", ios_frames_done, ios_given);
 }
 
 static const char *
@@ -3399,6 +3865,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	f.frame_lines_max = FRAME_LINES_MAX;
 	f.margin = EXPOSURE_MARGIN;
 	f.sensor = hw_index;
+	f.focus = af_position;
 	lck_mtx_unlock(&ios_lock);
 
 	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
@@ -3492,6 +3959,13 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	if (c.command == REDWOOD_CAMERA_KEEP) {
 		return keep_picture(&c, uio);
 	}
+	if (c.command == REDWOOD_CAMERA_FOCUS) {
+		lck_mtx_lock(&ios_lock);
+		ios_ask.focus = c.a;
+		ios_ask.focus_pending = true;
+		lck_mtx_unlock(&ios_lock);
+		return 0;
+	}
 	if (c.command == REDWOOD_CAMERA_SENSOR) {
 		if (c.a >= sizeof(sensors) / sizeof(sensors[0])) {
 			return EINVAL;
@@ -3536,7 +4010,9 @@ static bool
 ios_select(unsigned index, uint32_t mode_n)
 {
 	select_sensor(index);
-	find_pins();
+	if (!fake) {
+		find_pins();
+	}
 	if (!ctab_load()) {
 		return false;
 	}
@@ -3621,7 +4097,11 @@ serve_ios(void)
 		lck_mtx_lock(&ios_lock);
 		ios_wanted = false;
 		lck_mtx_unlock(&ios_lock);
-		ios_session();
+		if (fake) {
+			fake_session();
+		} else {
+			ios_session();
+		}
 	}
 	say("camera: /dev/redwood-camera: no more frames in this run\n");
 }
@@ -3682,13 +4162,6 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	if (level == 5) {
 		camdev_make();
 	}
-	wait_ms(secs * 1000);           /* (the system up first: nothing else is on these buses then) */
-	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
-	gcc = ml_io_map(GCC_PHYS, 0x30000);
-	camcc = ml_io_map(CAMCC_PHYS, CAMCC_SIZE);
-	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
-	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
-	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
 	select_sensor(level == 5 ? 1 : 0);
 	if (PE_parse_boot_arg_str("cam_sensor", which, sizeof(which))) {
 		for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
@@ -3698,6 +4171,20 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 		}
 	}
+	if (fake) {
+		say("camera: cam=5 cam_fake=1: the %s camera's frames for iOS are a chart made here; nothing of the phone is touched\n",
+		    hw->name);
+		serve_ios();
+		say("camera: done\n");
+		thread_terminate(current_thread());
+	}
+	wait_ms(secs * 1000);           /* (the system up first: nothing else is on these buses then) */
+	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	gcc = ml_io_map(GCC_PHYS, 0x30000);
+	camcc = ml_io_map(CAMCC_PHYS, CAMCC_SIZE);
+	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
 	say("camera: cam=%u: the %s camera%s\n", level, hw->name, level == 5 ? ": its frames for iOS" :
 	    level == 4 ? ": its frames through its CSIPHY and RDI 0 into memory" :
 	    level == 3 ? ": the CSID's test pattern through RDI 0 into memory" :
@@ -3737,6 +4224,9 @@ redwood_camera_init(void)
 		return;
 	}
 	level = level > 5 ? 5 : level;
+	uint32_t fake_n = 0;
+
+	fake = level == 5 && PE_parse_boot_argn("cam_fake", &fake_n, sizeof(fake_n)) && fake_n != 0;
 	if (level >= 3) {
 		/*
 		 * Memory in one piece for the host (cam_keep_mb, default 24: a 12-megapixel NV12 picture of cam=5,

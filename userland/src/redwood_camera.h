@@ -39,8 +39,12 @@ struct redwood_camera_frame {
 	uint32_t        frame_lines_max; /* the longest frame it may be given */
 	uint32_t        margin;         /* exposure_lines is at most frame_lines - margin */
 	uint32_t        sensor;         /* which: 0 the macro, 1 the wide, 2 the front, 3 the ultra-wide camera */
-	uint32_t        reserved[6];
+	uint32_t        focus;          /* the lens's position as last set, 0 (the furthest) to 1023: REDWOOD_CAMERA_NO_FOCUS where it
+	                                 * has no motor (or it does not answer) */
+	uint32_t        reserved[5];
 };
+
+#define REDWOOD_CAMERA_NO_FOCUS 0xffffffffu
 
 enum {
 	REDWOOD_CAMERA_EXPOSURE = 1,    /* a: lines, b: gain, c: frame lines (0: the shortest that holds the exposure) */
@@ -48,6 +52,7 @@ enum {
 	                                 * 3 BGRA); bytes follow */
 	REDWOOD_CAMERA_SENSOR = 3,      /* another sensor: a which (as in the frames' header), b its mode (~0: the usual one);
 	                                 * the frames stop, everything goes down, and the next read starts the other one */
+	REDWOOD_CAMERA_FOCUS = 4,       /* the lens to a: 0 (the furthest) to 1023, from the next frame or so */
 };
 
 struct redwood_camera_command {

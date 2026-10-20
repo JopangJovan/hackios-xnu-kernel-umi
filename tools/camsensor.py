@@ -26,6 +26,11 @@ count x { kind u16 (0 MCLK, 1 VANA, 2 VDIG, 3 VIO, 8 RESET; Android's cam_sensor
 (MCLK in kHz), 0 u32, delay in us u32 }; the number of tables, and each table: name[8], count, then
 count x { address u16, data u16, address bytes u8, data bytes u8, operation u8, 0 u8, delay in us
 u32 }. The modes' own tables are res0, res1, ...
+
+The listing also gives each mode's colour filter order: the first word of its resolution element,
+colorFilterArrangement in CamX's order (0 BGGR, 1 GBRG, 2 GRBG, 3 RGGB, 4 mono; camera.qcom.so's
+TranslateColorFilterArrangement makes Android's of it by the table 3, 2, 1, 0, 5). It is not in the
+table: the kernel's sensors[] carries it (bsd/dev/redwood_camera.c).
 """
 import struct
 import sys
@@ -73,7 +78,7 @@ def main():
     # the resolutions: a 196-byte element each
     res_sid = next(s for s in order if syms[s][0] == 'resolutionData')
     raw = value(res_sid)
-    modes, mode_tables = [], []
+    modes, mode_tables, cfa = [], [], []
     for k in range(len(raw) // 196):
         w = struct.unpack_from('<49I', raw, 196 * k)
         fps = struct.unpack_from('<d', raw, 196 * k + 40)[0]
@@ -81,6 +86,7 @@ def main():
         data_type, x, y, width, height = stream[1:6]
         lanes, settle, cphy, writes_sid = w[14], w[17], w[18], w[24]
         modes.append((width, height, x, y, lanes, cphy, settle, w[7], w[3], w[4], int(fps * 1000), data_type))
+        cfa.append(CFA.get(w[0], str(w[0])))
         mode_tables.append(('res%d' % k, regsetting(data, pool, syms, value, writes_sid)))
     lane_sid = next((s for s in order if syms[s][0] == 'laneAssign'), None)
     lane_assign = struct.unpack('<H', value(lane_sid))[0] if lane_sid is not None and syms[lane_sid][2] == 2 else 0
@@ -109,7 +115,7 @@ def main():
         print(f'  {name}: ' + ' '.join(f'{TYPES.get(t, t)}={v}+{d}ms' for t, v, d in power[name]))
     for k, m in enumerate(modes):
         print(f'  mode {k}: {m[0]}x{m[1]} at {m[2]},{m[3]} dt {m[11]:#x}, {m[4]} {"trio(s), C-PHY" if m[5] else "lane(s), D-PHY"}, '
-              f'settle {m[6]}, pixel clock {m[7]}, line {m[8]}, frame {m[9]}, {m[10] / 1000:.2f} fps')
+              f'settle {m[6]}, pixel clock {m[7]}, line {m[8]}, frame {m[9]}, {m[10] / 1000:.2f} fps, {cfa[k]}')
     for name, writes in tables:
         print(f'  {name}: {len(writes)} writes: ' + ' '.join(f'{a:x}={v:x}' + (f'+{d}us' if d else '') for a, v, _, _, _, d in writes[:10]) +
               (' ...' if len(writes) > 10 else ''))
@@ -133,6 +139,7 @@ def main():
 
 
 TYPES = {0: 'MCLK', 1: 'VANA', 2: 'VDIG', 3: 'VIO', 4: 'VAF', 8: 'RESET', 9: 'STANDBY'}
+CFA = {0: 'BGGR', 1: 'GBRG', 2: 'GRBG', 3: 'RGGB', 4: 'mono'}
 
 
 def regsetting(data, pool, syms, value, sid):

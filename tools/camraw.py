@@ -13,12 +13,11 @@ interpolation -- with a plain grey-world white balance and a gamma of 2.2: a fir
 finished photograph; PREFIX-N-raw.png is the frame's raw values as they are (grey, 8 bits).
 Formats 2 and 3 are a picture iOS made of a frame (cam=5): NV12 (full-range YCbCr 4:2:0, the chroma plane
 after the luma one, both of the stride) or BGRA, which becomes PREFIX.png as it is.
---bayer N takes the frames for that order instead of the header's. The OV02B10's picture is RGGB
-here (in a picture of a room the second and third sites of each cell track each other, the
-greens; red against blue by plausible colours); its own colour bars (cam_pattern=1) come a line
-off that, GBRG, and the header says so for them. The S5KHM2SD's picture is GBRG (its greens are
-the first and fourth sites; red against blue by the two sensors' raw levels under the same warm
-light), and the header says so too.
+--bayer N takes the frames for that order instead of the header's. The header's is the one each
+sensor's module file gives (tools/camsensor.py lists it): the OV02B10's and the OV16A1Q's picture is
+BGGR, the S5KHM2SD's and the S5K4H7's GRBG. The OV02B10's own colour bars (cam_pattern=1) are taken
+for GBRG, and the header says so for them. (Frames taken before the kernel had this right say
+RGGB for BGGR and GBRG for GRBG: --bayer 3 and --bayer 1 for them.)
 """
 import struct
 import sys

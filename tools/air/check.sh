@@ -78,4 +78,37 @@ echo "== the air.* operations, one at a time"
 python3 "$ROOT/tools/air/intrincheck.py" 2>&1 | tail -8
 intrin_rc=${PIPESTATUS[0]}
 
-exit $((reader_rc | cpu_rc | intrin_rc))
+echo
+echo "== the same operations run, not folded"
+# A different check and not a slower one: folding asks NIR's constant
+# expression, this builds the arguments into a buffer so nothing can be folded
+# and hands the shader to a driver that compiles and executes it. That is how
+# air.sign(-0) was caught -- NIR's folder keeps the sign of a zero, softpipe
+# does not, and nir_fsign promises neither.
+#
+# --cases 4 and not the whole pool: 612 cases in 79 seconds against 2586 in
+# 300, and it still catches that bug, which is how the subset was chosen rather
+# than guessed. The full run is `intrincheck.py --run --few`.
+python3 "$ROOT/tools/air/intrincheck.py" --run --cases 4 2>&1 | tail -6
+run_rc=${PIPESTATUS[0]}
+
+echo
+echo "== the atomics, with a kernel written to make a lost update show"
+# None of Apple's kernels can test an atomic: a sum written by threads that
+# never raced reads the same as one written by threads that did. This one
+# dispatches sixteen threads whose fetch_add results must be the numbers 0..15
+# with nothing repeated, so a lost update leaves a duplicate and a gap.
+python3 "$ROOT/tools/air/atomiccheck.py" 2>&1 | tail -8
+atomic_rc=${PIPESTATUS[0]}
+
+echo
+echo "== the texture operations, on more than one texel"
+# texcheck.sh runs the corpus's own texture shaders, which all sample texel
+# (1, 1) because that is where air_run's vertex shader puts the coordinate: a
+# lowering that ignored the coordinate and always fetched (1, 1) would pass all
+# six of them. These ask for the corners too, so swapping x and y is caught on
+# the five asymmetric coordinates and correctly not on the symmetric ones.
+python3 "$ROOT/tools/air/texopcheck.py" 2>&1 | tail -10
+texop_rc=${PIPESTATUS[0]}
+
+exit $((reader_rc | cpu_rc | intrin_rc | run_rc | atomic_rc | texop_rc))

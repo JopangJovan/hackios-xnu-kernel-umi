@@ -30,39 +30,69 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | | of 119 |
 | --- | --- |
 | checked numerically, one operation at a time, against a reference outside this tree | 78 |
-| of those, exactly defined and agreeing on every case (44 028 cases) | 71 |
+| of those, exactly defined and agreeing on every case (45 607 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
-| textures, atomics, barriers, derivatives and simd: no reference here | 41 |
+| of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
+| the atomics and the barrier, against kernels written for them (`atomiccheck.py`) | 10 |
+| texture operations verified exactly, on several texels each (`texopcheck.py`) | 13 |
+| texture operations with a case softpipe cannot run: a 16-bit result | 7 |
+| texture operations with no case: multisample, depth, write | 11 |
 
 313 of 456 is 313 of 321 entry points — 97.5% — because 135 modules are `air.visible` library
 functions and not entry points at all.
 
 **What those numbers are not**, because they will be quoted without this paragraph otherwise:
 
-- **The arithmetic operations are now checked; the reference is not the Adreno.** 71 of the
-  corpus's declarations agree with C's own functions on every one of 44 028 cases, which is a real
-  answer to what used to be the largest hole here (section 4, item 4). But what is folded is NIR's
-  constant expression for each opcode, on this machine — so an opcode whose Adreno instruction
-  differs from what `nir_opt_constant_folding` computes would be invisible to all 44 028 of them.
-  Nothing in this table's bottom row calls an `air.*` function: **no operation has been run on the
-  GPU.**
-- **Still unverified by anything: the atomics, the barrier, the derivatives and the simd
-  reductions** — 41 declarations with no reference in `intrincheck.py`, because what they mean
-  depends on more than one thread or on neighbouring fragments and a folded constant cannot say
-  it. The texture operations among them are covered differently and partly, by the six shaders
-  that returned the exact texel on the Adreno.
-- **Nothing here tests Metal's own filtering or addressing.** The six texture shaders that drew on
-  the Adreno took their sampler from the API, which this harness chose: nearest, clamped, sampled
-  at a texel centre. That is evidence about binding, descriptors and ir3's texture instructions —
-  exactly what it was built to be — and silence about everything Metal's sampler state decides.
-  **The 64-bit `constexpr sampler` word is not decoded** (section 3.3). Two modules of the corpus
-  declare such a sampler; everywhere else the API supplies it.
-- **Compute has just started being checked, and atomics are not among it.** `air_run` can now
-  dispatch a kernel and read its device buffers back (section 5b); the first one agrees with its
-  NIR exactly. But 17 of the 40 kernels that translate use a global atomic, and *a total written
-  by threads that never raced looks exactly like one written by threads that did* — so nothing
-  here is evidence about atomicity. The 24 kernels that use textures are not dispatched at all
-  yet: the harness binds textures for a draw and not for a dispatch.
+- **The arithmetic operations are now checked; nothing checked them against the Adreno.** 71 of
+  the corpus's declarations agree with C's own functions on every one of 45 607 cases, and 47 of
+  them agree again when *executed* by softpipe instead of folded — which is a real answer to what
+  used to be the largest hole here (section 4, item 4), and found three bugs getting there. But
+  both engines are on an x86 host. An opcode whose Adreno instruction differs from what
+  `nir_opt_constant_folding` and TGSI compute is invisible to all 48 193 of those cases, and the
+  24 narrow-type declarations softpipe cannot run at all are exactly the ones where ir3 differs
+  most from it. None of the seven shaders that have run on the phone calls an `air.*` function:
+  **no operation has been run on the GPU.**
+- **The atomics compute the right thing and the barrier waits; whether the atomics are *atomic*
+  is still open.** `tools/air/atomiccheck.py` dispatches two kernels written for the purpose
+  (section 4, item 5) and all eight operations the corpus uses agree — five on device memory
+  (`add.s`, `load`, `max.s`, `min.s`, `store`), three on threadgroup memory (`add.u`, `load`,
+  `store`) across two `air.wg.barrier`s. Among them a signed minimum taken across negative
+  values, which is where an unsigned one passes unnoticed. The barrier is genuinely under test:
+  softpipe advances its invocations in groups of four, so making the barrier a no-op leaves every
+  thread seeing 4 of 16 increments, and the check says exactly that. **Atomicity is not under
+  test**, because softpipe applies a group's atomic lane by lane and so cannot lose an update
+  however the lowering is written. That needs the phone. Two things are settled without running
+  anything: every atomic in the corpus asks for `memory_order_relaxed`, and a stronger order is
+  now refused by name instead of ignored, which is what the lowering used to do.
+- **All 119 declarations are now accounted for**, which is new as of tonight and is a weaker
+  claim than "all checked" — the distinction matters and an earlier draft of this paragraph, and
+  the commit message of `bbf6c3c`, ran the two together:
+
+  | | of 119 |
+  | --- | --- |
+  | verified: the answer was compared with one computed elsewhere and agreed | 94 |
+  | measured, no verdict: approximate arithmetic, against this machine's libm | 7 |
+  | has a case, which softpipe cannot run: a 16-bit result or operand | 7 |
+  | has no case, for a reason given in section 4 item 6: multisample, depth, write | 11 |
+
+  The 94 are 71 arithmetic operations, 10 atomics and the barrier, and 13 texture operations. The
+  derivatives and the simd reductions are in none of these rows because **no module of the corpus
+  calls them**: unexercised code, not untested behaviour, and saying "unverified" of them would
+  overstate what is at stake.
+- **The weakest of the three groups is the textures**, and the gap is not in the fetch — which is
+  now checked at the corners as well as the middle, and for integer and unsigned textures too —
+  but in everything Metal's sampler state decides. The 64-bit `constexpr sampler` word is still
+  not decoded (section 3.3) and every coordinate checked is a texel centre or a clean footprint
+  corner, where nearest filtering has no weights to round and clamping has no arithmetic.
+  The six texture shaders that drew on the Adreno took their sampler from the API too, so what
+  they are evidence about is binding, descriptors and ir3's texture instructions — exactly what
+  they were built to be — and silence about everything Metal's sampler state decides. Two modules
+  of the corpus declare a `constexpr sampler`; everywhere else the API supplies it.
+- **Of Apple's own kernels, one has been dispatched, and on software.** `air_run` can dispatch a
+  kernel and read its device buffers back (section 5b), and the one that has agrees with its NIR
+  exactly. The 24 kernels that use textures are not dispatched at all: the harness binds textures
+  for a draw and not for a dispatch. So the atomics being checked (above) is a statement about
+  two kernels written here for that purpose, not about the 17 of Apple's 40 that use one.
 
 ## 1. Where the frontend lives: inside Mesa, as `src/compiler/air`
 
@@ -433,7 +463,7 @@ Three references, each independent of the translator:
    --eval`. The reference is the C library's own `roundf`, `floorf`, `fmaxf`, `ldexpf` and the
    IEEE definitions, evaluated at the operation's own precision.
 
-   **71 exactly defined operations agree on every one of 44 028 cases; none differ.** Seven are
+   **71 exactly defined operations agree on every one of 45 607 cases; none differ.** Seven are
    approximate (`fast_sin`, `fast_cos`, `fast_exp`, `fast_pow`, `fast_atan2`) and are reported
    with their worst distance from libm and counted as nothing — see below.
 
@@ -473,10 +503,16 @@ Three references, each independent of the translator:
      `dst = ldexpf(src0, src1); /* flush denormals to zero. */ if (!isnormal(dst)) dst =
      copysignf(0.0f, src0);` — and `!isnormal` is true of an infinity as well as of a denormal, so
      `ldexp(0.5, 32767)` folds to `0` where Metal, OpenCL and C all say `+inf`. The comment names
-     denormals; the condition catches more than it means to. Found in Mesa 25.0.7, which is what
-     this port pins. **Not checked against Mesa main** — freedesktop's GitLab is behind bot
-     protection from here, so neither the file nor the 2020 merge request that looks like its
-     origin could be read. Worth reporting upstream by someone who can open the page; not worked
+     denormals; the condition catches more than it means to. Present in Mesa 26.2.5, the newest
+     release at the time of writing, byte for byte — checked by extracting that one file from
+     `archive.mesa3d.org`, which is a plain file server, because freedesktop's GitLab is behind
+     bot protection and the GitHub mirror paths 404. The merge request that looks like its origin
+     is freedesktop 3982, "nir: Flush to zero with OOB low exponents in ldexp", whose title says
+     both what it was for and what it missed: out-of-bounds *low* exponents, the high end never
+     considered. The MR itself could not be read, so treat the origin as likely and the state of
+     the current release as established. A one-line fix would be `isfinite(dst) && !isnormal(dst)`.
+     Worth reporting upstream by someone who can open the page; it is a bug for every Mesa
+     frontend whose language keeps IEEE overflow, which is OpenCL and Metal at least. Not worked
      around here, because the frontend's `nir_ldexp` is the right opcode.
 
    **The check can fail,** which is the first thing to establish about any check in this
@@ -486,6 +522,149 @@ Three references, each independent of the translator:
    caught on 83 of 100 cases. Every component of a vector result is compared, and every component
    of a vector argument is given a *different* value, because with the same value in all of them a
    lowering that swizzled or dropped a component returns the right answer for the wrong reason.
+
+   **Folded is not run, and the difference is not a matter of degree.** `--eval` asks NIR's
+   constant folder; `intrincheck.py --run` builds the same operations into shaders that *load
+   their arguments from a buffer* and hands them to `air_run`, which draws with them through a
+   real driver's compilation and execution. The buffer is the whole point: ir3 folds too, so a
+   shader calling `air.fast_round(0.5)` on an immediate is answered by the compiler and the
+   hardware never sees the instruction — a GPU test built that way passes with the GPU switched
+   off. A value loaded from a buffer cannot be folded, and `air_run` puts bytes the harness chose
+   there (`AIR_RUN_BUFFER`, added for this).
+
+   **47 of the 78 declarations agree on every one of 2 586 cases, run by softpipe rather than
+   folded; none differ.** Seven more are the approximate ones. The remaining 24 touch a type
+   narrower than 32 bits (`i1`, `i8`, `i16`, `f16`) and TGSI's registers are 32-bit, so softpipe
+   cannot answer for them: `nir_to_tgsi` asserts for the integers, which is loud and fine, and
+   for a half it computes at 32 bits instead — it answered `32767` where a half rounds to
+   `32768`, which is a verdict about softpipe and not about this frontend. `--check` reads the
+   screen out of `air_run`'s own first line and sets those aside by name. ir3 has real 16-bit
+   registers, so they are a question for the phone and are open.
+
+   Running them found two things the folding check could not, and could never have:
+
+   - **`air.sign(-0)` gave `+0`.** Metal's `sign` is OpenCL's, where `sign(-0)` is `-0` and
+     `sign(NaN)` is `+0`. `nir_fsign` does not promise either; its own documentation says that
+     for a zero source "there is a preference for the result to have the same sign, but this is
+     not required (it is required by OpenCL)". So a backend is licensed to lose it, NIR's
+     *constant folder* happens not to, and softpipe does — which is exactly why folding the
+     shader could not show it. Same shape as the atan2 bug: an opcode whose contract is weaker
+     than Metal's requirement. `air_intrinsics.c` now builds `sign` from comparisons, which
+     promise what Metal needs, rather than asking for a preference.
+   - **The 16-bit gap above, which is softpipe's and not ours** — but it took a wrong answer
+     (`32767` for a half that rounds to `32768`) to notice, not an assertion, and a check that
+     had trusted the number would have recorded a frontend bug that does not exist.
+
+   **It has not run on the phone.** `--emit DIR` writes the modules, the bytes for their input
+   buffer, a `manifest.json` of what each should return, and a `run.sh` that uses only `for`,
+   `echo` and shell parameter expansion — no `sed`, no `paste` — because what runs it is a Darwin
+   userland and not this machine's shell. `--check DIR LOG` then judges the log wherever it was
+   produced, so the arithmetic reference never leaves the host and the device needs nothing but
+   `air_run`. `--cases 4` cuts it to 211 modules and 1.7 MB, which is carryable. What is missing
+   is only the carrying: getting that directory into the boot image is the flash-root machinery of
+   subsystem (2), which this work is not supposed to touch, and the phone was held by another
+   session all night. **So every number above is from an x86 host, and the bottom row of the
+   table at the top of this document still reads 7.**
+
+5. **The atomics, with a kernel written to make a lost update show.** This document used to say
+   that none of Apple's kernels could test an atomic and why: "a sum written by threads that never
+   raced looks exactly like a sum written by threads that did. Detecting a lost update needs the
+   expected total to depend on every thread having contributed — which needs a kernel whose
+   arithmetic is known, i.e. one written for the purpose rather than one of Apple's."
+   `tools/air/atomiccheck.py` is that kernel, generated as AIR, assembled with `llvm-as` and
+   dispatched by `air_run` over its 4×4 threads, with both device buffers' initial bytes chosen
+   rather than left to the harness's pattern.
+
+   Four of its five checks are ordinary: the counter reaches the thread count, the atomic load
+   returns what was put there, the signed maximum is the largest thread index, and the signed
+   minimum of `index - 100` is `-100` — that last one is where an unsigned minimum would answer
+   `0xffffff9c` as a huge number, and where it did when the lowering was broken on purpose to see
+   whether this check works.
+
+   The fifth is the one that can see a race, and it needs no knowledge of the order the threads
+   ran in. Each thread writes the value its own `fetch_add` returned, so if the increment is
+   atomic those sixteen returned values are the numbers 0 to 15 in *some* order. A lost update
+   leaves a duplicate and a gap, and the gap names the increment that went missing. Each is
+   written as `old * 16 + index + 1`, so a slot no thread wrote cannot look like a result and a
+   thread writing another thread's slot does not read as correct either.
+
+   A second kernel does the threadgroup atomics and the barrier, which the first cannot reach —
+   they go through `nir_shared_atomic` and a different path for the memory. Threadgroup memory is
+   not zeroed at dispatch, and neither Metal nor Mesa promises it is, so the kernel initialises
+   it: every thread storing 0 to the same two words does that without needing a branch. Then each
+   thread adds 1 to one word and `1 << its own index` to the other, and after the second barrier
+   reads both back into its own slot of two device buffers. Every slot must hold 16 and `0xffff`,
+   and the two ways it can fail are told apart by *which* slot is wrong: a lost add clears a bit
+   in every slot and the bit names the thread whose increment went missing, while a barrier that
+   did not wait leaves a smaller number in the slot of the thread that ran ahead.
+
+   **All eight operations agree.** The barrier is genuinely under test, which was a surprise worth
+   recording: softpipe does not advance its invocations one at a time but in groups of four, so
+   with `barrier_op` made a no-op every thread sees 4 of 16 increments and the check says so,
+   naming the twelve threads whose bits are missing.
+
+   **Atomicity is still not under test.** Softpipe applies a group's atomic lane by lane, so it
+   cannot lose an update however the lowering is written, and the permutation comes out correct by
+   construction. The check passes there by being right rather than by being unopposed. What would
+   make it evidence is the same two kernels on the Adreno, where sixteen threads really do race,
+   and that has not happened. It is also only the eight operations the corpus proves exist, read
+   off its own declarations; `air_intrinsics.c` also handles `and`, `or`, `xor` and `xchg`, and
+   those stay untested because the names Apple would emit for them are a guess, and a test of a
+   guessed name is a test of the guess.
+
+6. **The texture operations, on more than one texel.** `tools/air/texcheck.sh` runs the corpus's
+   own texture shaders and 6 of its 55 return the exact texel on the Adreno; 49 cannot be run,
+   most of them because they are `air.visible` library functions and not entry points. Two things
+   that leaves undone, and the second is the serious one:
+
+   - whole operations have no coverage from it at all — the texel fetch, the size queries;
+   - **every one of those six samples the same texel**, `(1, 1)`, because that is where
+     `air_run`'s vertex shader puts the coordinate. A lowering that ignored the coordinate
+     entirely and always fetched `(1, 1)` would pass all six of them.
+
+   `tools/air/texopcheck.py` generates a fragment shader per operation *and coordinate*, asking
+   for the corners as well as the middle. **All 35 calls return exactly what was put there**,
+   covering 13 of the 31 texture declarations: `read_texture_2d` with 32- and with 16-bit
+   coordinates, the two size queries, `sample_texture_2d` and `sample_texture_3d`, each of those
+   for float, signed-integer and unsigned-integer textures, and `gather_texture_2d`. The
+   coordinates are immediates here, unlike the arithmetic: a texture fetch is not constant-folded
+   by NIR or by ir3, so there is nothing for the compiler to answer in the shader's place and no
+   buffer is needed to defeat it.
+
+   The integer-typed textures work because `air_run` already picks the texture's format from what
+   the shader samples into, with its own comment saying why — "a Metal `texture2d<uint>` read out
+   of a float texture gives numbers that are neither right nor obviously wrong". An earlier
+   version of this section said those declarations could not be checked for exactly that reason,
+   which was written from the probe's output without reading the code beside it. They can, and
+   the render target's type has to follow as well or the bits come back read the wrong way.
+
+   A gather returns one channel of the four texels around the coordinate, and Metal fixes the
+   order they come back in. They came back in GL's order, `(i0j1, i1j1, i1j0, i0j0)`, but that
+   Metal's convention is the same is not established here — so the four values are compared as a
+   multiset. That checks the footprint and the channel selection without committing to an order,
+   and since every channel gives a different multiset a wrong channel still shows. The coordinate
+   is `1.75/4`, which is `1.25` in texel space, so the footprint is `{1,2}×{1,2}` with nothing
+   ambiguous about the rounding.
+
+   Made to fail: swapping the first two coordinate components is caught on all five asymmetric
+   coordinates and correctly *not* on the three symmetric ones, which is the difference between
+   this and `texcheck.sh` stated as a measurement rather than an argument.
+
+   **What it does not check**, and these are the texture half's real remaining gaps:
+
+   - Metal's own sampler state. The sampler is the API's — nearest, clamped — and every
+     coordinate is a texel centre, where nearest filtering has no weights to round and clamping
+     has no arithmetic. The 64-bit `constexpr sampler` word remains undecoded (section 3.3).
+   - The seven declarations whose result or coordinate is 16-bit. They have cases and softpipe
+     refuses them: TGSI's registers are 32-bit, so `nir_to_tgsi` asserts rather than answering
+     wrongly, which is the better of its two failure modes. ir3 has real 16-bit registers, so
+     these are a question for the phone.
+   - `write_texture_2d` and `write_texture_3d` (4 declarations), which need the texture read back
+     after the draw, and the multisample reads (5), which need a multisample texture. Neither is
+     bound by `air_run`.
+   - The depth sample and the multisample depth read (2): nothing binds a depth texture, and a
+     shader reading an attachment nothing stored to is one of the four tests this port has
+     already had pass for the wrong reason.
 
 Where a shader has a known GLSL equivalent (AppleMetalGLRenderer's shaders *are* the GL
 pipeline's fixed functions), rendering both through the port's GLES and comparing images is a
@@ -810,21 +989,33 @@ build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler \
         --chip-id 0x007506030500 FILE[.metallib] [FUNCTION]                      # Adreno code
 tools/air/cpuref.py --compare FILE[.metallib] [FUNCTION]   # ours against LLVM's own answer
 tools/air/cpuref.py --all --draw FILE.metallib             # every function: LLVM, folded, drawn
-tools/air/intrincheck.py [-v] [OP ...]                     # one air.* operation at a time
+tools/air/intrincheck.py [-v] [OP ...]                     # one air.* operation at a time, folded
+tools/air/intrincheck.py --run --few [OP ...]              # the same, drawn by a real driver
+tools/air/intrincheck.py --emit DIR --few                  # modules + inputs + run.sh, to carry
+tools/air/intrincheck.py --check DIR RUN.LOG               # judge what the runner printed
+tools/air/atomiccheck.py [--keep DIR]                      # the atomics, with its own kernel
 build/mesa-host/build/src/gallium/drivers/freedreno/air_run \
         FILE[.metallib] [FUNCTION]                         # draw with it, print the pixel
 tools/air/texcheck.sh [FILE.metallib ...]                  # every texture shader, the texel it returns
+tools/air/texopcheck.py [-v] [--keep DIR]                  # the texture calls, several texels each
 ```
 
 `intrincheck.py` with no argument checks every operation the corpus calls; with one or more names
 it checks only those, which is how it is used while changing a lowering:
 `tools/air/intrincheck.py atan2`.
 
+`--run` is the same operations *executed* instead of folded, and it is a different check, not a
+slower one — section 4 item 4 says what each can see that the other cannot. `--emit` writes the
+modules, the bytes for their input buffer, a `manifest.json` of what each should return and a
+`run.sh` that uses only `for`, `echo` and parameter expansion, because what runs it may be the
+phone's Darwin userland and not this machine's shell. `--check` then judges the log wherever it
+was produced: the arithmetic reference never leaves the host.
+
 `0x007506030500` is how freedreno names the redwood's Adreno 7c+ Gen 3 (A635); it has no
 `gpu-id`, which is why `tools/mesa/air-ir3.patch` adds `--chip-id` to that tool.
 
 There is no hosted CI: the corpus is Apple's code and stays out of the repository (and out of
-GitHub). `check.sh` is the CI; it takes about four minutes, most of it the per-operation check, so it runs before every commit that touches
+GitHub). `check.sh` is the CI; it takes about five minutes, most of it the two per-operation checks, so it runs before every commit that touches
 the frontend, and the report it writes is committed as `docs/air-report.md` with the numbers of
 that commit.
 
