@@ -61,6 +61,21 @@
  * is not kept alive looks exactly like a daemon that quits, and two shapes with the same log have
  * cost this project an evening once already.
  *
+ * WHAT THE SYSTEM-CALL TRACE ADDS (systrace=2 systrace_name=fairplayd.H2, which logs every BSD call
+ * of one process and nothing else -- a few hundred lines rather than a flood). Its whole life, by
+ * census over four of its starts: open x241, write x220, close x78, mprotect x57, stat64 x54,
+ * getattrlist x45, lseek x39, pread x39, SYSCTL x33, mmap x31, fcntl x24, munmap x21, kevent_qos
+ * x16, sigaction x15, thread_selfid x13, proc_info x12, fsgetpath x12, __MAC_SYSCALL x12, openat
+ * x12, geteuid x12. The opens are the feature flags and its own bundle, and the writes at the end
+ * are OUR OWN lines, not its: it prints nothing of its own before leaving.
+ * Three things follow. It touches no IOKit node, no socket and no file of its own, so those theories
+ * are closed by trace and not by inference. It calls SYSCTL by number, never sysctlbyname -- which
+ * is why the hook on the name caught nothing all along, the wrong-name shape once more; the numeric
+ * one is hooked now. And __mac_syscall x12 is the channel to AMFI and the sandbox, so a question
+ * asked there is among the few things left that it could be deciding on.
+ * Mach traps are not BSD calls and so are invisible to this trace: whatever it asks over Mach --
+ * including a bootstrap check-in -- would not appear here.
+ *
  * The next instrument should therefore be on the other side of the wall: this kernel is ours, so
  * logging the system calls of the process named fairplayd.H2 sees through the inlining that defeats
  * interposing. The other way in is to read the binary, and this project has a worked path for
@@ -258,6 +273,24 @@ watched_open(const char *path, int flags, ...)
 	return fd;
 }
 
+/*
+ * The numeric form, which is the one it actually uses: a trace of its system calls
+ * (systrace=2 systrace_name=fairplayd.H2) counts 33 sysctl and not one sysctlbyname, so the hook on
+ * the name took nothing all along -- the wrong name, again. The MIB is printed as numbers: the
+ * first two say which subsystem, and that is enough to name what it asked about.
+ */
+static int
+watched_sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in, size_t in_size)
+{
+	int result = sysctl(mib, count, out, out_size, in, in_size);
+
+	if (ours && mib != NULL && count >= 1) {
+		say("redwood: fairplayd: sysctl [%d %d %d %d] (%u deep) -> %d\n", mib[0], count > 1 ? mib[1] : -1,
+		    count > 2 ? mib[2] : -1, count > 3 ? mib[3] : -1, count, result);
+	}
+	return result;
+}
+
 static int
 watched_sysctlbyname(const char *name, void *out, size_t *out_size, void *in, size_t in_size)
 {
@@ -440,6 +473,7 @@ __attribute__((used)) static struct {
 	{ (const void *)watched_abort, (const void *)abort },
 	{ (const void *)watched_open, (const void *)open },
 	{ (const void *)watched_sysctlbyname, (const void *)sysctlbyname },
+	{ (const void *)watched_sysctl, (const void *)sysctl },
 	{ (const void *)watched_dlopen, (const void *)dlopen },
 	{ (const void *)watched_xpc_connection_create_mach_service, (const void *)xpc_connection_create_mach_service },
 	{ (const void *)watched_stat, (const void *)stat },
