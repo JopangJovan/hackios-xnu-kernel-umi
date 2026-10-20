@@ -810,8 +810,23 @@ FEW_INTS = [0, 1, -1, 7, -32768, 32767, 2147483647, -2147483648]
 # First in the list are the ones that decide a rule, because --cases N keeps the
 # first N: the suite carried to the phone used 4, which took [0, 1, -1, 7] and
 # so never asked about a midpoint at all.
-CONV_INTS = [0, -1, 16777217, 16777219, 2147483647, 16777215, 1, 7,
-             -32768, 32767, -2147483648]
+# A half destination needs its own midpoints, and for the same reason one level
+# down: f16 holds integers exactly only to 2048, above which the spacing is 2.
+#   2051  half way between 2050 and 2052, whose lower neighbour is odd, so
+#         round-to-nearest-even gives 2052 and truncation gives 2050 -- the f16
+#         discriminator, the counterpart of 16777219
+#   2049  half way between 2048 and 2050, where both rules give 2048: carried to
+#         show that a midpoint is not automatically a test
+#   2048  the last integer f16 holds exactly
+# Without these the four half-destination declarations of the corpus were asked
+# only about values that overflow f16, and answered inf to all of them: the
+# expectations read [0, inf, inf, inf], which tests saturation and says nothing
+# whatever about rounding. They agreed on the Adreno and that agreement was
+# empty. The order interleaves the two precisions so that --cases 4 reaches a
+# discriminator for each: 0 for sanity, -1 for a whole-ulp f32 difference,
+# 16777219 for the f32 rule, 2051 for the f16 rule.
+CONV_INTS = [0, -1, 16777219, 2051, 16777217, 2049, 2048, 16777215,
+             2147483647, 1, 7, -32768, 32767, -2147483648]
 FEW_INTS2 = [1, -1, 0, 7]
 FEW_DOT = [0.0, 1.0, -1.0, 2.0, -4.0, 0.5, -0.25, 8.0]
 
@@ -844,7 +859,7 @@ def pool_for_full(ty, family):
         # and widening it would grow the whole exhaustive grid for one question
         # that belongs to one family.
         if family == "convert" and bty == "i32":
-            return INTS + [16777215, 16777217, 16777219]
+            return INTS + [16777215, 16777217, 16777219, 2048, 2049, 2051]
         return INTS
     return DOT_FLOATS if family == "dot" else FLOATS
 

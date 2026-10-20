@@ -30,7 +30,7 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | | of 119 |
 | --- | --- |
 | checked numerically, one operation at a time, against a reference outside this tree | 78 |
-| of those, exactly defined and agreeing on every case (45 607 cases) | 71 |
+| of those, exactly defined and agreeing on every case (45 652 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
 | of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
 | of those, run **on the phone's own Adreno** (808 cases) and agreeing there | 66 |
@@ -47,11 +47,11 @@ functions and not entry points at all.
 
 - **The arithmetic operations are checked; two of them have now been checked against the
   Adreno, and the other 76 have not.** 71 of the corpus's declarations agree with C's own
-  functions on every one of 45 607 cases, and 47 of them agree again when *executed* by softpipe
+  functions on every one of 45 652 cases, and 47 of them agree again when *executed* by softpipe
   instead of folded — which is a real answer to what used to be the largest hole here (section 4,
   item 4), and found three bugs getting there. But those two engines are both on an x86 host. An
   opcode whose Adreno instruction differs from what `nir_opt_constant_folding` and TGSI compute is
-  invisible to all 48 193 of those cases, and the 24 narrow-type declarations softpipe cannot run
+  invisible to all 48 238 of those cases, and the 24 narrow-type declarations softpipe cannot run
   at all are exactly the ones where ir3 differs most from it.
 
   On 20 October that stopped being true. All 78 declarations ran on the phone's own Adreno
@@ -114,6 +114,33 @@ functions and not entry points at all.
   a question, not a confirmation. **Everything ir3 compiles on this phone converts unsigned to
   float by truncating, the window server's drawing included**, and this frontend is not party to
   it: it is physically absent from that test.
+
+  **The cause is ir3 and not the a6xx instruction, and an earlier draft of this section had that
+  wrong.** It said inspection had eliminated two of three culprits and the remaining one was the
+  hardware. The steps were right and the conclusion was not: `create_cov` ends with a rounding
+  field that the reading stopped short of. `cov` *has* a rounding mode — `ROUND_ZERO = 0`,
+  `ROUND_EVEN = 1` in `instr-a3xx.h` — and `ir3_compiler_nir.c` sets it for a destination of
+  `TYPE_F16` or `TYPE_F32` from `float_controls_execution_mode`, which is a SPIR-V declaration.
+  `nir_get_rounding_mode_from_float_controls` returns `nir_rounding_mode_undef` when nothing is
+  declared, so neither branch fires and the field keeps its zero, which is truncation. GLSL ES
+  declares nothing and this frontend declares nothing, which is exactly why two independent paths
+  returned the same wrong number. **The hardware can round; ir3 only asks when someone else has
+  asked first, and supplies no default where IEEE-754 and GLSL both require round-to-nearest.**
+  The fix is one line, and unlike the `ir3_cmdline` bug this one is in a file upstream still
+  carries, with reproduction down two independent paths — so it is the first thing in this work
+  that can actually be reported. A peer session is testing the one-line change in its own build.
+
+  **The same branch covers `TYPE_F16`, and that half of it this suite was not asking about.** The
+  corpus has four integer-to-half conversions — `air.convert.f.f16.{s.i32,u.i16,u.i32,u.i8}` —
+  and all four agreed on the Adreno. The agreement was empty: the pool gave them only values that
+  overflow `f16`, so their expectations read `[0, inf, inf, inf]`, which tests saturation and says
+  nothing whatever about rounding. In `f16` integers are exact to 2048 and spaced by 2 above it, so
+  **2051** is the discriminator — between 2050 and 2052 with an odd lower neighbour, where
+  round-to-nearest-even gives 2052 and truncation gives 2050 — and 2049 is carried beside it as a
+  midpoint where both rules agree, to show that a midpoint is not automatically a test. The pool now
+  interleaves the two precisions so `--cases 4` reaches a discriminator for each. The prediction,
+  untested at the time of writing: these four must currently return 2050, and the one-line fix above
+  must turn them into 2052.
 
   **Which rule it is, as against merely "not round-to-nearest", is settled by one value.**
   `0x01000003` is 2²⁴+3, half way between the representable 2²⁴+2 and 2²⁴+4; round-half-to-even and
@@ -543,7 +570,7 @@ Three references, each independent of the translator:
    --eval`. The reference is the C library's own `roundf`, `floorf`, `fmaxf`, `ldexpf` and the
    IEEE definitions, evaluated at the operation's own precision.
 
-   **71 exactly defined operations agree on every one of 45 607 cases; none differ.** Seven are
+   **71 exactly defined operations agree on every one of 45 652 cases; none differ.** Seven are
    approximate (`fast_sin`, `fast_cos`, `fast_exp`, `fast_pow`, `fast_atan2`) and are reported
    with their worst distance from libm and counted as nothing — see below.
 
