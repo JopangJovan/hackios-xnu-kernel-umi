@@ -309,6 +309,31 @@ functions and not entry points at all.
   they are evidence about is binding, descriptors and ir3's texture instructions — exactly what
   they were built to be — and silence about everything Metal's sampler state decides. Two modules
   of the corpus declare a `constexpr sampler`; everywhere else the API supplies it.
+- **Four modules call a function that takes a texture, and that is attempted and not done.**
+  `air.convert`-style arguments pass through a `nir_call` happily; a texture does not, because
+  this frontend resolves a texture at translation time into a binding and `tex_handle` wants an
+  `AIR_VAL_PTR`, not an SSA def. The attempt, kept here so it is not repeated from the start:
+
+  - binding the pointer-class arguments from the caller's own resolution and passing only the
+    rest as NIR parameters **works** — "argument 0 is not a texture" goes away, and one of the
+    four, `FilmGrainChromaKernel_Uint`, gets past the call to a different limit (a shuffle mask
+    that is not constant);
+  - the module's own values have to be carried into the callee's fresh value table rather than
+    re-registered, because `translate_globals` is not idempotent: it appends to
+    `info->resources` and adds to `shared_size`, so a second run invents an inline sampler and
+    doubles the threadgroup memory. Copying the `module_values` set is the right carry;
+  - and then three of the four **crash**, in `nir_lower_goto_ifs` → `nir_repair_ssa` →
+    `nir_block_is_unreachable`, on an assertion that dominance metadata is valid. Marking the
+    hand-built callee impl's metadata invalid (`nir_metadata_preserve(impl, nir_metadata_none)`)
+    does not fix it, and the obvious hypothesis — that the callee has unreachable blocks, which
+    is what that predicate is about — is **wrong**: these callees have no `unreachable`
+    terminator at all.
+
+  So the work is reverted rather than left half-built, and the state above is the committed one.
+  What is missing is a diagnosis, not another fix: two speculative ones have already failed, and
+  a third would be guessing. Each of the four has exactly one call site, so specialising per site
+  costs nothing in duplication when it does work.
+
 - **Of Apple's own 47 kernels, 6 are dispatched, all on software.** `tools/air/kernelcheck.py`
   prints where each one stops, as a table whose rows are checked against the total before it is
   printed:
