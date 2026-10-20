@@ -475,7 +475,20 @@ new_brotli(id self, SEL cmd, void *a, void *b, void *c, void *d)
  * have asked for the content once the document was loaded, and why does it not".
  * The next thing to measure is accordingly one step earlier: a task that is created and never
  * resumed is a different story from a task that is never created, and they look the same in a report
- * that only counts resumes. Both are counted now.
+ * that only counts resumes. Both are counted now -- and the creation hooks fire for nothing, while
+ * four resumes are counted, so the four tasks are made somewhere these two do not see. The fact that
+ * matters survives either way: four requests, no feed.
+ *
+ * WHAT IS REACHABLE IN JetEngine FROM A HOOK, since that decides whether the next step is a run or a
+ * week of reading. Of 71 042 Objective-C classes in the App Store's process, 40 are named like Jet
+ * and 27 like JE, and they are real: JEBrotliDecoder/Encoder, JETreatment, JETreatmentProfile,
+ * JETreatmentContext, JETreatmentAction and the JEDeres* actions, JEMediaActivityTracker,
+ * JEMetricsDataPredicate, JEUnfairLock, JEWrappedMetricsPipeline, JetEngine itself, JetUI, and --
+ * the one worth taking first -- _TtGC9JetEngine7PromiseT__, which is JetEngine's own Promise.
+ * The App Store's page is built on promises of its own, and a promise graph is the instrument that
+ * found the root in appstored in one slot. The same graph on JetEngine.Promise, with the entry and
+ * exit counted apart, is where the next session should start: it says whether anything is waiting
+ * for the content that is never asked for, and it costs a run rather than a read.
  */
 static id (*old_dataTaskLocal)(id, SEL, void *, void *);
 static id
