@@ -33,8 +33,8 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | of those, exactly defined and agreeing on every case (45 607 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
 | of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
-| of those, run **on the phone's own Adreno** (812 cases) and agreeing there | 68 |
-| of those, **disagreeing on the Adreno** where every host engine agrees | 3 |
+| of those, run **on the phone's own Adreno** (808 cases) and agreeing there | 66 |
+| of those, **disagreeing on the Adreno** where every host engine agrees | 5 |
 | the atomics and the barrier, against kernels written for them (`atomiccheck.py`) | 10 |
 | texture operations verified exactly, on several texels each (`texopcheck.py`) | 13 |
 | texture operations with a case softpipe cannot run: a 16-bit result | 7 |
@@ -55,9 +55,12 @@ functions and not entry points at all.
   at all are exactly the ones where ir3 differs most from it.
 
   On 20 October that stopped being true. All 78 declarations ran on the phone's own Adreno
-  (`logs/080952-run.log`, section 4 item 4): **68 of the 71 exactly-defined ones agree with C on
-  every one of 812 cases, and 3 disagree** — and the 3 are the whole point of having gone there,
-  because every engine on this machine agrees with C about them.
+  (`logs/084315-run.log`, section 4 item 4): **66 of the 71 exactly-defined ones agree with C on
+  every one of 808 cases, and 5 disagree** — and the 5 are the whole point of having gone there,
+  because every engine on this machine agrees with C about them. All five are integer-to-float
+  conversions: `air.convert.f.{f32,v2f32,v3f32}.u.*` and, once the pool was sharpened to ask,
+  `air.convert.f.{f32,v2f32}.s.*` as well — `i2f` truncates exactly as `u2f` does, which the
+  earlier pool had no value to notice.
 
   Two things that run went better than expected. The **24 narrow-type declarations** that softpipe
   cannot run at all — `i1`, `i8`, `i16`, `f16`, where TGSI's 32-bit registers made a verdict
@@ -102,10 +105,23 @@ functions and not entry points at all.
   the frontend is emitting the right opcode and a workaround there would hide a fault that belongs
   to everything ir3 compiles.
 
-  **A prediction that follows and has not been tested:** the port's OpenGL ES goes through the same
-  ir3 and the same instruction, so a GLES shader converting a large `uint` to `float` on this phone
-  should truncate identically. That would place the fault beyond this frontend entirely. It is one
-  shader's worth of work and it has not been done.
+  **The prediction that followed has been tested and holds, by a peer session rather than here.**
+  The port's OpenGL ES goes through the same ir3 and the same instruction, so a GLES shader should
+  truncate identically — and `userland/src/u2f_test.c` (`RC=rc.u2f`) asks GLSL ES 3.0 the same
+  question through the same Mesa, with no AIR anywhere in it. Four of its six inputs disagree with
+  C on `freedreno; Adreno 7c+ Gen 3; OpenGL ES 3.2 Mesa 25.0.7`, and the two that agree are exactly
+  the two where truncation and rounding give the same answer — so agreement there is the absence of
+  a question, not a confirmation. **Everything ir3 compiles on this phone converts unsigned to
+  float by truncating, the window server's drawing included**, and this frontend is not party to
+  it: it is physically absent from that test.
+
+  **Which rule it is, as against merely "not round-to-nearest", is settled by one value.**
+  `0x01000003` is 2²⁴+3, half way between the representable 2²⁴+2 and 2²⁴+4; round-half-to-even and
+  round-half-away-from-zero both give 2²⁴+4, and the GPU gives 2²⁴+2. That is truncation and nothing
+  else. `0xFFFFFFFF` alone could never have shown this, and neither could `0x01000001`, the other
+  midpoint, where truncation and round-to-even happen to agree — which is why the pool carries both
+  and why one midpoint is not a test of a rounding rule. What remains unestablished is only whose
+  job the compensation is, and that still needs the a6xx ISA documentation.
 
 - **`air.fast_pow` returns NaN on the Adreno for a negative base, where softpipe returns the exact
   value.** `fast_pow(-0.5, 1)` is `-0.5` in C and on softpipe, and NaN on the phone. This is

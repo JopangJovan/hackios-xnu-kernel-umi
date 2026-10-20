@@ -1175,7 +1175,22 @@ def parse_runner_log(path):
 def check_log(outdir, logpath, verbose):
     """Compare a runner log against the manifest. Where it ran is not our
     business; what it computed is."""
-    with open(os.path.join(outdir, "manifest.json")) as f:
+    # A log older than the manifest cannot have come from this suite, and
+    # comparing the two is worse than useless: the module ids are 0000.. in
+    # every suite, so an older log lines up perfectly and every expectation
+    # lands on a different operation's numbers. That produced a plausible
+    # "8 differ" with lines like "got 1 want 65535" before it was noticed to be
+    # nothing at all. Refused rather than warned, because the output of the
+    # mistake looks exactly like a finding.
+    mani = os.path.join(outdir, "manifest.json")
+    if os.path.getmtime(logpath) < os.path.getmtime(mani):
+        print("intrincheck: %s is older than %s, so it cannot be this suite's log "
+              "(every suite numbers its modules from 0000, so the ids would match "
+              "and the operations would not). Re-run the suite, or re-emit it if "
+              "the log is the one you mean."
+              % (os.path.basename(logpath), os.path.basename(mani)), file=sys.stderr)
+        return 1
+    with open(mani) as f:
         manifest = json.load(f)
     got, screen = parse_runner_log(logpath)
     # TGSI's registers are 32-bit, so softpipe cannot run an operation on a
