@@ -23,7 +23,7 @@ Of the 456 modules of the device's system `.metallib` files (`tools/air/check.sh
 | translated to NIR, passing `nir_validate` | 318 |
 | compiled by ir3 into Adreno machine code | 318 |
 | numerically identical to LLVM's own execution, and drawn | 255 |
-| **run on the phone's GPU** | **7** |
+| **run on the phone's GPU** — 7 drawn, 44 dispatched | **51** |
 
 And of the 119 distinct `air.*` operations those modules call (`tools/air/intrincheck.py`):
 
@@ -83,9 +83,13 @@ functions and not entry points at all.
   narrow types is narrower than before: the `i1`, `i8` and `i16` ones ran and agree; the `f16` ones
   were never asked. Nothing refused to run, though: no assertion, no fallback, no module missing.
 
-  The row "run on the phone's GPU | 7" in the first table above is unaffected and still reads 7:
-  it counts modules of the 456-module corpus, and these are generated modules that are not in the
-  corpus. The two measurements are deliberately not added together.
+  The row "run on the phone's GPU" in the first table above does not count these: it counts
+  modules of the 456-module corpus, and these are generated modules that are not in it. The two
+  measurements are deliberately not added together. That row now reads **51** for a different
+  reason — 7 fragment shaders drawn and 44 compute kernels dispatched, which are disjoint sets
+  because a kernel is not a fragment shader. It read 7 until the kernels ran, and it stayed 7 for
+  a while after they did, which is the third time this one figure has been left behind by the work
+  that moved it.
 - **Two traps this frontend's own checks fell into, kept here for the instances; the general forms
   are in README's "Как врут собственные проверки", which collects all six and belongs there because
   the others came from the camera, the services and the build rather than from AIR.** Comparing one
@@ -339,42 +343,77 @@ functions and not entry points at all.
   `air_get` already materialises one in whichever builder asks, which was checked rather than
   assumed.
 
-- **Of Apple's own 47 kernels, 6 are dispatched, all on software.** `tools/air/kernelcheck.py`
-  prints where each one stops, as a table whose rows are checked against the total before it is
-  printed:
+- **Of Apple's own 47 kernels, 44 are dispatched on the Adreno and none crash.**
+  `tools/air/kernelcheck.py` prints where each one stops, as a table whose rows are checked
+  against the total before it is printed:
 
   | | on softpipe | **on the Adreno** |
   | --- | --- | --- |
-  | dispatched and read back | 6 | **40** |
+  | dispatched and read back | 6 | **44** |
   | softpipe's `nir_to_tgsi`: scratch and intrinsics it lacks | 38 | — |
   | a shuffle mask that is not constant (a frontend limit) | 3 | 3 |
-  | **crashed `air_run`** (a defect here, not a limit) | 0 | **4** |
+  | **crashed `air_run`** (a defect here, not a limit) | 0 | **0** |
 
   **The deferred question is answered: ir3 runs them.** 38 kernels stopped at a software
-  rasteriser that has no scratch memory and lacks compute intrinsics, and on the hardware 40 of
-  the 47 dispatch and read their results back — 22 of those 40 binding at least one image. The
-  phone replaced softpipe and the column that was never ours emptied.
+  rasteriser that has no scratch memory and lacks compute intrinsics; on the hardware 44 of the 47
+  dispatch and read their results back, and every one of the 23 that bind an image is among them.
+  The phone replaced softpipe and the column that was never ours emptied. The corpus report's
+  kernel row reads 44 of 47 through ir3 as well, stopping on the same three, so the compile and
+  the dispatch agree about which kernels are out of reach.
 
   What the rows do **not** say is right. There is no executed reference for these kernels
   anywhere: softpipe refuses 38 of them, which is why they came here, so a number out of the
-  Adreno has nothing on this machine to disagree with. 40 have been shown to *run*.
+  Adreno has nothing on this machine to disagree with. 44 have been shown to *run*.
 
-  Four crash, and the crash is on this side of the line. All four fault at the same place, which
-  `llvm-nm` against the binary that ran resolves to
+  The four that used to crash now dispatch, and the crash was this harness's:
 
-      pc   fd6_texture_state + 0xd4
-      lr   fd6_emit_cs_state<chip6> + 0x100
-           fd6_launch_grid<chip6> + 0xfc
-           fd_launch_grid + 0x3b4
-           dispatch_kernel + 0x194c
+      void *csampler = NULL;
+      pipe->bind_sampler_states(pipe, PIPE_SHADER_COMPUTE, 0, num_tex, &csampler);
 
-  — freedreno's own descriptor emission for the compute stage, reached from the image binding this
-  harness does. Two explanations are already dead: the driver's texture state is not uninitialised
-  (`CALLOC_STRUCT(fd6_context)` zeroes it, so the loops over `num_textures` do not run), and it is
-  not "an image with no buffer", because seven kernels with exactly that shape dispatch fine.
-  Whether the fault is a state this harness builds wrongly or a freedreno bug is **not
-  established**, and 22 kernels binding images successfully is the reason it cannot be read as
-  "images do not work".
+  `bind_sampler_states` reads `num_tex` pointers from the address it is given, and `&csampler` is
+  the address of *one*, so it reads `num_tex - 1` words past that variable and stores whatever is
+  there as `samplers[1..]`. The draw path beside it has always built a proper `void *samplers[]`
+  array, so the new code failed to learn what the old code already knew. The fault was at
+  `fd6_texture_state + 0xd4`, reached through `fd6_emit_cs_state` from `fd_launch_grid`: a wild
+  pointer plus a small field offset, which is exactly the `0x100000000034` that was being
+  dereferenced.
+
+  **What that mechanism does and does not predict.** Both of freedreno's loops skip an empty slot
+  (`if (!tex->samplers[i]) continue;` in `fd6_texture_state`, a zeroed dummy in the emit path), and
+  `fd_sampler_states_bind` sets a slot's valid bit only for a non-NULL pointer — so a stack word
+  that happens to be zero is read, stored and harmlessly ignored. The read goes out of bounds at
+  `num_tex >= 2`; the *fault* needs one of those words to be non-zero. So the texture count is not
+  a threshold, and the pre-fix run says so plainly (`logs/155708-run.log`): eight kernels with two
+  textures (`BlitKernel_Unorm`, three `BlitLuma*`, `MetalFaceMask_GenerateMask`, `confidence`,
+  `fbs_bistochastize_final`, `fbs_slice_trilinear`) and two with three (`BlitChromaKernel_Uint`,
+  `BlitChromaKernel_Unorm`) all dispatched while the read was still out of bounds for every one of
+  them. The four that died read 4, 4, 6 and 6. Said as a threshold of two, this would predict a
+  crash for ten kernels that did not crash.
+
+  **The feature that looked discriminating was a confound, and the run settled it.** Exactly 4 of
+  the 47 kernels carry an inlined module-local function; three crashed and the fourth was refused
+  earlier on the shuffle mask, so every one that reached dispatch died — 3 of 3, which is not a
+  correlation so much as an invitation. `spillCorrectionPreProcess` carries no call at all and
+  died with them, and all four now dispatch with the inlining path untouched. Had the inlining
+  been "fixed" instead, three might have gone through and the fourth would have been left needing
+  a second cause.
+
+  Two other explanations were already dead before this one, and killing them was what left the
+  adjacent line to be read: the driver's texture state is not uninitialised
+  (`CALLOC_STRUCT(fd6_context)` zeroes it), and it was not "an image with no buffer", because
+  nine kernels of exactly that shape — one image, written — dispatched throughout
+  (`logs/155708-run.log`). A peer session's reading of the same
+  function proposed `view_seqno[16]` overflowing against `textures[32]` — a real fragility in
+  freedreno — and it is not reachable from here, because this harness refuses a slot index of 16
+  or more by name. Checking whether someone else's bug was reachable, instead of looking one line
+  further for our own, is how two of the three earlier attempts on this function were spent.
+
+  `air_run` now prints the texture count beside the image count, which is what made the paragraph
+  above a measurement instead of an argument — and the first thing written from that run was still
+  the wrong generalisation, "two is the threshold", corrected with a guess ("there are surely
+  kernels reading two among the forty") when the counts were already in the log. A peer session
+  counted them. That is where accuracy usually goes: not in the first claim but in its repair,
+  which arrives feeling like diligence and is rarely re-checked against the same evidence.
 
   The row for a call of a module-local function was 5 until those calls were translated; it is now
   gone, its five having moved to softpipe (four) and the shuffle mask (one). Twice in a row the
@@ -395,7 +434,7 @@ functions and not entry points at all.
   as well, which `texopcheck.py` had listed as having no case for exactly this reason.
 
   So the atomics being checked (above) is still a statement about two kernels written here for
-  that purpose, not about the 17 of Apple's 40 that use one.
+  that purpose, not about the 17 of Apple's 44 that use one.
 
 ## 1. Where the frontend lives: inside Mesa, as `src/compiler/air`
 
