@@ -187,13 +187,31 @@ functions and not entry points at all.
   once and NIR folds the conversion into a 32-bit one. The generated Adreno code for
   `air.convert.f.f16.u.i32` is four `cov.u32f32` and not one `cov.u32f16`.
 
-  The pool has the value that would decide it, for when the harness can. In `f16` integers are
-  exact to 2048 and spaced by 2 above, so **2051** is the discriminator — between 2050 and 2052
-  with an odd lower neighbour, where round-to-nearest-even gives 2052 and truncation gives 2050 —
-  and 2049 is carried beside it as a midpoint where both rules agree, to show that a midpoint is
-  not automatically a test. What is needed to use them is a 16-bit render target in `air_run` and a
-  `--check` that reads a half back from it; until then the rounding fix above is measured for
-  32-bit destinations only, and the patch's header says so.
+  The pool has the value that would decide it. In `f16` integers are exact to 2048 and spaced by 2
+  above, so **2051** is the discriminator — between 2050 and 2052 with an odd lower neighbour,
+  where round-to-nearest-even gives 2052 and truncation gives 2050 — and 2049 is carried beside it
+  as a midpoint where both rules agree, to show that a midpoint is not automatically a test.
+
+  **`air_run` now has the 16-bit render target, and it is not enough.** Picking
+  `R16G16B16A16_FLOAT` for a `half` output was necessary and was only one of two causes; the other
+  is in the generator, which packs every float-ish result into a `float4` with an explicit
+  `fpext half ... to float` (`intrincheck.py`, `emit_buffered`). The widening therefore happens
+  inside the shader and no choice of target can undo it.
+
+  **Going further would mean guessing, so it stops here.** A half-returning fragment shader needs
+  `!"air.render_target"` metadata naming the type, and the corpus is the authority on that
+  vocabulary — the whole `air.*` meaning was read out of `AGXCompilerCore` rather than invented. Of
+  the 456 modules, the render-target type names used are `float4` (275), `int4` (268), `uint4` (268)
+  and `ushort` (2). **There is no `half4` among them.** The token does occur once somewhere in the
+  shared cache, which makes the spelling plausible and attests nothing about this use of it.
+
+  And the spelling is the smaller problem. A `half` render target appears in **no** module of the
+  corpus, so a shader built around one would exercise a path through this frontend that Apple's own
+  shaders never take and that nothing else here tests. A disagreement would then sit between two
+  explanations — the GPU rounds wrong, or this frontend mishandles a construct it has never seen —
+  and an ambiguous measurement is worth less than a stated gap. So the ten declarations stay set
+  aside, and **the rounding fix is measured for 32-bit destinations only**, which is what the
+  patch's header claims and no more.
 
   **Which rule it is, as against merely "not round-to-nearest", is settled by one value.**
   `0x01000003` is 2²⁴+3, half way between the representable 2²⁴+2 and 2²⁴+4; round-half-to-even and
