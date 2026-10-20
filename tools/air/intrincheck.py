@@ -886,7 +886,20 @@ RUNNER = """#!/bin/sh
 # Parsing happens on the host (intrincheck.py --check); this stays dumb on
 # purpose, because what is here may be a Darwin userland with no sed or paste.
 D=`dirname "$0"`
-AIR_RUN=${AIR_RUN:-$D/air_run}
+# Where air_run is: the environment first, then one beside the modules (that is
+# a host run, which unpacks both into one directory), then the device's own
+# /redwood/bin. The fallback is what makes this runnable from the phone's job
+# list, which splits a line on blanks and cannot set a variable at all
+# (userland/src/init.c, run_command) -- so the job line is "/bin/sh .../run.sh"
+# and nothing can be passed to it.
+if [ -z "$AIR_RUN" ]; then
+	if [ -x "$D/air_run" ]; then
+		AIR_RUN=$D/air_run
+	else
+		AIR_RUN=/redwood/bin/air_run
+	fi
+fi
+echo "runner: $AIR_RUN"
 for bc in "$D"/*.bc; do
 	id=${bc##*/}
 	id=${id%.bc}
@@ -980,8 +993,28 @@ def parse_runner_log(path):
     screen = None
     ident = None
     block = []
+    lines = [l.rstrip("\n") for l in open(path, errors="replace")]
+    # A log QEMU produced has every line twice: qemu/run-ios.sh writes the
+    # console to two places that both end up here, and the two copies are
+    # adjacent. Undoing it needs care, because a suite legitimately prints the
+    # same four numbers for two different cases, so no per-line rule is safe.
+    # The test is therefore global: the whole file must consist of adjacent
+    # equal pairs. That is a property a real log does not have by accident, and
+    # the phone's own log (xl run) does not have at all -- it is not doubled.
+    if len(lines) >= 2 and len(lines) % 2 == 0 and \
+       all(lines[i] == lines[i + 1] for i in range(0, len(lines), 2)):
+        lines = lines[0::2]
+        print("intrincheck: %s had every line twice, as a QEMU console log does; "
+              "read every second one" % os.path.basename(path))
     def finish():
         if ident is None:
+            return
+        # An id already answered is not replaced. The console log of a phone or
+        # QEMU run repeats lines -- qemu/run-ios.sh prints every one twice --
+        # and the second copy of a marker opens a block with nothing after it,
+        # which would turn an answer into a refusal. A refusal therefore never
+        # overwrites an answer, and the first answer stands.
+        if out.get(ident, ("",))[0] == "ok":
             return
         text = "\n".join(block)
         i = text.find("came back as")
@@ -1002,7 +1035,7 @@ def parse_runner_log(path):
             vals.append(t)
         out[ident] = ("ok", vals)
 
-    for line in open(path, errors="replace"):
+    for line in lines:
         if screen is None and " on " in line and line.startswith("air_run: "):
             screen = "softpipe" if "softpipe" in line else line.split(" on ")[-1].strip()
         if line.startswith("=== "):
@@ -1010,7 +1043,7 @@ def parse_runner_log(path):
             ident = line[4:].strip()
             block = []
         else:
-            block.append(line.rstrip("\n"))
+            block.append(line)
     finish()
     return out, screen
 

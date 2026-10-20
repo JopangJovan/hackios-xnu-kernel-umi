@@ -1,0 +1,45 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+#
+# The first air.* operation executed on this GPU (RC_JOBS=rc.jobs.airops). Every number in
+# docs/air.md section 4 about the arithmetic -- 45607 folded cases, 2586 run ones -- was computed
+# on an x86 host by NIR's constant folder and by softpipe. Neither is an Adreno. An opcode whose
+# Adreno instruction disagrees with what those two compute is invisible to all of it, and the
+# seven shaders that have run on the phone call no air.* function at all. This job is that gap.
+#
+# The first line is the shader M1 is stated against. It is here for two reasons that the suite
+# below cannot cover for itself: it takes no input buffer, so it can be an ordinary job line, and
+# --disasm makes ir3 print the Adreno instructions it generated. The screen's name proves
+# fd_screen_create won; only the disassembly proves the shader went through ir3 and not some
+# later software path, and the four floats look identical either way. Expect
+#     2.10170319e-18  0.178894654  1.48687698e+16  1.21394141e+33
+/redwood/bin/air_run --disasm /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib clearFragment01
+# Then the generated suite: 100 modules over 78 air.* declarations, written by
+# tools/air/intrincheck.py --emit and carried in by EXTRA_SHARE. Each module calls one operation
+# on arguments it reads out of a buffer -- never on immediates, because a shader whose arguments
+# are constants is answered by the compiler and the GPU is never asked.
+#
+# Nothing here says what any of them should return, and that is deliberate: the expected values
+# stay on the host in manifest.json, which is not carried, and `intrincheck.py --check DIR LOG`
+# judges this log afterwards. So the device cannot be made to agree by reading the answer, and
+# this file needs no updating when the suite is regenerated.
+#
+# Two of those modules again, run directly, before the shell is asked for anything. They are here
+# so that this run cannot come back with nothing: a job line cannot set AIR_RUN_BUFFER, so these
+# two read air_run's own pattern buffer instead ((i * 7 + 13) & 0xff) -- which the host can read
+# too, so their numbers are comparable without the manifest and without a shell. If the loop below
+# fails for any reason at all, these two lines still answer the question this whole job exists for:
+# an air.* operation compiled by ir3 and executed on the Adreno.
+#
+# What softpipe computes for them on an x86 host, which is what the Adreno has to match:
+#   0077  air.fast_sqrt.f32   1.44972523e-09   2.15926367e+15   0   0
+#   0061  air.dot.v4f32       -inf             -inf             0   0
+# (the pattern bytes read as floats are extreme, so the dot product overflows; -inf is the right
+# answer to the question asked, not a failure)
+/redwood/bin/air_run /redwood/share/airops/0077.bc
+/redwood/bin/air_run /redwood/share/airops/0061.bc
+# A shell, and not 100 job lines: init's run_command splits a line on blanks and cannot set a
+# variable (src/init.c), while every module needs AIR_RUN_BUFFER pointing at its own bytes. The
+# shell is iOS's own /bin/sh -- with the root on the flash this volume is the iOS one, and
+# rc.jobs.jb and rc.jobs.sileo already run it there. run.sh finds air_run in /redwood/bin when
+# there is none beside the modules.
+/bin/sh /redwood/share/airops/run.sh

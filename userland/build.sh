@@ -19,6 +19,12 @@
 #                                   init hands the list to the kernel (etc/inject.conf -> sysctl kern.exec_inject)
 #                      EXTRA="..."  more programs for /redwood/bin (files on this machine): one-off
 #                                   diagnostics, which a file given as RC_JOBS can then run
+#                      EXTRA_SHARE="..." directories on this machine to copy whole into /redwood/share,
+#                                   each under its own name: the data a one-off diagnostic reads, when it
+#                                   needs more than a program (tools/air/intrincheck.py --emit writes such
+#                                   a directory). This goes into the boot volume, which every recipe
+#                                   carries and which the flash recipe puts in RAM, so its size is paid
+#                                   for at every boot -- a few megabytes, not more
 #                      RC_JOBS=<file> what the job com.redwood.demo runs: rc.jobs (default), or
 #                                   rc.jobs.unlock, which also swipes the lock screen away (for the phone,
 #                                   where nothing else can touch the screen yet)
@@ -135,6 +141,15 @@ cp com.redwood.varstore.plist root/LaunchDaemons/
 echo "Darwin on redwood: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
+# EXTRA_SHARE: whole directories of data for a one-off diagnostic, each under its own name. Here and
+# not in root/bin, because what goes in is not a program: a generated test suite is modules and the
+# bytes they read, and the job list runs it by its own run.sh. -L so that a directory assembled out
+# of symbolic links arrives as files, since the image is made from this tree and not from the links'
+# targets.
+for d in $EXTRA_SHARE; do
+	[ -d "$d" ] || { echo "build.sh: EXTRA_SHARE: $d is not a directory"; exit 1; }
+	cp -rL "$d" root/share/
+done
 if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -z "$PREBUILT" ]; then
 		# ordinary dynamically linked programs of our own, built against the iOS SDK
