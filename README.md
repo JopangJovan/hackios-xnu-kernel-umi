@@ -1954,14 +1954,26 @@ redwood: appstored: KEY brotli entered 0 returned 0, processStream entered 0 ret
 `/System/Library/PrivateFrameworks/JetEngine.framework/JetEngine`, в функции Swift, имён которых в кеше
 нет. Отсюда и продолжать, и это работа статическая — по той же проторённой дорожке с Ghidra.
 
-Две вещи туда же. В приложении свой граф промисов, и он **не весь исполнен**: 192 промиса, и два потока
-стоят каждый на двух, которых никто не исполняет, — один в
+И это оправдано, потому что **последние ожидания в приложении сняты**. Граф показывал, что приложение
+исполнено не всё: 192 промиса, два потока стоят каждый на двух, которых никто не исполняет, — один в
 `-[ACAccountStore _updateStorefrontInLocalAccount:]`, другой в
 `ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:` внутри
-`-[AMSURLRequestEncoder requestByEncodingRequest:parameters:]`: та же семья, что и тупик в `appstored`,
-и осталась она потому, что снявший тот тупик перехват отвечает только на
-`_ams_localiTunesAccountAfterUpdatingStorefront:`. `-[AMSBagValue valueWithError:]` — 92 входа и 91
-выход: один поток приложения ждёт значения из мешка прямо в момент отчёта.
+`-[AMSURLRequestEncoder requestByEncodingRequest:parameters:]` (та же семья, что и тупик в `appstored`;
+осталась потому, что снявший тот тупик перехват отвечает только на
+`_ams_localiTunesAccountAfterUpdatingStorefront:`), а `-[AMSBagValue valueWithError:]` стоял на 92
+входах и 91 выходе. Оба ответили сразу — обновление витрины отдаёт местную учётную запись, куки
+отдают **пусто** (для устройства без учётной записи это законный ответ, и в журнале обе строки помечены
+как подставленные), — и в следующем прогоне:
+
+```
+entered   89 returned   89 -[AMSBagValue valueWithError:]
+entered  104 returned  104 -[AMSPromise resultBeforeDate:error:]
+и ни одного «STILL IN IT» во всём приложении
+```
+
+Все ожидания завершаются, страница по-прежнему приходит и по-прежнему разбирается без ошибки — и на
+экране по-прежнему «LOADING». Значит, рисование не ждёт от AppleMediaServices ничего: подозреваемые вне
+JetEngine кончились, и чтение его Swift статикой теперь обосновано, а не предположено.
 
 И SwiftUI тут ни при чём: виджеты «Погода» и «Календарь» на домашнем экране — это WidgetKit, то есть
 SwiftUI, и своё содержимое они на этом телефоне рисуют. Значит, мешает что-то своё именно этому пути.

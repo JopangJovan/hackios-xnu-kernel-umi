@@ -170,7 +170,7 @@ enum {
 	COUNT_prepareRequest, COUNT_finishWithResult, COUNT_finishWithError, COUNT_finishFunnel,
 	COUNT_finishResultError, COUNT_thenWithBlock, COUNT_continueWithBlock, COUNT_bagValue,
 	COUNT_resultBefore, COUNT_afterUpdating, COUNT_addCookies4, COUNT_fpDeviceType, COUNT_brotli,
-	COUNT_processStream, COUNT_last
+	COUNT_processStream, COUNT_updateStorefront, COUNT_addCookiesBlocking, COUNT_last
 };
 static const char *const counted[COUNT_last] = {
 	"-[ACAccount ams_storefront]", "-[AMSBagNetworkDataSource cachedStorefront]",
@@ -196,6 +196,8 @@ static const char *const counted[COUNT_last] = {
 	"-[AMSUserAgent _sharedComponentFairPlayDeviceType]",
 	"-[JEBrotliDecoder decompressStreamWithAvailableIn:nextIn:availableOut:nextOut:]",
 	"-[JPReader processStream:signatureVerifier:options:error:]",
+	"-[ACAccountStore _updateStorefrontInLocalAccount:]",
+	"ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies: (answered empty)",
 };
 static unsigned long entered[COUNT_last];
 /*
@@ -402,14 +404,22 @@ dump_tasks(void)
  * -- straight back into JetEngine, into Swift functions the cache carries no names for. That is
  * where the next session starts, and it is static work: the project's Ghidra path (see
  * src/inject_fairplay.c for the tools and their rules).
- * Two things to carry there. The app has its own promise graph and it is NOT all finished: 192
- * promises, and two threads (2632, 2633 in one session) each parked on two that nobody fulfils --
- * one in -[ACAccountStore _updateStorefrontInLocalAccount:], one in
+ * AND THE APP'S OWN WAITS ARE GONE, which is what justifies going there. The graph had shown the app
+ * NOT all finished: 192 promises, two threads each parked on two that nobody fulfils -- one in
+ * -[ACAccountStore _updateStorefrontInLocalAccount:], one in
  * ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies: inside
  * -[AMSURLRequestEncoder requestByEncodingRequest:parameters:] -- the same family as the deadlock
- * named in appstored, still here because the hook that cut that one only answers
- * _ams_localiTunesAccountAfterUpdatingStorefront:. -[AMSBagValue valueWithError:] stands at 92
- * entered, 91 returned: one thread in the app is waiting for a bag value as the report is printed.
+ * cut in appstored, left over because the hook that cut that one only answers
+ * _ams_localiTunesAccountAfterUpdatingStorefront:, and -[AMSBagValue valueWithError:] standing at 92
+ * entered and 91 returned, one outstanding at the moment the report printed. Both are answered now
+ * (above), and the next run says:
+ *   entered   89 returned   89 -[AMSBagValue valueWithError:]
+ *   entered  104 returned  104 -[AMSPromise resultBeforeDate:error:]
+ *   and not one "STILL IN IT" anywhere in the app
+ * Every wait completes, the page is still fetched and still parses without error -- and the screen
+ * still says LOADING. So the drawing is not waiting on AppleMediaServices for anything: the last
+ * suspects outside JetEngine are cleared, and the static read of its Swift is justified rather than
+ * assumed. That is the one thing left and it is the expensive one; it belongs to a fresh session.
  * And SwiftUI itself is not the suspect: the Weather and Calendar home-screen widgets are WidgetKit,
  * which is SwiftUI, and they draw their own content on this phone. Whatever stops _JetEngine_SwiftUI
  * is particular to this path.
@@ -450,6 +460,50 @@ new_brotli(id self, SEL cmd, void *a, void *b, void *c, void *d)
 		say("redwood: store: BROTLI decompressStream -> %ld (call %lu)\n", result, returned[COUNT_brotli]);
 	}
 	return result;
+}
+
+/*
+ * THE TWO WAITS LEFT IN THE APP, answered the way the device type was. The app's own promise graph
+ * shows two threads parked on promises nobody fulfils: one in
+ * -[ACAccountStore _updateStorefrontInLocalAccount:] and one in
+ * ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies: inside
+ * -[AMSURLRequestEncoder requestByEncodingRequest:parameters:]. Both are the same family as the
+ * deadlock cut in appstored. Answering them says in one run whether they are on the drawing path,
+ * which is far cheaper than reading unnamed Swift in JetEngine without knowing the answer is there.
+ * The storefront update answers with the local account at once, as its sibling already does. The
+ * cookies answer with nothing at all -- an empty set is a legitimate answer for a device with no
+ * account, and the app is asking amsaccountsd for cookies and not being answered. Both return NULL
+ * rather than a made-up value: nil is safe to message in Objective-C whatever the real return type
+ * is, where a plausible-looking 1 would be a pointer. And both say on the line that they were
+ * injected, so that a page drawn with no cookies is never read as a page drawn normally.
+ */
+static void *(*old_updateStorefront)(id, SEL, void *);
+static void *
+new_updateStorefront(id self, SEL cmd, void *account)
+{
+	(void)cmd;
+	(void)account;
+	entered[COUNT_updateStorefront]++;
+	returned[COUNT_updateStorefront]++;
+	say("redwood: store: INJECTED _updateStorefrontInLocalAccount: answered at once, no update\n");
+	return (void *)((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("ams_localiTunesAccount"));
+}
+
+static void *(*old_addCookiesBlocking)(id, SEL, void *, void *, void *, void *);
+static void *
+new_addCookiesBlocking(id self, SEL cmd, void *account, void *client, void *bag, void *cleanup)
+{
+	(void)self;
+	(void)cmd;
+	(void)account;
+	(void)client;
+	(void)bag;
+	(void)cleanup;
+	entered[COUNT_addCookiesBlocking]++;
+	returned[COUNT_addCookiesBlocking]++;
+	say("redwood: store: INJECTED ams_addCookiesForAccount:...:cleanupGlobalCookies: answered with "
+	    "NO COOKIES (not measured; the real one waits for ever on amsaccountsd)\n");
+	return NULL;
 }
 
 /*
@@ -1352,7 +1406,9 @@ static struct replacement replacements[] = {
 	{ "ACAccountStore", "_ams_localiTunesAccountAfterUpdatingStorefront:", false, (IMP)new_afterUpdating,
 	  (IMP *)&old_afterUpdating, false },
 	{ "NSMutableURLRequest", "ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:", false,
-	  (IMP)new_addCookies4, (IMP *)&old_addCookies4, false },
+	  (IMP)new_addCookiesBlocking, (IMP *)&old_addCookiesBlocking, false },
+	{ "ACAccountStore", "_updateStorefrontInLocalAccount:", false, (IMP)new_updateStorefront,
+	  (IMP *)&old_updateStorefront, false },
 	{ "JPReader", "processStream:signatureVerifier:options:error:", false, (IMP)new_processStream,
 	  (IMP *)&old_processStream, false },
 	{ "JEBrotliDecoder", "decompressStreamWithAvailableIn:nextIn:availableOut:nextOut:", false, (IMP)new_brotli,
