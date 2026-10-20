@@ -120,11 +120,25 @@ def from_log(path, ks):
             out[name] = ("missing", "")
             continue
         text = "".join(b)
-        if "came back as" in text or "after the dispatch" in text:
+        # A crash is not a refusal and must not be counted as one. air_run's
+        # fault handler prints "signal N at ADDR" with a backtrace, and a
+        # refusal prints a sentence saying what it would not do: the first is a
+        # defect in this harness, the second is a limit it states. Folding them
+        # together hid four segfaults inside a row called "refused", which read
+        # as though the frontend had declined them.
+        crash = next((l.strip() for l in b if "signal " in l and " at 0x" in l), None)
+        if crash:
+            out[name] = ("crashed", crash[:110])
+        elif "came back as" in text or "after the dispatch" in text:
             out[name] = ("dispatched", "")
         else:
-            why = next((l.strip() for l in b if "air_run:" in l or "Assertion" in l), "")
-            out[name] = ("refused", why[:100])
+            # the LAST air_run line, not the first: the first is usually the
+            # progress line it had already printed before giving up
+            why = ""
+            for l in b:
+                if "air_run:" in l or "Assertion" in l:
+                    why = l.strip()
+            out[name] = ("refused", why[:110])
     return out
 
 
@@ -160,19 +174,23 @@ def main(argv):
             return 1
         got = sum(1 for v in res.values() if v[0] == "dispatched")
         ref = {n: v[1] for n, v in res.items() if v[0] == "refused"}
+        crashed = {n: v[1] for n, v in res.items() if v[0] == "crashed"}
         miss = [n for n, v in res.items() if v[0] == "missing"]
         print("kernelcheck: %d compute kernels, as %s reports them"
               % (len(ks), os.path.basename(log)))
         print("  %2d  dispatched and read back" % got)
         print("  %2d  refused, with a reason in the log" % len(ref))
+        print("  %2d  CRASHED air_run (a defect here, not a limit)" % len(crashed))
         print("  %2d  not in the log at all (the loader drops its middle when it grows)"
               % len(miss))
         if want_list:
             for n in sorted(ref):
                 print("        %-44s %s" % (n, ref[n]))
+            for n in sorted(crashed):
+                print("        %-44s %s" % (n, crashed[n]))
             for n in sorted(miss):
                 print("        %-44s (absent)" % n)
-        total = got + len(ref) + len(miss)
+        total = got + len(ref) + len(crashed) + len(miss)
         if total != len(ks):
             print("kernelcheck: the rows add to %d and there are %d kernels" % (total, len(ks)),
                   file=sys.stderr)
