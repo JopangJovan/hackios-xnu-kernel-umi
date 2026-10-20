@@ -20,8 +20,8 @@ Of the 456 modules of the device's system `.metallib` files (`tools/air/check.sh
 | | of 456 |
 | --- | --- |
 | read by our own bitcode reader, byte for byte as `llvm-dis` reads them | 456 |
-| translated to NIR, passing `nir_validate` | 318 |
-| compiled by ir3 into Adreno machine code | 318 |
+| translated to NIR, passing `nir_validate` | 321 |
+| compiled by ir3 into Adreno machine code | 321 |
 | numerically identical to LLVM's own execution, and drawn | 255 |
 | **run on the phone's GPU** — 7 drawn, 44 dispatched | **51** |
 
@@ -313,10 +313,10 @@ functions and not entry points at all.
   they are evidence about is binding, descriptors and ir3's texture instructions — exactly what
   they were built to be — and silence about everything Metal's sampler state decides. Two modules
   of the corpus declare a `constexpr sampler`; everywhere else the API supplies it.
-- **A function of the module that takes a texture: done, and the diagnosis was the work.** Three
-  of the four such entry points now translate; the fourth stops on the non-constant shuffle mask
-  it would have stopped on anyway. The fix is a split of `translate_globals`, and arriving at it
-  took two reverts and three failed guesses, which is the part worth keeping.
+- **A function of the module that takes a texture: done, and the diagnosis was the work.** All
+  four such entry points translate — three with this fix, the fourth once the shuffle mask it also
+  stopped on was decoded. The fix is a split of `translate_globals`, and arriving at it took two
+  reverts and three failed guesses, which is the part worth keeping.
 
   A texture is not a value in this frontend: it is resolved at translation time into a binding,
   and `tex_handle` wants an `AIR_VAL_PTR` rather than an SSA def. So a pointer-class argument is
@@ -349,21 +349,44 @@ functions and not entry points at all.
 
   | | on softpipe | **on the Adreno** |
   | --- | --- | --- |
-  | dispatched and read back | 6 | **44** |
-  | softpipe's `nir_to_tgsi`: scratch and intrinsics it lacks | 38 | — |
-  | a shuffle mask that is not constant (a frontend limit) | 3 | 3 |
+  | dispatched and read back | 6 | **44**, with 3 not yet run |
+  | softpipe's `nir_to_tgsi`: scratch and intrinsics it lacks | 41 | — |
+  | a shuffle mask our reader would not decode (ours, now fixed) | 0 | 0 |
   | **crashed `air_run`** (a defect here, not a limit) | 0 | **0** |
 
-  **The deferred question is answered: ir3 runs them.** 38 kernels stopped at a software
-  rasteriser that has no scratch memory and lacks compute intrinsics; on the hardware 44 of the 47
-  dispatch and read their results back, and every one of the 23 that bind an image is among them.
-  The phone replaced softpipe and the column that was never ours emptied. The corpus report's
-  kernel row reads 44 of 47 through ir3 as well, stopping on the same three, so the compile and
-  the dispatch agree about which kernels are out of reach.
+  The three in the last-but-one row were refused when the Adreno column was measured, so that
+  column says 44 of 47 and not 47 of 47: they translate and ir3 compiles them now, and whether
+  they dispatch is a question for the next run rather than a figure to carry forward. Two of the
+  three read and write textures, which is the shape that crashed before the sampler fix, so the
+  run is worth more than a tick.
+
+  **The deferred question is answered: ir3 runs them.** 41 kernels stop at a software rasteriser
+  that has no scratch memory and lacks compute intrinsics; on the hardware 44 of the 47 dispatch
+  and read their results back, and every one of the 23 that bind an image is among them. The phone
+  replaced softpipe and the column that was never ours emptied. **All 47 now translate and compile
+  through ir3** — so does every other entry point of the corpus — and the only column with a gap
+  left in it is the one the phone fills.
 
   What the rows do **not** say is right. There is no executed reference for these kernels
-  anywhere: softpipe refuses 38 of them, which is why they came here, so a number out of the
+  anywhere: softpipe refuses 41 of them, which is why they came here, so a number out of the
   Adreno has nothing on this machine to disagree with. 44 have been shown to *run*.
+
+  **The last row was blaming the shader for our own gap.** "A shuffle mask that is not constant"
+  was impossible as written: LLVM requires a `shufflevector` mask to be constant, so the message
+  was describing something that cannot occur. What the three kernels actually carry is a mask like
+  `<i32 0, i32 poison, i32 1, i32 poison>` — the shape a Metal `half2`-to-`half4` widening
+  compiles to — and in it the zero is written `CST_CODE_NULL`, not `CST_CODE_INTEGER 0`, because
+  that is how LLVM stores every zero of a scalar type. A mask is stored as an aggregate of
+  element constants rather than as plain data exactly when one lane is poison, so those two
+  encodings meet only in this case, and our reader accepted only the second. We refused on a zero
+  we could read perfectly well, and recorded it as a limit of the shader.
+
+  The fix is not three cases but one: `air_const_as_uint` (`air_module.h`) reads either spelling,
+  and the three other places that took an integer constant off a record — `llvm.memcpy` and
+  `llvm.memset` lengths, `air.wg.barrier` flags — now go through it. None of those three was
+  reachable in this corpus, so this is not a correction of any number; it closes a class. Two
+  spellings of zero is a property of the format, and a format detail belongs in one decoder
+  rather than in every reader of it.
 
   The four that used to crash now dispatch, and the crash was this harness's:
 
@@ -416,7 +439,8 @@ functions and not entry points at all.
   which arrives feeling like diligence and is rarely re-checked against the same evidence.
 
   The row for a call of a module-local function was 5 until those calls were translated; it is now
-  gone, its five having moved to softpipe (four) and the shuffle mask (one). Twice in a row the
+  gone, its five having moved to softpipe (four) and the shuffle mask (one) — and that last one
+  moved again when the mask was decoded, so all five are softpipe's. Twice in a row the
   dispatched count on softpipe stayed at 6 while a column stopped being ours, and the run above is
   where that finally paid: those same kernels dispatch on the hardware. Until 20 October, 24 of these were
   refused by `air_run` itself — it bound textures and images for a draw and not for a dispatch —
