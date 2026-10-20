@@ -372,6 +372,32 @@ bus_give_back(struct bus *b)
 	wr(GPIO_CFG(b->scl), b->cfg[1]);
 }
 
+/*
+ * A sensor stopped in the middle of a byte -- the camera switched away from it between frames, its
+ * digital rail left on because the driver found it on -- goes on holding the data line down, and the
+ * bus never comes to rest again however long one waits for it. The way out is the one Linux's
+ * bit-banged master takes (i2c_generic_scl_recovery): clock the line that is free until the sensor has
+ * finished that byte and lets the data line go, then a stop. Nine clocks are a byte and the
+ * acknowledgement after it. This is what kept the wide camera's bus (CCI 0 master 1) for the rest of a
+ * session once Camera.app had switched to the front camera and back.
+ */
+static bool
+bus_unwedge(struct bus *b)
+{
+	for (unsigned clocks = 1; clocks <= 9; clocks++) {
+		line(b->scl, false);
+		half_bit();
+		line(b->scl, true);
+		half_bit();
+		if (level_of(b->sda)) {
+			i2c_stop(b);
+			say("camera: %s: the data line was held down and came back after %u clock(s)\n", b->name, clocks);
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool
 bus_take(struct bus *b)
 {
@@ -382,14 +408,20 @@ bus_take(struct bus *b)
 	line(b->sda, true);
 	line(b->scl, true);
 	half_bit();
-	if (!level_of(b->sda) || !level_of(b->scl)) {
+	if (level_of(b->sda) && level_of(b->scl)) {
+		return true;
+	}
+	/* the data line alone held down is a sensor that did not finish a byte: clock it out (see above) */
+	if (level_of(b->scl) && !level_of(b->sda) && bus_unwedge(b) && level_of(b->scl)) {
+		return true;
+	}
+	{
 		bool sda = level_of(b->sda), scl = level_of(b->scl);
 
 		bus_give_back(b);
 		say("camera: %s is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n", b->name, b->sda, sda, b->scl, scl);
-		return false;
 	}
-	return true;
+	return false;
 }
 
 /*
@@ -726,16 +758,38 @@ ldo_on(unsigned n, unsigned mv)
 	if (!pm8008_put(PM8008_REGULATORS, (uint16_t)(base + LDO_ENABLE), (uint8_t)(enable | 0x80), false)) {
 		return false;
 	}
-	for (int tries = 0; tries < 10; tries++) {
+	for (int tries = 0, allones = 0; tries < 10; tries++) {
 		spin_us(20 + mv * 1000 / 38400 + 1);   /* the driver's wait: 20 us and the set point at the stepper's 38.4 mV/us */
 		if (!pm8008_get(PM8008_REGULATORS, (uint16_t)(base + LDO_STATUS1), &status, 1)) {
 			give_up("a PM8008i that does not answer");
 			return false;
 		}
+		/*
+		 * A byte with every bit set is not a status: a good one reads 0x87, and the bits between
+		 * "ready" and the mode are not used. It is what this bus reads when the PM8008i has not
+		 * answered properly, as it does for a few goes right after the front camera's rails have
+		 * gone down -- and it was read as an over-current, which switched the camera off for the
+		 * rest of the run just as Camera.app went back to the wide camera. Ask again.
+		 */
+		if (status == 0xff) {
+			if (allones++ == 0) {
+				say("camera: PM8008i LDO%u: a status of all ones, which is no answer: asking again\n", n);
+			}
+			continue;
+		}
 		if (status & 0x20) {
-			say("camera: PM8008i LDO%u reports over-current (status %#04x)\n", n, status);
-			give_up("an LDO over its current");
-			return false;
+			uint8_t again = 0;
+
+			/* as healthy() does while it runs: an over-current counts when it is still there */
+			wait_ms(2);
+			if (pm8008_get(PM8008_REGULATORS, (uint16_t)(base + LDO_STATUS1), &again, 1) && !(again & 0x20)) {
+				say("camera: PM8008i LDO%u: status %#04x, and %#04x when asked again\n", n, status, again);
+				status = again;
+			} else {
+				say("camera: PM8008i LDO%u reports over-current (status %#04x)\n", n, status);
+				give_up("an LDO over its current");
+				return false;
+			}
 		}
 		if (status & 0x80) {
 			say("camera: PM8008i LDO%u on at %u mV (status %#04x)\n", n, mv, status);
@@ -743,7 +797,7 @@ ldo_on(unsigned n, unsigned mv)
 		}
 	}
 	say("camera: PM8008i LDO%u not ready (status %#04x)\n", n, status);
-	give_up("an LDO that is not ready");
+	give_up(status == 0xff ? "a PM8008i whose status is all ones" : "an LDO that is not ready");
 	return false;
 }
 
