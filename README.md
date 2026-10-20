@@ -1949,7 +1949,22 @@ redwood: appstored: KEY brotli entered 0 returned 0, processStream entered 0 ret
 `appstored`, где всё уже работает, — значит, это зацепка, а не ответ.
 
 Остаётся само рисование: 177 786 байт приходят, `JPReader` разбирает их в результат, и ничего не
-появляется. Следующий вопрос — что с этим результатом происходит дальше.
+появляется. Кто берёт результат дальше — видно по кадрам стека на выходе из `processStream:`
+(`ipsw dyld a2s` называет хотя бы образ): **обратно в JetEngine**,
+`/System/Library/PrivateFrameworks/JetEngine.framework/JetEngine`, в функции Swift, имён которых в кеше
+нет. Отсюда и продолжать, и это работа статическая — по той же проторённой дорожке с Ghidra.
+
+Две вещи туда же. В приложении свой граф промисов, и он **не весь исполнен**: 192 промиса, и два потока
+стоят каждый на двух, которых никто не исполняет, — один в
+`-[ACAccountStore _updateStorefrontInLocalAccount:]`, другой в
+`ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:` внутри
+`-[AMSURLRequestEncoder requestByEncodingRequest:parameters:]`: та же семья, что и тупик в `appstored`,
+и осталась она потому, что снявший тот тупик перехват отвечает только на
+`_ams_localiTunesAccountAfterUpdatingStorefront:`. `-[AMSBagValue valueWithError:]` — 92 входа и 91
+выход: один поток приложения ждёт значения из мешка прямо в момент отчёта.
+
+И SwiftUI тут ни при чём: виджеты «Погода» и «Календарь» на домашнем экране — это WidgetKit, то есть
+SwiftUI, и своё содержимое они на этом телефоне рисуют. Значит, мешает что-то своё именно этому пути.
 
 Значит, работа всё-таки не в AMS: понять, почему `fairplayd.H2` выходит с `exit(0)` сразу, и удержать
 его живым; подмена выше — опыт, показывающий, что это починит.

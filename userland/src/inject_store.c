@@ -394,7 +394,25 @@ dump_tasks(void)
  * watched through __cxa_throw, whose type name is the second word of its std::type_info), and it is
  * thrown in appstored as well, where everything now works -- so it is a lead, not an answer.
  * WHAT IS LEFT is the drawing itself: 177 786 bytes arrive, JPReader parses them into a result, and
- * nothing appears. The next question is what becomes of that result.
+ * nothing appears. Whoever owns it next is on the stack when it is handed back, so the walk is done
+ * at the exit too, and "ipsw dyld a2s" names the image if not the function:
+ *   JETPACK processStream: out, a result, error (none), to 0x19d96245c 0x19d963f88 0x19d9634bc ...
+ *   0x19d96245c: func_19d962020 + 1084
+ *     dylib=/System/Library/PrivateFrameworks/JetEngine.framework/JetEngine
+ * -- straight back into JetEngine, into Swift functions the cache carries no names for. That is
+ * where the next session starts, and it is static work: the project's Ghidra path (see
+ * src/inject_fairplay.c for the tools and their rules).
+ * Two things to carry there. The app has its own promise graph and it is NOT all finished: 192
+ * promises, and two threads (2632, 2633 in one session) each parked on two that nobody fulfils --
+ * one in -[ACAccountStore _updateStorefrontInLocalAccount:], one in
+ * ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies: inside
+ * -[AMSURLRequestEncoder requestByEncodingRequest:parameters:] -- the same family as the deadlock
+ * named in appstored, still here because the hook that cut that one only answers
+ * _ams_localiTunesAccountAfterUpdatingStorefront:. -[AMSBagValue valueWithError:] stands at 92
+ * entered, 91 returned: one thread in the app is waiting for a bag value as the report is printed.
+ * And SwiftUI itself is not the suspect: the Weather and Calendar home-screen widgets are WidgetKit,
+ * which is SwiftUI, and they draw their own content on this phone. Whatever stops _JetEngine_SwiftUI
+ * is particular to this path.
  *
  * THE THREE SHAPES OF AN INSTRUMENT THAT LIES, all of them met on this branch, all of them making a
  * thing that happened look like a thing that did not:
@@ -459,8 +477,15 @@ new_processStream(id self, SEL cmd, void *stream, void *verifier, void *options,
 	say("redwood: store: JETPACK processStream: in\n");
 	result = old_processStream(self, cmd, stream, verifier, options, error);
 	returned[COUNT_processStream]++;
-	say("redwood: store: JETPACK processStream: out, %s, error %s\n", result != NULL ? "a result" : "(nil)",
-	    error != NULL && *error != NULL ? text_of(*error, one, sizeof(one)) : "(none)");
+	{
+		/* and who owns the result next: whoever is on the stack when it is handed back */
+		char frames[10 * 20 + 1] = "";
+
+		frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
+		say("redwood: store: JETPACK processStream: out, %s, error %s, to%s\n",
+		    result != NULL ? "a result" : "(nil)",
+		    error != NULL && *error != NULL ? text_of(*error, one, sizeof(one)) : "(none)", frames);
+	}
 	return result;
 }
 
