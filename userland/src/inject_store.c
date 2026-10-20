@@ -396,7 +396,13 @@ dump_tasks(void)
  * signatures is a worse thing than an experiment that does not, and this one is not needed.
  * The only C++ exception thrown anywhere in either process is std::future_error (every throw is
  * watched through __cxa_throw, whose type name is the second word of its std::type_info), and it is
- * thrown in appstored as well, where everything now works -- so it is a lead, not an answer.
+ * thrown in appstored as well, where everything now works -- so it looked like a lead and not an
+ * answer. COUNTED, it looks less innocent: 95 of them in appstored and 68 in the App Store in one
+ * session, with only 4 and 2 NSExceptions beside them. A std::future_error is what a C++ promise
+ * destroyed before its value gives its waiter, AMSCore's futures are C++ (AMSCore::Future,
+ * std::__assoc_state), and "seventeen waits and one finish" is the shape a flood of broken promises
+ * would make. Whether it is the disease or a symptom beside it is one measurement away: the first
+ * few throws now print their frames, and a2s names the thrower.
  * WHAT IS LEFT is the drawing itself: 177 786 bytes arrive, JPReader parses them into a result, and
  * nothing appears. Whoever owns it next is on the stack when it is handed back, so the walk is done
  * at the exit too, and "ipsw dyld a2s" names the image if not the function:
@@ -501,6 +507,35 @@ new_dataTaskLocal(id self, SEL cmd, void *request, void *handler)
 	task = ((id (*)(id, SEL, void *, void *))old_dataTaskLocal)(self, cmd, request, handler);
 	returned[COUNT_dataTaskCreated]++;
 	say("redwood: store: TASK CREATED %s\n", text_of((id)request, buffer, sizeof(buffer)));
+	return task;
+}
+
+static id (*old_dataTaskURL)(id, SEL, void *, void *);
+static id
+new_dataTaskURL(id self, SEL cmd, void *url, void *handler)
+{
+	id task;
+	char buffer[260];
+
+	entered[COUNT_dataTaskCreated]++;
+	task = ((id (*)(id, SEL, void *, void *))old_dataTaskURL)(self, cmd, url, handler);
+	returned[COUNT_dataTaskCreated]++;
+	say("redwood: store: TASK CREATED (url) %s\n", text_of((id)url, buffer, sizeof(buffer)));
+	return task;
+}
+
+/* AMS makes its own, with a signpost: -[AMSURLSession dataTaskWithRequest:signpostID:completionHandler:] */
+static id (*old_dataTaskSignpost)(id, SEL, void *, void *, void *);
+static id
+new_dataTaskSignpost(id self, SEL cmd, void *request, void *signpost, void *handler)
+{
+	id task;
+	char buffer[260];
+
+	entered[COUNT_dataTaskCreated]++;
+	task = ((id (*)(id, SEL, void *, void *, void *))old_dataTaskSignpost)(self, cmd, request, signpost, handler);
+	returned[COUNT_dataTaskCreated]++;
+	say("redwood: store: TASK CREATED (ams) %s\n", text_of((id)request, buffer, sizeof(buffer)));
 	return task;
 }
 
@@ -625,12 +660,27 @@ new_processStream(id self, SEL cmd, void *stream, void *verifier, void *options,
 /* every C++ exception thrown in the process, by name: the parser's rejections are throws */
 extern void __cxa_throw(void *exception, void *info, void (*destructor)(void *));
 
+static unsigned long throws;
+
 static void
 watched___cxa_throw(void *exception, void *info, void (*destructor)(void *))
 {
 	const char *name = info != NULL ? ((const char **)info)[1] : NULL;
+	char frames[10 * 20 + 1] = "";
 
-	say("redwood: store: C++ THROW %s\n", name != NULL ? name : "(no name)");
+	/*
+	 * And WHERE from. std::future_error is thrown 95 times in appstored and 68 in the App Store in
+	 * one session -- a flood, not an incident, and future_error is what a C++ promise destroyed
+	 * before its value throws. AMSCore's futures are C++ (AMSCore::Future, __assoc_state), so this
+	 * may be the disease behind "seventeen waits and one finish" rather than a symptom beside it.
+	 * The first few are printed with their frames, which "ipsw dyld a2s" turns into the thrower; the
+	 * rest are only counted, because a flood on this console costs the lines that matter.
+	 */
+	throws++;
+	if (throws <= 6) {
+		frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
+		say("redwood: store: C++ THROW %s from%s\n", name != NULL ? name : "(no name)", frames);
+	}
 	__cxa_throw(exception, info, destructor);
 }
 
@@ -1124,6 +1174,8 @@ one_report(unsigned seconds)
 	dump_threads();
 	dump_selectors("AMSURLSession", "equest");
 	dump_selectors("JEBrotliDecoder", NULL);
+	dump_selectors("_TtGC9JetEngine7PromiseT__", NULL);
+	dump_selectors("JetEngine", NULL);
 	dump_classes("Jet");
 	dump_classes("JE");
 	say("redwood: store: %lu notifications posted\n", notifications);
@@ -1362,12 +1414,26 @@ new_bagValue(id self, SEL cmd, void *error)
 	char frames[10 * 20 + 1] = "";
 	void *result;
 
+	char which[120];
+
+	/*
+	 * WHICH KEY, and whether it came back. The store asks the bag for its own configuration, and a
+	 * key the bag has not got is answered "Bag Value Missing" -- appstored already logs two of
+	 * those. If what tells the app where to fetch its content is such a key, then nothing asking
+	 * for content is exactly what one would see.
+	 */
 	entered[COUNT_bagValue]++;
 	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-	say("redwood: store: WAIT -[AMSBagValue valueWithError:] from%s\n", frames);
+	say("redwood: store: BAG KEY %s\n", text_of(self, which, sizeof(which)));
 	result = old_bagValue(self, cmd, error);
 	returned[COUNT_bagValue]++;
-	say("redwood: store: WAIT -[AMSBagValue valueWithError:] came back %s\n", result ? "with a value" : "empty");
+	{
+		id *out = (id *)error;          /* the out-parameter is declared void * here; it is an NSError ** */
+
+		say("redwood: store: BAG KEY %s -> %s%s%s\n", text_of(self, which, sizeof(which)),
+		    result != NULL ? "a value" : "NOTHING", out != NULL && *out != NULL ? ", error " : "",
+		    out != NULL && *out != NULL ? text_of(*out, frames, sizeof(frames)) : "");
+	}
 	return result;
 }
 
@@ -1510,6 +1576,14 @@ static struct replacement replacements[] = {
 	  (IMP *)&old_dataTaskLocal, false },
 	{ "__NSURLSessionLocal", "dataTaskWithRequest:", false, (IMP)new_dataTaskPlain,
 	  (IMP *)&old_dataTaskPlain, false },
+	{ "__NSURLSessionLocal", "dataTaskWithURL:completionHandler:", false, (IMP)new_dataTaskURL,
+	  (IMP *)&old_dataTaskURL, false },
+	{ "NSURLSession", "dataTaskWithURL:completionHandler:", false, (IMP)new_dataTaskURL,
+	  (IMP *)&old_dataTaskURL, false },
+	{ "AMSURLSession", "dataTaskWithRequest:signpostID:completionHandler:", false, (IMP)new_dataTaskSignpost,
+	  (IMP *)&old_dataTaskSignpost, false },
+	{ "AMSURLSession", "dataTaskWithRequest:completionHandler:", false, (IMP)new_dataTaskLocal,
+	  (IMP *)&old_dataTaskLocal, false },
 	{ "NSURLSessionTask", "resume", false, (IMP)new_resume_base, (IMP *)&old_resume_base, false },
 	{ "__NSCFLocalSessionTask", "resume", false, (IMP)new_resume_local, (IMP *)&old_resume_local, false },
 };

@@ -49,6 +49,8 @@
 # src/inject_store.c, which a build with STOREFRONT=1 puts there.
 /redwood/bin/store_test user 501 show
 # and only then the store, open long enough to time out (30 s) and try again
-/redwood/bin/rwtouch tap 0.615 0.59 wait 95
+# twice, because one tap at a fixed moment lands on an undrawn home screen often enough to void a
+# run: open, go home, open again. The second is a warm launch and a cleaner measurement anyway.
+/redwood/bin/rwtouch tap 0.615 0.59 wait 30 button home wait 5 tap 0.615 0.59 wait 95
 /bin/ps -A
 /redwood/bin/rwtouch button home wait 6
