@@ -20,8 +20,8 @@ Of the 456 modules of the device's system `.metallib` files (`tools/air/check.sh
 | | of 456 |
 | --- | --- |
 | read by our own bitcode reader, byte for byte as `llvm-dis` reads them | 456 |
-| translated to NIR, passing `nir_validate` | 313 |
-| compiled by ir3 into Adreno machine code | 313 |
+| translated to NIR, passing `nir_validate` | 315 |
+| compiled by ir3 into Adreno machine code | 315 |
 | numerically identical to LLVM's own execution, and drawn | 255 |
 | **run on the phone's GPU** | **7** |
 
@@ -41,7 +41,7 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | texture operations with a case softpipe cannot run: a 16-bit result | 7 |
 | texture operations with no case: multisample, depth, write | 11 |
 
-313 of 456 is 313 of 321 entry points — 97.5% — because 135 modules are `air.visible` library
+315 of 456 is 315 of 321 entry points — 98.1% — because 135 modules are `air.visible` library
 functions and not entry points at all.
 
 **What those numbers are not**, because they will be quoted without this paragraph otherwise:
@@ -1041,8 +1041,9 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
 - **M2** — the 283 modules with no `air.*` call: a stated fraction reach *ir3*, a growing subset
   *softpipe*/*adreno*.
   **262 of the 283 reach ir3**, 255 of them agree with LLVM numerically, and those same 255 draw
-  a matching pixel. (With textures done the whole corpus is at 313 of 456; this milestone's own
-  count is the intrinsic-free subset.) The other 21 are
+  a matching pixel. (With textures done the whole corpus reached 313 of 456, and 315 once calls
+  to a function of the module were translated; this milestone's own count is the intrinsic-free
+  subset.) The other 21 are
   `air.visible` library functions, which are not entry points at all (below). Counting every
   entry point rather than every module: 275 of 321, 86%. Nothing has run on the Adreno.
 - **M3** — textures and samplers, each form with a test that renders a known image.

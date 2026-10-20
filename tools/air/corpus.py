@@ -32,6 +32,39 @@ IR3 = os.environ.get(
 CHIP_ID = os.environ.get("AIR_CHIP_ID", "0x007506030500")
 
 
+def refuse_if_stale(prog, what):
+    """A tool older than the frontend it contains is measuring the past.
+
+    ir3_compiler is not in the host build's default target, so a plain
+    `ninja -C build/mesa-host/build` leaves it as it was while air2nir beside
+    it is rebuilt. That produced a column of numbers from the old frontend and
+    a translate column from the new one: on 20 October the two read 315 and
+    313, and the missing two looked like modules ir3 could not compile. They
+    compiled perfectly; the compiler was six hours old. Both columns came from
+    the same table and only one of them was current, which is the worst case --
+    a stale tool whose output is plausible beside a fresh one.
+
+    So the age is checked rather than assumed, against every source of the
+    frontend, and the run is refused instead of warned: a number nobody can
+    trust is worse than no number.
+    """
+    if not os.path.exists(prog):
+        return
+    src = os.path.join(ROOT, "tools/mesa/air")
+    newest, name = 0.0, None
+    for f in os.listdir(src):
+        if f.endswith((".c", ".h")):
+            t = os.path.getmtime(os.path.join(src, f))
+            if t > newest:
+                newest, name = t, f
+    if newest and os.path.getmtime(prog) < newest:
+        print("corpus.py: %s is older than tools/mesa/air/%s, so its column would be "
+              "the previous frontend's. Build it: ninja -C build/mesa-host/build %s"
+              % (what, name, os.path.relpath(prog, os.path.join(ROOT, "build/mesa-host/build"))),
+              file=sys.stderr)
+        sys.exit(1)
+
+
 def read_report(paths):
     """air2nir --report, which forks per module so one crash is one line."""
     rows = []
@@ -110,6 +143,7 @@ def main():
     if not rows:
         sys.exit("corpus.py: no modules; is %s built?" % AIR2NIR)
     if args.ir3:
+        refuse_if_stale(IR3, "ir3_compiler")
         run_ir3(rows)
 
     total = len(rows)
