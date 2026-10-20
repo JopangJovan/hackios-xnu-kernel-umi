@@ -86,24 +86,21 @@ functions and not entry points at all.
   The row "run on the phone's GPU | 7" in the first table above is unaffected and still reads 7:
   it counts modules of the 456-module corpus, and these are generated modules that are not in the
   corpus. The two measurements are deliberately not added together.
-- **Compare against someone else's tree from a pristine extract, never from your own build.**
-  Checking whether Mesa's `main` still had the rounding fault meant comparing one file against
-  ours — and ours has our own patch in it, 202 487 bytes against 202 144 clean. Taken from this
-  tree the two would have differed by exactly our own change, and the search would have been for a
-  difference in `main` that is not there. Unpacking the tarball again costs a second and removes
-  the working copy from the question.
-
-  The same mistake has a twin in how a check is run: `patch -s --dry-run` exited 0 against `main`'s
-  file and that was written down as "applies cleanly", when without `-s` it says
-  "Hunk #1 succeeded at 410 (offset 2 lines)". The context matched and the line number had moved,
-  which is a different and more useful statement. **Quiet output is not clean output** — a flag
-  that hides a success's details makes the success less informative than it appears, which is the
-  same shape as the skips below.
+- **Two traps this frontend's own checks fell into, kept here for the instances; the general forms
+  are in README's "Как врут собственные проверки", which collects all six and belongs there because
+  the others came from the camera, the services and the build rather than from AIR.** Comparing one
+  file of Mesa's `main` against ours had to start from a fresh tarball extract, because ours carries
+  our own patch — 202 487 bytes against 202 144 clean — so a comparison from this tree would have
+  differed by exactly our own change. And `patch -s --dry-run` exiting 0 against that file was
+  written down as "applies cleanly" when without `-s` it says "succeeded at 410 (offset 2 lines)":
+  the context matched and the line number had moved, which is the more useful statement and the one
+  the patch header now carries.
 
 - **A `continue` that adds nothing to a total is where this check has gone wrong three times.**
-  Not a maxim but a thing to grep for. Three times on 20 October an absent check was dressed as a
-  passing one, and each time the shape was identical: a loop skipped a case and incremented no
-  counter, so "not examined" was reported as "examined and agreed".
+  Not a maxim but a thing to grep for, and the general form is in README beside the other five.
+  Three times on 20 October an absent check was dressed as a passing one, and each time the shape
+  was identical: a loop skipped a case and incremented no counter, so "not examined" was reported
+  as "examined and agreed".
 
   - `if idx >= len(flat): continue` dropped every case whose value was missing from the log, and
     the total fell by exactly as much as nobody was watching;
