@@ -30,7 +30,7 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | | of 119 |
 | --- | --- |
 | checked numerically, one operation at a time, against a reference outside this tree | 78 |
-| of those, exactly defined and agreeing on every case (45 652 cases) | 71 |
+| of those, exactly defined and agreeing on every case (45 697 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
 | of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
 | of those, run **on the phone's own Adreno** (714 cases) and agreeing there | 61 |
@@ -48,11 +48,11 @@ functions and not entry points at all.
 
 - **The arithmetic operations are checked; two of them have now been checked against the
   Adreno, and the other 76 have not.** 71 of the corpus's declarations agree with C's own
-  functions on every one of 45 652 cases, and 47 of them agree again when *executed* by softpipe
+  functions on every one of 45 697 cases, and 47 of them agree again when *executed* by softpipe
   instead of folded — which is a real answer to what used to be the largest hole here (section 4,
   item 4), and found three bugs getting there. But those two engines are both on an x86 host. An
   opcode whose Adreno instruction differs from what `nir_opt_constant_folding` and TGSI compute is
-  invisible to all 48 238 of those cases, and the 24 narrow-type declarations softpipe cannot run
+  invisible to all 48 283 of those cases, and the 24 narrow-type declarations softpipe cannot run
   at all are exactly the ones where ir3 differs most from it.
 
   On 20 October that stopped being true. All 78 declarations ran on the phone's own Adreno, and
@@ -159,6 +159,19 @@ functions and not entry points at all.
   declares nothing and this frontend declares nothing, which is exactly why two independent paths
   returned the same wrong number. **The hardware can round; ir3 only asks when someone else has
   asked first, and supplies no default where IEEE-754 and GLSL both require round-to-nearest.**
+  **How much this reaches is a number and not an adjective.** Of the 456 modules of the corpus, 20
+  contain a conversion the patch can change — a `u2f`, an `i2f` or an `f2f16`, the three that
+  round; none contains only the exact kinds (`f2f32`, `b2f`), where setting the mode cannot alter a
+  value. So on the Metal side the blast radius is 20 modules, not all 313 that translate, and
+  whether each of those 20 actually changes depends on the values it meets at run time.
+
+  That bounds this frontend's half and says nothing about the other. The port's OpenGL ES reaches
+  ir3 through Mesa's own GLSL compiler, which this check does not look at, so **"it changes
+  everything ir3 compiles, the window server included" is reasoning and not measurement.** A peer
+  session is putting that to a visual test — an ordinary boot to the home screen with the patch,
+  compared against one without it — because the claim is the part of this that would matter to
+  someone deciding whether to carry the patch, and it is the part with no runs behind it.
+
   The fix is one line, and unlike the `ir3_cmdline` bug this one is in a file upstream still
   carries, with reproduction down two independent paths — so it is the first thing in this work
   that can actually be reported. The change is now carried here as `tools/mesa/ir3-round-default.patch`, measured on the
@@ -174,13 +187,45 @@ functions and not entry points at all.
   once and NIR folds the conversion into a 32-bit one. The generated Adreno code for
   `air.convert.f.f16.u.i32` is four `cov.u32f32` and not one `cov.u32f16`.
 
-  The pool has the value that would decide it, for when the harness can. In `f16` integers are
-  exact to 2048 and spaced by 2 above, so **2051** is the discriminator — between 2050 and 2052
-  with an odd lower neighbour, where round-to-nearest-even gives 2052 and truncation gives 2050 —
-  and 2049 is carried beside it as a midpoint where both rules agree, to show that a midpoint is
-  not automatically a test. What is needed to use them is a 16-bit render target in `air_run` and a
-  `--check` that reads a half back from it; until then the rounding fix above is measured for
-  32-bit destinations only, and the patch's header says so.
+  The pool has the value that would decide it. In `f16` integers are exact to 2048 and spaced by 2
+  above, so **2051** is the discriminator — between 2050 and 2052 with an odd lower neighbour,
+  where round-to-nearest-even gives 2052 and truncation gives 2050 — and 2049 is carried beside it
+  as a midpoint where both rules agree, to show that a midpoint is not automatically a test.
+
+  **`air_run` now has the 16-bit render target, and it is not enough.** Picking
+  `R16G16B16A16_FLOAT` for a `half` output was necessary and was only one of two causes; the other
+  is in the generator, which packs every float-ish result into a `float4` with an explicit
+  `fpext half ... to float` (`intrincheck.py`, `emit_buffered`). The widening therefore happens
+  inside the shader and no choice of target can undo it.
+
+  **Going further would mean guessing, so it stops here.** A half-returning fragment shader needs
+  `!"air.render_target"` metadata naming the type, and the corpus is the authority on that
+  vocabulary — the whole `air.*` meaning was read out of `AGXCompilerCore` rather than invented. Of
+  the 456 modules, the render-target type names used are `float4` (275), `int4` (268), `uint4` (268)
+  and `ushort` (2). **There is no `half4` among them.** The token does occur once somewhere in the
+  shared cache, which makes the spelling plausible and attests nothing about this use of it.
+
+  **And there is a second half to the f16 question that no harness can settle, because nothing is
+  required.** One F16 path through that `create_cov` branch is `pack_half_2x16`, and
+  `nir_lower_mediump.c` says of it, in Mesa's own words, "pack_half rounding is undefined". Where
+  the specification requires nothing, a truncating `packHalf2x16` is a permitted choice and not a
+  fault, so a measurement of it would be an observation about an implementation rather than an
+  argument about conformance — and the patch's header now scopes its case to the destinations where
+  a mode *is* required, integer to float, naming the `pack_half` path as a reviewer's question
+  instead of leaving it to be found. A peer session had planned to reach the F16 branch through
+  `packHalf2x16` for exactly that reason and dropped it on this, which is the better call: the
+  experiment would have answered our internal question and been useless for the report.
+
+  So the f16 question is two questions. For integer-to-half, round-to-nearest-even is required and
+  this instrument cannot ask. For `pack_half`, nothing is required and there is nothing to ask.
+
+  And the spelling is the smaller problem. A `half` render target appears in **no** module of the
+  corpus, so a shader built around one would exercise a path through this frontend that Apple's own
+  shaders never take and that nothing else here tests. A disagreement would then sit between two
+  explanations — the GPU rounds wrong, or this frontend mishandles a construct it has never seen —
+  and an ambiguous measurement is worth less than a stated gap. So the ten declarations stay set
+  aside, and **the rounding fix is measured for 32-bit destinations only**, which is what the
+  patch's header claims and no more.
 
   **Which rule it is, as against merely "not round-to-nearest", is settled by one value.**
   `0x01000003` is 2²⁴+3, half way between the representable 2²⁴+2 and 2²⁴+4; round-half-to-even and
@@ -610,7 +655,7 @@ Three references, each independent of the translator:
    --eval`. The reference is the C library's own `roundf`, `floorf`, `fmaxf`, `ldexpf` and the
    IEEE definitions, evaluated at the operation's own precision.
 
-   **71 exactly defined operations agree on every one of 45 652 cases; none differ.** Seven are
+   **71 exactly defined operations agree on every one of 45 697 cases; none differ.** Seven are
    approximate (`fast_sin`, `fast_cos`, `fast_exp`, `fast_pow`, `fast_atan2`) and are reported
    with their worst distance from libm and counted as nothing — see below.
 

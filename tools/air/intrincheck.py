@@ -1375,9 +1375,11 @@ def check_log(outdir, logpath, verbose):
               "agreement about very little: %s"
               % (len(thin), ", ".join("%s (%d)" % (k, per_decl[k]["n"]) for k in thin)))
     if half_set_aside:
-        print("intrincheck: %d declarations set aside: they return half, and air_run reads "
-              "back through a 32-bit float target, so the half conversion is optimised away "
-              "and the reference describes an operation the shader does not perform (%s)"
+        print("intrincheck: %d declarations set aside: they return half, which this suite packs into a "
+              "float4 output (an fpext in emit_buffered), so the conversion is widened inside "
+              "the shader and the reference describes an operation it does not perform. "
+              "air_run has the 16-bit target; the generator is what still needs a half "
+              "render target, and the corpus attests no type name for one (%s)"
               % (len(half_set_aside), ", ".join(sorted(half_set_aside))))
     denorm = sum(v["denorm"] for v in per_decl.values())
     if denorm:
