@@ -33,8 +33,9 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | of those, exactly defined and agreeing on every case (45 652 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
 | of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
-| of those, run **on the phone's own Adreno** (808 cases) and agreeing there | 66 |
+| of those, run **on the phone's own Adreno** (714 cases) and agreeing there | 56 |
 | of those, **disagreeing on the Adreno** where every host engine agrees | 5 |
+| of those, set aside: they return `half`, which `air_run` cannot read back | 10 |
 | the atomics and the barrier, against kernels written for them (`atomiccheck.py`) | 10 |
 | texture operations verified exactly, on several texels each (`texopcheck.py`) | 13 |
 | texture operations with a case softpipe cannot run: a 16-bit result | 7 |
@@ -55,22 +56,45 @@ functions and not entry points at all.
   at all are exactly the ones where ir3 differs most from it.
 
   On 20 October that stopped being true. All 78 declarations ran on the phone's own Adreno
-  (`logs/084315-run.log`, section 4 item 4): **66 of the 71 exactly-defined ones agree with C on
-  every one of 808 cases, and 5 disagree** — and the 5 are the whole point of having gone there,
-  because every engine on this machine agrees with C about them. All five are integer-to-float
-  conversions: `air.convert.f.{f32,v2f32,v3f32}.u.*` and, once the pool was sharpened to ask,
-  `air.convert.f.{f32,v2f32}.s.*` as well — `i2f` truncates exactly as `u2f` does, which the
-  earlier pool had no value to notice.
+  (`logs/090218-run.log`, section 4 item 4): **56 of the 71 exactly-defined ones agree with C on
+  every one of 714 cases, 5 disagree, and 10 are set aside** — and the 5 are the whole point of
+  having gone there, because every engine on this machine agrees with C about them. All five are
+  integer-to-float conversions: `air.convert.f.{f32,v2f32,v3f32}.u.*` and, once the pool was
+  sharpened to ask, `air.convert.f.{f32,v2f32}.s.*` as well — `i2f` truncates exactly as `u2f`
+  does, which the earlier pool had no value to notice.
 
-  Two things that run went better than expected. The **24 narrow-type declarations** that softpipe
-  cannot run at all — `i1`, `i8`, `i16`, `f16`, where TGSI's 32-bit registers made a verdict
-  impossible — ran on the Adreno and are among the 68 that agree. ir3 has real 16-bit registers,
-  that was the open question, and the answer is that they are right. And nothing refused to run:
-  no assertion, no fallback, no module missing from the log.
+  **An earlier version of this paragraph said 66 agree on 808 cases, and that was 10 declarations
+  too many.** It also said the 24 narrow-type declarations softpipe cannot run had all run on the
+  Adreno and agreed, which was the part that mattered and the part that was wrong. Ten of them
+  return `half`, `air_run` reads back through a 32-bit float target and has none that is 16 bits
+  wide, so the half is widened at once and NIR folds the conversion into a 32-bit one: the
+  reference describes an operation the shader does not perform. They are now set aside by name —
+  `air.convert.f.f16.{s.i32,u.i16,u.i32,u.i8}`, `air.fmax.{f16,v4f16}`, `air.fmin.{f16,v4f16}`,
+  `air.mix.f16`, `air.saturate.f16` — and 56 + 5 + 10 = 71 closes the account. What is true of the
+  narrow types is narrower than before: the `i1`, `i8` and `i16` ones ran and agree; the `f16` ones
+  were never asked. Nothing refused to run, though: no assertion, no fallback, no module missing.
 
   The row "run on the phone's GPU | 7" in the first table above is unaffected and still reads 7:
   it counts modules of the 456-module corpus, and these are generated modules that are not in the
   corpus. The two measurements are deliberately not added together.
+- **A `continue` that adds nothing to a total is where this check has gone wrong three times.**
+  Not a maxim but a thing to grep for. Three times on 20 October an absent check was dressed as a
+  passing one, and each time the shape was identical: a loop skipped a case and incremented no
+  counter, so "not examined" was reported as "examined and agreed".
+
+  - `if idx >= len(flat): continue` dropped every case whose value was missing from the log, and
+    the total fell by exactly as much as nobody was watching;
+  - `read_whole`'s predecessors read a configuration file with one `read()` into a fixed buffer, so
+    a file past its buffer silently lost its tail and the jobs in it never ran;
+  - `check_log` skipped every infinite expectation, which is how ten `half`-returning declarations
+    came to be reported as agreeing on every case when three of every four cases were not compared
+    at all.
+
+  So the rule is not "skip less". It is that every case set aside must reach the summary with its
+  own number and its own reason, and that a verdict resting on very few cases must say how few —
+  `air.all.v2i1` agrees on two cases, and that is worth knowing before quoting it. Green has to
+  mean "looked at and agreed", never "did not look".
+
 - **The Adreno truncates `u32 → f32` where C, NIR and softpipe round.** This is the first thing
   found here that no engine on this machine could have found, and it is why the suite was carried
   to the phone at all. `air.convert.f.f32.u.i32` and its 2- and 3-component forms, given
