@@ -33,8 +33,8 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | of those, exactly defined and agreeing on every case (45 652 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
 | of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
-| of those, run **on the phone's own Adreno** (714 cases) and agreeing there | 56 |
-| of those, **disagreeing on the Adreno** where every host engine agrees | 5 |
+| of those, run **on the phone's own Adreno** (714 cases) and agreeing there | 61 |
+| of those, disagreeing before the `ir3` rounding fix this port now carries (0 after) | 5 |
 | of those, set aside: they return `half`, which `air_run` cannot read back | 10 |
 | the atomics and the barrier, against kernels written for them (`atomiccheck.py`) | 10 |
 | texture operations verified exactly, on several texels each (`texopcheck.py`) | 13 |
@@ -55,13 +55,22 @@ functions and not entry points at all.
   invisible to all 48 238 of those cases, and the 24 narrow-type declarations softpipe cannot run
   at all are exactly the ones where ir3 differs most from it.
 
-  On 20 October that stopped being true. All 78 declarations ran on the phone's own Adreno
-  (`logs/090218-run.log`, section 4 item 4): **56 of the 71 exactly-defined ones agree with C on
-  every one of 714 cases, 5 disagree, and 10 are set aside** — and the 5 are the whole point of
-  having gone there, because every engine on this machine agrees with C about them. All five are
-  integer-to-float conversions: `air.convert.f.{f32,v2f32,v3f32}.u.*` and, once the pool was
-  sharpened to ask, `air.convert.f.{f32,v2f32}.s.*` as well — `i2f` truncates exactly as `u2f`
-  does, which the earlier pool had no value to notice.
+  On 20 October that stopped being true. All 78 declarations ran on the phone's own Adreno, and
+  twice: once as the port stood, and once with the one-line `ir3` rounding fix this tree now
+  carries (`tools/mesa/ir3-round-default.patch`).
+
+  | | agree | differ | set aside | cases |
+  | --- | --- | --- | --- | --- |
+  | as the port stood (`logs/090218-run.log`) | 56 | **5** | 10 | 714 |
+  | with the rounding fix (`logs/090918-run.log`) | **61** | **0** | 10 | 714 |
+
+  The 5 were the whole point of having gone there, because every engine on this machine agrees
+  with C about them. All five are integer-to-float conversions:
+  `air.convert.f.{f32,v2f32,v3f32}.u.*` and, once the pool was sharpened to ask,
+  `air.convert.f.{f32,v2f32}.s.*` as well — `i2f` truncates exactly as `u2f` does, which the
+  earlier pool had no value to notice. With the fix all five agree and nothing else moved, which is
+  the useful shape of an after-measurement: the thing that was wrong is right, and nothing that was
+  right has changed.
 
   **An earlier version of this paragraph said 66 agree on 808 cases, and that was 10 declarations
   too many.** It also said the 24 narrow-type declarations softpipe cannot run had all run on the
