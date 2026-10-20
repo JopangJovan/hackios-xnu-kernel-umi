@@ -161,19 +161,26 @@ functions and not entry points at all.
   asked first, and supplies no default where IEEE-754 and GLSL both require round-to-nearest.**
   The fix is one line, and unlike the `ir3_cmdline` bug this one is in a file upstream still
   carries, with reproduction down two independent paths — so it is the first thing in this work
-  that can actually be reported. A peer session is testing the one-line change in its own build.
+  that can actually be reported. The change is now carried here as `tools/mesa/ir3-round-default.patch`, measured on the
+  phone before and after down both paths.
 
-  **The same branch covers `TYPE_F16`, and that half of it this suite was not asking about.** The
-  corpus has four integer-to-half conversions — `air.convert.f.f16.{s.i32,u.i16,u.i32,u.i8}` —
-  and all four agreed on the Adreno. The agreement was empty: the pool gave them only values that
-  overflow `f16`, so their expectations read `[0, inf, inf, inf]`, which tests saturation and says
-  nothing whatever about rounding. In `f16` integers are exact to 2048 and spaced by 2 above it, so
-  **2051** is the discriminator — between 2050 and 2052 with an odd lower neighbour, where
-  round-to-nearest-even gives 2052 and truncation gives 2050 — and 2049 is carried beside it as a
-  midpoint where both rules agree, to show that a midpoint is not automatically a test. The pool now
-  interleaves the two precisions so `--cases 4` reaches a discriminator for each. The prediction,
-  untested at the time of writing: these four must currently return 2050, and the one-line fix above
-  must turn them into 2052.
+  **The same branch covers `TYPE_F16`, and that half of it is still unanswered — this suite cannot
+  ask it.** Ten declarations of the corpus return `half`, and every one of them was reported as
+  agreeing on the Adreno while being tested on almost nothing: the pool gave them only values that
+  overflow `f16`, so their expectations read `[0, inf, inf, inf]`, and the comparison skipped every
+  infinity without counting it, leaving the zero to carry the verdict. They are set aside by name
+  now (the table at the top of this document has their row), and the reason is the harness and not
+  the hardware: `air_run` reads back through a 32-bit float target, so a half result is widened at
+  once and NIR folds the conversion into a 32-bit one. The generated Adreno code for
+  `air.convert.f.f16.u.i32` is four `cov.u32f32` and not one `cov.u32f16`.
+
+  The pool has the value that would decide it, for when the harness can. In `f16` integers are
+  exact to 2048 and spaced by 2 above, so **2051** is the discriminator — between 2050 and 2052
+  with an odd lower neighbour, where round-to-nearest-even gives 2052 and truncation gives 2050 —
+  and 2049 is carried beside it as a midpoint where both rules agree, to show that a midpoint is
+  not automatically a test. What is needed to use them is a 16-bit render target in `air_run` and a
+  `--check` that reads a half back from it; until then the rounding fix above is measured for
+  32-bit destinations only, and the patch's header says so.
 
   **Which rule it is, as against merely "not round-to-nearest", is settled by one value.**
   `0x01000003` is 2²⁴+3, half way between the representable 2²⁴+2 and 2²⁴+4; round-half-to-even and
