@@ -154,6 +154,7 @@ struct replacement {
 };
 static struct replacement replacements[];
 static size_t replacement_count(void);
+static void image_added(const struct mach_header *header, intptr_t image_slide);
 
 /*
  * How many times each hook was entered: a count that survives a console that drops lines. The names
@@ -168,7 +169,8 @@ enum {
 	COUNT_dataTaskPromise, COUNT_dataTask, COUNT_addCookies, COUNT_addStorefrontHeader, COUNT_addAnisette,
 	COUNT_prepareRequest, COUNT_finishWithResult, COUNT_finishWithError, COUNT_finishFunnel,
 	COUNT_finishResultError, COUNT_thenWithBlock, COUNT_continueWithBlock, COUNT_bagValue,
-	COUNT_resultBefore, COUNT_afterUpdating, COUNT_addCookies4, COUNT_fpDeviceType, COUNT_last
+	COUNT_resultBefore, COUNT_afterUpdating, COUNT_addCookies4, COUNT_fpDeviceType, COUNT_brotli,
+	COUNT_last
 };
 static const char *const counted[COUNT_last] = {
 	"-[ACAccount ams_storefront]", "-[AMSBagNetworkDataSource cachedStorefront]",
@@ -192,6 +194,7 @@ static const char *const counted[COUNT_last] = {
 	"-[ACAccountStore _ams_localiTunesAccountAfterUpdatingStorefront:]",
 	"ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:",
 	"-[AMSUserAgent _sharedComponentFairPlayDeviceType]",
+	"-[JEBrotliDecoder decompressStreamWithAvailableIn:nextIn:availableOut:nextOut:]",
 };
 static unsigned long entered[COUNT_last];
 /*
@@ -228,6 +231,21 @@ say(const char *format, ...)
 	}
 	if (console == -2) {
 		console = open("/dev/console", O_WRONLY | O_APPEND);
+	}
+	/*
+	 * And say which process. Two of them carry this library and both write to the one console, so a
+	 * report read by position belongs to whichever process happened to be writing -- the lines are
+	 * interleaved, not grouped. Every line names its own program instead.
+	 */
+	if (strncmp(line, "redwood: store: ", 16) == 0) {
+		char named[sizeof(line) + 32];
+
+		n = snprintf(named, sizeof(named), "redwood: %s: %s", who, line + 16);
+		if (n > (int)sizeof(named) - 1) {
+			n = sizeof(named) - 1;
+		}
+		write(console >= 0 ? console : 2, named, (size_t)n);
+		return;
 	}
 	write(console >= 0 ? console : 2, line, (size_t)n);
 }
@@ -339,6 +357,112 @@ dump_tasks(void)
 		    error != NULL ? ", error " : "", error != NULL ? text_of(error, two, sizeof(two)) : "",
 		    url != NULL ? text_of(url, three, sizeof(three)) : "(no url)");
 	}
+}
+
+/*
+ * WHAT HAPPENS TO THE PAGE AFTER IT ARRIVES. The front page comes down whole and nothing draws it,
+ * and the report that showed that also showed something nobody was looking for: THE SAME 177 786
+ * BYTES WERE FETCHED TWICE. A document that parsed would not be fetched again, so the likeliest
+ * story is loaded, rejected, tried again.
+ * JetEngine says how it would reject one. It carries jetpackSignatureVerificationDidFailNotification
+ * -- a signature is verified and there is a named way of announcing that it was not liked -- and a
+ * JEBrotliDecoder, so the body is compressed before any of that; JetPackSigningPolicy,
+ * JetpackSignatureVerifierP, JetPackageFormatParser and JetpackErrorDomain are all in the same
+ * library. Every one of those rejects AFTER the bytes are on disk, which is the shape measured.
+ * Rather than guess the notification's string (a name is one of the ways an instrument lies -- see
+ * below), every notification posted in the process is watched and the ones whose name speaks of
+ * jetpacks, signatures, verification or brotli are printed.
+ * WHAT IT SAYS SO FAR. No signature-failure notification is ever posted: 169 to 197 notifications in
+ * a session of the app and not one about a jetpack, a signature, verification or brotli -- the only
+ * JetEngine notification seen at all is JetEngine.Unstable.Accounts.didChangeNotification, so the
+ * engine is alive and posting. JEBrotliDecoder is in the App Store's process and not in appstored,
+ * it answers to -decoder and -decompressStreamWithAvailableIn:nextIn:availableOut:nextOut:, the
+ * app's NOT TAKEN list does not name it, and no BROTLI line is ever printed. That points at a page
+ * that is fetched and never decompressed -- but it is NOT settled, because the counter line for that
+ * hook is missing from the report as well, and a line that is missing is the thing this branch has
+ * been wrong about five times. The next run should print the brotli counter on its own, early, not
+ * as one line of a sixty-line report.
+ *
+ * THE THREE SHAPES OF AN INSTRUMENT THAT LIES, all of them met on this branch, all of them making a
+ * thing that happened look like a thing that did not:
+ *   the wrong channel -- the library was inside AppStore.app and said nothing, because an app
+ *     started by SpringBoard has no console on standard error (say() writes to /dev/console now);
+ *   the wrong name -- a hook on ams_addCookiesForAccount:clientInfo:bag: never fired for a whole
+ *     evening because the cookies go through the four-argument ...:cleanupGlobalCookies: instead;
+ *   the wrong moment -- one report at 150 s, while the App Store starts when it is tapped at 95 s
+ *     and its report fell past the end of the run (every minute now);
+ *   the wrong order -- the hook on JEBrotliDecoder was NOT TAKEN although the class is plainly in
+ *     the process (the report's own selector dump lists its methods): the table is tried when dyld
+ *     adds an image, and a Swift framework's classes are registered after that callback runs, so
+ *     the one moment it was looked for was the one moment it was not there. The table is tried
+ *     again every minute now, which costs nothing and cannot miss a late arrival.
+ * The fifth shape belongs in this list when it is found.
+ */
+/*
+ * And the decompression, since no signature-failure notification is ever posted (169 to 197
+ * notifications in a session of the app, not one of them about a jetpack, a signature, verification
+ * or brotli). JEBrotliDecoder is in the App Store's process and not in appstored, and it answers to
+ * -decoder and -decompressStreamWithAvailableIn:nextIn:availableOut:nextOut:. The result is an
+ * integer status, so it is printed as one: a decode that never runs and a decode that fails are the
+ * same silence otherwise.
+ */
+static long (*old_brotli)(id, SEL, void *, void *, void *, void *);
+static long
+new_brotli(id self, SEL cmd, void *a, void *b, void *c, void *d)
+{
+	long result;
+
+	entered[COUNT_brotli]++;
+	result = old_brotli(self, cmd, a, b, c, d);
+	returned[COUNT_brotli]++;
+	if (returned[COUNT_brotli] <= 4 || result != 1) {
+		say("redwood: store: BROTLI decompressStream -> %ld (call %lu)\n", result, returned[COUNT_brotli]);
+	}
+	return result;
+}
+
+static unsigned long notifications;
+
+static bool
+interesting_name(const char *name)
+{
+	static const char *const words[] = { "jet", "Jet", "ignature", "erif", "rotli", "JE", "Pack" };
+
+	for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		if (strstr(name, words[i]) != NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static id (*old_postName)(id, SEL, id, id, id);
+static id
+new_postName(id self, SEL cmd, id name, id object, id info)
+{
+	char buffer[160];
+	const char *text = text_of(name, buffer, sizeof(buffer));
+
+	notifications++;
+	if (interesting_name(text)) {
+		say("redwood: store: NOTIFICATION %s\n", text);
+	}
+	return old_postName(self, cmd, name, object, info);
+}
+
+static id (*old_postNotification)(id, SEL, id);
+static id
+new_postNotification(id self, SEL cmd, id note)
+{
+	char buffer[160];
+	id name = ((id (*)(id, SEL))objc_msgSend)(note, sel_registerName("name"));
+	const char *text = text_of(name, buffer, sizeof(buffer));
+
+	notifications++;
+	if (interesting_name(text)) {
+		say("redwood: store: NOTIFICATION (object) %s\n", text);
+	}
+	return old_postNotification(self, cmd, note);
 }
 
 /*
@@ -749,6 +873,7 @@ static void
 one_report(unsigned seconds)
 {
 	say("redwood: store(%s): report at %u s\n", who, seconds);
+	image_added(NULL, 0);           /* and try again for anything whose class has turned up since */
 
 	for (size_t i = 0; i < replacement_count(); i++) {
 		if (!replacements[i].done) {
@@ -772,6 +897,8 @@ one_report(unsigned seconds)
 	dump_tasks();
 	dump_threads();
 	dump_selectors("AMSURLSession", "equest");
+	dump_selectors("JEBrotliDecoder", NULL);
+	say("redwood: store: %lu notifications posted\n", notifications);
 }
 
 /*
@@ -1133,6 +1260,12 @@ static struct replacement replacements[] = {
 	  (IMP *)&old_afterUpdating, false },
 	{ "NSMutableURLRequest", "ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:", false,
 	  (IMP)new_addCookies4, (IMP *)&old_addCookies4, false },
+	{ "JEBrotliDecoder", "decompressStreamWithAvailableIn:nextIn:availableOut:nextOut:", false, (IMP)new_brotli,
+	  (IMP *)&old_brotli, false },
+	{ "NSNotificationCenter", "postNotificationName:object:userInfo:", false, (IMP)new_postName,
+	  (IMP *)&old_postName, false },
+	{ "NSNotificationCenter", "postNotification:", false, (IMP)new_postNotification,
+	  (IMP *)&old_postNotification, false },
 	{ "AMSUserAgent", "_sharedComponentFairPlayDeviceType", false, (IMP)new_fpDeviceType,
 	  (IMP *)&old_fpDeviceType, false },
 	{ "AMSUserAgent", "_sharedComponentFairPlayDeviceType", true, (IMP)new_fpDeviceType,
