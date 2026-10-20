@@ -23,7 +23,7 @@ Of the 456 modules of the device's system `.metallib` files (`tools/air/check.sh
 | translated to NIR, passing `nir_validate` | 318 |
 | compiled by ir3 into Adreno machine code | 318 |
 | numerically identical to LLVM's own execution, and drawn | 255 |
-| **run on the phone's GPU** | **7** |
+| **run on the phone's GPU** — 7 drawn, 40 dispatched | **47** |
 
 And of the 119 distinct `air.*` operations those modules call (`tools/air/intrincheck.py`):
 
@@ -83,9 +83,13 @@ functions and not entry points at all.
   narrow types is narrower than before: the `i1`, `i8` and `i16` ones ran and agree; the `f16` ones
   were never asked. Nothing refused to run, though: no assertion, no fallback, no module missing.
 
-  The row "run on the phone's GPU | 7" in the first table above is unaffected and still reads 7:
-  it counts modules of the 456-module corpus, and these are generated modules that are not in the
-  corpus. The two measurements are deliberately not added together.
+  The row "run on the phone's GPU" in the first table above does not count these: it counts
+  modules of the 456-module corpus, and these are generated modules that are not in it. The two
+  measurements are deliberately not added together. That row now reads **47** for a different
+  reason — 7 fragment shaders drawn and 40 compute kernels dispatched, which are disjoint sets
+  because a kernel is not a fragment shader. It read 7 until the kernels ran, and it stayed 7 for
+  a while after they did, which is the third time this one figure has been left behind by the work
+  that moved it.
 - **Two traps this frontend's own checks fell into, kept here for the instances; the general forms
   are in README's "Как врут собственные проверки", which collects all six and belongs there because
   the others came from the camera, the services and the build rather than from AIR.** Comparing one
