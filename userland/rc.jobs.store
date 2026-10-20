@@ -57,6 +57,8 @@
 # ... and the welcome card is only the first of the onboarding: after "Continue" comes the choice
 # about personalised ads, and "Turn Off" is the honest answer for a phone with no account at all.
 /redwood/bin/rwtouch tap 0.5 0.895 wait 25
-/redwood/bin/rwtouch tap 0.5 0.962 wait 95
+# ... and then simply wait, with the report ticking every fifteen seconds: whatever the Today tab
+# asks for after onboarding shows up in the task table with its status, length and type.
+/redwood/bin/rwtouch tap 0.5 0.962 wait 200
 /bin/ps -A
 /redwood/bin/rwtouch button home wait 6

@@ -752,6 +752,77 @@ new_postNotification(id self, SEL cmd, id note)
 }
 
 /*
+ * EVERY ERROR THE STORE MAKES, by domain and code, in a table that repeats. After onboarding the
+ * App Store draws its own tab bar and then says "Cannot Connect to App Store" with a Retry button
+ * (docs/appstore-cannot-connect.png) -- and the task table still shows the same five requests, so
+ * whatever it could not connect to was never asked for. The app knows something we do not, and it
+ * knows it as an NSError: this remembers the domain and code of every one made in the process, with
+ * a count, and prints them in each report. Nothing of the userInfo is printed -- that is where
+ * tokens and account details live, and this library is going to run with an Apple ID signed in one
+ * day.
+ */
+#define ERRORS 64
+static struct error_note {
+	char domain[48];
+	long code;
+	unsigned count;
+} errors[ERRORS];
+static unsigned error_count;
+static pthread_mutex_t error_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+note_error(id domain, long code)
+{
+	char text[48];
+
+	if (domain == NULL) {
+		return;
+	}
+	text_of(domain, text, sizeof(text));
+	pthread_mutex_lock(&error_lock);
+	for (unsigned i = 0; i < error_count; i++) {
+		if (errors[i].code == code && strncmp(errors[i].domain, text, sizeof(errors[0].domain) - 1) == 0) {
+			errors[i].count++;
+			pthread_mutex_unlock(&error_lock);
+			return;
+		}
+	}
+	if (error_count < ERRORS) {
+		strlcpy(errors[error_count].domain, text, sizeof(errors[0].domain));
+		errors[error_count].code = code;
+		errors[error_count].count = 1;
+		error_count++;
+	}
+	pthread_mutex_unlock(&error_lock);
+}
+
+static void
+dump_errors(void)
+{
+	say("redwood: store: %u kinds of error made\n", error_count);
+	for (unsigned i = 0; i < error_count; i++) {
+		say("redwood: store: error %-40s code %ld, %u time(s)\n", errors[i].domain, errors[i].code,
+		    errors[i].count);
+	}
+}
+
+static id (*old_errorWith)(id, SEL, void *, long, void *);
+static id
+new_errorWith(id self, SEL cmd, void *domain, long code, void *info)
+{
+	note_error((id)domain, code);
+	return old_errorWith(self, cmd, domain, code, info);
+}
+
+static id (*old_errorInit)(id, SEL, void *, long, void *);
+static id
+new_errorInit(id self, SEL cmd, void *domain, long code, void *info)
+{
+	note_error((id)domain, code);
+	return old_errorInit(self, cmd, domain, code, info);
+}
+
+/*
  * THE SIXTH SHAPE OF AN INSTRUMENT THAT LIES: THE WRONG SLICE. The loader's log keeps the first
  * 256 KB and the last 1 MB and throws away the middle when a run overruns it, saying so in one line
  * -- "the log between the first 256 KB and the last 1 MB was dropped". Every run of this library has
@@ -1242,6 +1313,7 @@ one_report(unsigned seconds)
 	dump_promises();
 	dump_tasks();
 	dump_bagkeys();
+	dump_errors();
 	dump_threads();
 	/* the long dumps once; the numbers in every report, because only a late one survives the log */
 	if (first) {
@@ -1666,6 +1738,8 @@ static struct replacement replacements[] = {
 	  (IMP *)&old_dataTaskSignpost, false },
 	{ "AMSURLSession", "dataTaskWithRequest:completionHandler:", false, (IMP)new_dataTaskAMS,
 	  (IMP *)&old_dataTaskAMS, false },
+	{ "NSError", "errorWithDomain:code:userInfo:", true, (IMP)new_errorWith, (IMP *)&old_errorWith, false },
+	{ "NSError", "initWithDomain:code:userInfo:", false, (IMP)new_errorInit, (IMP *)&old_errorInit, false },
 	{ "NSURLSessionTask", "resume", false, (IMP)new_resume_base, (IMP *)&old_resume_base, false },
 	{ "__NSCFLocalSessionTask", "resume", false, (IMP)new_resume_local, (IMP *)&old_resume_local, false },
 };
