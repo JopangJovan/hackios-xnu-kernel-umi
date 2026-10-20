@@ -170,7 +170,7 @@ enum {
 	COUNT_prepareRequest, COUNT_finishWithResult, COUNT_finishWithError, COUNT_finishFunnel,
 	COUNT_finishResultError, COUNT_thenWithBlock, COUNT_continueWithBlock, COUNT_bagValue,
 	COUNT_resultBefore, COUNT_afterUpdating, COUNT_addCookies4, COUNT_fpDeviceType, COUNT_brotli,
-	COUNT_last
+	COUNT_processStream, COUNT_last
 };
 static const char *const counted[COUNT_last] = {
 	"-[ACAccount ams_storefront]", "-[AMSBagNetworkDataSource cachedStorefront]",
@@ -195,6 +195,7 @@ static const char *const counted[COUNT_last] = {
 	"ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:",
 	"-[AMSUserAgent _sharedComponentFairPlayDeviceType]",
 	"-[JEBrotliDecoder decompressStreamWithAvailableIn:nextIn:availableOut:nextOut:]",
+	"-[JPReader processStream:signatureVerifier:options:error:]",
 };
 static unsigned long entered[COUNT_last];
 /*
@@ -372,16 +373,28 @@ dump_tasks(void)
  * Rather than guess the notification's string (a name is one of the ways an instrument lies -- see
  * below), every notification posted in the process is watched and the ones whose name speaks of
  * jetpacks, signatures, verification or brotli are printed.
- * WHAT IT SAYS SO FAR. No signature-failure notification is ever posted: 169 to 197 notifications in
- * a session of the app and not one about a jetpack, a signature, verification or brotli -- the only
+ * WHAT IT SAYS. No signature-failure notification is ever posted: 169 to 197 notifications in a
+ * session of the app and not one about a jetpack, a signature, verification or brotli -- the only
  * JetEngine notification seen at all is JetEngine.Unstable.Accounts.didChangeNotification, so the
- * engine is alive and posting. JEBrotliDecoder is in the App Store's process and not in appstored,
- * it answers to -decoder and -decompressStreamWithAvailableIn:nextIn:availableOut:nextOut:, the
- * app's NOT TAKEN list does not name it, and no BROTLI line is ever printed. That points at a page
- * that is fetched and never decompressed -- but it is NOT settled, because the counter line for that
- * hook is missing from the report as well, and a line that is missing is the thing this branch has
- * been wrong about five times. The next run should print the brotli counter on its own, early, not
- * as one line of a sixty-line report.
+ * engine is alive and posting.
+ * AND THE READER IS PLAINLY HAPPY. With the counters printed on their own line, early, instead of as
+ * one line of a sixty-line report:
+ *   redwood: AppStore: JETPACK processStream: in
+ *   redwood: AppStore: JETPACK processStream: out, a result, error (none)
+ *   redwood: AppStore: KEY brotli entered 0 returned 0, processStream entered 2 returned 2
+ *   redwood: appstored: KEY brotli entered 0 returned 0, processStream entered 0 returned 0
+ * -[JPReader processStream:signatureVerifier:options:error:] is entered twice -- once per fetch --
+ * and both times it RETURNS A RESULT WITH NO ERROR. So the page is fetched whole and parsed without
+ * complaint: it is not the signature, not the package format, and not Brotli (which never runs at
+ * all). That retires all three at once, and with them the experiment of swapping
+ * +[JPSignatureVerifier defaultSignatureVerifier] for +unsafeIgnoreSignatureVerifier -- there is
+ * nothing for it to prove, since the verification already passes. An image that does not verify
+ * signatures is a worse thing than an experiment that does not, and this one is not needed.
+ * The only C++ exception thrown anywhere in either process is std::future_error (every throw is
+ * watched through __cxa_throw, whose type name is the second word of its std::type_info), and it is
+ * thrown in appstored as well, where everything now works -- so it is a lead, not an answer.
+ * WHAT IS LEFT is the drawing itself: 177 786 bytes arrive, JPReader parses them into a result, and
+ * nothing appears. The next question is what becomes of that result.
  *
  * THE THREE SHAPES OF AN INSTRUMENT THAT LIES, all of them met on this branch, all of them making a
  * thing that happened look like a thing that did not:
@@ -420,6 +433,54 @@ new_brotli(id self, SEL cmd, void *a, void *b, void *c, void *d)
 	}
 	return result;
 }
+
+/*
+ * THE IMAGE THAT OPENS A JETPACK IS JetPack, NOT JetEngine. -[JPReader
+ * processStream:signatureVerifier:options:error:] is the entry point, and being an Objective-C
+ * method with an error: out-parameter it tells the three remaining stories apart on its own: never
+ * called, called and returning an error (and which), or called and succeeding while something later
+ * drops the result.
+ * And the parser throws C++ exceptions -- JetPack::InvalidSegmentTagException takes the offending
+ * segment tag as an int -- which is the best explanation of the silence measured so far: a throw
+ * that somebody catches makes no notification, no log line and no decompression. A constructor in
+ * another image cannot be replaced from here, but every throw goes through __cxa_throw, which is
+ * bound through the stubs and can be interposed; the type's mangled name is the second word of its
+ * std::type_info (the Itanium ABI puts __type_name there), so every C++ exception thrown anywhere
+ * in the process says what it was.
+ */
+static id (*old_processStream)(id, SEL, void *, void *, void *, id *);
+static id
+new_processStream(id self, SEL cmd, void *stream, void *verifier, void *options, id *error)
+{
+	id result;
+	char one[200];
+
+	entered[COUNT_processStream]++;
+	say("redwood: store: JETPACK processStream: in\n");
+	result = old_processStream(self, cmd, stream, verifier, options, error);
+	returned[COUNT_processStream]++;
+	say("redwood: store: JETPACK processStream: out, %s, error %s\n", result != NULL ? "a result" : "(nil)",
+	    error != NULL && *error != NULL ? text_of(*error, one, sizeof(one)) : "(none)");
+	return result;
+}
+
+/* every C++ exception thrown in the process, by name: the parser's rejections are throws */
+extern void __cxa_throw(void *exception, void *info, void (*destructor)(void *));
+
+static void
+watched___cxa_throw(void *exception, void *info, void (*destructor)(void *))
+{
+	const char *name = info != NULL ? ((const char **)info)[1] : NULL;
+
+	say("redwood: store: C++ THROW %s\n", name != NULL ? name : "(no name)");
+	__cxa_throw(exception, info, destructor);
+}
+
+__attribute__((used)) static struct {
+	const void *ours, *theirs;
+} interposed[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)watched___cxa_throw, (const void *)__cxa_throw },
+};
 
 static unsigned long notifications;
 
@@ -874,6 +935,13 @@ one_report(unsigned seconds)
 {
 	say("redwood: store(%s): report at %u s\n", who, seconds);
 	image_added(NULL, 0);           /* and try again for anything whose class has turned up since */
+	/*
+	 * These two on their own, before the long report: last time the brotli counter was one line of
+	 * sixty and it went missing, and a missing line is what this branch has been wrong about five
+	 * times. A number that matters does not travel in a crowd.
+	 */
+	say("redwood: store: KEY brotli entered %lu returned %lu, processStream entered %lu returned %lu\n",
+	    entered[COUNT_brotli], returned[COUNT_brotli], entered[COUNT_processStream], returned[COUNT_processStream]);
 
 	for (size_t i = 0; i < replacement_count(); i++) {
 		if (!replacements[i].done) {
@@ -1260,6 +1328,8 @@ static struct replacement replacements[] = {
 	  (IMP *)&old_afterUpdating, false },
 	{ "NSMutableURLRequest", "ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:", false,
 	  (IMP)new_addCookies4, (IMP *)&old_addCookies4, false },
+	{ "JPReader", "processStream:signatureVerifier:options:error:", false, (IMP)new_processStream,
+	  (IMP *)&old_processStream, false },
 	{ "JEBrotliDecoder", "decompressStreamWithAvailableIn:nextIn:availableOut:nextOut:", false, (IMP)new_brotli,
 	  (IMP *)&old_brotli, false },
 	{ "NSNotificationCenter", "postNotificationName:object:userInfo:", false, (IMP)new_postName,

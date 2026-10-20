@@ -219,8 +219,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood-media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
 		# ... and inside appstored (STOREFRONT=1), which answers with a storefront and watches for a bag
 		# request being built (src/inject_store.c)
+		# (-lc++abi for __cxa_throw: every C++ exception thrown in the process is watched, which is how
+		#  the jetpack parser's rejections are seen -- a throw somebody catches logs nothing of itself)
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-store.dylib -framework CoreFoundation -lobjc \
-			-o obj/libredwood-store.dylib src/inject_store.c
+			-lc++abi -o obj/libredwood-store.dylib src/inject_store.c
 		# ... and inside fairplayd.H2, which starts and leaves at once: what it looks for, and where it
 		# gives up (src/inject_fairplay.c; watches only, replaces nothing)
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-fairplay.dylib -framework CoreFoundation \
