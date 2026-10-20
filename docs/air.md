@@ -343,20 +343,43 @@ functions and not entry points at all.
   prints where each one stops, as a table whose rows are checked against the total before it is
   printed:
 
-  | | of 47 |
-  | --- | --- |
-  | dispatched and read back | 6 |
-  | refused by this harness | 0 |
-  | softpipe's `nir_to_tgsi`: scratch and intrinsics it lacks (ir3 has these) | 38 |
-  | calls a function the module defines | 0 |
-  | a shuffle mask that is not constant | 3 |
+  | | on softpipe | **on the Adreno** |
+  | --- | --- | --- |
+  | dispatched and read back | 6 | **40** |
+  | softpipe's `nir_to_tgsi`: scratch and intrinsics it lacks | 38 | — |
+  | a shuffle mask that is not constant (a frontend limit) | 3 | 3 |
+  | **crashed `air_run`** (a defect here, not a limit) | 0 | **4** |
+
+  **The deferred question is answered: ir3 runs them.** 38 kernels stopped at a software
+  rasteriser that has no scratch memory and lacks compute intrinsics, and on the hardware 40 of
+  the 47 dispatch and read their results back — 22 of those 40 binding at least one image. The
+  phone replaced softpipe and the column that was never ours emptied.
+
+  What the rows do **not** say is right. There is no executed reference for these kernels
+  anywhere: softpipe refuses 38 of them, which is why they came here, so a number out of the
+  Adreno has nothing on this machine to disagree with. 40 have been shown to *run*.
+
+  Four crash, and the crash is on this side of the line. All four fault at the same place, which
+  `llvm-nm` against the binary that ran resolves to
+
+      pc   fd6_texture_state + 0xd4
+      lr   fd6_emit_cs_state<chip6> + 0x100
+           fd6_launch_grid<chip6> + 0xfc
+           fd_launch_grid + 0x3b4
+           dispatch_kernel + 0x194c
+
+  — freedreno's own descriptor emission for the compute stage, reached from the image binding this
+  harness does. Two explanations are already dead: the driver's texture state is not uninitialised
+  (`CALLOC_STRUCT(fd6_context)` zeroes it, so the loops over `num_textures` do not run), and it is
+  not "an image with no buffer", because seven kernels with exactly that shape dispatch fine.
+  Whether the fault is a state this harness builds wrongly or a freedreno bug is **not
+  established**, and 22 kernels binding images successfully is the reason it cannot be read as
+  "images do not work".
 
   The row for a call of a module-local function was 5 until those calls were translated; it is now
-  0, and its five went to the two rows below it — four to softpipe and one to the shuffle mask. The
-  dispatched count did not move, which is the same shape as before: the wall is no longer ours and
-  the number behind it is unchanged.
-
-  The 6 is the honest number and not the interesting one. Until 20 October, 24 of these were
+  gone, its five having moved to softpipe (four) and the shuffle mask (one). Twice in a row the
+  dispatched count on softpipe stayed at 6 while a column stopped being ours, and the run above is
+  where that finally paid: those same kernels dispatch on the hardware. Until 20 October, 24 of these were
   refused by `air_run` itself — it bound textures and images for a draw and not for a dispatch —
   and binding them moved the count only from 5 to 6, because softpipe is the wall behind ours.
   What changed is whose wall it is: **nothing is refused by this harness any more**, and the 34
