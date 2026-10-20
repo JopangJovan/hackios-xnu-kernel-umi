@@ -127,6 +127,7 @@
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <signal.h>
+#include <time.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -397,12 +398,24 @@ dump_tasks(void)
  * The only C++ exception thrown anywhere in either process is std::future_error (every throw is
  * watched through __cxa_throw, whose type name is the second word of its std::type_info), and it is
  * thrown in appstored as well, where everything now works -- so it looked like a lead and not an
- * answer. COUNTED, it looks less innocent: 95 of them in appstored and 68 in the App Store in one
- * session, with only 4 and 2 NSExceptions beside them. A std::future_error is what a C++ promise
- * destroyed before its value gives its waiter, AMSCore's futures are C++ (AMSCore::Future,
- * std::__assoc_state), and "seventeen waits and one finish" is the shape a flood of broken promises
- * would make. Whether it is the disease or a symptom beside it is one measurement away: the first
- * few throws now print their frames, and a2s names the thrower.
+ * answer. COUNTED, it looked less innocent: 95 of them in appstored and 68 in the App Store in one
+ * session, with only 4 and 2 NSExceptions beside them, and "seventeen waits and one finish" is the
+ * shape a flood of broken promises would make. It was tempting, and it is WRONG.
+ * The frames and the times say so, which is why both are printed:
+ *   C++ THROW #1 at 0.11 s NSt3__112future_errorE from 0x18ff0bd14 0x18fd1c8b8 0x18fd197f0 ...
+ *   0x18ff0bd14: std::make_exception_ptr<std::future_error>
+ *   0x18fd1c8b8: std::promise<std::tuple<PromiseResult>>::~promise
+ *   0x18fd197f0: std::__shared_ptr_emplace<AMSCore::Future<PromiseResult>::FutureImp>::__on_zero_shared
+ *   0x1900b57dc: std::shared_ptr<AMSCore::Future<PromiseResult>::FutureImp>::~shared_ptr
+ *   0x18fd1a9c4: -[AMSPromise .cxx_destruct]
+ * Every one of the first throws is the same path, and every one is inside the first quarter-second
+ * of the process -- 0.11 to 0.26 s, long before anything is fetched. It is an AMSPromise being
+ * DEALLOCATED: ~promise stores a broken_promise into the shared state when it is destroyed without
+ * a value, which is what the C++ standard says it must do, and make_exception_ptr is how it is
+ * stored rather than how it is reported. 163 of them a session is AMS's style of letting go of
+ * promises nobody needs, not a flood of failures. The number means nothing on its own, the
+ * connection to "nothing asks for content" is disproved, and this paragraph is here so that the
+ * next reader does not find the number again and make the same handsome mistake.
  * WHAT IS LEFT is the drawing itself: 177 786 bytes arrive, JPReader parses them into a result, and
  * nothing appears. Whoever owns it next is on the stack when it is handed back, so the walk is done
  * at the exit too, and "ipsw dyld a2s" names the image if not the function:
@@ -661,12 +674,40 @@ new_processStream(id self, SEL cmd, void *stream, void *verifier, void *options,
 extern void __cxa_throw(void *exception, void *info, void (*destructor)(void *));
 
 static unsigned long throws;
+static double throw_first, throw_last, started_at;
+static unsigned long throw_bucket[12];          /* how many in each half-minute of the first six */
+
+static double
+now_seconds(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
 
 static void
 watched___cxa_throw(void *exception, void *info, void (*destructor)(void *))
 {
 	const char *name = info != NULL ? ((const char **)info)[1] : NULL;
 	char frames[10 * 20 + 1] = "";
+	double when = now_seconds() - started_at;
+	unsigned bucket = (unsigned)(when / 30.0);
+
+	/*
+	 * WHEN as well as where, because the number alone proves nothing. A hundred of these spread
+	 * evenly over a session is the code's style -- future_error is a perfectly ordinary way for a
+	 * cache lookup to say "no value" -- while a pack of them just after the page is loaded is about
+	 * the page. And a flood of broken promises usually has ONE original, with the rest its echo
+	 * through the continuations, so the first one's time and frames matter more than the rest.
+	 */
+	if (throw_first == 0.0) {
+		throw_first = when;
+	}
+	throw_last = when;
+	if (bucket < 12) {
+		throw_bucket[bucket]++;
+	}
 
 	/*
 	 * And WHERE from. std::future_error is thrown 95 times in appstored and 68 in the App Store in
@@ -678,8 +719,10 @@ watched___cxa_throw(void *exception, void *info, void (*destructor)(void *))
 	 */
 	throws++;
 	if (throws <= 6) {
+		(void)0;
 		frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-		say("redwood: store: C++ THROW %s from%s\n", name != NULL ? name : "(no name)", frames);
+		say("redwood: store: C++ THROW #%lu at %.2f s %s from%s\n", throws, when,
+		    name != NULL ? name : "(no name)", frames);
 	}
 	__cxa_throw(exception, info, destructor);
 }
@@ -1150,6 +1193,10 @@ one_report(unsigned seconds)
 	 */
 	say("redwood: store: KEY brotli entered %lu returned %lu, processStream entered %lu returned %lu\n",
 	    entered[COUNT_brotli], returned[COUNT_brotli], entered[COUNT_processStream], returned[COUNT_processStream]);
+	say("redwood: store: KEY throws %lu, first at %.2f s, last at %.2f s, per half-minute"
+	    " %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n", throws, throw_first, throw_last,
+	    throw_bucket[0], throw_bucket[1], throw_bucket[2], throw_bucket[3], throw_bucket[4], throw_bucket[5],
+	    throw_bucket[6], throw_bucket[7], throw_bucket[8], throw_bucket[9], throw_bucket[10], throw_bucket[11]);
 
 	for (size_t i = 0; i < replacement_count(); i++) {
 		if (!replacements[i].done) {
@@ -1656,6 +1703,7 @@ redwood_store_init(void)
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	watch_for_faults();
+	started_at = now_seconds();
 	storefront = CFStringCreateWithCString(NULL, STOREFRONT, kCFStringEncodingUTF8);
 	fairplay_device_type = CFStringCreateWithCString(NULL, FAIRPLAY_DEVICE_TYPE, kCFStringEncodingUTF8);
 	who = name;
