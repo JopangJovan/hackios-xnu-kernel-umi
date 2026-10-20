@@ -309,6 +309,53 @@ functions and not entry points at all.
   they are evidence about is binding, descriptors and ir3's texture instructions — exactly what
   they were built to be — and silence about everything Metal's sampler state decides. Two modules
   of the corpus declare a `constexpr sampler`; everywhere else the API supplies it.
+- **Four modules call a function that takes a texture, and that is attempted and not done.**
+  `air.convert`-style arguments pass through a `nir_call` happily; a texture does not, because
+  this frontend resolves a texture at translation time into a binding and `tex_handle` wants an
+  `AIR_VAL_PTR`, not an SSA def. The attempt, kept here so it is not repeated from the start:
+
+  - binding the pointer-class arguments from the caller's own resolution and passing only the
+    rest as NIR parameters **works** — "argument 0 is not a texture" goes away, and one of the
+    four, `FilmGrainChromaKernel_Uint`, gets past the call to a different limit (a shuffle mask
+    that is not constant);
+  - the module's own values have to be carried into the callee's fresh value table rather than
+    re-registered, because `translate_globals` is not idempotent: it appends to
+    `info->resources` and adds to `shared_size`, so a second run invents an inline sampler and
+    doubles the threadgroup memory. Copying the `module_values` set is the right carry;
+  - and then three of the four **crash**, in `nir_lower_goto_ifs` → `nir_repair_ssa` →
+    `nir_block_is_unreachable`, on an assertion that dominance metadata is valid. Marking the
+    hand-built callee impl's metadata invalid (`nir_metadata_preserve(impl, nir_metadata_none)`)
+    does not fix it, and the obvious hypothesis — that the callee has unreachable blocks, which
+    is what that predicate is about — is **wrong**: these callees have no `unreachable`
+    terminator at all.
+
+  **The diagnosis is now complete, and it is the second bullet above that causes the third.** A
+  peer session read `nir_dominance.c` and pointed out what the assertion actually says:
+  `nir_block_is_unreachable` asks *the block's own* `nir_function_impl` for its dominance
+  metadata, and `nir_repair_ssa` requires that metadata only on the impl it was called for. So a
+  use sitting in another function's block makes it ask the wrong function — nothing to do with a
+  block being unreachable, which is why that hypothesis failed.
+
+  Their proposed test, `nir_validate_shader` before `nir_lower_goto_ifs`, did not settle it and
+  taught something anyway: it fails identically on `fbs_slice_trilinear`, which translates
+  perfectly. Its complaints are about block indices in an unstructured impl, which nothing indexes
+  before `nir_lower_goto_ifs` — pre-existing and benign, and they masked the real thing.
+
+  The carrier is the `module_values` copy. A probe printing any copied value that holds an
+  `nir_def` found five in `FilmGrainLumaKernel_Uint` alone, of both kinds: a pointer with a byte
+  offset and a plain SSA value. Those defs were created in the *entry point's* impl by
+  `translate_globals`, so copying the values into a callee leaves the callee using the caller's
+  values — exactly the cross-function def/use the peer described, arriving through the globals
+  rather than through an argument. An argument cannot carry one: a guard refusing a pointer
+  argument with an offset never fired, so every pointer argument here has none.
+
+  **So the fix is known and is not a third guess**: `translate_globals` must be split, the part
+  that assigns bindings and appends to `info->resources` running once, and the part that
+  materialises `nir_def`s running per impl, so each callee builds its own. That is a change to
+  shared code that handles six kinds of global, and it is not started. The state above is the
+  committed one; each of the four modules has exactly one call site, so specialising per site
+  costs nothing in duplication once this is done.
+
 - **Of Apple's own 47 kernels, 6 are dispatched, all on software.** `tools/air/kernelcheck.py`
   prints where each one stops, as a table whose rows are checked against the total before it is
   printed:
