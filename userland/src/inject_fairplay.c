@@ -442,6 +442,18 @@ watched_mkdir(const char *path, mode_t mode)
  * finished string.
  * ONLY THE KEY IS PRINTED, never the answer: MobileGestalt answers with serial numbers, the unique
  * device identifier and the like, and this log goes into a repository.
+ *
+ * AND THE ANSWER IS THAT IT ASKS NOTHING. Not one MGCopyAnswer and not one entitlement read in a
+ * session, while the same library's open() and access() hooks print 1675 lines from the same
+ * processes -- so the interposing works and the calls do not happen. It is not for want of the
+ * machinery: its import table carries _MGCopyAnswer, _SecTaskCopyValueForEntitlement,
+ * _IOServiceMatching, _IOServiceGetMatchingServices, _IOServiceOpen, _bootstrap_check_in,
+ * _bootstrap_look_up, _notify_register_check and the rest. It imports all of it and calls none of
+ * it.
+ * So the decision is made BEFORE it asks the device anything at all, which rules out the reading
+ * that was most tempting -- that it looked for H2 hardware, did not find it, and left. It never
+ * looks. What it does do first, from the kernel's trace, is what CoreFoundation does for every
+ * process: the feature flags, and its own bundle, where /usr/sbin/Info.plist does not exist.
  */
 static CFTypeRef
 watched_MGCopyAnswer(CFStringRef key)
