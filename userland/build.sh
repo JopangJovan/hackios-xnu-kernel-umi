@@ -251,7 +251,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# ... and inside fairplayd.H2, which starts and leaves at once: what it looks for, and where it
 		# gives up (src/inject_fairplay.c; watches only, replaces nothing)
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-fairplay.dylib -framework CoreFoundation \
-			-framework IOKit -o obj/libredwood-fairplay.dylib src/inject_fairplay.c
+			-framework IOKit -framework Security -lMobileGestalt \
+			-o obj/libredwood-fairplay.dylib src/inject_fairplay.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
 		$DYN -bundle -framework CoreFoundation -o obj/RedwoodAudio src/audio_plugin.c
 		if [ -n "$GL" ]; then

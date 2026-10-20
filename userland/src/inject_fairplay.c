@@ -85,9 +85,20 @@
  * be the kernel: systrace already prints the call and the return, and printing the sysctl MIB and
  * the __mac_syscall policy and request beside them is a small addition in the same place
  * (xnu/redwood.patch, systrace_report). That is the next instrument, and it wants a kernel build.
- * It matters here because this kernel's AMFI stand-in answers exactly two requests, 0x5a and 0x60,
- * and returns ENOPOLICY to every other (bsd/kern/kern_minimac.c): a daemon that asks a third thing
- * is refused in a way no file and no library hook would ever show.
+ * It mattered because this kernel's AMFI stand-in answers exactly two requests, 0x5a and 0x60, and
+ * returns ENOPOLICY to every other (bsd/kern/kern_minimac.c), and a daemon refused there would be
+ * refused invisibly. MEASURED, AMFI IS CLEARED, and by two roads at once.
+ * The kernel's own trace, once it was taught to print the policy and the return:
+ *   policy "AMFI" request 90 = 0          (0x5a, the dyld policy check, answered)
+ *   policy "Sandbox" request 2 = 0, request 4 = 0
+ * and not one other request, not one ENOPOLICY. (That 0x5a is also the known call to check the
+ * instrument against: it is dyld's, it happens at every process start, and seeing it with its
+ * return proves the trace prints both halves.)
+ * And a static read of the binary agrees from the other side: fairplayd.H2 imports neither
+ * __mac_syscall nor sysctl, and has no svc instruction anywhere in its text, so the twelve AMFI and
+ * thirty-three sysctl calls in its trace belong to dyld, libSystem and CoreFoundation -- not to it.
+ * It imports no exit either, so its departure is a return from main, which is a decision and not a
+ * refusal: a MAC denial forced by the kernel kills a process, it does not give a clean exit(0).
  *
  * The next instrument should therefore be on the other side of the wall: this kernel is ours, so
  * logging the system calls of the process named fairplayd.H2 sees through the inlining that defeats
@@ -129,6 +140,10 @@ extern xpc_connection_t xpc_connection_create_mach_service(const char *name, dis
 #include <unistd.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
+
+/* MobileGestalt and the entitlement reader, declared here because the SDK keeps no headers for them */
+extern CFTypeRef MGCopyAnswer(CFStringRef key);
+extern CFTypeRef SecTaskCopyValueForEntitlement(void *task, CFStringRef entitlement, CFErrorRef *error);
 
 #define CACHE_BASE 0x180000000UL
 
@@ -415,6 +430,51 @@ watched_mkdir(const char *path, mode_t mode)
 	return result;
 }
 
+/*
+ * WHAT IT ASKS ABOUT THE DEVICE, which is the question left after AMFI was cleared twice over --
+ * by a static read of the binary (it imports neither __mac_syscall nor sysctl, and has no svc
+ * instruction at all, so the twelve and the thirty-three in the kernel's trace are dyld's and
+ * libSystem's, not its) and by the trace itself (policy "AMFI" request 90 = 0, policy "Sandbox"
+ * requests 2 and 4 = 0, and no ENOPOLICY anywhere).
+ * MGCopyAnswer and SecTaskCopyValueForEntitlement are called ACROSS AN IMAGE BOUNDARY, which is
+ * exactly what dyld interposing can stand between -- unlike the libsystem-internal calls this
+ * library could not see. The key is built at run time by the obfuscator, but at the call it is a
+ * finished string.
+ * ONLY THE KEY IS PRINTED, never the answer: MobileGestalt answers with serial numbers, the unique
+ * device identifier and the like, and this log goes into a repository.
+ */
+static CFTypeRef
+watched_MGCopyAnswer(CFStringRef key)
+{
+	CFTypeRef answer = MGCopyAnswer(key);
+
+	if (ours) {
+		char text[96] = "";
+
+		if (key == NULL || !CFStringGetCString(key, text, sizeof(text), kCFStringEncodingUTF8)) {
+			strlcpy(text, "(unreadable)", sizeof(text));
+		}
+		say("redwood: fairplayd: MGCopyAnswer(\"%s\") -> %s\n", text, answer != NULL ? "an answer" : "NOTHING");
+	}
+	return answer;
+}
+
+static CFTypeRef
+watched_SecTaskCopyValueForEntitlement(void *task, CFStringRef entitlement, CFErrorRef *error)
+{
+	CFTypeRef value = SecTaskCopyValueForEntitlement(task, entitlement, error);
+
+	if (ours) {
+		char text[96] = "";
+
+		if (entitlement == NULL || !CFStringGetCString(entitlement, text, sizeof(text), kCFStringEncodingUTF8)) {
+			strlcpy(text, "(unreadable)", sizeof(text));
+		}
+		say("redwood: fairplayd: entitlement \"%s\" -> %s\n", text, value != NULL ? "held" : "NOT HELD");
+	}
+	return value;
+}
+
 static void
 watched__exit(int status)
 {
@@ -525,6 +585,8 @@ __attribute__((used)) static struct {
 	{ (const void *)watched_sysctl, (const void *)sysctl },
 	{ (const void *)watched___sysctl, (const void *)__sysctl },
 	{ (const void *)watched___mac_syscall, (const void *)__mac_syscall },
+	{ (const void *)watched_MGCopyAnswer, (const void *)MGCopyAnswer },
+	{ (const void *)watched_SecTaskCopyValueForEntitlement, (const void *)SecTaskCopyValueForEntitlement },
 	{ (const void *)watched_dlopen, (const void *)dlopen },
 	{ (const void *)watched_xpc_connection_create_mach_service, (const void *)xpc_connection_create_mach_service },
 	{ (const void *)watched_stat, (const void *)stat },
