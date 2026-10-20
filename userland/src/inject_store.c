@@ -523,6 +523,26 @@ new_dataTaskLocal(id self, SEL cmd, void *request, void *handler)
 	return task;
 }
 
+/*
+ * One original per row, with no two rows sharing a slot -- the mistake that cost four runs here and
+ * is documented beside image_added: the table stores the first original it finds and the other rows
+ * then call it with a receiver of another class. Three rows pointed at old_dataTaskLocal and two at
+ * old_dataTaskURL, and both daemons aborted from the build that introduced them.
+ */
+static id (*old_dataTaskAMS)(id, SEL, void *, void *);
+static id
+new_dataTaskAMS(id self, SEL cmd, void *request, void *handler)
+{
+	id task;
+	char buffer[260];
+
+	entered[COUNT_dataTaskCreated]++;
+	task = ((id (*)(id, SEL, void *, void *))old_dataTaskAMS)(self, cmd, request, handler);
+	returned[COUNT_dataTaskCreated]++;
+	say("redwood: store: TASK CREATED (ams session) %s\n", text_of((id)request, buffer, sizeof(buffer)));
+	return task;
+}
+
 static id (*old_dataTaskURL)(id, SEL, void *, void *);
 static id
 new_dataTaskURL(id self, SEL cmd, void *url, void *handler)
@@ -670,68 +690,22 @@ new_processStream(id self, SEL cmd, void *stream, void *verifier, void *options,
 	return result;
 }
 
-/* every C++ exception thrown in the process, by name: the parser's rejections are throws */
-extern void __cxa_throw(void *exception, void *info, void (*destructor)(void *));
-
-static unsigned long throws;
-static double throw_first, throw_last, started_at;
-static unsigned long throw_bucket[12];          /* how many in each half-minute of the first six */
-
-static double
-now_seconds(void)
-{
-	struct timespec t;
-
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
-}
-
-static void
-watched___cxa_throw(void *exception, void *info, void (*destructor)(void *))
-{
-	const char *name = info != NULL ? ((const char **)info)[1] : NULL;
-	char frames[10 * 20 + 1] = "";
-	double when = now_seconds() - started_at;
-	unsigned bucket = (unsigned)(when / 30.0);
-
-	/*
-	 * WHEN as well as where, because the number alone proves nothing. A hundred of these spread
-	 * evenly over a session is the code's style -- future_error is a perfectly ordinary way for a
-	 * cache lookup to say "no value" -- while a pack of them just after the page is loaded is about
-	 * the page. And a flood of broken promises usually has ONE original, with the rest its echo
-	 * through the continuations, so the first one's time and frames matter more than the rest.
-	 */
-	if (throw_first == 0.0) {
-		throw_first = when;
-	}
-	throw_last = when;
-	if (bucket < 12) {
-		throw_bucket[bucket]++;
-	}
-
-	/*
-	 * And WHERE from. std::future_error is thrown 95 times in appstored and 68 in the App Store in
-	 * one session -- a flood, not an incident, and future_error is what a C++ promise destroyed
-	 * before its value throws. AMSCore's futures are C++ (AMSCore::Future, __assoc_state), so this
-	 * may be the disease behind "seventeen waits and one finish" rather than a symptom beside it.
-	 * The first few are printed with their frames, which "ipsw dyld a2s" turns into the thrower; the
-	 * rest are only counted, because a flood on this console costs the lines that matter.
-	 */
-	throws++;
-	if (throws <= 6) {
-		(void)0;
-		frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-		say("redwood: store: C++ THROW #%lu at %.2f s %s from%s\n", throws, when,
-		    name != NULL ? name : "(no name)", frames);
-	}
-	__cxa_throw(exception, info, destructor);
-}
-
-__attribute__((used)) static struct {
-	const void *ours, *theirs;
-} interposed[] __attribute__((section("__DATA,__interpose"))) = {
-	{ (const void *)watched___cxa_throw, (const void *)__cxa_throw },
-};
+/*
+ * THE SEVENTH SHAPE OF AN INSTRUMENT THAT LIES, and the worst of them: ONE THAT CHANGES WHAT IT
+ * MEASURES. There was an interpose on __cxa_throw here, to see every C++ exception by name. It
+ * answered its question -- std::future_error is AMSPromise being deallocated, see above -- and then,
+ * when it was trimmed to print only the first few and count the rest, both daemons began to die:
+ *   redwood: appstored: signal 6 ... called from _abort, demangling_terminate_handler,
+ *   _objc_terminate, std::__terminate
+ * which is an exception reaching std::terminate instead of its handler. appstored went from one
+ * start a session to eight, each ending in SIGABRT, and the App Store with it. The runs before that
+ * build printed 500 to 600 throws and never aborted once, so it is the hook and not the system: an
+ * exception thrown from a C frame of ours, with no unwind information, does not always find its way
+ * home. The interpose is gone. What it was for is written down above, and if it is ever wanted
+ * again it must be written so that the throw leaves through the original frame, not ours.
+ * (It was caught at all only because the fault reporter watches SIGABRT, which it does because of an
+ * earlier lesson on this branch. One instrument caught another.)
+ */
 
 static unsigned long notifications;
 
@@ -1246,10 +1220,6 @@ one_report(unsigned seconds)
 	 */
 	say("redwood: store: KEY brotli entered %lu returned %lu, processStream entered %lu returned %lu\n",
 	    entered[COUNT_brotli], returned[COUNT_brotli], entered[COUNT_processStream], returned[COUNT_processStream]);
-	say("redwood: store: KEY throws %lu, first at %.2f s, last at %.2f s, per half-minute"
-	    " %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n", throws, throw_first, throw_last,
-	    throw_bucket[0], throw_bucket[1], throw_bucket[2], throw_bucket[3], throw_bucket[4], throw_bucket[5],
-	    throw_bucket[6], throw_bucket[7], throw_bucket[8], throw_bucket[9], throw_bucket[10], throw_bucket[11]);
 
 	for (size_t i = 0; i < replacement_count(); i++) {
 		if (!replacements[i].done) {
@@ -1538,10 +1508,19 @@ new_bagValue(id self, SEL cmd, void *error)
 	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
 	result = old_bagValue(self, cmd, error);
 	returned[COUNT_bagValue]++;
+	/*
+	 * The key, and NOT by asking the AMSBagValue to describe itself. That is what the first version
+	 * did, and it aborted both daemons: appstored went from one start a session to five, each
+	 * ending in SIGABRT through std::terminate, from the run that introduced it (075028) onwards.
+	 * -description on this object at this moment raises, nothing catches it, and the process dies.
+	 * A plain -key is an NSString and safe to print; if there is none, the key is simply unknown.
+	 */
 	{
-		id *out = (id *)error;          /* the out-parameter is declared void * here; it is an NSError ** */
+		SEL key_sel = sel_registerName("key");
+		id key = class_getInstanceMethod(object_getClass(self), key_sel) != NULL ?
+		    ((id (*)(id, SEL))objc_msgSend)(self, key_sel) : NULL;
 
-		note_bagkey(text_of(self, which, sizeof(which)), result != NULL);
+		note_bagkey(key != NULL ? text_of(key, which, sizeof(which)) : "(no key)", result != NULL);
 	}
 	return result;
 }
@@ -1675,24 +1654,18 @@ static struct replacement replacements[] = {
 	  (IMP *)&old_postNotification, false },
 	{ "AMSUserAgent", "_sharedComponentFairPlayDeviceType", false, (IMP)new_fpDeviceType,
 	  (IMP *)&old_fpDeviceType, false },
-	{ "AMSUserAgent", "_sharedComponentFairPlayDeviceType", true, (IMP)new_fpDeviceType,
-	  (IMP *)&old_fpDeviceType, false },
 	{ "AMSBagValue", "valueWithError:", false, (IMP)new_bagValue, (IMP *)&old_bagValue, false },
 	{ "AMSPromise", "resultBeforeDate:error:", false, (IMP)new_resultBefore, (IMP *)&old_resultBefore, false },
 	{ "__NSURLSessionLocal", "dataTaskWithRequest:completionHandler:", false, (IMP)new_dataTaskLocal,
-	  (IMP *)&old_dataTaskLocal, false },
-	{ "NSURLSession", "dataTaskWithRequest:completionHandler:", false, (IMP)new_dataTaskLocal,
 	  (IMP *)&old_dataTaskLocal, false },
 	{ "__NSURLSessionLocal", "dataTaskWithRequest:", false, (IMP)new_dataTaskPlain,
 	  (IMP *)&old_dataTaskPlain, false },
 	{ "__NSURLSessionLocal", "dataTaskWithURL:completionHandler:", false, (IMP)new_dataTaskURL,
 	  (IMP *)&old_dataTaskURL, false },
-	{ "NSURLSession", "dataTaskWithURL:completionHandler:", false, (IMP)new_dataTaskURL,
-	  (IMP *)&old_dataTaskURL, false },
 	{ "AMSURLSession", "dataTaskWithRequest:signpostID:completionHandler:", false, (IMP)new_dataTaskSignpost,
 	  (IMP *)&old_dataTaskSignpost, false },
-	{ "AMSURLSession", "dataTaskWithRequest:completionHandler:", false, (IMP)new_dataTaskLocal,
-	  (IMP *)&old_dataTaskLocal, false },
+	{ "AMSURLSession", "dataTaskWithRequest:completionHandler:", false, (IMP)new_dataTaskAMS,
+	  (IMP *)&old_dataTaskAMS, false },
 	{ "NSURLSessionTask", "resume", false, (IMP)new_resume_base, (IMP *)&old_resume_base, false },
 	{ "__NSCFLocalSessionTask", "resume", false, (IMP)new_resume_local, (IMP *)&old_resume_local, false },
 };
@@ -1765,7 +1738,6 @@ redwood_store_init(void)
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	watch_for_faults();
-	started_at = now_seconds();
 	storefront = CFStringCreateWithCString(NULL, STOREFRONT, kCFStringEncodingUTF8);
 	fairplay_device_type = CFStringCreateWithCString(NULL, FAIRPLAY_DEVICE_TYPE, kCFStringEncodingUTF8);
 	who = name;
