@@ -86,6 +86,20 @@ functions and not entry points at all.
   The row "run on the phone's GPU | 7" in the first table above is unaffected and still reads 7:
   it counts modules of the 456-module corpus, and these are generated modules that are not in the
   corpus. The two measurements are deliberately not added together.
+- **Compare against someone else's tree from a pristine extract, never from your own build.**
+  Checking whether Mesa's `main` still had the rounding fault meant comparing one file against
+  ours — and ours has our own patch in it, 202 487 bytes against 202 144 clean. Taken from this
+  tree the two would have differed by exactly our own change, and the search would have been for a
+  difference in `main` that is not there. Unpacking the tarball again costs a second and removes
+  the working copy from the question.
+
+  The same mistake has a twin in how a check is run: `patch -s --dry-run` exited 0 against `main`'s
+  file and that was written down as "applies cleanly", when without `-s` it says
+  "Hunk #1 succeeded at 410 (offset 2 lines)". The context matched and the line number had moved,
+  which is a different and more useful statement. **Quiet output is not clean output** — a flag
+  that hides a success's details makes the success less informative than it appears, which is the
+  same shape as the skips below.
+
 - **A `continue` that adds nothing to a total is where this check has gone wrong three times.**
   Not a maxim but a thing to grep for. Three times on 20 October an absent check was dressed as a
   passing one, and each time the shape was identical: a loop skipped a case and incremented no
