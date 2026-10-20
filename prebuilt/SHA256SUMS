@@ -1,4 +1,4 @@
-Built 2026-10-20 07:20 from this tree.
+Built 2026-10-20 08:18 from this tree.
 
 7deb597ef63478c75bf88f8f3622d9971eef483da9686a0fc83dcc58b0d3f05a  prebuilt/mach.development.bcm2837
 3de0d8b2095989a9a8f9f9679b8bec01d80bad38eee535d934d29b7b76fee984  prebuilt/loader.efi
@@ -6,7 +6,7 @@ cab0c58744bd9e4490ef4b9aabfe25758838a35279d1384d382e60e8653c91c3  prebuilt/userl
 1a413befd511384052e1962c1394adce20f718e1f2657ce63ab09828ebc4bd1b  prebuilt/userland/cpu_test
 db564073effc31e7ab1679a7ffe0631ec22c3030ad347c927028f3e53c8583c3  prebuilt/userland/hello
 a8baa9ab38333280369b0824aafaf92c7aa6a85851ff0b2551a4c711dbe59cfd  prebuilt/userland/hello_dyn
-4725b9837964062f28a64adf4f101d60688d586d04e8827407022700c43e3318  prebuilt/userland/init
+0e2e63e737049a6b17e47f0edd55a8ef5bfe2d9881f4d0966bd2fd5b0c943185  prebuilt/userland/init
 5ebffd6d90a36ab8ecf4d9f48cf1b2f1dbd5b33661546d913d83147c9c86710d  prebuilt/userland/libredwood-app.dylib
 e527b3425eeb56ab4e10ff503776758e89904af336984892fde46d5f0dc4f73d  prebuilt/userland/libredwood.dylib
 8df90a3426f2802cc063db2ad3548d85237140a678699c742bc1ba31552cd0d9  prebuilt/userland/libredwood-media.dylib
