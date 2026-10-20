@@ -35,9 +35,12 @@
  * arrives.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreMedia/CoreMedia.h>
+#include <CoreVideo/CoreVideo.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
@@ -334,6 +337,45 @@ gnr_render(id self, SEL selector, void *sample_buffer, id input)
 	}
 }
 
+static bool
+is_node(id node, const char *name)
+{
+	return node != nil && strcmp(object_getClassName(node), name) == 0;
+}
+
+/*
+ * How long a photograph's encoding took, from the picture handed to the photo encoder node to the one
+ * it hands on (HEVC in software, see register_hevc_encoder below: the slowest step of a photograph).
+ */
+static void
+time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
+{
+	CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample_buffer);
+	static uint64_t began;
+	static mach_timebase_info_data_t timebase;
+	id connection, input;
+
+	if (image == NULL || CVPixelBufferGetWidth(image) < 2000) {
+		return;                 /* not a photograph */
+	}
+	if (is_node(((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("node")), "BWPhotoEncoderNode")) {
+		if (began != 0) {
+			if (timebase.denom == 0) {
+				mach_timebase_info(&timebase);
+			}
+			say("redwood: mediaserverd: a photograph of %zux%zu encoded in %.0f ms\n", CVPixelBufferGetWidth(image),
+			    CVPixelBufferGetHeight(image), (double)(mach_absolute_time() - began) * timebase.numer / timebase.denom / 1e6);
+		}
+		began = 0;
+		return;
+	}
+	connection = ((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("connection"));
+	input = connection != nil ? ((id (*)(id, SEL))objc_msgSend)(connection, sel_registerName("input")) : nil;
+	if (input != nil && is_node(((id (*)(id, SEL))objc_msgSend)(input, sel_registerName("node")), "BWPhotoEncoderNode")) {
+		began = mach_absolute_time();
+	}
+}
+
 /*
  * A node's output given no sample buffer at all, which no node takes: the session's audio source
  * (-[BWAudioSourceNode _generateSamples]), whose audio unit never started here (see audio_source_start
@@ -345,7 +387,7 @@ gnr_render(id self, SEL selector, void *sample_buffer, id input)
 static IMP original_emit_sample_buffer;
 
 static void
-emit_sample_buffer(id self, SEL selector, void *sample_buffer)
+emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 {
 	static bool said;
 
@@ -356,7 +398,8 @@ emit_sample_buffer(id self, SEL selector, void *sample_buffer)
 		}
 		return;
 	}
-	((void (*)(id, SEL, void *))original_emit_sample_buffer)(self, selector, sample_buffer);
+	time_photo_encoder(self, sample_buffer);
+	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
 }
 
 /*

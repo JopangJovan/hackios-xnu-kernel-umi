@@ -111,6 +111,14 @@ void isp_render_bgra(const struct isp *isp, const struct redwood_camera_frame *f
  * Every pixel at the sensor's own size (f->width x f->height): the two colours a site does not have
  * from the same colour's sites around it (bilinear); rows from first_row to end_row (even), NV12.
  */
+/*
+ * A photograph, width x height: every pixel of the sensor's part the picture shows (the zoom's, turned as the
+ * moving pictures are) demosaiced as isp_render_full_nv12() does, and scaled to the picture between the
+ * two nearest lines and pixels; rows from first_row to end_row (even), NV12.
+ */
+void isp_render_still_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, uint8_t *y,
+    size_t y_stride, uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row,
+    bool video_range);
 void isp_render_full_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
     uint8_t *uv, size_t uv_stride, uint32_t first_row, uint32_t end_row, bool video_range);
 /*

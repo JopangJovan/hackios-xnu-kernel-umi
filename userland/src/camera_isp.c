@@ -711,6 +711,104 @@ isp_render_full_nv12(const struct isp *isp, const struct redwood_camera_frame *f
 	}
 }
 
+/* one line (y) of the sensor demosaiced, as 8-bit R, G, B (the unpacked lines around it in this thread's l) */
+static void
+demosaic_row(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, uint32_t row, const int colour[4],
+    const struct pipe *p, int *const l[3], uint8_t *rgb)
+{
+	for (int i = 0; i < 3; i++) {
+		unpack_line(f, raw, (int)row - 1 + i, l[i]);
+	}
+	full_line(isp, f, (const int *const *)l, row, colour, p, rgb);
+}
+
+void
+isp_render_still_nv12(const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
+    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
+{
+	uint32_t x0, y0, cw, ch, fw = f->width;
+	int colour[4];
+	struct pipe p;
+	static __thread int *lines[3];
+	static __thread uint8_t *rows[2], *out[2];
+	static __thread uint32_t have_fw, have_width;
+	int32_t cached[2] = { -1, -1 };
+
+	if (fw > have_fw) {
+		for (int i = 0; i < 3; i++) {
+			free(lines[i]);
+			lines[i] = malloc(sizeof(int) * fw);
+		}
+		for (int i = 0; i < 2; i++) {
+			free(rows[i]);
+			rows[i] = malloc(3 * (size_t)fw);
+		}
+		have_fw = fw;
+	}
+	if (width > have_width) {
+		for (int i = 0; i < 2; i++) {
+			free(out[i]);
+			out[i] = malloc(3 * (size_t)width);
+		}
+		have_width = width;
+	}
+	if (lines[2] == NULL || rows[1] == NULL || out[1] == NULL) {
+		return;
+	}
+	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
+	cfa(f->bayer, colour);
+	pipe_init(isp, &p);
+	float sx_step = 2.0f * cw / width, sy_step = 2.0f * ch / height;
+
+	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
+		for (int k = 0; k < 2; k++) {
+			uint32_t r = row + k < height ? row + k : row, at = isp->turned ? height - 1 - r : r;
+			float sy = 2.0f * y0 + (at + 0.5f) * sy_step - 0.5f, ty;
+			uint32_t sy0 = sy < 0 ? 0 : (uint32_t)sy, sy1, slot[2];
+
+			sy0 = sy0 > f->height - 1 ? f->height - 1 : sy0;
+			sy1 = sy0 + 1 > f->height - 1 ? f->height - 1 : sy0 + 1;
+			ty = sy < (float)sy0 ? 0 : sy - sy0;
+			/* the two lines of the sensor it is between, demosaiced (kept from the line before where they are the same) */
+			for (int n = 0; n < 2; n++) {
+				uint32_t want = n ? sy1 : sy0;
+
+				if (cached[0] == (int32_t)want || cached[1] == (int32_t)want) {
+					slot[n] = cached[0] == (int32_t)want ? 0 : 1;
+					continue;
+				}
+				/* (into the slot the other line does not need: sy0's for sy1, and sy1's kept for sy0) */
+				slot[n] = n == 1 ? slot[0] ^ 1 : cached[0] == (int32_t)sy1 ? 1 : 0;
+				demosaic_row(isp, f, raw, want, colour, &p, lines, rows[slot[n]]);
+				cached[slot[n]] = (int32_t)want;
+			}
+			const uint8_t *a = rows[slot[0]], *b = rows[slot[1]];
+			uint8_t *o = out[k];
+
+			for (uint32_t x = 0; x < width; x++) {
+				float sx = 2.0f * x0 + (x + 0.5f) * sx_step - 0.5f, tx;
+				uint32_t sx0 = sx < 0 ? 0 : (uint32_t)sx, sx1;
+
+				sx0 = sx0 > fw - 1 ? fw - 1 : sx0;
+				sx1 = sx0 + 1 > fw - 1 ? fw - 1 : sx0 + 1;
+				tx = sx < (float)sx0 ? 0 : sx - sx0;
+				uint8_t *px = o + 3 * (isp->turned ? width - 1 - x : x);
+
+				for (int c = 0; c < 3; c++) {
+					float top = a[3 * sx0 + c] + tx * (a[3 * sx1 + c] - a[3 * sx0 + c]);
+					float bottom = b[3 * sx0 + c] + tx * (b[3 * sx1 + c] - b[3 * sx0 + c]);
+
+					px[c] = (uint8_t)(top + ty * (bottom - top) + 0.5f);
+				}
+			}
+		}
+		bool second = row + 1 < height;
+
+		nv12_pair(out[0], out[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
+		    uv + (size_t)(row / 2) * uv_stride, video_range);
+	}
+}
+
 /* ---- lens shading from a flat field --------------------------------------------------------------------- */
 
 bool

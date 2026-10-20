@@ -38,6 +38,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach/mach_time.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -396,6 +397,8 @@ format(int sensor_width, int sensor_height, int max_fps, bool binned, double fov
 
 /* ---- the stream ------------------------------------------------------------------------------------- */
 
+#define HELD    3               /* the moving pictures kept from the pool after they are given (see deliver) */
+
 struct output {
 	const char *    name;
 	CFDictionaryRef config;                 /* from VideoOutputConfigurations */
@@ -403,7 +406,8 @@ struct output {
 	void *          handler;                /* a block: ^(CVPixelBufferRef, CMTime) */
 	bool            said_shape;
 	uint64_t        delivered, refused;
-	CVPixelBufferRef held;                  /* the picture given last, kept from the pool (see deliver) */
+	CVPixelBufferRef held[HELD];            /* the pictures given last, kept from the pool (see deliver) */
+	unsigned        held_next;
 	bool            said_pool;
 };
 
@@ -811,6 +815,7 @@ struct render_job {
 	const uint8_t *raw;
 	CVPixelBufferRef pb;
 	uint32_t format, width, height, pieces;
+	bool still;                     /* the photograph: every pixel of the sensor (isp_render_still_nv12) */
 };
 
 static void
@@ -824,6 +829,10 @@ render_piece(void *context, size_t i)
 	if (j->format == PF_BGRA) {
 		isp_render_bgra(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddress(j->pb), CVPixelBufferGetBytesPerRow(j->pb), j->width,
 		    j->height, first, end);
+	} else if (j->still) {
+		isp_render_still_nv12(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddressOfPlane(j->pb, 0),
+		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0), CVPixelBufferGetBaseAddressOfPlane(j->pb, 1),
+		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end, j->format == PF_420V);
 	} else {
 		isp_render_nv12(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddressOfPlane(j->pb, 0), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0),
 		    CVPixelBufferGetBaseAddressOfPlane(j->pb, 1), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end,
@@ -856,12 +865,17 @@ output_buffer(struct output *out)
 		}
 		return NULL;
 	}
-	if (CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb) != kCVReturnSuccess && out->held != NULL) {
-		let_go(out);            /* a pool that will not grow by one: the picture kept is the one to have */
-		(void)CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb);
+	for (unsigned i = 0; CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb) != kCVReturnSuccess && i < HELD; i++) {
+		/* a pool that will not grow that far: the oldest picture kept is the one to have */
+		unsigned oldest = (out->held_next + i) % HELD;
+
+		if (out->held[oldest] != NULL) {
+			CVPixelBufferRelease(out->held[oldest]);
+			out->held[oldest] = NULL;
+		}
 		if (!out->said_pool) {
 			out->said_pool = true;
-			say("%s: the graph's pool has no second buffer: the picture on the screen is drawn over", out->name);
+			say("%s: the graph's pool will not grow by %u: fewer pictures kept", out->name, HELD);
 		}
 	}
 	if (pb == NULL) {
@@ -883,9 +897,11 @@ typedef void (^pixel_buffer_handler)(CVPixelBufferRef, CMTime);
 static void
 let_go(struct output *out)
 {
-	if (out->held != NULL) {
-		CVPixelBufferRelease(out->held);
-		out->held = NULL;
+	for (unsigned i = 0; i < HELD; i++) {
+		if (out->held[i] != NULL) {
+			CVPixelBufferRelease(out->held[i]);
+			out->held[i] = NULL;
+		}
 	}
 }
 
@@ -965,9 +981,19 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8 };
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
+	uint64_t began = mach_absolute_time();
 
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+	if (job.still) {
+		static mach_timebase_info_data_t tb;
+
+		if (tb.denom == 0) {
+			mach_timebase_info(&tb);
+		}
+		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
+		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
+	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
 	CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
@@ -985,14 +1011,18 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 
 	((pixel_buffer_handler)out->handler)(pb, pts);
 	/*
-	 * The moving picture's buffer is kept until the next one is given. The preview's pool would
-	 * otherwise hand the same buffer straight back -- the graph lets go of it as soon as it has passed
-	 * it on -- while the window server is still copying it to the screen, and the next frame drawn
-	 * into it showed as bands of two frames, torn across. Kept, it makes the pool take another.
+	 * The moving picture's buffers are kept for HELD frames after they are given. The preview's pool
+	 * would otherwise hand a buffer straight back -- the graph lets go of it as soon as it has passed
+	 * it on -- while it is still on its way to the screen (the preview sink, Camera.app's image queue,
+	 * the window server copying it), and the next frame drawn into it showed as bands of two frames,
+	 * torn across. Kept, they make the pool take others. (One kept was not enough.)
 	 */
 	if (strcmp(out->name, "StillImage") != 0) {
-		let_go(out);
-		out->held = pb;
+		if (out->held[out->held_next] != NULL) {
+			CVPixelBufferRelease(out->held[out->held_next]);
+		}
+		out->held[out->held_next] = pb;
+		out->held_next = (out->held_next + 1) % HELD;
 	} else {
 		CVPixelBufferRelease(pb);
 	}
