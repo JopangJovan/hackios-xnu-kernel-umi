@@ -380,6 +380,21 @@ functions and not entry points at all.
   established**, and 22 kernels binding images successfully is the reason it cannot be read as
   "images do not work".
 
+  **What distinguishes the four is two things, not one**, which is as far as looking at them goes
+  today. Three of them — `FilmGrainLumaKernel_Uint`, `FilmGrainLumaKernel_Unorm`,
+  `FilmGrainChromaKernel_Unorm` — are exactly the kernels that contain an inlined module-local
+  function, and nothing that dispatched contains one. The fourth,
+  `spillCorrectionPreProcess`, contains no call at all and is instead the only kernel in the
+  corpus that binds **four** images, where the next most is three. Seven kernels with the
+  identical shape to the first three — one image, written, no buffers — dispatch without
+  trouble, so the counts alone are not the cause and neither is the image binding as such.
+
+  That is a lead and not a diagnosis: it says where to look (the inlining path, and separately
+  whatever four images do that three do not) and it does not say what is wrong. The temptation
+  here is to fix the likelier of the two and report the number that follows; what this file has
+  learned is that a fix without a mechanism is how two of the three earlier attempts on this very
+  function were spent.
+
   The row for a call of a module-local function was 5 until those calls were translated; it is now
   gone, its five having moved to softpipe (four) and the shuffle mask (one). Twice in a row the
   dispatched count on softpipe stayed at 6 while a column stopped being ours, and the run above is
