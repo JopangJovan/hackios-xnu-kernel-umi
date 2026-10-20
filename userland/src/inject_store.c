@@ -778,6 +778,57 @@ new_postNotification(id self, SEL cmd, id note)
 }
 
 /*
+ * THE SIXTH SHAPE OF AN INSTRUMENT THAT LIES: THE WRONG SLICE. The loader's log keeps the first
+ * 256 KB and the last 1 MB and throws away the middle when a run overruns it, saying so in one line
+ * -- "the log between the first 256 KB and the last 1 MB was dropped". Every run of this library has
+ * hit it: 1 466 624 bytes, every time, with the middle gone. Anything printed once, in the middle of
+ * a run, was never going to be read, and several measurements here were "missing" for that reason
+ * alone and for no reason in the system at all.
+ * So nothing that matters is printed once. Keys are remembered and printed again in every report,
+ * the way promises and tasks already are, because the reports repeat and a later one lands in the
+ * part of the log that is kept. (The other five shapes are listed beside the hooks below.)
+ */
+#define BAGKEYS 64
+static struct bagkey_note {
+	char key[72];
+	unsigned asked;
+	unsigned answered;
+} bagkeys[BAGKEYS];
+static unsigned bagkey_count;
+static pthread_mutex_t bagkey_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+note_bagkey(const char *key, bool answered)
+{
+	pthread_mutex_lock(&bagkey_lock);
+	for (unsigned i = 0; i < bagkey_count; i++) {
+		if (strncmp(bagkeys[i].key, key, sizeof(bagkeys[0].key) - 1) == 0) {
+			bagkeys[i].asked++;
+			bagkeys[i].answered += answered ? 1 : 0;
+			pthread_mutex_unlock(&bagkey_lock);
+			return;
+		}
+	}
+	if (bagkey_count < BAGKEYS) {
+		strlcpy(bagkeys[bagkey_count].key, key, sizeof(bagkeys[0].key));
+		bagkeys[bagkey_count].asked = 1;
+		bagkeys[bagkey_count].answered = answered ? 1 : 0;
+		bagkey_count++;
+	}
+	pthread_mutex_unlock(&bagkey_lock);
+}
+
+static void
+dump_bagkeys(void)
+{
+	say("redwood: store: %u bag keys asked for\n", bagkey_count);
+	for (unsigned i = 0; i < bagkey_count; i++) {
+		say("redwood: store: bag key %-44s asked %u, answered %u%s\n", bagkeys[i].key, bagkeys[i].asked,
+		    bagkeys[i].answered, bagkeys[i].answered == 0 ? "   <-- THE BAG HAS NOT GOT IT" : "");
+	}
+}
+
+/*
  * A GRAPH OF PROMISES, not a list of calls. One promise in seventeen is ever finished here, and
  * naming the next deadlock by hand would take a slot each: what is wanted is the root -- a promise
  * with waiters, no finish, and a producer that is itself waiting on nothing anybody is fulfilling.
@@ -1184,6 +1235,8 @@ dump_selectors(const char *class_name, const char *needle)
 static void
 one_report(unsigned seconds)
 {
+	bool first = seconds <= 15;
+
 	say("redwood: store(%s): report at %u s\n", who, seconds);
 	image_added(NULL, 0);           /* and try again for anything whose class has turned up since */
 	/*
@@ -1218,13 +1271,17 @@ one_report(unsigned seconds)
 	}
 	dump_promises();
 	dump_tasks();
+	dump_bagkeys();
 	dump_threads();
-	dump_selectors("AMSURLSession", "equest");
-	dump_selectors("JEBrotliDecoder", NULL);
-	dump_selectors("_TtGC9JetEngine7PromiseT__", NULL);
-	dump_selectors("JetEngine", NULL);
-	dump_classes("Jet");
-	dump_classes("JE");
+	/* the long dumps once; the numbers in every report, because only a late one survives the log */
+	if (first) {
+		dump_selectors("AMSURLSession", "equest");
+		dump_selectors("JEBrotliDecoder", NULL);
+		dump_selectors("_TtGC9JetEngine7PromiseT__", NULL);
+		dump_selectors("JetEngine", NULL);
+		dump_classes("Jet");
+		dump_classes("JE");
+	}
 	say("redwood: store: %lu notifications posted\n", notifications);
 }
 
@@ -1236,9 +1293,17 @@ one_report(unsigned seconds)
 static void *
 late_report(__unused void *ignored)
 {
-	for (unsigned minute = 1; minute <= 5; minute++) {
-		sleep(60);
-		one_report(minute * 60);
+	/*
+	 * Every fifteen seconds, to the end of the run. The loader keeps the first 256 KB and the last
+	 * 1 MB of a run's log and drops everything between, and with iOS and REST=1 the middle is most
+	 * of it: a report once a minute still fell inside the hole, twice in a row, which is why these
+	 * measurements kept looking missing when nothing was wrong with them. Often enough that one
+	 * lands in the last megabyte is the only thing that works, so the long dumps happen once and the
+	 * numbers repeat.
+	 */
+	for (unsigned n = 1; n <= 40; n++) {
+		sleep(15);
+		one_report(n * 15);
 	}
 	return NULL;
 }
@@ -1471,15 +1536,12 @@ new_bagValue(id self, SEL cmd, void *error)
 	 */
 	entered[COUNT_bagValue]++;
 	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-	say("redwood: store: BAG KEY %s\n", text_of(self, which, sizeof(which)));
 	result = old_bagValue(self, cmd, error);
 	returned[COUNT_bagValue]++;
 	{
 		id *out = (id *)error;          /* the out-parameter is declared void * here; it is an NSError ** */
 
-		say("redwood: store: BAG KEY %s -> %s%s%s\n", text_of(self, which, sizeof(which)),
-		    result != NULL ? "a value" : "NOTHING", out != NULL && *out != NULL ? ", error " : "",
-		    out != NULL && *out != NULL ? text_of(*out, frames, sizeof(frames)) : "");
+		note_bagkey(text_of(self, which, sizeof(which)), result != NULL);
 	}
 	return result;
 }
