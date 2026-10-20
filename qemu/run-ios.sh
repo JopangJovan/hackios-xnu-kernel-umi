@@ -3,6 +3,13 @@
 # address (it becomes /dev/md0, the root) and the small image in the payload (/dev/md1), the
 # same arrangement `xl ramdisk` + `xl run` make on the phone.
 # usage: run-ios.sh [seconds] [extra qemu args...]
+#
+# Counting anything in the log this writes: every console line comes out TWICE, the second copy in a
+# block replayed some thousands of lines later (take any launchd line and grep -n it). So `grep -c` gives
+# about double, and `sort -u` does not fix it either, because other processes' output interleaves and
+# splits one of the two copies. Count distinct events instead -- by timestamp, or by program and pid for
+# "Successfully spawned". The phone's logs do not do this; `xl log` fetches the buffer once.
+#
 # env: ROOT=<small image>, IMG=<system image>, CMDLINE=<extra boot-args>
 #      QEMU_RAM_GB=<n>     the guest's RAM, default 7: memory then ends where the phone's does and the
 #                          kernel gets the same 4.2 GB window (the system image included) as on the phone.

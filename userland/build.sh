@@ -10,13 +10,15 @@
 #                                   after init's checks; rc.ios runs a few iOS programs and halts
 #                      JOBS="..."   labels of the stock iOS launchd jobs to load (default: IOS_JOBS)
 #                      REST=1       ... and the rest of them, started only when asked for (see mkjobs.py)
-#                      WIFID=1      ... and wifid, iOS's Wi-Fi daemon (see below at IOS_JOBS)
+#                      WIFID=0      without wifid, iOS's Wi-Fi daemon, which is in by default (see below)
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
 #                                   (default: src/inject.c in backboardd, src/inject_sb.c in SpringBoard,
 #                                   src/inject_media.c in mediaserverd);
 #                                   init hands the list to the kernel (etc/inject.conf -> sysctl kern.exec_inject)
+#                      STOREFRONT=1 ... and src/inject_store.c inside appstored: the storefront answered,
+#                                   and a bag request watched for (an experiment; see that file)
 #                      EXTRA="..."  more programs for /redwood/bin (files on this machine): one-off
 #                                   diagnostics, which a file given as RC_JOBS can then run
 #                      EXTRA_SHARE="..." directories on this machine to copy whole into /redwood/share,
@@ -60,7 +62,11 @@
 #                    changing the recipe below).
 #   flashboot.apfs   FLASHBOOT=1: the RAM part of a boot whose root is the iOS volume on the phone's
 #                    flash (see below); with CRYPTEXES=flash the boot volume alone, the cryptexes being
-#                    on the flash
+#                    on the flash. FLASHBOOT=1 also decides what goes into root.apfs: the job list is
+#                    then made for the whole iOS volume (mkjobs.py --root-volume), so it holds daemons
+#                    -- fairplayd, identityservicesd, passd ... -- that the system image has not got.
+#                    That root.apfs is for a flash boot; a RAM boot wants one built without FLASHBOOT=1,
+#                    or launchd will fail to start those few when something asks for them.
 #
 #   PREBUILT=1       do not compile anything: take our programs from ../prebuilt/userland (this is also
 #                    what happens when the cross toolchain is not set up, see ../xnu-deps/setup.sh);
@@ -99,10 +105,17 @@ IOS_JOBS=${JOBS-"
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
 	com.apple.SpringBoard
 "}
-# WIFID=1: iOS's own Wi-Fi daemon as well, for Settings to have a Wi-Fi to show: the kernel answers it in
+# iOS's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
 # bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
 # networks the radio hears. NOT FINISHED: a network cannot be joined from Settings yet.
-[ -n "$WIFID" ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
+# It is in by default now, because it costs nothing where there is no radio at all: in QEMU it comes up, talks
+# to itself about country codes and sits there -- 114 processes started against 119 without it, no crash, never
+# restarted -- and it answers what the rest of the system keeps asking for anyway. com.apple.wifi.manager, which
+# wifid registers itself rather than declaring in its plist, fell from 30 failed lookups a session to 3,
+# com.apple.private.corewifi-xpc from 1 to none, and the session's whole failed-lookup count from 331 to 305.
+# (Count a QEMU run log with its duplicate lines removed: run-ios.sh prints launchd's log twice.)
+# WIFID=0 leaves it out.
+[ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is
 # libredwood-media.dylib).
@@ -117,6 +130,14 @@ INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd cont
 /redwood/lib/libredwood-media.dylib mediaserverd
 /redwood/lib/libredwood-app.dylib Sileo
 /redwood/lib/libredwood-tweaks.dylib Preferences"}
+# STOREFRONT=1: and a library of ours inside appstored as well (src/inject_store.c). It is not in the
+# list above because it changes what the daemon believes: AMS's account is made to answer with the
+# storefront Apple's bag server returned for this device, which is how the App Store is asked whether
+# a storefront is the only thing it is missing. It also writes down whether a bag request is ever
+# built at all. For an experiment, not for an image anybody else boots.
+[ -n "$STOREFRONT" ] && INJECT="$INJECT
+/redwood/lib/libredwood-store.dylib appstored AppStore
+/redwood/lib/libredwood-fairplay.dylib fairplayd.H2"
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -190,6 +211,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
+		# (the account database answers only a client with the entitlements its own daemons hold: src/store_test.m)
+		$DYN -fobjc-arc -framework Foundation -framework Accounts -o obj/store_test src/store_test.m &&
+			{ ${LDID:-ldid} -Ssrc/store_test.entitlements obj/store_test 2>/dev/null ||
+			  echo "build.sh: no ldid: store_test is unsigned, and accountsd will not show it the accounts"; }
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
 			{ ${LDID:-ldid} -Ssrc/battery_test.entitlements obj/battery_test 2>/dev/null ||
@@ -217,6 +242,17 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libredwood-media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
+		# ... and inside appstored (STOREFRONT=1), which answers with a storefront and watches for a bag
+		# request being built (src/inject_store.c)
+		# (-lc++abi for __cxa_throw: every C++ exception thrown in the process is watched, which is how
+		#  the jetpack parser's rejections are seen -- a throw somebody catches logs nothing of itself)
+		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-store.dylib -framework CoreFoundation -lobjc \
+			-lc++abi -o obj/libredwood-store.dylib src/inject_store.c
+		# ... and inside fairplayd.H2, which starts and leaves at once: what it looks for, and where it
+		# gives up (src/inject_fairplay.c; watches only, replaces nothing)
+		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-fairplay.dylib -framework CoreFoundation \
+			-framework IOKit -framework Security -lMobileGestalt \
+			-o obj/libredwood-fairplay.dylib src/inject_fairplay.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
 		$DYN -bundle -framework CoreFoundation -o obj/RedwoodAudio src/audio_plugin.c
 		if [ -n "$GL" ]; then
@@ -252,6 +288,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
+	[ -f obj/store_test ] && cp obj/store_test root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
@@ -267,6 +304,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
+	[ -f obj/libredwood-store.dylib ] && cp obj/libredwood-store.dylib root/lib/
+	[ -f obj/libredwood-fairplay.dylib ] && cp obj/libredwood-fairplay.dylib root/lib/
 	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
 	[ -f obj/libredwood-tweaks.dylib ] && cp obj/libredwood-tweaks.dylib root/lib/
 	if [ -f obj/RedwoodAudio ]; then
@@ -338,9 +377,15 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# kernel's log; the daemons keep their own standard error on the console all the same.
 	rm -f root/etc/quiet
 	[ -n "$QUIET" ] && : > root/etc/quiet
-	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory)
+	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory).
+	# With FLASHBOOT=1 the root will be Apple's whole volume on the flash, not the part of it that fits in
+	# the system image, so mkjobs.py judges "is this daemon's program there" by the listing of the volume
+	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
+	# fairplayd among them).
 	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
-	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $IOS/rootfs root/LaunchDaemons $IOS_JOBS
+	VOLUME=""
+	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
+	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
 # (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/redwood_adreno.c, finds it in fw/

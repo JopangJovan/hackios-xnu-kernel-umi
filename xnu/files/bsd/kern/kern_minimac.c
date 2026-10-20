@@ -250,6 +250,13 @@ minisandbox_policy_syscall(struct proc *p, int call, user_addr_t arg)
  * com.apple.private.network.socket-delegate -- without which NECP said "does not hold the
  * necessary entitlement to delegate network traffic" -- and so on).
  *
+ * That NECP line is worth knowing for what it is NOT: it costs nothing. The macro that prints it
+ * (bsd/net/necp.c, NECP_VERIFY_DELEGATION_ENTITLEMENT) only breaks out of the parameter it was
+ * reading, so the delegation is dropped and the policy is matched against the caller itself; no
+ * error is returned and no connection is refused. A session where trustd prints it four hundred
+ * times is a session where trustd's own connections all go through. A stock iPhone prints it too.
+ * It is noise, not a wall -- do not go looking for a daemon's missing network behind it.
+ *
  *   PRIV_WORK_INTERVAL    is granted to every process, entitlement or not: telling the scheduler
  *                         about the work of drawing a frame. UIKit does it as soon as anything
  *                         scrolls, and takes a refusal for a programming error ("Failed to create
