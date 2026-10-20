@@ -170,7 +170,8 @@ enum {
 	COUNT_prepareRequest, COUNT_finishWithResult, COUNT_finishWithError, COUNT_finishFunnel,
 	COUNT_finishResultError, COUNT_thenWithBlock, COUNT_continueWithBlock, COUNT_bagValue,
 	COUNT_resultBefore, COUNT_afterUpdating, COUNT_addCookies4, COUNT_fpDeviceType, COUNT_brotli,
-	COUNT_processStream, COUNT_updateStorefront, COUNT_addCookiesBlocking, COUNT_last
+	COUNT_processStream, COUNT_updateStorefront, COUNT_addCookiesBlocking, COUNT_dataTaskCreated,
+	COUNT_last
 };
 static const char *const counted[COUNT_last] = {
 	"-[ACAccount ams_storefront]", "-[AMSBagNetworkDataSource cachedStorefront]",
@@ -198,6 +199,7 @@ static const char *const counted[COUNT_last] = {
 	"-[JPReader processStream:signatureVerifier:options:error:]",
 	"-[ACAccountStore _updateStorefrontInLocalAccount:]",
 	"ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies: (answered empty)",
+	"-[NSURLSession dataTaskWithRequest:...] (created, not resumed)",
 };
 static unsigned long entered[COUNT_last];
 /*
@@ -460,6 +462,70 @@ new_brotli(id self, SEL cmd, void *a, void *b, void *c, void *d)
 		say("redwood: store: BROTLI decompressStream -> %ld (call %lu)\n", result, returned[COUNT_brotli]);
 	}
 	return result;
+}
+
+/*
+ * AND THE SHARPER FACT, which was in the task report all along and wanted reading for the thing
+ * nobody was looking for: THE APP MAKES EXACTLY FOUR REQUESTS AND NONE OF THEM IS FOR CONTENT.
+ * Three sessions, four tasks each, every time the same four: the bag twice, and
+ * apps.mzstatic.com/.../ios-appstore.jetpack twice. The jetpack is the store's user interface, not
+ * its content; the Today page's items come from a separate feed (amp-api), and no such request is
+ * ever made. So "the page is parsed and not drawn" is better said as: nothing ever asks for anything
+ * to draw. That moves the question from "why does JetEngine not draw this document" to "what should
+ * have asked for the content once the document was loaded, and why does it not".
+ * The next thing to measure is accordingly one step earlier: a task that is created and never
+ * resumed is a different story from a task that is never created, and they look the same in a report
+ * that only counts resumes. Both are counted now.
+ */
+static id (*old_dataTaskLocal)(id, SEL, void *, void *);
+static id
+new_dataTaskLocal(id self, SEL cmd, void *request, void *handler)
+{
+	id task;
+	char buffer[260];
+
+	entered[COUNT_dataTaskCreated]++;
+	task = ((id (*)(id, SEL, void *, void *))old_dataTaskLocal)(self, cmd, request, handler);
+	returned[COUNT_dataTaskCreated]++;
+	say("redwood: store: TASK CREATED %s\n", text_of((id)request, buffer, sizeof(buffer)));
+	return task;
+}
+
+static id (*old_dataTaskPlain)(id, SEL, void *);
+static id
+new_dataTaskPlain(id self, SEL cmd, void *request)
+{
+	id task;
+	char buffer[260];
+
+	entered[COUNT_dataTaskCreated]++;
+	task = ((id (*)(id, SEL, void *))old_dataTaskPlain)(self, cmd, request);
+	returned[COUNT_dataTaskCreated]++;
+	say("redwood: store: TASK CREATED (no handler) %s\n", text_of((id)request, buffer, sizeof(buffer)));
+	return task;
+}
+
+/* and what of JetEngine's own surface is reachable from here at all */
+static void
+dump_classes(const char *needle)
+{
+	unsigned count = 0;
+	Class *classes = objc_copyClassList(&count);
+	unsigned shown = 0;
+
+	if (classes == NULL) {
+		return;
+	}
+	for (unsigned i = 0; i < count && shown < 40; i++) {
+		const char *name = class_getName(classes[i]);
+
+		if (name != NULL && strstr(name, needle) != NULL) {
+			shown++;
+			say("redwood: store: class %s\n", name);
+		}
+	}
+	free(classes);
+	say("redwood: store: %u classes in all, %u named like \"%s\"\n", count, shown, needle);
 }
 
 /*
@@ -1045,6 +1111,8 @@ one_report(unsigned seconds)
 	dump_threads();
 	dump_selectors("AMSURLSession", "equest");
 	dump_selectors("JEBrotliDecoder", NULL);
+	dump_classes("Jet");
+	dump_classes("JE");
 	say("redwood: store: %lu notifications posted\n", notifications);
 }
 
@@ -1423,6 +1491,12 @@ static struct replacement replacements[] = {
 	  (IMP *)&old_fpDeviceType, false },
 	{ "AMSBagValue", "valueWithError:", false, (IMP)new_bagValue, (IMP *)&old_bagValue, false },
 	{ "AMSPromise", "resultBeforeDate:error:", false, (IMP)new_resultBefore, (IMP *)&old_resultBefore, false },
+	{ "__NSURLSessionLocal", "dataTaskWithRequest:completionHandler:", false, (IMP)new_dataTaskLocal,
+	  (IMP *)&old_dataTaskLocal, false },
+	{ "NSURLSession", "dataTaskWithRequest:completionHandler:", false, (IMP)new_dataTaskLocal,
+	  (IMP *)&old_dataTaskLocal, false },
+	{ "__NSURLSessionLocal", "dataTaskWithRequest:", false, (IMP)new_dataTaskPlain,
+	  (IMP *)&old_dataTaskPlain, false },
 	{ "NSURLSessionTask", "resume", false, (IMP)new_resume_base, (IMP *)&old_resume_base, false },
 	{ "__NSCFLocalSessionTask", "resume", false, (IMP)new_resume_local, (IMP *)&old_resume_local, false },
 };
