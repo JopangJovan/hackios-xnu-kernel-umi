@@ -11,15 +11,15 @@ correct**: correctness needs the CPU reference and a run on the GPU.
 | --- | --- | --- |
 | container | 456 | 100% |
 | reader | 456 | 100% |
-| translate | 318 | 70% |
-| ir3 | 318 | 70% |
+| translate | 321 | 70% |
+| ir3 | 321 | 70% |
 
 ## By stage of the shader
 
 | what the module is | modules | translate | ir3 |
 | --- | --- | --- | --- |
 | fragment | 271 | 271 | 271 |
-| kernel | 47 | 44 | 44 |
+| kernel | 47 | 47 | 47 |
 | vertex | 3 | 3 | 3 |
 | visible | 135 | 0 | 0 |
 
@@ -30,9 +30,9 @@ The container's TYPE tag agrees with the module's own metadata on 456 of 456; 0 
 | library | modules | translate | ir3 |
 | --- | --- | --- | --- |
 | AppleMetalGLRenderer.bundle/default.metallib | 274 | 274 | 274 |
-| PortraitFilters.cifilter/default.metallib | 36 | 35 | 35 |
+| PortraitFilters.cifilter/default.metallib | 36 | 36 | 36 |
 | PortraitFilters.cifilter/portrait_filters.metallib | 135 | 0 | 0 |
-| VideoDecoders/AV1SW.metallib | 11 | 9 | 9 |
+| VideoDecoders/AV1SW.metallib | 11 | 11 | 11 |
 
 ## Modules that call no `air.*` at all
 
@@ -43,7 +43,6 @@ The container's TYPE tag agrees with the module's own metadata on 456 of 456; 0 
 | modules | where it stops |
 | --- | --- |
 | 135 | stage: air.visible, a library function (not yet) |
-| 3 | instruction: a shuffle mask that is not constant |
 
 ## The `air.*` functions the corpus calls
 
