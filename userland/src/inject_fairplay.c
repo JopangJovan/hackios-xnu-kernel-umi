@@ -291,6 +291,42 @@ watched_sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in, 
 	return result;
 }
 
+/*
+ * ... and the private name underneath it. The hook on sysctl() did not fire once while the trace
+ * counted thirty-three of them, because inside libsystem the call is __sysctl: a stub is interposed
+ * only where another image calls through it. That is the wrong-name shape for the fourth time on
+ * this branch, and the answer each time is the same -- hook every name the thing is known by, and
+ * let the one that never fires say so.
+ */
+extern int __sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in, size_t in_size);
+
+static int
+watched___sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in, size_t in_size)
+{
+	int result = __sysctl(mib, count, out, out_size, in, in_size);
+
+	if (ours && mib != NULL && count >= 1) {
+		say("redwood: fairplayd: sysctl [%d %d %d %d] (%u deep) -> %d\n", mib[0], count > 1 ? mib[1] : -1,
+		    count > 2 ? mib[2] : -1, count > 3 ? mib[3] : -1, count, result);
+	}
+	return result;
+}
+
+/* the channel to AMFI and the sandbox: twelve calls a life, and one of the few things left */
+extern int __mac_syscall(const char *policy, int call, void *arg);
+
+static int
+watched___mac_syscall(const char *policy, int call, void *arg)
+{
+	int result = __mac_syscall(policy, call, arg);
+
+	if (ours) {
+		say("redwood: fairplayd: __mac_syscall(\"%s\", %d) -> %d\n", policy != NULL ? policy : "(null)",
+		    call, result);
+	}
+	return result;
+}
+
 static int
 watched_sysctlbyname(const char *name, void *out, size_t *out_size, void *in, size_t in_size)
 {
@@ -474,6 +510,8 @@ __attribute__((used)) static struct {
 	{ (const void *)watched_open, (const void *)open },
 	{ (const void *)watched_sysctlbyname, (const void *)sysctlbyname },
 	{ (const void *)watched_sysctl, (const void *)sysctl },
+	{ (const void *)watched___sysctl, (const void *)__sysctl },
+	{ (const void *)watched___mac_syscall, (const void *)__mac_syscall },
 	{ (const void *)watched_dlopen, (const void *)dlopen },
 	{ (const void *)watched_xpc_connection_create_mach_service, (const void *)xpc_connection_create_mach_service },
 	{ (const void *)watched_stat, (const void *)stat },
