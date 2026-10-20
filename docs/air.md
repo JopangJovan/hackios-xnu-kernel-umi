@@ -159,6 +159,19 @@ functions and not entry points at all.
   declares nothing and this frontend declares nothing, which is exactly why two independent paths
   returned the same wrong number. **The hardware can round; ir3 only asks when someone else has
   asked first, and supplies no default where IEEE-754 and GLSL both require round-to-nearest.**
+  **How much this reaches is a number and not an adjective.** Of the 456 modules of the corpus, 20
+  contain a conversion the patch can change — a `u2f`, an `i2f` or an `f2f16`, the three that
+  round; none contains only the exact kinds (`f2f32`, `b2f`), where setting the mode cannot alter a
+  value. So on the Metal side the blast radius is 20 modules, not all 313 that translate, and
+  whether each of those 20 actually changes depends on the values it meets at run time.
+
+  That bounds this frontend's half and says nothing about the other. The port's OpenGL ES reaches
+  ir3 through Mesa's own GLSL compiler, which this check does not look at, so **"it changes
+  everything ir3 compiles, the window server included" is reasoning and not measurement.** A peer
+  session is putting that to a visual test — an ordinary boot to the home screen with the patch,
+  compared against one without it — because the claim is the part of this that would matter to
+  someone deciding whether to carry the patch, and it is the part with no runs behind it.
+
   The fix is one line, and unlike the `ir3_cmdline` bug this one is in a file upstream still
   carries, with reproduction down two independent paths — so it is the first thing in this work
   that can actually be reported. The change is now carried here as `tools/mesa/ir3-round-default.patch`, measured on the
