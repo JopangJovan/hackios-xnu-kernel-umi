@@ -20,8 +20,8 @@ Of the 456 modules of the device's system `.metallib` files (`tools/air/check.sh
 | | of 456 |
 | --- | --- |
 | read by our own bitcode reader, byte for byte as `llvm-dis` reads them | 456 |
-| translated to NIR, passing `nir_validate` | 315 |
-| compiled by ir3 into Adreno machine code | 315 |
+| translated to NIR, passing `nir_validate` | 318 |
+| compiled by ir3 into Adreno machine code | 318 |
 | numerically identical to LLVM's own execution, and drawn | 255 |
 | **run on the phone's GPU** | **7** |
 
@@ -41,7 +41,7 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | texture operations with a case softpipe cannot run: a 16-bit result | 7 |
 | texture operations with no case: multisample, depth, write | 11 |
 
-315 of 456 is 315 of 321 entry points — 98.1% — because 135 modules are `air.visible` library
+318 of 456 is 318 of 321 entry points — 99.1% — because 135 modules are `air.visible` library
 functions and not entry points at all.
 
 **What those numbers are not**, because they will be quoted without this paragraph otherwise:
@@ -309,52 +309,35 @@ functions and not entry points at all.
   they are evidence about is binding, descriptors and ir3's texture instructions — exactly what
   they were built to be — and silence about everything Metal's sampler state decides. Two modules
   of the corpus declare a `constexpr sampler`; everywhere else the API supplies it.
-- **Four modules call a function that takes a texture, and that is attempted and not done.**
-  `air.convert`-style arguments pass through a `nir_call` happily; a texture does not, because
-  this frontend resolves a texture at translation time into a binding and `tex_handle` wants an
-  `AIR_VAL_PTR`, not an SSA def. The attempt, kept here so it is not repeated from the start:
+- **A function of the module that takes a texture: done, and the diagnosis was the work.** Three
+  of the four such entry points now translate; the fourth stops on the non-constant shuffle mask
+  it would have stopped on anyway. The fix is a split of `translate_globals`, and arriving at it
+  took two reverts and three failed guesses, which is the part worth keeping.
 
-  - binding the pointer-class arguments from the caller's own resolution and passing only the
-    rest as NIR parameters **works** — "argument 0 is not a texture" goes away, and one of the
-    four, `FilmGrainChromaKernel_Uint`, gets past the call to a different limit (a shuffle mask
-    that is not constant);
-  - the module's own values have to be carried into the callee's fresh value table rather than
-    re-registered, because `translate_globals` is not idempotent: it appends to
-    `info->resources` and adds to `shared_size`, so a second run invents an inline sampler and
-    doubles the threadgroup memory. Copying the `module_values` set is the right carry;
-  - and then three of the four **crash**, in `nir_lower_goto_ifs` → `nir_repair_ssa` →
-    `nir_block_is_unreachable`, on an assertion that dominance metadata is valid. Marking the
-    hand-built callee impl's metadata invalid (`nir_metadata_preserve(impl, nir_metadata_none)`)
-    does not fix it, and the obvious hypothesis — that the callee has unreachable blocks, which
-    is what that predicate is about — is **wrong**: these callees have no `unreachable`
-    terminator at all.
+  A texture is not a value in this frontend: it is resolved at translation time into a binding,
+  and `tex_handle` wants an `AIR_VAL_PTR` rather than an SSA def. So a pointer-class argument is
+  bound from the caller's own resolution and takes no NIR parameter, which specialises the callee
+  to its call site — free here, since each of the four has exactly one. That much worked at once.
 
-  **The diagnosis is now complete, and it is the second bullet above that causes the third.** A
-  peer session read `nir_dominance.c` and pointed out what the assertion actually says:
-  `nir_block_is_unreachable` asks *the block's own* `nir_function_impl` for its dominance
-  metadata, and `nir_repair_ssa` requires that metadata only on the impl it was called for. So a
-  use sitting in another function's block makes it ask the wrong function — nothing to do with a
-  block being unreachable, which is why that hypothesis failed.
+  What did not was everything after. The callee needs the module's globals, and copying the entry
+  point's values into it crashed three of the four in `nir_lower_goto_ifs` → `nir_repair_ssa` →
+  `nir_block_is_unreachable`. **Two hypotheses died with evidence before the right one arrived**:
+  the callee has no unreachable block at all, and `nir_validate_shader` — the test a peer session
+  proposed for it — fails identically on `fbs_slice_trilinear`, which translates perfectly, so
+  its complaint about block indices in an unstructured impl was true and about something else.
+  The peer's reading of the assertion was right and their route was not: it asks *the block's own*
+  impl for dominance metadata, so a use in another function's block asks the wrong function — but
+  the cross-function value arrived through the globals, not through an argument. A guard refusing
+  a pointer argument with a byte offset was evaluated 26 times over the corpus and never fired, so
+  arguments are not the carrier; the count is the evidence, because a silent guard and an
+  unreachable guard look the same.
 
-  Their proposed test, `nir_validate_shader` before `nir_lower_goto_ifs`, did not settle it and
-  taught something anyway: it fails identically on `fbs_slice_trilinear`, which translates
-  perfectly. Its complaints are about block indices in an unstructured impl, which nothing indexes
-  before `nir_lower_goto_ifs` — pre-existing and benign, and they masked the real thing.
-
-  The carrier is the `module_values` copy. A probe printing any copied value that holds an
-  `nir_def` found five in `FilmGrainLumaKernel_Uint` alone, of both kinds: a pointer with a byte
-  offset and a plain SSA value. Those defs were created in the *entry point's* impl by
-  `translate_globals`, so copying the values into a callee leaves the callee using the caller's
-  values — exactly the cross-function def/use the peer described, arriving through the globals
-  rather than through an argument. An argument cannot carry one: a guard refusing a pointer
-  argument with an offset never fired, so every pointer argument here has none.
-
-  **So the fix is known and is not a third guess**: `translate_globals` must be split, the part
-  that assigns bindings and appends to `info->resources` running once, and the part that
-  materialises `nir_def`s running per impl, so each callee builds its own. That is a change to
-  shared code that handles six kinds of global, and it is not started. The state above is the
-  committed one; each of the four modules has exactly one call site, so specialising per site
-  costs nothing in duplication once this is done.
+  So `translate_globals` is now two. `plan_globals` decides what each global is and runs **once**,
+  because it appends inline samplers to `info->resources` and lays out shared and scratch memory.
+  `materialise_globals` builds the values and runs **per function**, because a byte offset is an
+  `nir_def` and a def belongs to the impl that made it. Module-level constants needed neither:
+  `air_get` already materialises one in whichever builder asks, which was checked rather than
+  assumed.
 
 - **Of Apple's own 47 kernels, 6 are dispatched, all on software.** `tools/air/kernelcheck.py`
   prints where each one stops, as a table whose rows are checked against the total before it is
@@ -364,9 +347,14 @@ functions and not entry points at all.
   | --- | --- |
   | dispatched and read back | 6 |
   | refused by this harness | 0 |
-  | softpipe's `nir_to_tgsi`: scratch and intrinsics it lacks (ir3 has these) | 34 |
-  | calls an `air.visible` library function in the module | 5 |
-  | a shuffle mask that is not constant | 2 |
+  | softpipe's `nir_to_tgsi`: scratch and intrinsics it lacks (ir3 has these) | 38 |
+  | calls a function the module defines | 0 |
+  | a shuffle mask that is not constant | 3 |
+
+  The row for a call of a module-local function was 5 until those calls were translated; it is now
+  0, and its five went to the two rows below it — four to softpipe and one to the shuffle mask. The
+  dispatched count did not move, which is the same shape as before: the wall is no longer ours and
+  the number behind it is unchanged.
 
   The 6 is the honest number and not the interesting one. Until 20 October, 24 of these were
   refused by `air_run` itself — it bound textures and images for a draw and not for a dispatch —
