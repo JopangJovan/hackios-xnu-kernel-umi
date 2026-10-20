@@ -21,9 +21,25 @@
 #                                   and a bag request watched for (an experiment; see that file)
 #                      EXTRA="..."  more programs for /redwood/bin (files on this machine): one-off
 #                                   diagnostics, which a file given as RC_JOBS can then run
+#                      EXTRA_SHARE="..." directories on this machine to copy whole into /redwood/share,
+#                                   each under its own name: the data a one-off diagnostic reads, when it
+#                                   needs more than a program (tools/air/intrincheck.py --emit writes such
+#                                   a directory). This goes into the boot volume, which every recipe
+#                                   carries and which the flash recipe puts in RAM, so its size is paid
+#                                   for at every boot -- a few megabytes, not more
 #                      RC_JOBS=<file> what the job com.redwood.demo runs: rc.jobs (default), or
 #                                   rc.jobs.unlock, which also swipes the lock screen away (for the phone,
-#                                   where nothing else can touch the screen yet)
+#                                   where nothing else can touch the screen yet).
+#                                   A job list cannot assume a shell. iOS 16.5's own root has none at all
+#                                   -- /bin is df and ps, and nothing else -- so a line beginning /bin/sh
+#                                   fails with "No such file or directory" and status 127 on a flash-root
+#                                   boot. The /var/jb/bin/sh that rc.jobs.jb and rc.jobs.sileo run is the
+#                                   package manager's prefix, which only a JB=1 image carries. And init
+#                                   runs these lines itself (src/init.c, run_command): words split on
+#                                   blanks, no quoting, no variable assignment, no redirection beyond a
+#                                   trailing ">> FILE" and "&". So a program that needs a value passed to
+#                                   it needs an option for it, not an environment variable -- which is why
+#                                   air_run grew --buffer.
 #                      GL=1         with an OpenGL ES implementation for the window server: Mesa
 #                                   (tools/mk-mesa.sh fetches and builds it) behind src/eagl.c, as
 #                                   lib/libOSMesa.8.dylib (15 MB) and lib/libredwood-gl.dylib. Where the
@@ -156,6 +172,15 @@ cp com.redwood.varstore.plist root/LaunchDaemons/
 echo "Darwin on redwood: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
+# EXTRA_SHARE: whole directories of data for a one-off diagnostic, each under its own name. Here and
+# not in root/bin, because what goes in is not a program: a generated test suite is modules and the
+# bytes they read, and the job list runs it by its own run.sh. -L so that a directory assembled out
+# of symbolic links arrives as files, since the image is made from this tree and not from the links'
+# targets.
+for d in $EXTRA_SHARE; do
+	[ -d "$d" ] || { echo "build.sh: EXTRA_SHARE: $d is not a directory"; exit 1; }
+	cp -rL "$d" root/share/
+done
 if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -z "$PREBUILT" ]; then
 		# ordinary dynamically linked programs of our own, built against the iOS SDK
@@ -240,6 +265,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libredwood-gl.dylib \
 				src/eagl.c src/gl_osmesa.c
 			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
+			# ... and what this GPU makes of an unsigned integer turned into a float (src/u2f_test.c)
+			$DYN $M/libOSMesa.8.dylib -o obj/u2f_test src/u2f_test.c
 			cp $M/libOSMesa.8.dylib obj/
 			# air_run draws with a Metal shader translated by the AIR frontend
 			# and reads the pixels back (docs/air.md). It is built inside the
@@ -288,6 +315,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -n "$GL" ]; then
 		cp obj/libOSMesa.8.dylib root/lib/
 		cp obj/gl_test root/bin/
+		if [ -f obj/u2f_test ]; then cp obj/u2f_test root/bin/; fi   # an "if": see the inject.conf loop below
 		[ -f obj/air_run ] && cp obj/air_run root/bin/
 		[ "$GL" = test ] || cp obj/libredwood-gl.dylib root/lib/
 	fi

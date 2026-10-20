@@ -774,11 +774,59 @@ DOT_FLOATS = [0.0, 1.0, -1.0, 2.0, 3.0, -4.0, 0.5, -0.25, 8.0, -16.0]
 # So these are the values that have actually broken something: both zeros, the
 # half-way cases that separate round from rint, the largest float below a half,
 # and the integer extremes.
+#
+# THE ORDER OF EVERY POOL BELOW IS LOAD-BEARING: --cases N keeps the first N and
+# nothing else, so a value's position decides whether it is ever asked on the
+# phone. Do not sort these, and do not add a value at the front: put it after
+# the ones that decide something. Getting this wrong does not make a check fail,
+# it narrows the question and stays green -- which is how the Adreno's u32 -> f32
+# truncation came to be found by luck rather than by design. The suite carried on
+# 20 October used --cases 4, which took [0, 1, -1, 7] from the integer pool, and
+# -1 read as unsigned happened to be the one value in it that rounding decides.
 FEW_FLOATS = [0.0, -0.0, 0.5, -0.5,
               struct.unpack("<f", struct.pack("<I", 0x3EFFFFFF))[0],
               2.5, -2.5, 3.7]
 FEW_FLOATS2 = [1.0, -1.0, 0.0, 0.25]
 FEW_INTS = [0, 1, -1, 7, -32768, 32767, 2147483647, -2147483648]
+# Integer-to-float conversion gets its own pool, because what breaks there is
+# not the magnitude but the rounding, and only a value that falls between two
+# representable floats exercises it at all. The Adreno truncates u32 -> f32
+# (section 4 of docs/air.md), and 0xFFFFFFFF was enough to see that something
+# was wrong while saying nothing about which rule is in use. These say which:
+#
+#   0x00FFFFFF  2^24-1, the last integer every float can hold exactly: every
+#               rounding rule must agree here, so a disagreement is not rounding
+#   0x01000001  2^24+1, exactly half way between 2^24 and 2^24+2. The lower
+#               neighbour has an even mantissa, so half-to-even rounds DOWN here
+#               and half-away-from-zero rounds up
+#   0x01000003  2^24+3, half way between 2^24+2 and 2^24+4, where the lower
+#               neighbour is odd: half-to-even rounds UP. With the line above it,
+#               the pair separates to-even from away-from-zero, which one midpoint
+#               alone cannot do
+#   0x7FFFFFFF  and 0xFFFFFFFF (-1): 1 below a power of two, where the nearest
+#               float is 255 away on one side and 1 on the other -- truncation
+#               and rounding differ by a whole ulp, which is what was seen
+#
+# First in the list are the ones that decide a rule, because --cases N keeps the
+# first N: the suite carried to the phone used 4, which took [0, 1, -1, 7] and
+# so never asked about a midpoint at all.
+# A half destination needs its own midpoints, and for the same reason one level
+# down: f16 holds integers exactly only to 2048, above which the spacing is 2.
+#   2051  half way between 2050 and 2052, whose lower neighbour is odd, so
+#         round-to-nearest-even gives 2052 and truncation gives 2050 -- the f16
+#         discriminator, the counterpart of 16777219
+#   2049  half way between 2048 and 2050, where both rules give 2048: carried to
+#         show that a midpoint is not automatically a test
+#   2048  the last integer f16 holds exactly
+# Without these the four half-destination declarations of the corpus were asked
+# only about values that overflow f16, and answered inf to all of them: the
+# expectations read [0, inf, inf, inf], which tests saturation and says nothing
+# whatever about rounding. They agreed on the Adreno and that agreement was
+# empty. The order interleaves the two precisions so that --cases 4 reaches a
+# discriminator for each: 0 for sanity, -1 for a whole-ulp f32 difference,
+# 16777219 for the f32 rule, 2051 for the f16 rule.
+CONV_INTS = [0, -1, 16777219, 2051, 16777217, 2049, 2048, 16777215,
+             2147483647, 1, 7, -32768, 32767, -2147483648]
 FEW_INTS2 = [1, -1, 0, 7]
 FEW_DOT = [0.0, 1.0, -1.0, 2.0, -4.0, 0.5, -0.25, 8.0]
 
@@ -789,6 +837,8 @@ def pool_for(ty, family, few=False, nth=0):
         if bty == "i1":
             return [0, 1]
         if bty.startswith("i"):
+            if family == "convert" and bty == "i32":
+                return CONV_INTS
             return FEW_INTS if nth == 0 else FEW_INTS2
         if family == "dot":
             return FEW_DOT
@@ -801,6 +851,15 @@ def pool_for_full(ty, family):
     if bty == "i1":
         return [0, 1]
     if bty.startswith("i"):
+        # The exhaustive pool has 0x7FFFFFFF and -1, both of which rounding
+        # decides, but no exact midpoint between two floats -- so it could tell
+        # a wrong conversion from a right one and could not tell which rule was
+        # in use. The three added here can (see CONV_INTS), and only the convert
+        # family pays for them: INTS is the pool for every integer operation,
+        # and widening it would grow the whole exhaustive grid for one question
+        # that belongs to one family.
+        if family == "convert" and bty == "i32":
+            return INTS + [16777215, 16777217, 16777219, 2048, 2049, 2051]
         return INTS
     return DOT_FLOATS if family == "dot" else FLOATS
 
@@ -886,13 +945,48 @@ RUNNER = """#!/bin/sh
 # Parsing happens on the host (intrincheck.py --check); this stays dumb on
 # purpose, because what is here may be a Darwin userland with no sed or paste.
 D=`dirname "$0"`
-AIR_RUN=${AIR_RUN:-$D/air_run}
+# Where air_run is: the environment first, then one beside the modules (that is
+# a host run, which unpacks both into one directory), then the device's own
+# /redwood/bin. The fallback is what makes this runnable from the phone's job
+# list, which splits a line on blanks and cannot set a variable at all
+# (userland/src/init.c, run_command) -- so the job line is "/bin/sh .../run.sh"
+# and nothing can be passed to it.
+if [ -z "$AIR_RUN" ]; then
+	if [ -x "$D/air_run" ]; then
+		AIR_RUN=$D/air_run
+	else
+		AIR_RUN=/redwood/bin/air_run
+	fi
+fi
+echo "runner: $AIR_RUN"
 for bc in "$D"/*.bc; do
 	id=${bc##*/}
 	id=${id%.bc}
 	echo "=== $id"
 	AIR_RUN_BUFFER="$D/$id.bin" "$AIR_RUN" "$bc" 2>&1
 done
+"""
+
+
+JOBS_HEAD = """# Commands run by the launchd job com.redwood.demo, generated by
+# tools/air/intrincheck.py --emit. Do not edit: regenerate it.
+#
+# %(n)d modules over %(decls)d air.* declarations. Each one calls a single operation on
+# arguments it reads out of a buffer -- never on immediates, because a shader whose
+# arguments are constants is answered by the compiler and the GPU is never asked.
+#
+# Nothing here says what any of them should return. The expected values stay on the host
+# in manifest.json, which is not carried, and `intrincheck.py --check DIR LOG` judges the
+# log afterwards -- so the device cannot be made to agree by reading the answer, and this
+# file needs no updating when the suite is regenerated.
+#
+# The first line is the shader M1 is stated against: it takes no input buffer, and
+# --disasm makes ir3 print the Adreno instructions it generated. The screen's name proves
+# fd_screen_create won; only the disassembly proves the shader went through ir3 and not
+# some later software path, and the four floats look identical either way. Expect
+#     2.10170319e-18  0.178894654  1.48687698e+16  1.21394141e+33
+/redwood/bin/air_run --disasm /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib clearFragment01
+# Then the suite, carried into %(there)s by build.sh EXTRA_SHARE.
 """
 
 
@@ -947,8 +1041,28 @@ def emit_suite(arith, outdir, want, verbose, few=False, cases=0):
     with open(run, "w") as f:
         f.write(RUNNER)
     os.chmod(run, 0o755)
-    print("intrincheck: %d modules in %s, %d declarations, with run.sh and manifest.json"
-          % (len(manifest), outdir, len(set(m["name"] for m in manifest))))
+    # rc.jobs: the same suite as a job list, for a device with no shell. run.sh
+    # above is for this machine; the phone cannot use it, because iOS 16.5's own
+    # root carries no sh at all (/bin holds df and ps, nothing else) and the
+    # /var/jb/bin/sh that userland/rc.jobs.jb runs belongs to the jailbreak
+    # prefix, which a flash-root image does not carry. So every module gets a
+    # line of its own and its bytes come from --buffer, which is the one thing
+    # init's run_command can express: full paths, blanks between them, no
+    # variable and no quoting.
+    #
+    # The device path is where userland/build.sh EXTRA_SHARE puts this
+    # directory, which is /redwood/share and its own name.
+    there = "/redwood/share/" + os.path.basename(os.path.normpath(outdir))
+    with open(os.path.join(outdir, "rc.jobs"), "w") as f:
+        f.write(JOBS_HEAD % dict(n=len(manifest),
+                                 decls=len(set(m["name"] for m in manifest)),
+                                 there=there))
+        for m in manifest:
+            f.write("/redwood/bin/air_run --buffer %s/%s.bin %s/%s.bc\n"
+                    % (there, m["id"], there, m["id"]))
+    print("intrincheck: %d modules in %s, %d declarations, with run.sh, rc.jobs "
+          "and manifest.json" % (len(manifest), outdir,
+                                 len(set(m["name"] for m in manifest))))
     return 0
 
 
@@ -967,6 +1081,15 @@ def is_narrow(name, retty):
     return False
 
 
+def is_number(t):
+    """Is this line a number whole, and not a line that merely starts like one?"""
+    try:
+        float(t)
+        return True
+    except ValueError:
+        return False
+
+
 def parse_runner_log(path):
     """({id: result}, screen) from whatever the runner printed.
 
@@ -980,8 +1103,28 @@ def parse_runner_log(path):
     screen = None
     ident = None
     block = []
+    lines = [l.rstrip("\n") for l in open(path, errors="replace")]
+    # A log QEMU produced has every line twice: qemu/run-ios.sh writes the
+    # console to two places that both end up here, and the two copies are
+    # adjacent. Undoing it needs care, because a suite legitimately prints the
+    # same four numbers for two different cases, so no per-line rule is safe.
+    # The test is therefore global: the whole file must consist of adjacent
+    # equal pairs. That is a property a real log does not have by accident, and
+    # the phone's own log (xl run) does not have at all -- it is not doubled.
+    if len(lines) >= 2 and len(lines) % 2 == 0 and \
+       all(lines[i] == lines[i + 1] for i in range(0, len(lines), 2)):
+        lines = lines[0::2]
+        print("intrincheck: %s had every line twice, as a QEMU console log does; "
+              "read every second one" % os.path.basename(path))
     def finish():
         if ident is None:
+            return
+        # An id already answered is not replaced. The console log of a phone or
+        # QEMU run repeats lines -- qemu/run-ios.sh prints every one twice --
+        # and the second copy of a marker opens a block with nothing after it,
+        # which would turn an answer into a refusal. A refusal therefore never
+        # overwrites an answer, and the first answer stands.
+        if out.get(ident, ("",))[0] == "ok":
             return
         text = "\n".join(block)
         i = text.find("came back as")
@@ -994,23 +1137,52 @@ def parse_runner_log(path):
                     break
             out[ident] = ("refused", why or (block[-1].strip() if block else "no output"))
             return
+        # The values, which air_run prints one per line and then closes with a
+        # line of its own ("air_run: drew ..."). That closing line is what ends
+        # the reading, not the first line that does not look like a number: a
+        # phone's console is shared, and launchd, backboardd and the DRM shim
+        # all write to it between one line of ours and the next. Breaking at
+        # the first foreign line would silently take three values where four
+        # were printed, and a short row reads exactly like a wrong answer. So
+        # anything that is not a number is skipped, and only our own next line
+        # stops it.
         vals = []
         for line in text[i:].splitlines()[1:]:
             t = line.strip()
-            if not t or not re.match(r"^-?[0-9.]|^-?(inf|nan)", t):
+            if t.startswith("air_run:") or t.startswith("=== "):
                 break
-            vals.append(t)
+            # A value is a line that is a number and nothing else. Matching a
+            # leading digit is not enough: "2026-10-20 07:50:00.641 distnoted
+            # [14:221] ..." begins with one, and taking it for a value put a
+            # string where an integer was expected and crashed the check --
+            # which is the good failure, but on another day it would have been
+            # counted as a wrong answer from the GPU.
+            if is_number(t):
+                vals.append(t)
         out[ident] = ("ok", vals)
 
-    for line in open(path, errors="replace"):
+    for line in lines:
         if screen is None and " on " in line and line.startswith("air_run: "):
             screen = "softpipe" if "softpipe" in line else line.split(" on ")[-1].strip()
+        # A block starts at run.sh's marker, or -- when there was no run.sh,
+        # because the device has no shell and every module was a job line of its
+        # own -- at air_run's own first line, which names the module it was
+        # given. Either way the id comes from the log and not from the order of
+        # the blocks in it, so a line lost or repeated anywhere cannot move one
+        # module's numbers onto another's name.
+        mark = None
         if line.startswith("=== "):
+            mark = line[4:].strip()
+        else:
+            m = re.match(r"^air_run: (?:\S*/)?(\d+)\.bc[ :]", line)
+            if m:
+                mark = m.group(1)
+        if mark is not None:
             finish()
-            ident = line[4:].strip()
+            ident = mark
             block = []
         else:
-            block.append(line.rstrip("\n"))
+            block.append(line)
     finish()
     return out, screen
 
@@ -1018,7 +1190,22 @@ def parse_runner_log(path):
 def check_log(outdir, logpath, verbose):
     """Compare a runner log against the manifest. Where it ran is not our
     business; what it computed is."""
-    with open(os.path.join(outdir, "manifest.json")) as f:
+    # A log older than the manifest cannot have come from this suite, and
+    # comparing the two is worse than useless: the module ids are 0000.. in
+    # every suite, so an older log lines up perfectly and every expectation
+    # lands on a different operation's numbers. That produced a plausible
+    # "8 differ" with lines like "got 1 want 65535" before it was noticed to be
+    # nothing at all. Refused rather than warned, because the output of the
+    # mistake looks exactly like a finding.
+    mani = os.path.join(outdir, "manifest.json")
+    if os.path.getmtime(logpath) < os.path.getmtime(mani):
+        print("intrincheck: %s is older than %s, so it cannot be this suite's log "
+              "(every suite numbers its modules from 0000, so the ids would match "
+              "and the operations would not). Re-run the suite, or re-emit it if "
+              "the log is the one you mean."
+              % (os.path.basename(logpath), os.path.basename(mani)), file=sys.stderr)
+        return 1
+    with open(mani) as f:
         manifest = json.load(f)
     got, screen = parse_runner_log(logpath)
     # TGSI's registers are 32-bit, so softpipe cannot run an operation on a
@@ -1032,10 +1219,32 @@ def check_log(outdir, logpath, verbose):
     narrow_skipped = set()
     missing = 0
     refused = {}
+    short = {}
+    half_set_aside = set()
     total = 0
     for m in manifest:
         if narrow_here and is_narrow(m["name"], m["retty"]):
             narrow_skipped.add(m["name"])
+            continue
+        # A declaration that returns half cannot be judged from a run of
+        # air_run, and this is the frontend's harness and not the shader at
+        # fault. air_run reads back through R32G32B32A32_FLOAT -- it has no
+        # 16-bit target at all -- so a half result is widened at once and NIR
+        # folds u2f16 followed by that widening into a single u2f32. The
+        # generated Adreno code for air.convert.f.f16.u.i32 is four
+        # cov.u32f32 and not one cov.u32f16, and softpipe returns
+        # 4.2949673e+09 where a half would give inf. The reference computes
+        # f16(x) and the shader computes f32(x), so comparing them says
+        # nothing about either.
+        #
+        # This used to pass unnoticed because every value large enough to show
+        # it produced an infinite expectation, and infinities were skipped
+        # without being counted: three cases of four skipped, the zero
+        # agreeing, and the declaration reported as agreeing on every case.
+        # Set aside by name now. Giving air_run a 16-bit target is the real
+        # answer and is separate work; this commit only stops the claim.
+        if parse_type(m["retty"])[0] in ("half", "f16"):
+            half_set_aside.add(m["name"])
             continue
         r = got.get(m["id"])
         if r is None:
@@ -1046,6 +1255,18 @@ def check_log(outdir, logpath, verbose):
             continue
         vals = r[1]
         isf = parse_type(m["retty"])[0] in ("float", "half", "double")
+        # A block that answered printed the render target's four components,
+        # always four whether the module filled two of them or all four. Any
+        # other count means the block was not read whole -- a line of ours lost
+        # among the console's other writers, or one seen twice -- and it is
+        # reported as that rather than compared. The loop below used to skip a
+        # case whose value was simply not there (`idx >= len(flat)`), which is
+        # the quiet failure this repository has been bitten by before: cases
+        # that vanish instead of failing, and a total that is lower by exactly
+        # as much as nobody noticed.
+        if len(vals) != 4:
+            short.setdefault(m["name"], []).append((m["id"], len(vals)))
+            continue
         flat = []
         for v in vals:
             try:
@@ -1053,17 +1274,34 @@ def check_log(outdir, logpath, verbose):
             except ValueError:
                 flat.append(float("nan"))
         if not isf and m["signed"]:
-            flat = [wrap(v, 32, True) for v in flat]
+            # only what really came back as an integer: a value that would not
+            # parse is a NaN here, and wrap() cannot take one
+            flat = [wrap(v, 32, True) if isinstance(v, int) else v for v in flat]
         st = per_decl.setdefault(m["name"], dict(exact=m["exact"], n=0, bad=[],
-                                                 worst=0, worst_case=None))
+                                                 worst=0, worst_case=None, denorm=0))
         for i, args in enumerate(m["cases"]):
             for c, exp in enumerate(m["expect"][i]):
                 idx = i * m["rn"] + c
                 if idx >= len(flat):
                     continue
-                if (isinstance(exp, float)
-                        and (math.isinf(exp)
-                             or (exp != 0.0 and abs(exp) < 1.17549435e-38))):
+                # An infinite expectation used to be skipped here along with the
+                # denormals, and that skip hid a real disagreement rather than a
+                # licensed one. The four half-returning conversions expected
+                # [0, inf, inf, inf]; every infinity was skipped, the zero
+                # agreed, and three wrong answers were reported as a declaration
+                # that agrees on every case. An infinity is as testable as any
+                # other value -- the shader has to return one too -- so it is
+                # compared now.
+                #
+                # A denormal is a different matter and still skipped: Metal
+                # compiles with air.compile.denorms_disable, so flushing one to
+                # zero is permitted and a disagreement there is not a fault.
+                # Counted rather than dropped, because that is the distinction
+                # this check keeps getting wrong.
+                if (isinstance(exp, float) and exp != 0.0
+                        and not math.isinf(exp)
+                        and abs(exp) < 1.17549435e-38):
+                    st["denorm"] += 1
                     continue
                 st["n"] += 1
                 total += 1
@@ -1118,12 +1356,36 @@ def check_log(outdir, logpath, verbose):
         print("intrincheck: %d declarations were refused by the harness" % len(refused))
     if missing:
         print("intrincheck: %d modules are in the manifest and not in the log" % missing)
+    if short:
+        n = sum(len(v) for v in short.values())
+        print("intrincheck: %d modules printed something other than four values and were "
+              "not read: %s" % (n, ", ".join("%s (%s)" % (k, " ".join(
+                  "%s:%d" % (i, c) for i, c in v)) for k, v in sorted(short.items()))))
     if narrow_skipped:
         print("intrincheck: %d declarations left out: a narrow type (i1, i8, i16, f16) "
               "and this ran on softpipe, whose registers are 32-bit" % len(narrow_skipped))
+    # How thin a verdict is matters as much as the verdict. "Agrees on every
+    # case" over one case is not a statement about the operation, and the four
+    # half-returning conversions were exactly that: three of their four cases
+    # skipped, agreement resting on the zero. Named here rather than left for
+    # someone to work out from the totals.
+    thin = sorted(k for k, v in per_decl.items() if v["n"] and v["n"] < 3 and not v["bad"])
+    if thin:
+        print("intrincheck: %d declarations agree on fewer than 3 cases, which is "
+              "agreement about very little: %s"
+              % (len(thin), ", ".join("%s (%d)" % (k, per_decl[k]["n"]) for k in thin)))
+    if half_set_aside:
+        print("intrincheck: %d declarations set aside: they return half, and air_run reads "
+              "back through a 32-bit float target, so the half conversion is optimised away "
+              "and the reference describes an operation the shader does not perform (%s)"
+              % (len(half_set_aside), ", ".join(sorted(half_set_aside))))
+    denorm = sum(v["denorm"] for v in per_decl.values())
+    if denorm:
+        print("intrincheck: %d cases not compared: the result is a denormal and Metal "
+              "compiles with air.compile.denorms_disable" % denorm)
     print("intrincheck: %d cases in all, as RUN on %s and not as folded"
           % (total, screen or "an unnamed screen"))
-    return 1 if (bad or missing) else 0
+    return 1 if (bad or missing or short) else 0
 
 
 def main(argv):

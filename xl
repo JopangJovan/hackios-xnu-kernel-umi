@@ -36,7 +36,13 @@
 #               (default userland/root.apfs; "none" sends none). Without a system image in the
 #               phone's RAM it is the root itself (e.g. XL_RAMDISK=userland/hello).
 # One phone, several working copies: a run holds a lock, and `stop` and `reboot` from another working
-# copy than the one it was started from are refused (XL_FORCE=1 to end it all the same).
+# copy than the one it was started from are refused (XL_FORCE=1 to end it all the same). While a run
+# is in progress every other command is refused too, `ramdisk` among them.
+# The lock says whether a run is live; it says nothing about the image resident in the phone's memory,
+# which outlives both the lock and any note beside it and belongs to whoever uploaded it last. So
+# `ramdisk` records who uploaded what, and how big it was, in $PHONE.ramdisk, and `run` prints that
+# when the last upload was not from this copy. The record starts empty -- an upload by a copy without
+# this change leaves none -- and `run` says so rather than assuming.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # the kernel and the loader built here, or else the ones that come with the repository
 K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
@@ -110,6 +116,24 @@ run() { # run <oem command> <label>
 		*) [ -f "$rd" ] || { echo "xl: ramdisk $rd not found"; return 1; } ;;
 		esac
 		case $K in prebuilt/*) echo "xl: no kernel built here, running $K" >&2 ;; esac
+		# The resident image: whose it is and how big, when the last upload was not from here.
+		# Both values and not just "not from here", because a foreign image of the same kind
+		# changes nothing, while a foreign one of another kind makes the boot fail in a way that
+		# names neither it nor its owner -- /sbin/launchd.ios: No such file or directory, with a
+		# perfectly good image on this side. The warning is not a refusal: relying on another
+		# copy's upload is legitimate when you know what it is, and this says what it is.
+		if [ -s $PHONE.ramdisk ]; then
+			local rwho rwhat rsize
+			IFS=$'\t' read -r rwho rwhat rsize < $PHONE.ramdisk
+			if [ "$rwho" != "$(pwd)" ]; then
+				echo "xl: the resident image was uploaded from $rwho:" \
+				     "$rwhat, $(( rsize / 1048576 )) MB. Upload your own" \
+				     "(./xl ramdisk FILE) unless that is the one you want" >&2
+			fi
+		else
+			echo "xl: nothing here recorded who uploaded the resident image;" \
+			     "if this run needs a particular one, upload it" >&2
+		fi
 		# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
 		# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
 		local args=${XL_CMDLINE--v}
@@ -186,7 +210,10 @@ camera() { # camera [prefix]: the frames the last run's camera left (boot-arg ca
 
 ramdisk() { # ramdisk [<file>|none]
 	enter || return 1
-	if [ "$1" = none ]; then fb oem ramdisk none >/dev/null; echo "xl: resident ramdisk dropped"; return; fi
+	if [ "$1" = none ]; then
+		fb oem ramdisk none >/dev/null; rm -f $PHONE.ramdisk
+		echo "xl: resident ramdisk dropped"; return
+	fi
 	set -- "${1:-userland/system.apfs}"
 	[ -f "$1" ] || { echo "xl: $1 not found"; return 1; }
 	local t0=$(date +%s) size=$(stat -c %s "$1")
@@ -194,6 +221,15 @@ ramdisk() { # ramdisk [<file>|none]
 	FB_TIMEOUT=1800 fb stage "$1" | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	local dt=$(( $(date +%s) - t0 )); [ $dt -lt 1 ] && dt=1
 	echo "xl: $(( size / 1048576 )) MB uploaded in $dt s ($(( size / 1048576 / dt )) MB/s)"
+	# Who put what there, for `run` to warn about below. The resident image is a third state of
+	# the phone that neither the lock nor the note describes: it stays in memory across runs and
+	# across working copies, so a run that uploads nothing boots against whatever the last upload
+	# left -- which may be another copy's, of another kind. That cost two runs on 20 October, and
+	# the only thing that distinguished them on sight was the loader's own "resident image at pa
+	# ... size 400000" against "size 97308000". The size is recorded for exactly that reason: a
+	# foreign image of the same kind is harmless, a foreign one of another kind kills the run and
+	# says nothing.
+	printf '%s\t%s\t%s\n' "$(pwd)" "$1" "$size" > $PHONE.ramdisk 2>/dev/null
 }
 
 screenshot() { # screenshot [file.png]
