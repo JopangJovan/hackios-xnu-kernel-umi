@@ -293,6 +293,55 @@ frames_from(uintptr_t fp, char *text, size_t size)
 }
 
 /*
+ * WHAT CAME BACK, not that a task was started. "It fetches its content and the screen still says
+ * LOADING" has four shapes behind it -- the request never completes, it completes with an HTTP
+ * error, it completes with a body the renderer rejects, or it completes and nothing is drawn -- and
+ * they are the same line without the response. So every task that is resumed is kept (retained, or
+ * it would be gone by the time the report runs) and asked at 150 s what became of it: its state,
+ * the status, the bytes received, the type, and the error if there is one.
+ */
+#define TASKS 64
+static id tasks[TASKS];
+static unsigned task_count;
+static pthread_mutex_t task_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+remember_task(id task)
+{
+	pthread_mutex_lock(&task_lock);
+	if (task_count < TASKS) {
+		tasks[task_count++] = (id)CFRetain((CFTypeRef)task);
+	}
+	pthread_mutex_unlock(&task_lock);
+}
+
+static void
+dump_tasks(void)
+{
+	static const char *const states[] = { "running", "suspended", "cancelling", "COMPLETED" };
+
+	say("redwood: store: %u tasks resumed\n", task_count);
+	for (unsigned i = 0; i < task_count; i++) {
+		id task = tasks[i];
+		long state = ((long (*)(id, SEL))objc_msgSend)(task, sel_registerName("state"));
+		id response = ((id (*)(id, SEL))objc_msgSend)(task, sel_registerName("response"));
+		id error = ((id (*)(id, SEL))objc_msgSend)(task, sel_registerName("error"));
+		id request = ((id (*)(id, SEL))objc_msgSend)(task, sel_registerName("originalRequest"));
+		id url = request != NULL ? ((id (*)(id, SEL))objc_msgSend)(request, sel_registerName("URL")) : NULL;
+		long long got = ((long long (*)(id, SEL))objc_msgSend)(task, sel_registerName("countOfBytesReceived"));
+		long status = response != NULL ? ((long (*)(id, SEL))objc_msgSend)(response, sel_registerName("statusCode")) : 0;
+		id type = response != NULL ? ((id (*)(id, SEL))objc_msgSend)(response, sel_registerName("MIMEType")) : NULL;
+		char one[96], two[64], three[200];
+
+		say("redwood: store: task %u %s status %ld, %lld bytes, %s%s%s, %s\n", i,
+		    state >= 0 && state < 4 ? states[state] : "?", status, got,
+		    type != NULL ? text_of(type, one, sizeof(one)) : "(no type)",
+		    error != NULL ? ", error " : "", error != NULL ? text_of(error, two, sizeof(two)) : "",
+		    url != NULL ? text_of(url, three, sizeof(three)) : "(no url)");
+	}
+}
+
+/*
  * A GRAPH OF PROMISES, not a list of calls. One promise in seventeen is ever finished here, and
  * naming the next deadlock by hand would take a slot each: what is wanted is the root -- a promise
  * with waiters, no finish, and a producer that is itself waiting on nothing anybody is fulfilling.
@@ -656,6 +705,7 @@ new_resume_base(id self, SEL _cmd)
 {
 	entered[COUNT_resume]++;
 	say_resume(self, "NSURLSessionTask");
+	remember_task(self);
 	old_resume_base(self, _cmd);
 	returned[COUNT_resume]++;
 }
@@ -695,10 +745,11 @@ dump_selectors(const char *class_name, const char *needle)
 	free(methods);
 }
 
-static void *
-late_report(__unused void *ignored)
+static void
+one_report(unsigned seconds)
 {
-	sleep(150);                     /* past the start's flood, where the console keeps what it is given */
+	say("redwood: store(%s): report at %u s\n", who, seconds);
+
 	for (size_t i = 0; i < replacement_count(); i++) {
 		if (!replacements[i].done) {
 			say("redwood: store: NOT TAKEN %c[%s %s]\n", replacements[i].class_method ? '+' : '-',
@@ -718,11 +769,23 @@ late_report(__unused void *ignored)
 		    entered[i] == 0 ? "   <-- NEVER ENTERED: suspect the hook, not the code" : "");
 	}
 	dump_promises();
+	dump_tasks();
 	dump_threads();
 	dump_selectors("AMSURLSession", "equest");
-	dump_selectors("AMSMutablePromise", NULL);
-	dump_selectors("AMSBagNetworkTask", " queryItems");
-	dump_selectors("AMSBagNetworkTask", NULL);
+}
+
+/*
+ * Every minute rather than once. appstored starts with the system and the App Store starts when
+ * somebody taps it, a minute and a half later, so a single report at 150 s falls past the end of
+ * the run for one of them -- and the app's side of the story went missing in exactly that way.
+ */
+static void *
+late_report(__unused void *ignored)
+{
+	for (unsigned minute = 1; minute <= 5; minute++) {
+		sleep(60);
+		one_report(minute * 60);
+	}
 	return NULL;
 }
 
