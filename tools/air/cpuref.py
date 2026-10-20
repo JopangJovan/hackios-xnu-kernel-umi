@@ -78,6 +78,20 @@ def parse_type(t):
     return (base, 1) if base else (None, 0)
 
 
+def param_type(t):
+    """The type out of a define's parameter: "<4 x float> %0" -> "<4 x float>".
+
+    Taken as the leading type rather than by stripping a list of attribute
+    words: LLVM has dozens of parameter attributes and they sit between the
+    type and the name, so a blacklist misses one -- "returned" was the one that
+    made a library function unreadable here, and the next version of LLVM would
+    have found another.
+    """
+    m = re.match(r"\s*(<\s*\d+\s+x\s+[A-Za-z_0-9]+\s*>|\[[^\]]*\]|[A-Za-z_0-9]+)",
+                 t)
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else t.strip()
+
+
 def split_fields(s):
     """The top-level comma-separated members of a struct body."""
     out, depth, cur = [], 0, ""
@@ -157,7 +171,61 @@ def buffer_args(ll, entry):
     return out
 
 
-def build_and_run(ll, entry, bufs, workdir):
+# Apple's name for each type, from the air.visible_input/output metadata beside
+# a library function. It is a second statement of what the arguments are: the
+# LLVM signature says <4 x float>, the metadata says float4, and a harness that
+# agrees with only one of them is guessing. parse_type reads the LLVM side; this
+# reads Apple's, and the two are checked against each other before anything runs.
+APPLE_TYPES = {
+    "float": ("float", 1), "float2": ("float", 2),
+    "float3": ("float", 3), "float4": ("float", 4),
+    "half": ("half", 1), "half2": ("half", 2),
+    "half3": ("half", 3), "half4": ("half", 4),
+}
+
+
+def library_types(ll):
+    """(inputs, output) as Apple names them, in parameter order."""
+    ins = {}
+    for body in re.findall(r"^!\d+ = !\{(.*)\}$", ll, re.M):
+        if '"air.visible_input"' in body:
+            pm = re.match(r"\s*i32 (\d+)", body)
+            tn = re.search(r'"air\.arg_type_name", !"([^"]*)"', body)
+            if pm and tn:
+                ins[int(pm.group(1))] = tn.group(1)
+    out = None
+    for body in re.findall(r"^!\d+ = !\{(.*)\}$", ll, re.M):
+        if '"air.visible_output"' in body:
+            tn = re.search(r'"air\.arg_type_name", !"([^"]*)"', body)
+            if tn:
+                out = tn.group(1)
+    return [ins.get(i) for i in range(len(ins))], out
+
+
+def check_against_metadata(entry, ll):
+    """Refuse when the LLVM types and Apple's names do not say the same thing."""
+    names, out = library_types(ll)
+    if len(names) != len(entry["params"]):
+        return ("the metadata names %d arguments and the signature has %d"
+                % (len(names), len(entry["params"])))
+    for i, (t, name) in enumerate(zip(entry["params"], names)):
+        base, n = parse_type(param_type(t))
+        if base is None:
+            return "argument %d is %s, which this harness cannot make" % (i, param_type(t))
+        if name is None:
+            return "argument %d has no air.arg_type_name" % i
+        want = APPLE_TYPES.get(name)
+        if want is None:
+            return "argument %d is called %s, a type this harness does not make" % (i, name)
+        if (want[0] == "float") != (base.fmt == "f") or want[1] != n:
+            return ("argument %d is %s in the signature and %s in the metadata"
+                    % (i, param_type(t), name))
+    if out is not None and out not in APPLE_TYPES:
+        return "the result is called %s, which this harness cannot read" % out
+    return None
+
+
+def build_and_run(ll, entry, bufs, workdir, library=False):
     """Compile the module for this machine and call the entry point.
 
     The call is made from a wrapper written in LLVM IR, not from C. A shader
@@ -178,6 +246,23 @@ def build_and_run(ll, entry, bufs, workdir):
         fields.append((base, n, t.strip()))
     if not fields:
         return None, "the entry point returns nothing to compare"
+
+    # A library function takes values, not buffers, so the wrapper reads each
+    # argument out of one buffer at byte 16*i -- the same slot the frontend's
+    # generated entry point reads it from (wrap_library_function in
+    # air_to_nir.c). Both sides read the same offsets, so this comparison
+    # cannot catch a slot layout that is wrong in the same way twice; what it
+    # does catch is the two sides disagreeing about which slot is which
+    # argument, because the pattern makes every slot's bytes different.
+    if library:
+        wrap_params, call_args, pre = ["ptr %in"], [], []
+        for i, t in enumerate(entry["params"]):
+            t = param_type(t)
+            pre.append("  %%g%d = getelementptr i8, ptr %%in, i64 %d" % (i, 16 * i))
+            pre.append("  %%a%d = load %s, ptr %%g%d, align 16" % (i, t, i))
+            call_args.append("%s %%a%d" % (t, i))
+        return _finish(ll, entry, {0: 16 * max(len(entry["params"]), 1)}, workdir,
+                       fields, ret, wrap_params, call_args, pre, True)
 
     # the wrapper's own arguments: one pointer per buffer, and the output
     wrap_params, call_args, pre = [], [], []
@@ -202,10 +287,23 @@ def build_and_run(ll, entry, bufs, workdir):
             # really is only the GPU knows, so such a shader is not compared
             return None, "parameter %d is %s, not a buffer" % (i, t)
 
-    # store each field at its own 16-byte slot of the output buffer
+    return _finish(ll, entry, bufs, workdir, fields, ret, wrap_params, call_args, pre)
+
+
+def _finish(ll, entry, bufs, workdir, fields, ret, wrap_params, call_args, pre,
+            library=False):
+    """Compile the wrapper and the C harness around it, and run them."""
+    # store each field at its own 16-byte slot of the output buffer. A shader
+    # returns a struct of fields and each one is extracted; a library function
+    # returns one value and there is nothing to extract -- extractvalue on a
+    # vector is not valid IR, and llc says so with a caret and no sentence.
+    is_struct = bool(re.match(r"<?\{", ret.strip()))
     stores, slots = [], []
     for i, (base, n, t) in enumerate(fields):
-        stores.append("  %%f%d = extractvalue %s %%r, %d" % (i, ret, i))
+        if is_struct:
+            stores.append("  %%f%d = extractvalue %s %%r, %d" % (i, ret, i))
+        else:
+            stores.append("  %%f%d = bitcast %s %%r to %s" % (i, t, t))
         stores.append("  %%o%d = getelementptr i8, ptr %%out, i64 %d" % (i, i * 16))
         stores.append("  store %s %%f%d, ptr %%o%d, align 1" % (t, i, i))
         slots.append((base, n))
@@ -235,8 +333,18 @@ define void @__cpuref_call(%s, ptr %%out) {
     setup, args = [], []
     for i in sorted(bufs):
         setup.append("    static unsigned char buf%d[%d];" % (i, bufs[i]))
-        setup.append("    for (int i = 0; i < %d; i++) buf%d[i] = (i * 7 + 13) & 0xff;"
-                     % (bufs[i], i))
+        if library:
+            # floats, not bytes: these modules are compiled with no-nans and
+            # no-infs, so arbitrary bytes put the call outside the contract it
+            # was compiled under. The same words air2nir and air_run use
+            # (library_byte in both).
+            setup.append("    for (int w = 0; w < %d; w++) {"
+                         " float f = (float)((w * 13) %% 29 - 14) / 4.0f;"
+                         " __builtin_memcpy(buf%d + 4 * w, &f, 4); }"
+                         % (bufs[i] // 4, i))
+        else:
+            setup.append("    for (int i = 0; i < %d; i++) buf%d[i] = (i * 7 + 13) & 0xff;"
+                         % (bufs[i], i))
         args.append("buf%d" % i)
     decl = ", ".join(["const void *"] * len(args) + ["void *"]) if args else "void *"
 
@@ -325,14 +433,25 @@ def main():
         entry = entry_of(ll)
         if not entry:
             sys.exit("cpuref.py: no entry point found")
+        library = entry["stage"] == "visible"
         bufs = buffer_args(ll, entry)
-        print("cpuref: %s (%s), %d parameters, %d of them buffers" %
-              (entry["name"], entry["stage"], len(entry["params"]), len(bufs)))
+        if library:
+            why = check_against_metadata(entry, ll)
+            if why:
+                print("cpuref: cannot run this one: %s" % why)
+                return 1
+            bufs = {0: 16 * max(len(entry["params"]), 1)}
+            print("cpuref: %s (a library function), %d arguments, each read from "
+                  "byte 16*i of one buffer" % (entry["name"], len(entry["params"])))
+        else:
+            print("cpuref: %s (%s), %d parameters, %d of them buffers" %
+                  (entry["name"], entry["stage"], len(entry["params"]), len(bufs)))
         for i, n in sorted(bufs.items()):
-            print("  parameter %d: a buffer of %d bytes, filled with (i * 7 + 13) & 0xff"
-                  % (i, n))
+            print("  parameter %d: a buffer of %d bytes, filled with %s"
+                  % (i, n, "the floats ((w * 13) % 29 - 14) / 4" if library
+                     else "(i * 7 + 13) & 0xff"))
 
-        values, why = build_and_run(ll, entry, bufs, work)
+        values, why = build_and_run(ll, entry, bufs, work, library)
         if why:
             print("cpuref: cannot run this one: %s" % why)
             return 1
@@ -341,7 +460,7 @@ def main():
             print("  %s" % v)
 
         if args.compare:
-            ours, why = evaluate_ours(args.file, entry["name"])
+            ours, why = evaluate_ours(args.file, entry["name"], library)
             if why:
                 print("cpuref: ours could not be evaluated: %s" % why)
                 return 1
@@ -372,10 +491,10 @@ def draw_ours(path, function):
     return (values, None) if values else (None, "air_run printed no pixel")
 
 
-def evaluate_ours(path, function):
+def evaluate_ours(path, function, library=False):
     """air2nir --eval: the same shader folded over the same buffer bytes."""
-    out = subprocess.run([AIR2NIR, "--eval", path, function],
-                         capture_output=True, text=True)
+    cmd = [AIR2NIR] + (["--library"] if library else []) + ["--eval", path, function]
+    out = subprocess.run(cmd, capture_output=True, text=True)
     if out.returncode:
         return None, (out.stderr or out.stdout).strip().splitlines()[-1][:160]
     values = []

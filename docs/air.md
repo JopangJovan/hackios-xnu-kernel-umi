@@ -41,8 +41,42 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | texture operations with a case softpipe cannot run: a 16-bit result | 7 |
 | texture operations with no case: multisample, depth, write | 11 |
 
-318 of 456 is 318 of 321 entry points — 99.1% — because 135 modules are `air.visible` library
-functions and not entry points at all.
+321 of 456 is **every entry point** of the corpus: 271 fragment shaders, 47 compute kernels and 3
+vertex shaders. The other 135 modules are `air.visible` library functions, not entry points at
+all, and they have a measurement of their own:
+
+| the 135 library functions | |
+| --- | --- |
+| wrapped in a generated entry point and translated (`--library`) | 124 |
+| refused: a texture, sampler or matrix argument the wrapper cannot pass | 11 |
+| dispatched by a Gallium driver and read back | 124 |
+| of those, agreeing with our own constant folding of the same shader | 104 |
+| of those, run but disagreeing | 0 |
+| ran, but the folder did not reduce the result to a constant | 20 |
+| **agreeing with LLVM on this machine, bit for bit** | **21 of 21** |
+
+`tools/air/libcheck.py` prints that table and refuses to print it when the rows do not add up.
+The last row is the one that counts, and it is small for a stated reason: LLVM can be the
+reference only for a function that calls no `air.*` at all, because an `air.*` call is an
+undefined symbol on the host and defining one would put our own reading of that operation on
+both sides of the comparison. 57 more call only exactly defined `air.*` operations and could be
+compared that way if those definitions were written; 46 call an approximate one
+(`air.fast_pow` and the like), which nothing compares bit-exactly anywhere.
+
+**What a library function's measurement is not: evidence about Metal's stitching.** Metal links
+these into a caller at pipeline time through the ABI their own metadata describes
+(`air.stitching_info`, with the four functions that do it and each argument's size and
+alignment). That ABI is the runtime's, not the compiler's, and it is not implemented. The wrapper
+is this project's own calling convention, invented to make the bodies runnable.
+
+**And what the 456 itself is not: the number of shaders on the device.** It is the number of
+modules in the `.metallib` *files* under `ios165/rootfs`. A library can also be a blob inside a
+dylib — `GPUCompiler`'s own `GNR.videoprocessor` carries one in `__DATA`, found while looking for
+something else — so every statement here of the form "the corpus contains no X" is bounded by how
+the corpus was collected, not by what the system contains. Where that distinction matters, this
+document says so; extending the corpus to embedded libraries would move this denominator and
+every percentage computed from it, so it is a change to make in one commit and recount, not a
+figure to adjust.
 
 **What those numbers are not**, because they will be quoted without this paragraph otherwise:
 
@@ -311,8 +345,16 @@ functions and not entry points at all.
   corner, where nearest filtering has no weights to round and clamping has no arithmetic.
   The six texture shaders that drew on the Adreno took their sampler from the API too, so what
   they are evidence about is binding, descriptors and ir3's texture instructions — exactly what
-  they were built to be — and silence about everything Metal's sampler state decides. Two modules
-  of the corpus declare a `constexpr sampler`; everywhere else the API supplies it.
+  they were built to be — and silence about everything Metal's sampler state decides. **Ten**
+  modules of the corpus declare a `constexpr sampler`, carrying three distinct state words, all
+  ten in `PortraitFilters.cifilter/default.metallib`; everywhere else the API supplies it. This
+  paragraph said "two" for a while, while the mapping table in section 7 said ten: two numbers for
+  one fact in one file, and the disagreement was enough to settle it without any new evidence.
+  Where the "two" came from is not established. What is worth recording is how the ten were
+  counted, because the obvious way does not work: a plain `grep` for `__air_sampler_state` over
+  the 456 modules finds **none**, since bitcode is bit-packed and a name matches only when it
+  happens to land on byte boundaries. The count above is from `llvm-dis` output, module by
+  module.
 - **A function of the module that takes a texture: done, and the diagnosis was the work.** All
   four such entry points translate — three with this fix, the fourth once the shuffle mask it also
   stopped on was decoded. The fix is a split of `translate_globals`, and arriving at it took two
@@ -379,12 +421,17 @@ functions and not entry points at all.
   encodings meet only in this case, and our reader accepted only the second. We refused on a zero
   we could read perfectly well, and recorded it as a limit of the shader.
 
-  The fix is not three cases but one: `air_const_as_uint` (`air_module.h`) reads either spelling,
-  and the three other places that took an integer constant off a record — `llvm.memcpy` and
-  `llvm.memset` lengths, `air.wg.barrier` flags — now go through it. None of those three was
-  reachable in this corpus, so this is not a correction of any number; it closes a class. Two
-  spellings of zero is a property of the format, and a format detail belongs in one decoder
-  rather than in every reader of it.
+  **And the decoder for it already existed.** `air_const_uint` (`air_module.h`) has read both
+  spellings since long before this, with a comment beside one of its callers saying that a zero
+  arrives as `CST_CODE_NULL` about as often as not. Four places tested `ckind == AIR_CONST_INT`
+  by hand instead of calling it — the shuffle mask, the `llvm.memcpy` and `llvm.memset` lengths,
+  and the `air.wg.barrier` flags — and the shuffle mask is the one where it cost something. All
+  four go through the helper now, which removed more code than it added.
+
+  The first write-up of this fix claimed it "closes a class" by adding that decoder. It did not:
+  the class was already closed and one reader had opted out of it, which is a different and less
+  flattering story. Worth keeping for the shape — a hand-rolled test beside an existing helper
+  that does the same job, in a file big enough that neither author sees the other.
 
   The four that used to crash now dispatch, and the crash was this harness's:
 
