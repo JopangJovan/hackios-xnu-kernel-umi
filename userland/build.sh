@@ -120,7 +120,7 @@ INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd cont
 # a storefront is the only thing it is missing. It also writes down whether a bag request is ever
 # built at all. For an experiment, not for an image anybody else boots.
 [ -n "$STOREFRONT" ] && INJECT="$INJECT
-/redwood/lib/libredwood-store.dylib appstored
+/redwood/lib/libredwood-store.dylib appstored AppStore
 /redwood/lib/libredwood-fairplay.dylib fairplayd.H2"
 mkdir -p obj
 

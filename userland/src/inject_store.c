@@ -123,6 +123,7 @@
 #include <mach/thread_act.h>
 #include <mach-o/dyld.h>
 #include <objc/message.h>
+#include <fcntl.h>
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <signal.h>
@@ -167,7 +168,7 @@ enum {
 	COUNT_dataTaskPromise, COUNT_dataTask, COUNT_addCookies, COUNT_addStorefrontHeader, COUNT_addAnisette,
 	COUNT_prepareRequest, COUNT_finishWithResult, COUNT_finishWithError, COUNT_finishFunnel,
 	COUNT_finishResultError, COUNT_thenWithBlock, COUNT_continueWithBlock, COUNT_bagValue,
-	COUNT_resultBefore, COUNT_afterUpdating, COUNT_addCookies4, COUNT_last
+	COUNT_resultBefore, COUNT_afterUpdating, COUNT_addCookies4, COUNT_fpDeviceType, COUNT_last
 };
 static const char *const counted[COUNT_last] = {
 	"-[ACAccount ams_storefront]", "-[AMSBagNetworkDataSource cachedStorefront]",
@@ -190,6 +191,7 @@ static const char *const counted[COUNT_last] = {
 	"-[AMSBagValue valueWithError:]", "-[AMSPromise resultBeforeDate:error:]",
 	"-[ACAccountStore _ams_localiTunesAccountAfterUpdatingStorefront:]",
 	"ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:",
+	"-[AMSUserAgent _sharedComponentFairPlayDeviceType]",
 };
 static unsigned long entered[COUNT_last];
 /*
@@ -202,9 +204,18 @@ static unsigned serial;
 
 
 /* Each line of ours alone on the console: it drops them under the start's flood (see rc.jobs.store). */
+/*
+ * To the console itself, not to standard error. A launchd job of ours has /dev/console on fd 2
+ * (mkjobs.py sets StandardErrorPath), but an application started by SpringBoard has nothing there,
+ * so the first run with this library inside AppStore.app looked exactly like a run where it had not
+ * been inserted at all -- another silence that meant "wrong channel", not "did not happen".
+ */
+static const char *who = "store";
+
 static void
 say(const char *format, ...)
 {
+	static int console = -2;
 	char line[512];
 	va_list ap;
 	int n;
@@ -215,7 +226,10 @@ say(const char *format, ...)
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
 	}
-	write(2, line, (size_t)n);
+	if (console == -2) {
+		console = open("/dev/console", O_WRONLY | O_APPEND);
+	}
+	write(console >= 0 ? console : 2, line, (size_t)n);
 }
 
 /* an object as a short string, for the log: a description, cut to fit */
@@ -241,7 +255,7 @@ step_in(int which)
 	unsigned n = __sync_add_and_fetch(&serial, 1);
 
 	entered[which]++;
-	say("redwood: appstored: -> #%u %s\n", n, counted[which]);
+	say("redwood: store: -> #%u %s\n", n, counted[which]);
 	return n;
 }
 
@@ -249,7 +263,7 @@ static void
 step_out(int which, unsigned n, bool got_something)
 {
 	returned[which]++;
-	say("redwood: appstored: <- #%u %s%s\n", n, counted[which], got_something ? "" : " (nil)");
+	say("redwood: store: <- #%u %s%s\n", n, counted[which], got_something ? "" : " (nil)");
 }
 
 /*
@@ -369,11 +383,11 @@ note_label(void *promise, const char *label, const char *frames)
 static void
 dump_promises(void)
 {
-	say("redwood: appstored: %u promises seen\n", promise_count);
+	say("redwood: store: %u promises seen\n", promise_count);
 	for (unsigned i = 0; i < promise_count; i++) {
 		struct promise_note *note = &promises[i];
 
-		say("redwood: appstored: promise %p %-16s waiters %2u sync %u finished %u%s tid %llu seen from%s\n",
+		say("redwood: store: promise %p %-16s waiters %2u sync %u finished %u%s tid %llu seen from%s\n",
 		    note->promise, note->label != NULL ? note->label : "", note->waiters, note->sync_waiters,
 		    note->finished,
 		    note->finished == 0 && note->sync_waiters > 0 ? "  <-- NOBODY FULFILS IT" : "",
@@ -399,10 +413,10 @@ dump_threads(void)
 	mach_port_t me = mach_task_self();
 
 	if (task_threads(me, &threads, &count) != KERN_SUCCESS) {
-		say("redwood: appstored: task_threads() refused\n");
+		say("redwood: store: task_threads() refused\n");
 		return;
 	}
-	say("redwood: appstored: %u threads\n", count);
+	say("redwood: store: %u threads\n", count);
 	for (unsigned i = 0; i < count; i++) {
 		arm_thread_state64_t state;
 		mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
@@ -416,11 +430,11 @@ dump_threads(void)
 			suspend = basic.suspend_count;
 		}
 		if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&state, &state_count) != KERN_SUCCESS) {
-			say("redwood: appstored: thread %u: no state (run %d)\n", i, run_state);
+			say("redwood: store: thread %u: no state (run %d)\n", i, run_state);
 			continue;
 		}
 		frames_from((uintptr_t)arm_thread_state64_get_fp(state), text, sizeof(text));
-		say("redwood: appstored: thread %u: run %d suspend %d pc %#lx lr %#lx from%s\n", i, run_state, suspend,
+		say("redwood: store: thread %u: run %d suspend %d pc %#lx lr %#lx from%s\n", i, run_state, suspend,
 		    (uintptr_t)arm_thread_state64_get_pc(state) - slide,
 		    (uintptr_t)arm_thread_state64_get_lr(state) - slide, text);
 	}
@@ -443,7 +457,7 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 		fp = (uintptr_t)context->uc_mcontext->__ss.__fp;
 	}
 	frames_from(fp, frames, sizeof(frames));
-	say("redwood: appstored: signal %d at %p, pc %#lx, lr %#lx, called from%s (unslid)\n", signal_number,
+	say("redwood: store: signal %d at %p, pc %#lx, lr %#lx, called from%s (unslid)\n", signal_number,
 	    info != NULL ? info->si_addr : NULL, pc - slide, lr - slide, frames);
 	signal(signal_number, SIG_DFL);
 	raise(signal_number);
@@ -496,7 +510,7 @@ new_ams_storefront(id self, SEL _cmd)
 		char buffer[128];
 
 		said = true;
-		say("redwood: appstored: ams_storefront was %s, now " STOREFRONT "\n", text_of(was, buffer, sizeof(buffer)));
+		say("redwood: store: ams_storefront was %s, now " STOREFRONT "\n", text_of(was, buffer, sizeof(buffer)));
 	}
 	returned[COUNT_ams_storefront]++;
 	return was != NULL ? was : (id)storefront;
@@ -508,7 +522,7 @@ new_cached_storefront(id self, SEL _cmd)
 	entered[COUNT_cachedStorefront]++;
 	id was = old_cached_storefront != NULL ? old_cached_storefront(self, _cmd) : NULL;
 
-	say("redwood: appstored: cachedStorefront was %s\n", was != NULL ? "set" : "(nil), now " STOREFRONT);
+	say("redwood: store: cachedStorefront was %s\n", was != NULL ? "set" : "(nil), now " STOREFRONT);
 	returned[COUNT_cachedStorefront]++;
 	return was != NULL ? was : (id)storefront;
 }
@@ -520,7 +534,7 @@ new_bag_storefront(id self, SEL _cmd, id media_type)
 	id was = old_bag_storefront != NULL ? old_bag_storefront(self, _cmd, media_type) : NULL;
 	char buffer[128];
 
-	say("redwood: appstored: bagStorefrontForAccountMediaType:%s was %s\n", text_of(media_type, buffer, sizeof(buffer)),
+	say("redwood: store: bagStorefrontForAccountMediaType:%s was %s\n", text_of(media_type, buffer, sizeof(buffer)),
 	    was != NULL ? "set" : "(nil), now " STOREFRONT);
 	returned[COUNT_bagStorefront_fixed]++;
 	return was != NULL ? was : (id)storefront;
@@ -533,7 +547,7 @@ new_bag_storefront_active(id self, SEL _cmd, id media_type)
 	id was = old_bag_storefront_active != NULL ? old_bag_storefront_active(self, _cmd, media_type) : NULL;
 	char buffer[128];
 
-	say("redwood: appstored: active bagStorefrontForAccountMediaType:%s was %s\n",
+	say("redwood: store: active bagStorefrontForAccountMediaType:%s was %s\n",
 	    text_of(media_type, buffer, sizeof(buffer)), was != NULL ? "set" : "(nil), now " STOREFRONT);
 	returned[COUNT_bagStorefront_active]++;
 	return was != NULL ? was : (id)storefront;
@@ -545,7 +559,7 @@ new_copy_storefront(id self, SEL _cmd, id account)
 	entered[COUNT_copyStorefront]++;
 	id was = old_copy_storefront != NULL ? old_copy_storefront(self, _cmd, account) : NULL;
 
-	say("redwood: appstored: ams_copyStorefrontFromAccount: was %s\n",
+	say("redwood: store: ams_copyStorefrontFromAccount: was %s\n",
 	    was != NULL ? "set" : "(nil), now " STOREFRONT);
 	returned[COUNT_copyStorefront]++;
 	return was != NULL ? was : (id)storefront;
@@ -560,7 +574,7 @@ new_bag_account(id self, SEL _cmd, id media_type, bool must_contain_storefront)
 	returned[COUNT_bagAccount]++;
 	char one[128], two[192];
 
-	say("redwood: appstored: _bagAccountForAccountMediaType:%s mustContainStorefront:%d -> %s\n",
+	say("redwood: store: _bagAccountForAccountMediaType:%s mustContainStorefront:%d -> %s\n",
 	    text_of(media_type, one, sizeof(one)), must_contain_storefront ? 1 : 0, text_of(account, two, sizeof(two)));
 	return account;
 }
@@ -575,18 +589,18 @@ new_perform_fetch(id self, SEL _cmd, long attempt, id account, id front)
 
 	id promise;
 
-	say("redwood: appstored: BAG FETCH attempt %ld, storefront %s, account %s\n", attempt,
+	say("redwood: store: BAG FETCH attempt %ld, storefront %s, account %s\n", attempt,
 	    text_of(front, two, sizeof(two)), text_of(account, one, sizeof(one)));
 	for (size_t i = 0; i < replacement_count(); i++) {
 		if (!replacements[i].done) {
-			say("redwood: appstored: NOT TAKEN %c[%s %s]\n", replacements[i].class_method ? '+' : '-',
+			say("redwood: store: NOT TAKEN %c[%s %s]\n", replacements[i].class_method ? '+' : '-',
 			    replacements[i].class_name, replacements[i].selector);
 		}
 	}
 	promise = old_perform_fetch(self, _cmd, attempt, account, front);
 	returned[COUNT_performFetch]++;
 	note_label(promise, "THE BAG FETCH", NULL);
-	say("redwood: appstored: BAG FETCH returned %s\n", promise != NULL ? "a promise" : "(nil)");
+	say("redwood: store: BAG FETCH returned %s\n", promise != NULL ? "a promise" : "(nil)");
 	return promise;
 }
 
@@ -597,7 +611,7 @@ new_query_items(id self, SEL _cmd, id client, id profile, id version, id cookies
 	id items = old_query_items(self, _cmd, client, profile, version, cookies, account, front);
 	char one[64], two[160];
 
-	say("redwood: appstored: BAG QUERY profile %s, storefront %s -> %s\n", text_of(profile, one, sizeof(one)),
+	say("redwood: store: BAG QUERY profile %s, storefront %s -> %s\n", text_of(profile, one, sizeof(one)),
 	    text_of(front, two, sizeof(two)), items != NULL ? "items" : "(nil)");
 	return items;
 }
@@ -609,7 +623,7 @@ new_perform_request(id self, SEL _cmd, id request, id completion)
 	entered[COUNT_performRequest]++;
 	char buffer[320];
 
-	say("redwood: appstored: AMSURLSession performRequest:completion: %s\n", text_of(request, buffer, sizeof(buffer)));
+	say("redwood: store: AMSURLSession performRequest:completion: %s\n", text_of(request, buffer, sizeof(buffer)));
 	return old_perform_request(self, _cmd, request, completion);
 }
 
@@ -619,7 +633,7 @@ new_perform_request_block(id self, SEL _cmd, id request, id completion)
 	entered[COUNT_performRequestBlock]++;
 	char buffer[320];
 
-	say("redwood: appstored: AMSURLSession performRequest:completionBlock: %s\n", text_of(request, buffer, sizeof(buffer)));
+	say("redwood: store: AMSURLSession performRequest:completionBlock: %s\n", text_of(request, buffer, sizeof(buffer)));
 	return old_perform_request_block(self, _cmd, request, completion);
 }
 
@@ -634,7 +648,7 @@ say_resume(id task, const char *where)
 	char buffer[320];
 	id request = ((id (*)(id, SEL))objc_msgSend)(task, sel_registerName("originalRequest"));
 
-	say("redwood: appstored: TASK RESUME (%s) %s\n", where, text_of(request, buffer, sizeof(buffer)));
+	say("redwood: store: TASK RESUME (%s) %s\n", where, text_of(request, buffer, sizeof(buffer)));
 }
 
 static void
@@ -668,14 +682,14 @@ dump_selectors(const char *class_name, const char *needle)
 	Method *methods = cls != NULL ? class_copyMethodList(cls, &count) : NULL;
 
 	if (methods == NULL) {
-		say("redwood: appstored: %s: no such class\n", class_name);
+		say("redwood: store: %s: no such class\n", class_name);
 		return;
 	}
 	for (unsigned i = 0; i < count; i++) {
 		const char *name = sel_getName(method_getName(methods[i]));
 
 		if (needle == NULL || strstr(name, needle) != NULL) {
-			say("redwood: appstored: %s has -%s\n", class_name, name);
+			say("redwood: store: %s has -%s\n", class_name, name);
 		}
 	}
 	free(methods);
@@ -687,7 +701,7 @@ late_report(__unused void *ignored)
 	sleep(150);                     /* past the start's flood, where the console keeps what it is given */
 	for (size_t i = 0; i < replacement_count(); i++) {
 		if (!replacements[i].done) {
-			say("redwood: appstored: NOT TAKEN %c[%s %s]\n", replacements[i].class_method ? '+' : '-',
+			say("redwood: store: NOT TAKEN %c[%s %s]\n", replacements[i].class_method ? '+' : '-',
 			    replacements[i].class_name, replacements[i].selector);
 		}
 	}
@@ -699,7 +713,7 @@ late_report(__unused void *ignored)
 		 * ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies: instead. Hooked and never
 		 * entered can mean the hook is wrong, not the code.
 		 */
-		say("redwood: appstored: entered %4lu returned %4lu %s%s\n", entered[i], returned[i], counted[i],
+		say("redwood: store: entered %4lu returned %4lu %s%s\n", entered[i], returned[i], counted[i],
 		    entered[i] > returned[i] ? "   <-- STILL IN IT" :
 		    entered[i] == 0 ? "   <-- NEVER ENTERED: suspect the hook, not the code" : "");
 	}
@@ -729,7 +743,7 @@ new_create_request(id self, SEL _cmd, id items)
 	entered[COUNT_createRequest]++;
 	request = old_create_request(self, _cmd, items);
 	returned[COUNT_createRequest]++;
-	say("redwood: appstored: STEP _createRequestWithQueryItems: -> %s\n", text_of(request, buffer, sizeof(buffer)));
+	say("redwood: store: STEP _createRequestWithQueryItems: -> %s\n", text_of(request, buffer, sizeof(buffer)));
 	note_label(request, "THE BAG REQUEST", NULL);
 	return request;
 }
@@ -743,7 +757,7 @@ new_session_promise(id self, SEL _cmd)
 	entered[COUNT_sessionPromise]++;
 	promise = old_session_promise(self, _cmd);
 	returned[COUNT_sessionPromise]++;
-	say("redwood: appstored: STEP URLSessionPromise -> %s\n", text_of(promise, buffer, sizeof(buffer)));
+	say("redwood: store: STEP URLSessionPromise -> %s\n", text_of(promise, buffer, sizeof(buffer)));
 	return promise;
 }
 
@@ -756,7 +770,7 @@ new_data_task_promise(id self, SEL _cmd, id request)
 	entered[COUNT_dataTaskPromise]++;
 	promise = old_data_task_promise(self, _cmd, request);
 	returned[COUNT_dataTaskPromise]++;
-	say("redwood: appstored: STEP dataTaskPromiseWithRequest: -> %s\n", text_of(promise, buffer, sizeof(buffer)));
+	say("redwood: store: STEP dataTaskPromiseWithRequest: -> %s\n", text_of(promise, buffer, sizeof(buffer)));
 	return promise;
 }
 
@@ -769,7 +783,7 @@ new_data_task(id self, SEL _cmd, id request)
 	entered[COUNT_dataTask]++;
 	task = old_data_task(self, _cmd, request);
 	returned[COUNT_dataTask]++;
-	say("redwood: appstored: STEP dataTaskWithRequest: -> %s\n", text_of(task, buffer, sizeof(buffer)));
+	say("redwood: store: STEP dataTaskWithRequest: -> %s\n", text_of(task, buffer, sizeof(buffer)));
 	return task;
 }
 
@@ -812,7 +826,7 @@ new_##name(id self, SEL cmd, void *a) \
 { \
 	unsigned n = step_in(COUNT_##name); \
 	void *result = old_##name(self, cmd, a); \
-	say("redwood: appstored: #%u is for promise %p\n", n, (void *)self); \
+	say("redwood: store: #%u is for promise %p\n", n, (void *)self); \
 	step_out(COUNT_##name, n, result != NULL); \
 	return result; \
 }
@@ -851,6 +865,40 @@ new_##name(id self, SEL cmd, void *a, void *b, void *c) \
 
 /* the funnel every finished promise goes through, and the two ways of waiting on one */
 /*
+ * IS FAIRPLAY LOAD-BEARING FOR BROWSING AT ALL? The root of the jam is outside this daemon --
+ * fairplayd.H2 starts, leaves at once and is restarted every ten seconds, and an AMS thread waits
+ * for a reply that never comes (src/inject_fairplay.c). Before reading an obfuscated daemon to find
+ * out why it quits, it is worth knowing whether the store needs its answer in the first place. The
+ * top of that stack is an Objective-C method -- -[AMSUserAgent _sharedComponentFairPlayDeviceType],
+ * a dispatch_once-memoised lookup that goes down to AMS::FairPlayProvider::getDeviceType() and
+ * _AMSFairPlayGetHardwareInfo -- so it costs a method_setImplementation, the same move as the
+ * storefront getters.
+ * The value is deliberately NOT plausible. A zero or an empty string would travel into the user
+ * agent and the Mescal path and read like data; this reads like what it is, and the log says on the
+ * same line that it was injected, so that nobody later mistakes it for a measurement.
+ * Why the wait looks infinite rather than failed, which is worth keeping in mind: launchd holds a
+ * job's MachService port whether or not the job is running, so a client's message is QUEUED, not
+ * refused. A daemon that is absent fails fast; a daemon launchd keeps restarting makes its clients
+ * wait for ever. That is the README's "look at what launchd restarts" bullet seen from the client.
+ */
+#define FAIRPLAY_DEVICE_TYPE "REDWOOD-INJECTED-NOT-A-FAIRPLAY-DEVICE"
+
+static CFStringRef fairplay_device_type;
+
+static id (*old_fpDeviceType)(id, SEL);
+static id
+new_fpDeviceType(id self, SEL _cmd)
+{
+	(void)self;
+	(void)_cmd;
+	entered[COUNT_fpDeviceType]++;
+	returned[COUNT_fpDeviceType]++;
+	say("redwood: store: FairPlay device type answered INJECTED \"" FAIRPLAY_DEVICE_TYPE "\" "
+	    "(not measured; the real one blocks for ever, see src/inject_fairplay.c)\n");
+	return (id)fairplay_device_type;
+}
+
+/*
  * THE WAIT THAT MATTERS, and the one thing this library changes besides answering a storefront.
  * Resolved from the threads' own frames:
  *   -[AMSBagNetworkTask performFetch]_block_invoke
@@ -876,7 +924,7 @@ new_afterUpdating(id self, SEL cmd, void *storefront)
 	entered[COUNT_afterUpdating]++;
 	account = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("ams_localiTunesAccount"));
 	returned[COUNT_afterUpdating]++;
-	say("redwood: appstored: _ams_localiTunesAccountAfterUpdatingStorefront: answered at once, %s\n",
+	say("redwood: store: _ams_localiTunesAccountAfterUpdatingStorefront: answered at once, %s\n",
 	    account != NULL ? "with the local account" : "with nothing");
 	return account;
 }
@@ -898,10 +946,10 @@ new_bagValue(id self, SEL cmd, void *error)
 
 	entered[COUNT_bagValue]++;
 	frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-	say("redwood: appstored: WAIT -[AMSBagValue valueWithError:] from%s\n", frames);
+	say("redwood: store: WAIT -[AMSBagValue valueWithError:] from%s\n", frames);
 	result = old_bagValue(self, cmd, error);
 	returned[COUNT_bagValue]++;
-	say("redwood: appstored: WAIT -[AMSBagValue valueWithError:] came back %s\n", result ? "with a value" : "empty");
+	say("redwood: store: WAIT -[AMSBagValue valueWithError:] came back %s\n", result ? "with a value" : "empty");
 	return result;
 }
 
@@ -1022,6 +1070,10 @@ static struct replacement replacements[] = {
 	  (IMP *)&old_afterUpdating, false },
 	{ "NSMutableURLRequest", "ams_addCookiesForAccount:clientInfo:bag:cleanupGlobalCookies:", false,
 	  (IMP)new_addCookies4, (IMP *)&old_addCookies4, false },
+	{ "AMSUserAgent", "_sharedComponentFairPlayDeviceType", false, (IMP)new_fpDeviceType,
+	  (IMP *)&old_fpDeviceType, false },
+	{ "AMSUserAgent", "_sharedComponentFairPlayDeviceType", true, (IMP)new_fpDeviceType,
+	  (IMP *)&old_fpDeviceType, false },
 	{ "AMSBagValue", "valueWithError:", false, (IMP)new_bagValue, (IMP *)&old_bagValue, false },
 	{ "AMSPromise", "resultBeforeDate:error:", false, (IMP)new_resultBefore, (IMP *)&old_resultBefore, false },
 	{ "NSURLSessionTask", "resume", false, (IMP)new_resume_base, (IMP *)&old_resume_base, false },
@@ -1063,7 +1115,7 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 		if (super != NULL && method == (r->class_method ? class_getClassMethod(super, selector) :
 		    class_getInstanceMethod(super, selector))) {
 			r->done = true;
-			say("redwood: appstored: %c[%s %s] is inherited, not this class's: left alone\n",
+			say("redwood: store: %c[%s %s] is inherited, not this class's: left alone\n",
 			    r->class_method ? '+' : '-', r->class_name, r->selector);
 			continue;
 		}
@@ -1073,7 +1125,7 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 			*r->original = original;
 		}
 		method_setImplementation(method, r->replacement);
-		say("redwood: appstored: %c[%s %s] taken (was %#lx unslid)\n", r->class_method ? '+' : '-', r->class_name,
+		say("redwood: store: %c[%s %s] taken (was %#lx unslid)\n", r->class_method ? '+' : '-', r->class_name,
 		    r->selector, (uintptr_t)original - slide);
 	}
 }
@@ -1085,13 +1137,21 @@ redwood_store_init(void)
 	const char *name = getprogname();
 	size_t length = 0;
 
-	if (name == NULL || strcmp(name, "appstored") != 0) {
+	/*
+	 * Both of them: appstored holds the bag, but AppStore.app has an AppleMediaServices of its own
+	 * and blocks in the same FairPlay lookup -- with the daemon unjammed and the app not, the
+	 * daemon fetches its bag and the screen still says LOADING, which is exactly what the first run
+	 * of the FairPlay answer showed.
+	 */
+	if (name == NULL || (strcmp(name, "appstored") != 0 && strcmp(name, "AppStore") != 0)) {
 		return;
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	watch_for_faults();
 	storefront = CFStringCreateWithCString(NULL, STOREFRONT, kCFStringEncodingUTF8);
-	say("redwood: appstored: ours is in, storefront to answer with is " STOREFRONT "\n");
+	fairplay_device_type = CFStringCreateWithCString(NULL, FAIRPLAY_DEVICE_TYPE, kCFStringEncodingUTF8);
+	who = name;
+	say("redwood: store(%s): ours is in, storefront to answer with is " STOREFRONT "\n", name);
 	{
 		pthread_t thread;
 
