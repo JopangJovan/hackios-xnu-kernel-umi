@@ -309,11 +309,35 @@ functions and not entry points at all.
   they are evidence about is binding, descriptors and ir3's texture instructions — exactly what
   they were built to be — and silence about everything Metal's sampler state decides. Two modules
   of the corpus declare a `constexpr sampler`; everywhere else the API supplies it.
-- **Of Apple's own kernels, one has been dispatched, and on software.** `air_run` can dispatch a
-  kernel and read its device buffers back (section 5b), and the one that has agrees with its NIR
-  exactly. The 24 kernels that use textures are not dispatched at all: the harness binds textures
-  for a draw and not for a dispatch. So the atomics being checked (above) is a statement about
-  two kernels written here for that purpose, not about the 17 of Apple's 40 that use one.
+- **Of Apple's own 47 kernels, 6 are dispatched, all on software.** `tools/air/kernelcheck.py`
+  prints where each one stops, as a table whose rows are checked against the total before it is
+  printed:
+
+  | | of 47 |
+  | --- | --- |
+  | dispatched and read back | 6 |
+  | refused by this harness | 0 |
+  | softpipe's `nir_to_tgsi`: scratch and intrinsics it lacks (ir3 has these) | 34 |
+  | calls an `air.visible` library function in the module | 5 |
+  | a shuffle mask that is not constant | 2 |
+
+  The 6 is the honest number and not the interesting one. Until 20 October, 24 of these were
+  refused by `air_run` itself — it bound textures and images for a draw and not for a dispatch —
+  and binding them moved the count only from 5 to 6, because softpipe is the wall behind ours.
+  What changed is whose wall it is: **nothing is refused by this harness any more**, and the 34
+  are stopped by a software rasteriser that lacks scratch memory and some compute intrinsics,
+  both of which ir3 has. They are a question for the phone now rather than a question for us,
+  which they were not before. Claiming 24 unblocked would be false; they moved from one wall to
+  another and the second is not ours.
+
+  Images are read back after a dispatch, which also matters for the textures: most of these
+  kernels write *only* an image, so without the readback a dispatch would have reported success
+  with nothing examined — and that is the shape this check has been caught by three times
+  (README, "Как врут собственные проверки"). The readback is what `air.write_texture_2d/3d` needed
+  as well, which `texopcheck.py` had listed as having no case for exactly this reason.
+
+  So the atomics being checked (above) is still a statement about two kernels written here for
+  that purpose, not about the 17 of Apple's 40 that use one.
 
 ## 1. Where the frontend lives: inside Mesa, as `src/compiler/air`
 
@@ -1059,7 +1083,8 @@ an unhandled metadata key), so "features not yet handled" is a ranked list, not 
   binding or descriptors. That narrowness disappears as soon as real filtering is tested.
 
   Of 55 texture shaders, 49 are not run, and the reasons are the honest part: 24 are compute
-  kernels (`air_run` draws, it does not dispatch); 11 are `air.visible` library functions; 4
+  kernels (`air_run` dispatches those as of 20 October, but softpipe's `nir_to_tgsi` stops most of
+  them — see the kernel table above); 11 are `air.visible` library functions; 4
   sample a multisample texture the harness does not bind; 1 writes only depth; 1 hits an
   assertion in softpipe's own NIR-to-TGSI; 8 are other translation refusals. **Not one returns a
   wrong number** — the failures are all a refusal to run, which is the shape of failure to want.
