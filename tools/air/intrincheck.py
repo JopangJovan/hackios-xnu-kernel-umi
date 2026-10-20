@@ -774,11 +774,44 @@ DOT_FLOATS = [0.0, 1.0, -1.0, 2.0, 3.0, -4.0, 0.5, -0.25, 8.0, -16.0]
 # So these are the values that have actually broken something: both zeros, the
 # half-way cases that separate round from rint, the largest float below a half,
 # and the integer extremes.
+#
+# THE ORDER OF EVERY POOL BELOW IS LOAD-BEARING: --cases N keeps the first N and
+# nothing else, so a value's position decides whether it is ever asked on the
+# phone. Do not sort these, and do not add a value at the front: put it after
+# the ones that decide something. Getting this wrong does not make a check fail,
+# it narrows the question and stays green -- which is how the Adreno's u32 -> f32
+# truncation came to be found by luck rather than by design. The suite carried on
+# 20 October used --cases 4, which took [0, 1, -1, 7] from the integer pool, and
+# -1 read as unsigned happened to be the one value in it that rounding decides.
 FEW_FLOATS = [0.0, -0.0, 0.5, -0.5,
               struct.unpack("<f", struct.pack("<I", 0x3EFFFFFF))[0],
               2.5, -2.5, 3.7]
 FEW_FLOATS2 = [1.0, -1.0, 0.0, 0.25]
 FEW_INTS = [0, 1, -1, 7, -32768, 32767, 2147483647, -2147483648]
+# Integer-to-float conversion gets its own pool, because what breaks there is
+# not the magnitude but the rounding, and only a value that falls between two
+# representable floats exercises it at all. The Adreno truncates u32 -> f32
+# (section 4 of docs/air.md), and 0xFFFFFFFF was enough to see that something
+# was wrong while saying nothing about which rule is in use. These say which:
+#
+#   0x00FFFFFF  2^24-1, the last integer every float can hold exactly: every
+#               rounding rule must agree here, so a disagreement is not rounding
+#   0x01000001  2^24+1, exactly half way between 2^24 and 2^24+2. The lower
+#               neighbour has an even mantissa, so half-to-even rounds DOWN here
+#               and half-away-from-zero rounds up
+#   0x01000003  2^24+3, half way between 2^24+2 and 2^24+4, where the lower
+#               neighbour is odd: half-to-even rounds UP. With the line above it,
+#               the pair separates to-even from away-from-zero, which one midpoint
+#               alone cannot do
+#   0x7FFFFFFF  and 0xFFFFFFFF (-1): 1 below a power of two, where the nearest
+#               float is 255 away on one side and 1 on the other -- truncation
+#               and rounding differ by a whole ulp, which is what was seen
+#
+# First in the list are the ones that decide a rule, because --cases N keeps the
+# first N: the suite carried to the phone used 4, which took [0, 1, -1, 7] and
+# so never asked about a midpoint at all.
+CONV_INTS = [0, -1, 16777217, 16777219, 2147483647, 16777215, 1, 7,
+             -32768, 32767, -2147483648]
 FEW_INTS2 = [1, -1, 0, 7]
 FEW_DOT = [0.0, 1.0, -1.0, 2.0, -4.0, 0.5, -0.25, 8.0]
 
@@ -789,6 +822,8 @@ def pool_for(ty, family, few=False, nth=0):
         if bty == "i1":
             return [0, 1]
         if bty.startswith("i"):
+            if family == "convert" and bty == "i32":
+                return CONV_INTS
             return FEW_INTS if nth == 0 else FEW_INTS2
         if family == "dot":
             return FEW_DOT
