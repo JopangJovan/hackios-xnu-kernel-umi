@@ -165,12 +165,30 @@ functions and not entry points at all.
   value. So on the Metal side the blast radius is 20 modules, not all 313 that translate, and
   whether each of those 20 actually changes depends on the values it meets at run time.
 
-  That bounds this frontend's half and says nothing about the other. The port's OpenGL ES reaches
-  ir3 through Mesa's own GLSL compiler, which this check does not look at, so **"it changes
-  everything ir3 compiles, the window server included" is reasoning and not measurement.** A peer
-  session is putting that to a visual test — an ordinary boot to the home screen with the patch,
-  compared against one without it — because the claim is the part of this that would matter to
-  someone deciding whether to carry the patch, and it is the part with no runs behind it.
+  That bounds this frontend's half. **The other half has now been measured too, by a peer session,
+  and the answer has a shape worth keeping.** The port's OpenGL ES reaches ir3 through Mesa's own
+  GLSL compiler, which the count above does not look at, so what the patch does to the screen could
+  only be answered by looking at the screen: one image, one command line, an ordinary boot to the
+  home screen, patched against unpatched.
+
+  | | differ by 1–8 | differ by more than 8 |
+  | --- | --- | --- |
+  | patched against unpatched (4 min 33 s apart) | 10 835 | 2 508 |
+  | unpatched against unpatched (8 min 36 s apart) | **13 738** | 2 286 |
+
+  Both large patches in the pair were cut out and looked at rather than guessed from their
+  coordinates: the Clock icon, whose hands had moved, and the status bar's clock. **No geometry
+  moved and no colour changed.** The small residue sat in the bottom bands — search, dock, page
+  dots, the transparent things with a blur behind them — exactly where a rounding change would show
+  and at exactly the magnitude predicted, which is why the control mattered: two runs of the *same*
+  binary, with a larger gap, differ by **more**. So the residue belongs to the run and not to the
+  patch, and the honest statement is not "nothing changed" but **"any change is smaller than what
+  the screen does to itself between launches"**.
+
+  That is the useful form here, because the pair alone would have supported a confident wrong
+  answer. The pixels were in the right place, of the right size, and told a coherent story about
+  blur arithmetic; a measurement without a control answers a question nobody asked, and it cost one
+  extra run to find out.
 
   The fix is one line, and unlike the `ir3_cmdline` bug this one is in a file upstream still
   carries, with reproduction down two independent paths — so it is the first thing in this work
