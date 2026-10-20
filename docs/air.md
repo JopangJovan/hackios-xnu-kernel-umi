@@ -30,7 +30,7 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | | of 119 |
 | --- | --- |
 | checked numerically, one operation at a time, against a reference outside this tree | 78 |
-| of those, exactly defined and agreeing on every case (45 652 cases) | 71 |
+| of those, exactly defined and agreeing on every case (45 697 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
 | of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
 | of those, run **on the phone's own Adreno** (714 cases) and agreeing there | 61 |
@@ -48,11 +48,11 @@ functions and not entry points at all.
 
 - **The arithmetic operations are checked; two of them have now been checked against the
   Adreno, and the other 76 have not.** 71 of the corpus's declarations agree with C's own
-  functions on every one of 45 652 cases, and 47 of them agree again when *executed* by softpipe
+  functions on every one of 45 697 cases, and 47 of them agree again when *executed* by softpipe
   instead of folded — which is a real answer to what used to be the largest hole here (section 4,
   item 4), and found three bugs getting there. But those two engines are both on an x86 host. An
   opcode whose Adreno instruction differs from what `nir_opt_constant_folding` and TGSI compute is
-  invisible to all 48 238 of those cases, and the 24 narrow-type declarations softpipe cannot run
+  invisible to all 48 283 of those cases, and the 24 narrow-type declarations softpipe cannot run
   at all are exactly the ones where ir3 differs most from it.
 
   On 20 October that stopped being true. All 78 declarations ran on the phone's own Adreno, and
@@ -610,7 +610,7 @@ Three references, each independent of the translator:
    --eval`. The reference is the C library's own `roundf`, `floorf`, `fmaxf`, `ldexpf` and the
    IEEE definitions, evaluated at the operation's own precision.
 
-   **71 exactly defined operations agree on every one of 45 652 cases; none differ.** Seven are
+   **71 exactly defined operations agree on every one of 45 697 cases; none differ.** Seven are
    approximate (`fast_sin`, `fast_cos`, `fast_exp`, `fast_pow`, `fast_atan2`) and are reported
    with their worst distance from libm and counted as nothing — see below.
 

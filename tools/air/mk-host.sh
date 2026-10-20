@@ -24,7 +24,12 @@ SRC=$B/mesa-$VERSION
 mkdir -p "$B"
 cd "$B"
 
-PATCHES=$(cat "$ROOT"/tools/mesa/air*.patch | sha256sum | cut -d' ' -f1)
+# air-*.patch is the frontend and the ir3 entry point; ir3-*.patch is a fix to ir3 itself, and it
+# belongs here as much as in the cross build -- this tool is where the corpus's "compiled by ir3"
+# column comes from and where its Adreno instructions are read, so a host ir3 that differs from the
+# device's would make both of those say something about a compiler nothing runs. The other patches
+# in tools/mesa are for the Darwin cross build and are deliberately left out.
+PATCHES=$(cat "$ROOT"/tools/mesa/air*.patch "$ROOT"/tools/mesa/ir3-*.patch | sha256sum | cut -d' ' -f1)
 if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.air-patches" 2>/dev/null)" != "$PATCHES" ]; then
 	if [ ! -f mesa-$VERSION.tar.xz ]; then
 		# the cross build may already have fetched it
@@ -38,7 +43,7 @@ if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.air-patches" 2>/dev/null)" != "$PATCHES" ]
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf "$SRC" build
 	tar xJf mesa-$VERSION.tar.xz
-	for p in "$ROOT"/tools/mesa/air-*.patch; do
+	for p in "$ROOT"/tools/mesa/air-*.patch "$ROOT"/tools/mesa/ir3-*.patch; do
 		patch -s --no-backup-if-mismatch -d "$SRC" -p1 < "$p"
 	done
 
