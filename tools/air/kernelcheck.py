@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""How far every compute kernel of the corpus gets, as a table that has to add up.
+
+The corpus's 47 kernels are the part of it a draw cannot test, and air_run
+dispatches them (air_run.c, dispatch_kernel). This reports where each one
+stops, grouped by cause.
+
+The grouping exists because the causes are not alike and lead to different
+work: one of them is ours to fix, one is softpipe's and may not be the
+Adreno's, and two are known limits with names. Telling them apart is the
+whole point -- "6 of 47 dispatch" on its own invites the reader to guess why
+the other 41 do not.
+
+Every kernel lands in exactly one row and the rows are checked against the
+total before anything is printed. That check is here because the first version
+of this table was assembled by hand in a report, and it came to 45 of 47: two
+kernels whose message matched no pattern fell into a prose aside instead of a
+row, which is exactly the habit README's "Как врут собственные проверки" warns
+about -- an exclusion without its own number. A table that cannot fail to add
+up is worth more than a careful author.
+
+usage: kernelcheck.py [--list] [FILE.metallib...]
+       (no files: the five libraries of the corpus, as check.sh has them)
+"""
+
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+AIR2NIR = os.environ.get(
+    "AIR2NIR", os.path.join(ROOT, "build/mesa-host/build/src/compiler/air/air2nir"))
+AIR_RUN = os.environ.get(
+    "AIR_RUN",
+    os.path.join(ROOT, "build/mesa-host/build/src/gallium/drivers/freedreno/air_run"))
+
+LIBS = [
+    "ios165/rootfs/System/Library/VideoDecoders/AV1SW.metallib",
+    "ios165/rootfs/System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib",
+    "ios165/rootfs/System/Library/CoreImage/PortraitFilters.cifilter/default.metallib",
+    "ios165/rootfs/System/Library/CoreImage/PortraitFilters.cifilter/portrait_filters.metallib",
+]
+
+# One row per cause, in the order a reader wants them: what works, then what is
+# ours, then what is not ours, then the named limits. The matcher is a substring
+# of air_run's own message, so a message this does not know falls to "unmatched"
+# and is printed with the kernel's name rather than counted as something else.
+CAUSES = [
+    ("dispatched", None,
+     "dispatched and read back"),
+    ("harness", "this harness",
+     "refused by this harness (ours to fix)"),
+    ("softpipe", ("tgsi_ureg.h", "nir_to_tgsi.c", "Unknown intrinsic"),
+     "softpipe's nir_to_tgsi: scratch and intrinsics it lacks (ir3 has these)"),
+    ("library", "intrinsic: a call of",
+     "calls an air.visible library function in the module"),
+    ("shuffle", "a shuffle mask that is not constant",
+     "a shuffle mask that is not constant (a frontend limit)"),
+]
+
+
+def kernels(libs):
+    out = []
+    for lib in libs:
+        path = lib if os.path.isabs(lib) else os.path.join(ROOT, lib)
+        if not os.path.exists(path):
+            print("kernelcheck: missing %s" % lib, file=sys.stderr)
+            sys.exit(1)
+        q = subprocess.run([AIR2NIR, "--list", path], capture_output=True)
+        for line in q.stdout.decode(errors="replace").splitlines():
+            f = line.split()
+            if len(f) >= 2 and f[1] == "kernel":
+                out.append((path, f[0]))
+    return out
+
+
+def classify(text):
+    for key, needles, _ in CAUSES:
+        if needles is None:
+            continue
+        if isinstance(needles, str):
+            needles = (needles,)
+        if any(n in text for n in needles):
+            return key
+    return None
+
+
+def main(argv):
+    want_list = "--list" in argv
+    libs = [a for a in argv if not a.startswith("--")] or LIBS
+    for prog in (AIR2NIR, AIR_RUN):
+        if not os.path.exists(prog):
+            print("kernelcheck: run tools/air/mk-host.sh first (%s)" % prog,
+                  file=sys.stderr)
+            return 1
+
+    ks = kernels(libs)
+    counts = {key: [] for key, _, _ in CAUSES}
+    unmatched = []
+    for path, name in ks:
+        q = subprocess.run([AIR_RUN, path, name], capture_output=True, timeout=300)
+        if q.returncode == 0:
+            counts["dispatched"].append(name)
+            continue
+        key = classify((q.stdout + q.stderr).decode(errors="replace"))
+        if key is None:
+            unmatched.append(name)
+        else:
+            counts[key].append(name)
+
+    # before printing anything: the rows must account for every kernel. A table
+    # that does not add up is worse than no table, because the reader checks the
+    # sum in their head and believes it.
+    total = sum(len(v) for v in counts.values()) + len(unmatched)
+    print("kernelcheck: %d compute kernels in %d librar%s"
+          % (len(ks), len(libs), "y" if len(libs) == 1 else "ies"))
+    for key, _, label in CAUSES:
+        print("  %2d  %s" % (len(counts[key]), label))
+        if want_list and counts[key]:
+            for n in sorted(counts[key]):
+                print("        %s" % n)
+    if unmatched:
+        print("  %2d  stopped with a message this script does not know: %s"
+              % (len(unmatched), ", ".join(sorted(unmatched))))
+    if total != len(ks):
+        print("kernelcheck: the rows add to %d and there are %d kernels, so this table "
+              "is wrong and not merely incomplete" % (total, len(ks)), file=sys.stderr)
+        return 1
+    print("kernelcheck: the rows add to %d, which is every kernel" % total)
+    return 1 if unmatched else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
