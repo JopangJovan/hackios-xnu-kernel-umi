@@ -11,15 +11,15 @@ correct**: correctness needs the CPU reference and a run on the GPU.
 | --- | --- | --- |
 | container | 456 | 100% |
 | reader | 456 | 100% |
-| translate | 313 | 69% |
-| ir3 | 313 | 69% |
+| translate | 318 | 70% |
+| ir3 | 318 | 70% |
 
 ## By stage of the shader
 
 | what the module is | modules | translate | ir3 |
 | --- | --- | --- | --- |
-| fragment | 271 | 270 | 270 |
-| kernel | 47 | 40 | 40 |
+| fragment | 271 | 271 | 271 |
+| kernel | 47 | 44 | 44 |
 | vertex | 3 | 3 | 3 |
 | visible | 135 | 0 | 0 |
 
@@ -29,10 +29,10 @@ The container's TYPE tag agrees with the module's own metadata on 456 of 456; 0 
 
 | library | modules | translate | ir3 |
 | --- | --- | --- | --- |
-| AppleMetalGLRenderer.bundle/default.metallib | 274 | 273 | 273 |
-| PortraitFilters.cifilter/default.metallib | 36 | 34 | 34 |
+| AppleMetalGLRenderer.bundle/default.metallib | 274 | 274 | 274 |
+| PortraitFilters.cifilter/default.metallib | 36 | 35 | 35 |
 | PortraitFilters.cifilter/portrait_filters.metallib | 135 | 0 | 0 |
-| VideoDecoders/AV1SW.metallib | 11 | 6 | 6 |
+| VideoDecoders/AV1SW.metallib | 11 | 9 | 9 |
 
 ## Modules that call no `air.*` at all
 
@@ -43,11 +43,7 @@ The container's TYPE tag agrees with the module's own metadata on 456 of 456; 0 
 | modules | where it stops |
 | --- | --- |
 | 135 | stage: air.visible, a library function (not yet) |
-| 2 | instruction: a shuffle mask that is not constant |
-| 2 | intrinsic: a call of _ZL13FilmGrainLumaN5metal9texture2dItLNS_6accessE1EvEES2_NS0_IsLS1_1EvEERU11MTLconstantK15FilmGrainParamsPU11MTLconstantKhDv2_j, a function in the module |
-| 2 | intrinsic: a call of _ZL15FilmGrainChromaN5metal9texture2dItLNS_6accessE1EvEES2_NS0_IsLS1_1EvEES2_S2_RU11MTLconstantK15FilmGrainParamsPU11MTLconstantKhS8_Dv2_j, a function in the module |
-| 1 | intrinsic: a call of ___metal_fract_v2float, a function in the module |
-| 1 | intrinsic: a call of ___metal_fract_v4float, a function in the module |
+| 3 | instruction: a shuffle mask that is not constant |
 
 ## The `air.*` functions the corpus calls
 
