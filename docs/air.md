@@ -23,7 +23,7 @@ Of the 456 modules of the device's system `.metallib` files (`tools/air/check.sh
 | translated to NIR, passing `nir_validate` | 321 |
 | compiled by ir3 into Adreno machine code | 321 |
 | numerically identical to LLVM's own execution, and drawn | 255 |
-| **run on the phone's GPU** — 7 drawn, 44 dispatched | **51** |
+| **run on the phone's GPU** — 7 drawn, 47 dispatched | **54** |
 
 And of the 119 distinct `air.*` operations those modules call (`tools/air/intrincheck.py`):
 
@@ -343,33 +343,31 @@ functions and not entry points at all.
   `air_get` already materialises one in whichever builder asks, which was checked rather than
   assumed.
 
-- **Of Apple's own 47 kernels, 44 are dispatched on the Adreno and none crash.**
+- **Of Apple's own 47 kernels, all 47 are dispatched on the Adreno and none crash.**
   `tools/air/kernelcheck.py` prints where each one stops, as a table whose rows are checked
   against the total before it is printed:
 
   | | on softpipe | **on the Adreno** |
   | --- | --- | --- |
-  | dispatched and read back | 6 | **44**, with 3 not yet run |
+  | dispatched and read back | 6 | **47** |
   | softpipe's `nir_to_tgsi`: scratch and intrinsics it lacks | 41 | — |
   | a shuffle mask our reader would not decode (ours, now fixed) | 0 | 0 |
   | **crashed `air_run`** (a defect here, not a limit) | 0 | **0** |
 
-  The three in the last-but-one row were refused when the Adreno column was measured, so that
-  column says 44 of 47 and not 47 of 47: they translate and ir3 compiles them now, and whether
-  they dispatch is a question for the next run rather than a figure to carry forward. Two of the
-  three read and write textures, which is the shape that crashed before the sampler fix, so the
-  run is worth more than a tick.
+  `logs/170547-run.log`, 710 919 bytes with no truncation marker. The three that the shuffle-mask
+  fix unblocked dispatched on the first run and read their images back; two of them bind six
+  textures, which is well past where the sampler bug used to fault, so that fix is confirmed a
+  second time by shaders it was not measured on.
 
   **The deferred question is answered: ir3 runs them.** 41 kernels stop at a software rasteriser
-  that has no scratch memory and lacks compute intrinsics; on the hardware 44 of the 47 dispatch
-  and read their results back, and every one of the 23 that bind an image is among them. The phone
-  replaced softpipe and the column that was never ours emptied. **All 47 now translate and compile
-  through ir3** — so does every other entry point of the corpus — and the only column with a gap
-  left in it is the one the phone fills.
+  that has no scratch memory and lacks compute intrinsics; on the hardware every one of the 47
+  dispatches and reads its result back, images and all. The phone replaced softpipe, and both
+  columns that were ours — the harness's refusals and the frontend's — are empty.
 
   What the rows do **not** say is right. There is no executed reference for these kernels
   anywhere: softpipe refuses 41 of them, which is why they came here, so a number out of the
-  Adreno has nothing on this machine to disagree with. 44 have been shown to *run*.
+  Adreno has nothing on this machine to disagree with. 47 have been shown to *run*, which is a
+  statement about capability and not about correctness.
 
   **The last row was blaming the shader for our own gap.** "A shuffle mask that is not constant"
   was impossible as written: LLVM requires a `shufflevector` mask to be constant, so the message
