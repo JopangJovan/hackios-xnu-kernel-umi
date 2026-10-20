@@ -120,7 +120,8 @@ INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd cont
 # a storefront is the only thing it is missing. It also writes down whether a bag request is ever
 # built at all. For an experiment, not for an image anybody else boots.
 [ -n "$STOREFRONT" ] && INJECT="$INJECT
-/redwood/lib/libredwood-store.dylib appstored"
+/redwood/lib/libredwood-store.dylib appstored
+/redwood/lib/libredwood-fairplay.dylib fairplayd.H2"
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -220,6 +221,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# request being built (src/inject_store.c)
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-store.dylib -framework CoreFoundation -lobjc \
 			-o obj/libredwood-store.dylib src/inject_store.c
+		# ... and inside fairplayd.H2, which starts and leaves at once: what it looks for, and where it
+		# gives up (src/inject_fairplay.c; watches only, replaces nothing)
+		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-fairplay.dylib -framework CoreFoundation \
+			-framework IOKit -o obj/libredwood-fairplay.dylib src/inject_fairplay.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
 		$DYN -bundle -framework CoreFoundation -o obj/RedwoodAudio src/audio_plugin.c
 		if [ -n "$GL" ]; then
@@ -270,6 +275,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libredwood-store.dylib ] && cp obj/libredwood-store.dylib root/lib/
+	[ -f obj/libredwood-fairplay.dylib ] && cp obj/libredwood-fairplay.dylib root/lib/
 	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
 	[ -f obj/libredwood-tweaks.dylib ] && cp obj/libredwood-tweaks.dylib root/lib/
 	if [ -f obj/RedwoodAudio ]; then
