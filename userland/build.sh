@@ -230,6 +230,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libredwood-gl.dylib \
 				src/eagl.c src/gl_osmesa.c
 			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
+			# ... and what this GPU makes of an unsigned integer turned into a float (src/u2f_test.c)
+			$DYN $M/libOSMesa.8.dylib -o obj/u2f_test src/u2f_test.c
 			cp $M/libOSMesa.8.dylib obj/
 			# air_run draws with a Metal shader translated by the AIR frontend
 			# and reads the pixels back (docs/air.md). It is built inside the
@@ -275,6 +277,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -n "$GL" ]; then
 		cp obj/libOSMesa.8.dylib root/lib/
 		cp obj/gl_test root/bin/
+		if [ -f obj/u2f_test ]; then cp obj/u2f_test root/bin/; fi   # an "if": see the inject.conf loop below
 		[ -f obj/air_run ] && cp obj/air_run root/bin/
 		[ "$GL" = test ] || cp obj/libredwood-gl.dylib root/lib/
 	fi
