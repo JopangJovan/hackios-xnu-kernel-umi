@@ -380,8 +380,35 @@ functions and not entry points at all.
   established**, and 22 kernels binding images successfully is the reason it cannot be read as
   "images do not work".
 
-  **What distinguishes the four is two things, not one**, which is as far as looking at them goes
-  today. Three of them — `FilmGrainLumaKernel_Uint`, `FilmGrainLumaKernel_Unorm`,
+  **The cause is found and it is this harness's, not freedreno's. Whether it accounts for all four
+  is a prediction, not yet a result.**
+
+      void *csampler = NULL;
+      pipe->bind_sampler_states(pipe, PIPE_SHADER_COMPUTE, 0, num_tex, &csampler);
+
+  `bind_sampler_states` reads `num_tex` pointers from the address it is given, and `&csampler` is
+  the address of *one*. At `num_tex == 1` that is right by accident, which is why 22 kernels bound
+  images without trouble; at two or more the driver takes whatever followed that variable on the
+  stack and stores it as `samplers[1..]`, and `fd6_texture_state`'s loop over `num_samplers` then
+  dereferences those for `->seqno`. A wild pointer plus a small field offset is exactly
+  `0x100000000034`. The draw path beside it has always built a proper `void *samplers[]` array, so
+  the new code failed to learn what the old code already knew.
+
+  A peer session's reading of the same function proposed a different mechanism — `view_seqno[16]`
+  overflowing because `num_textures` is unclamped against `textures[32]`, which is a real
+  fragility in freedreno — and it is not reachable from here: this harness refuses a slot index of
+  16 or more by name. Checking whether someone else's bug was reachable, instead of fixing it, is
+  what left the adjacent line to be read.
+
+  **And the feature that looked discriminating was probably a confound.** Exactly 4 of the 47
+  kernels carry an inlined module-local function; three crashed and the fourth was refused earlier
+  on the shuffle mask, so none dispatched and every one that reached dispatch died. That is 3 of 3
+  and not a correlation — but those same kernels are the only ones reading *two* textures, and two
+  is precisely the threshold of the bug above. One mechanism may account for all four, including
+  `spillCorrectionPreProcess`, which carries no call at all. `air_run` now prints the texture
+  count beside the image count so the next run decides it rather than an argument.
+
+  What distinguishing them achieved, before the cause was known: Three of them — `FilmGrainLumaKernel_Uint`, `FilmGrainLumaKernel_Unorm`,
   `FilmGrainChromaKernel_Unorm` — are exactly the kernels that contain an inlined module-local
   function, and nothing that dispatched contains one. The fourth,
   `spillCorrectionPreProcess`, contains no call at all and is instead the only kernel in the
