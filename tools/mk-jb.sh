@@ -2,7 +2,7 @@
 # Fetch what Sileo needs into jb/ (never in the repository, like fw-*): the Procursus bootstrap for
 # iOS and the Sileo package, both for arm64 and both "rootless" -- everything under /var/jb.
 #
-# Rootless is what fits this port: / is a packfs image that cannot be written to, and /private/var
+# Rootless is what fits this port: / is an APFS image that cannot be written to, and /private/var
 # is the only writable filesystem there is (a memory filesystem, made afresh at every boot), so the
 # whole prefix has to live under /var. The binaries of the rootless distribution are built for
 # iOS 15 and up (dpkg 1.22.6, apt 2.9.4) and Sileo for iOS 11 and up; the "1800" in the path is the
@@ -31,6 +31,17 @@ rm -rf "$OUT/root"
 mkdir -p "$OUT/root"
 zstd -dc "$OUT/debs/bootstrap.tar.zst" | tar -C "$OUT/root" -xf -
 [ -d "$OUT/root/var/jb" ] || { echo "mk-jb.sh: the bootstrap has no var/jb in it" >&2; exit 1; }
+# Unpacking as an ordinary user drops the set-user-ID and set-group-ID bits; they are put back on what
+# the bootstrap has them on: login above all (NewTerm logs the user in with "login -fp mobile", which
+# without the bit ends at once -- "Session Ended"), su, sudo, passwd, chpass, newgrp, quota. In the
+# image these files belong to root, so the bits mean what they say there.
+zstd -dc "$OUT/debs/bootstrap.tar.zst" | tar -tvf - | awk '$1 ~ /^-/ && ($1 ~ /^-..[sS]/ || $1 ~ /^-.....[sS]/) {
+	print substr($1, 4, 1) substr($1, 7, 1), $NF }' | while read -r bits path; do
+	[ -f "$OUT/root/$path" ] || continue
+	case $bits in [sS]?) chmod u+s "$OUT/root/$path" ;; esac
+	case $bits in ?[sS]) chmod g+s "$OUT/root/$path" ;; esac
+	echo "mk-jb.sh: set-ID bits back on ${path#./}"
+done
 
 # Sileo on top of it: a .deb is an ar archive of control and data, and the data is the tree itself
 TMP=$(mktemp -d)
@@ -55,6 +66,53 @@ mkdir -p "$TMP/control" && tar -C "$TMP/control" -xf "$TMP"/control.tar.* 2>/dev
 	echo "Status: install ok installed"
 	echo
 } >> "$OUT/root/var/jb/Library/dpkg/status"
+
+# ElleKit: the tweak-injection framework (Cydia Substrate's modern replacement). It is what loads a
+# tweak's .dylib into a process and does the function and method hooking; on a rootless jailbreak the
+# jailbreak itself installs it, and it is not in the apt repository, so it is fetched here from its own
+# distribution. Its libraries are fat (arm64 and arm64e): the arm64 slice runs on this phone's
+# Qualcomm chip. mobilesubstrate and org.coolstar.libhooker are virtual packages it Provides, which is
+# what preferenceloader and nearly every tweak depend on. The loader /var/jb/usr/lib/TweakLoader.dylib
+# (ellekit/libinjector) reads /var/jb/usr/lib/TweakInject/*.plist, matches the process by the Filter
+# and dlopens the tweak; src/init.c (etc/inject.conf) inserts it into SpringBoard, Preferences and the
+# apps. Tweaks link /var/jb/usr/lib/lib{substrate,hooker}.dylib and CydiaSubstrate.framework, all
+# ElleKit.
+EK=ellekit_${ELLEKIT:-0.4.5}_iphoneos-arm64.deb
+get "https://ellekit.space/pool/$EK" "$EK"
+EKTMP=$(mktemp -d); trap 'rm -rf "$TMP" "$EKTMP"' EXIT
+(cd "$EKTMP" && ar x "$OUT/debs/$EK")
+mkdir -p "$EKTMP/data" && { tar -C "$EKTMP/data" -xf "$EKTMP"/data.tar.* 2>/dev/null ||
+	zstd -dc "$EKTMP"/data.tar.zst | tar -C "$EKTMP/data" -xf -; }
+cp -a "$EKTMP/data/var/jb/." "$OUT/root/var/jb/"
+mkdir -p "$OUT/root/var/jb/usr/lib/TweakInject"
+# the old tweak directory, a symlink to the new one, as ElleKit's own preinst makes it
+mkdir -p "$OUT/root/var/jb/Library/MobileSubstrate"
+rm -rf "$OUT/root/var/jb/Library/MobileSubstrate/DynamicLibraries"
+ln -s /var/jb/usr/lib/TweakInject "$OUT/root/var/jb/Library/MobileSubstrate/DynamicLibraries"
+# dpkg is to know ElleKit is installed, with what it Provides, so apt satisfies tweaks' "mobilesubstrate"
+{
+	mkdir -p "$EKTMP/control" && { tar -C "$EKTMP/control" -xf "$EKTMP"/control.tar.* 2>/dev/null ||
+		zstd -dc "$EKTMP"/control.tar.zst | tar -C "$EKTMP/control" -xf -; }
+	sed '/^$/d' "$EKTMP/control/control"
+	echo "Status: install ok installed"
+	echo
+} >> "$OUT/root/var/jb/Library/dpkg/status"
+
+# Newer versions of what the bootstrap carries, and anything else worth having before the first boot:
+# the bootstrap is a snapshot, and some of it is older than the repository (debianutils, launchctl).
+# apt on the phone would upgrade them, but only over the network and only after a boot, while what is
+# in the image is what a first boot has. PREINSTALL names them; mobilesubstrate is not among them
+# because there is no such package -- ElleKit above Provides it.
+# OpenSSH among them: with the phone's radio up (wifi=1) a shell on the running system costs
+# seconds instead of a rebuilt image and a six-minute boot, which changes how the rest of this
+# port can be worked on. Nothing starts it -- a scenario does (userland/rc.jobs.ssh) -- and the
+# key that lets anyone in is not in the repository. dropbear would have been smaller, but its
+# package here depends on libtomcrypt1 and libtommath1, which are in no suite of this repository.
+PREINSTALL=${PREINSTALL-"debianutils launchctl preferenceloader openssh-server openssh-client openssh-sftp-server libssl3 libmd0"}
+if [ -n "$PREINSTALL" ]; then
+	get "$MIRROR/dists/iphoneos-arm64-rootless/$SUITE/main/binary-iphoneos-arm64/Packages" Packages
+	MIRROR="$MIRROR" python3 "$ROOT/tools/jb-preinstall.py" "$OUT/root" "$OUT/debs/Packages" "$OUT/debs" $PREINSTALL
+fi
 
 # the repositories Sileo starts with: Procursus itself, where everything here came from
 mkdir -p "$OUT/root/var/jb/etc/apt/sources.list.d"
@@ -139,6 +197,34 @@ cat > "$OUT/root/var/jb/prep.sh" <<'PREP'
 #!/var/jb/bin/sh
 # Run once per boot, after the prefix has been grafted onto /var/jb (rc.jobs.sileo does it).
 /var/jb/usr/libexec/firmware
+# The prefix's applications: in the system image they are in /Applications already (userland/build.sh),
+# where LaunchServices finds them by itself; with the iOS volume on the flash as the root they are not,
+# and are registered from the prefix as a rootless jailbreak does it (uikittools' uicache) -- by where the
+# bundle really is, as there: in /var/jb, grafted, its files are links into the boot volume
+# (/private/preboot/jb), and LaunchServices refuses a bundle made of links ("Unable to register").
+# Asked again every five seconds, two minutes at most, aside: right after SpringBoard it may be busy.
+for app in /var/jb/Applications/*.app; do
+	[ -d "/Applications/${app##*/}" ] && continue
+	# by its own path in the prefix first: that is the one a later uicache -- the trigger of any package
+	# that brings an application -- finds again when it rebuilds the database, and an application
+	# registered under some other path is "uninstalled" by that rebuild, which makes SpringBoard kill it
+	# (a running Sileo died the moment a tweak was installed). The real path, with the grafted prefix a
+	# directory of the boot volume, is only the fallback.
+	real=$(/var/jb/usr/bin/readlink "$app/Info.plist" 2>/dev/null)
+	real=${real%/Info.plist}
+	(
+		for try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
+			for path in "$app" ${real:+"$real"}; do
+				case "$(/var/jb/usr/bin/uicache -p "$path" 2>&1)" in
+				*Error*) ;;
+				*) echo "prep.sh: ${app##*/} registered from $path (try $try)"; exit 0 ;;
+				esac
+			done
+			sleep 5
+		done
+		echo "prep.sh: ${app##*/} could not be registered"
+	) &
+done
 /var/jb/usr/sbin/pwd_mkdb -p /var/jb/etc/master.passwd 2>/dev/null
 for package in debianutils apt dash bash zsh vi; do
 	[ -x "/var/jb/Library/dpkg/info/$package.postinst" ] &&

@@ -90,9 +90,17 @@ IOS_JOBS=${JOBS-"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is
 # libredwood-media.dylib).
+# What Sileo runs from /bin (see the package manager's prefix below): the system image's /bin, or the
+# boot volume's bin, bound over the iOS volume's /bin when that is the root (src/init.c, flash_root).
+SILEO_BIN="chmod cp mkdir mv rm"
+# (libredwood-tweaks is the tweak loader of the package manager's prefix, src/inject_tweaks.c: in
+# SpringBoard the library above opens it, here it is named for the programs that have no library of
+# ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
 INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libredwood-sb.dylib SpringBoard
-/redwood/lib/libredwood-media.dylib mediaserverd"}
+/redwood/lib/libredwood-media.dylib mediaserverd
+/redwood/lib/libredwood-app.dylib Sileo
+/redwood/lib/libredwood-tweaks.dylib Preferences"}
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -107,7 +115,7 @@ else
 	$CC $LD -o hello src/hello.c
 	$CC -Ilibmini -c libmini/mini.c -o obj/mini.o
 	$CC -c libmini/start.S -o obj/start.o
-	for prog in init child stage0; do
+	for prog in init child stage0 var_store; do
 		$CC -Ilibmini $LD -o obj/$prog.new src/$prog.c obj/mini.o obj/start.o
 		# keep the old file (and its time stamp) when nothing changed: system.apfs depends on stage0
 		cmp -s obj/$prog.new obj/$prog && rm obj/$prog.new || mv obj/$prog.new obj/$prog
@@ -119,6 +127,11 @@ rm -rf root
 mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
 cp obj/init root/sbin/init
 cp obj/child root/bin/child
+# The data volume into the flash and back (src/var_store.c), and the job that saves it when a run
+# ends: the program and its job together, away from the iOS job list below, which several working
+# copies are editing at once.
+[ -f obj/var_store ] && cp obj/var_store root/bin/
+cp com.redwood.varstore.plist root/LaunchDaemons/
 echo "Darwin on redwood: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
@@ -141,6 +154,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -o obj/cpu_test src/cpu_test.c
 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework IOSurface -o obj/cg_test src/cg_test.c
+		# what iOS here believes about Metal, and what CoreImage does without it (src/metal_test.m);
+		# OpenGLES for the CIContext made over an EAGLContext, which is deprecated and the point
+		$DYN -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics \
+			-framework CoreImage -framework IOKit -framework Metal -framework OpenGLES \
+			-lMobileGestalt -o obj/metal_test src/metal_test.m
 		$DYN -o obj/shm_test src/shm_test.c
 		$DYN -o obj/apfs_mmap_test src/apfs_mmap_test.c
 		$DYN -o obj/vol_ls src/vol_ls.c
@@ -164,6 +182,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-o obj/libredwood.dylib src/inject.c
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libredwood-sb.dylib src/inject_sb.c
+		# ... the tweak loader of the package manager's prefix (src/inject_tweaks.c): it goes into a
+		# program either as the one library the kernel inserts or opened by a library of ours
+		$DYN -dynamiclib -install_name /redwood/lib/libredwood-tweaks.dylib -framework CoreFoundation -lobjc \
+			-o obj/libredwood-tweaks.dylib src/inject_tweaks.c
 		# ... and inside an application, to say what killed it (src/inject_app.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-app.dylib -lobjc \
 			-o obj/libredwood-app.dylib src/inject_app.c
@@ -184,6 +206,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 				src/eagl.c src/gl_osmesa.c
 			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
 			cp $M/libOSMesa.8.dylib obj/
+			# air_run draws with a Metal shader translated by the AIR frontend
+			# and reads the pixels back (docs/air.md). It is built inside the
+			# Mesa build, because it needs Gallium itself and not the gl*
+			# entry points this library exports; AIR=1 tools/mk-mesa.sh makes
+			# it, and it is copied in when it is there.
+			[ -f $M/air_run ] && cp $M/air_run obj/air_run
 		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
@@ -195,6 +223,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/vol_ls ] && cp obj/vol_ls root/bin/
 	[ -f obj/snap_test ] && cp obj/snap_test root/bin/
 	[ -f obj/font_test ] && cp obj/font_test root/bin/
+	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
@@ -212,6 +241,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
+	[ -f obj/libredwood-tweaks.dylib ] && cp obj/libredwood-tweaks.dylib root/lib/
 	if [ -f obj/RedwoodAudio ]; then
 		mkdir -p root/lib/RedwoodAudio.driver
 		cp obj/RedwoodAudio root/lib/RedwoodAudio.driver/
@@ -220,11 +250,21 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -n "$GL" ]; then
 		cp obj/libOSMesa.8.dylib root/lib/
 		cp obj/gl_test root/bin/
+		[ -f obj/air_run ] && cp obj/air_run root/bin/
 		[ "$GL" = test ] || cp obj/libredwood-gl.dylib root/lib/
 	fi
 	# a program is not started with a library that is not there: it would not start at all
 	echo "$INJECT" | while read -r library names; do
-		[ -z "$library" ] || [ ! -f "root/lib/${library#/redwood/lib/}" ] || echo "$library $names"
+		# a /redwood/lib library only if it was actually built; any other path (e.g. a tweak loader
+		# in /var/jb) as it is, since it lives on the prefix and is there at run time
+		case "$library" in
+		"") ;;
+		# an "if" and not "&& echo": a last line whose library is absent would make the loop,
+		# and with it the pipeline and the whole build under set -e, fail -- which is what a tree
+		# with only prebuilt/userland in it does, since not every injection library is shipped there
+		/redwood/lib/*) if [ -f "root/lib/${library#/redwood/lib/}" ]; then echo "$library $names"; fi ;;
+		*) echo "$library $names" ;;
+		esac
 	done > root/etc/inject.conf
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
@@ -238,6 +278,31 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"
 	done >> root/etc/var.skel
+	# mobile's own temporary directory, $HOME/tmp, which iOS's template does not have: an application of
+	# mobile's without a data container of its own keeps its temporary files there -- Sileo, registered from
+	# the prefix with the root on the flash, downloads every package and index there, and without it each
+	# download ended in "No such file or directory"
+	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
+	# A key of ours for root, when there is one: ssh/authorized_keys, never in the repository (like
+	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
+	# Wi-Fi, which saves rebuilding an image for every question one wants to ask a running iOS. It
+	# refuses a key whose directory anyone but its owner may write, hence the 700.
+	# SHARE=1: no keys in an image that is going to somebody else. ssh_host_ed25519_key is a
+	# private key, and it would be leaving this machine inside a 2.5 GB container
+	if [ -z "$SHARE" ] && [ -f ../ssh/authorized_keys ]; then
+		mkdir -p root/var/root/.ssh
+		printf 'd\t700\t0\t0\t/private/var/root/.ssh\n' >> root/etc/var.skel
+		# the key that lets us in, and the host's own key beside it: made here and not on the
+		# phone, because ssh-keygen asks who uid 0 is and gets "No user exists for uid 0" --
+		# it asks through libiosexec, which reads a database the bootstrap does not ship (see
+		# init.c, where it is now built at every boot); the key is made here all the same,
+		# since nothing should depend on the order of those two
+		for k in authorized_keys ssh_host_ed25519_key ssh_host_ed25519_key.pub; do
+			[ -f ../ssh/$k ] || continue
+			cp ../ssh/$k root/var/root/.ssh/$k
+			printf 'f\t600\t0\t0\t/private/var/root/.ssh/%s\t/var/root/.ssh/%s\n' $k $k >> root/etc/var.skel
+		done
+	fi
 	cp ${RC:-rc.launchd} root/etc/rc
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
@@ -267,7 +332,8 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# the network the radio is to join: its name on the first line, its passphrase on the second. Yours, and
 	# so not in the repository; it goes where the firmware goes and the kernel reads it there (wifi_join=1)
 	rm -f root/fw/network
-	[ -f ../fw-wifi/network ] && install -m 0600 ../fw-wifi/network root/fw/network
+	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
+	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/redwood_haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
@@ -299,6 +365,27 @@ done
 if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
+fi
+# Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
+# device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
+# slot on 19 October 2026. It is the vendor's and never in the repository, so a copy made with bare
+# git worktree add has none of it, and neither has one whose tools/new-workspace.sh predates the fw-*
+# loop there. Say what went in and what was not there to go in; what each one is for is above.
+fwhave= fwnone=
+for d in gpu wifi haptic camera audio; do
+	if [ -d ../fw-$d ]; then fwhave="$fwhave $d"; else fwnone="$fwnone $d"; fi
+done
+echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${fwhave:- none present}${fwnone:+, absent:$fwnone}"
+# The images are what somebody would be handed to run this on a second phone, and two of the things
+# build.sh puts in them are secrets: the Wi-Fi network's name and passphrase, and the host's own
+# private key for ssh. Both are one small file inside 2.5 GB, and nobody would notice either leave.
+secrets=
+[ -f root/fw/network ] && secrets="$secrets fw/network (the name and passphrase of your Wi-Fi)"
+[ -f root/var/root/.ssh/ssh_host_ed25519_key ] &&
+	secrets="$secrets /var/root/.ssh/ssh_host_ed25519_key (a private key)"
+if [ -n "$secrets" ]; then
+	echo "build.sh: this image carries:$secrets"
+	echo "build.sh: do not pass it on as it is; SHARE=1 builds the same image without them."
 fi
 # When the iOS volume on the phone's flash is to become the root (boot-arg root_apfs=ufs_darwin,
 # with flashboot.apfs resident; src/init.c, flash_root): an empty directory to hide iOS's
@@ -335,7 +422,20 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	rm -rf flashboot flashboot.os
 	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
 	cp obj/stage0 flashboot/sbin/launchd
-	if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
+	# the OS cryptex, and the shared cache in it, only where this image will carry it:
+	# with CRYPTEXES=flash the cryptexes are read from the phone's flash and this tree is
+	# built and thrown away unused. The guard ends with the cache: everything after it goes
+	# into the boot volume, which every recipe carries, flash cryptexes included
+	if [ "$CRYPTEXES" != flash ]; then
+		if [ -d $IOS/cryptex ]; then cp -al $IOS/cryptex flashboot.os; else mkdir -p flashboot.os; fi
+		D=flashboot.os/System/Library/Caches/com.apple.dyld
+		mkdir -p $D
+		for f in $CACHE/dyld_shared_cache_arm64*; do
+			case "$f" in *.symbols) continue ;; esac
+			# -f: a cryptex fetched with the cache already in it would otherwise stop the build
+			ln -f "$f" $D/
+		done
+	fi
 	# the audio DSP's firmware and the speaker amplifiers' configuration, as in the system image's /fw: the kernel
 	# reads the firmware as soon as there is a root (this image, adsp=1), the configuration maybe later -- by then
 	# from the iOS volume's /fw, which src/init.c (flash_root) binds to this
@@ -347,12 +447,19 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 		mkdir -p flashboot/fw
 		cp ../fw-audio/aw882xx_acf.bin flashboot/fw/
 	fi
-	D=flashboot.os/System/Library/Caches/com.apple.dyld
-	mkdir -p $D
-	for f in $CACHE/dyld_shared_cache_arm64*; do
-		case "$f" in *.symbols) continue ;; esac
-		ln "$f" $D/
-	done
+	# the package manager's prefix, when tools/mk-jb.sh has fetched one: /jb of the boot volume, which is
+	# /private/preboot/jb once the iOS volume is the root -- the volume where a rootless jailbreak keeps its
+	# Procursus on an iPhone as well; init grafts it onto /var/jb (src/init.c, mount_writable)
+	if [ -d ../jb/root/var/jb ]; then
+		cp -a ../jb/root/var/jb flashboot/jb
+		mkdir -p flashboot/jb-rw        # where init mounts the prefix's writable copy (src/init.c)
+		# and what Sileo runs from /bin, for init to put over the iOS volume's /bin (see the system image below)
+		mkdir -p flashboot/jb-bin
+		for c in $SILEO_BIN; do
+			ln -s /var/jb/usr/bin/$c flashboot/jb-bin/$c
+		done
+		echo "  the package manager's prefix: $(du -sh flashboot/jb | cut -f1) as /jb of the boot volume"
+	fi
 	python3 ../tools/apfs/mkapfs.py -z --plain fw -o flashboot.boot.apfs Boot=flashboot | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh flashboot.boot.apfs Boot=flashboot
 	# the third container: Apple's App cryptex as it is (10 MB; fetch.sh), for the boot volume's Cryptexes/App
@@ -423,6 +530,13 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		for app in sysroot/jb/Applications/*.app; do
 			[ -d "$app" ] && cp -a "$app" sysroot/Applications/
 		done
+		# Sileo moves, copies and removes files as root with /bin/mv, /bin/cp, /bin/rm, /bin/mkdir and
+		# /bin/chmod -- where a jailbreak with a writable root keeps them -- and iOS's /bin has df and ps
+		# alone: every one of those spawns failed with nothing said, and the package it had downloaded never
+		# reached apt's archives ("Unable to fetch some archives"). The prefix's own programs, by those names.
+		for c in $SILEO_BIN; do
+			ln -sf /var/jb/usr/bin/$c sysroot/bin/$c
+		done
 		echo "  the package manager's prefix: $(du -sh sysroot/jb | cut -f1) as /jb (init puts it at /var/jb)"
 	fi
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
@@ -439,7 +553,8 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	mkdir -p $D
 	for f in $CACHE/dyld_shared_cache_arm64*; do
 		case "$f" in *.symbols) continue ;; esac     # symbolication data, never mapped
-		ln "$f" $D/
+		# -f: a cryptex fetched with the cache already in it would otherwise stop the build
+		ln -f "$f" $D/
 	done
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS

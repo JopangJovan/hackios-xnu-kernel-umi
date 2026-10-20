@@ -5,8 +5,11 @@
  *   wait SECONDS                 pause
  *   tap X Y                      a short touch
  *   swipe X0 Y0 X1 Y1 [MS]       drag from one point to the other in MS milliseconds (default 300)
- *   drag X0 Y0 X1 Y1 MS HOLD     the same, then stay at the end HOLD milliseconds before letting go
- *                                (what is dragged is held where it was taken, neither flung nor sprung back)
+ *   drag X0 Y0 X1 Y1 MS HOLD [GRAB]
+ *                                the same, then stay at the end HOLD milliseconds before letting go
+ *                                (what is dragged is held where it was taken, neither flung nor sprung back);
+ *                                GRAB milliseconds of staying still first, for what has to be picked up
+ *                                before it will move -- an icon of the home screen wants about 700
  *   hold X Y MS                  touch and stay
  *   zigzag X Y0 Y1 MS N [STEP]   touch at Y0, go to Y1 in MS milliseconds and back again, N times, then let go;
  *                                a sample every STEP milliseconds (default 8, what the touch screen gives, as
@@ -83,11 +86,20 @@ sleep_until(uint64_t start, uint64_t at)
  * 60 frames, and an application that is moved by the samples drew no more frames than that.)
  */
 static void
-drag(double x0, double y0, double x1, double y1, int ms, int hold)
+drag(double x0, double y0, double x1, double y1, int ms, int hold, int grab)
 {
 	uint64_t start, total_us = (uint64_t)(ms > 0 ? ms : 1) * 1000;
 
 	post(REDWOOD_TOUCH_DOWN, x0, y0);
+	/*
+	 * grab: stay where the finger landed before moving at all. An icon of the home screen is
+	 * picked up by a long press and only then dragged, and it has to be one touch throughout --
+	 * a press that ends puts up the icon's menu instead.
+	 */
+	for (int waited = 0; waited < grab; waited += 100) {
+		usleep(100000);
+		post(REDWOOD_TOUCH_MOVE, x0, y0);
+	}
 	start = mach_absolute_time();
 	for (uint64_t at = SAMPLE_MS * 1000;; at += SAMPLE_MS * 1000) {
 		double part;
@@ -189,11 +201,14 @@ main(int argc, char **argv)
 		} else if (strcmp(step, "swipe") == 0 && left >= 4) {
 			int ms = left >= 5 && argv[i + 5][0] >= '0' && argv[i + 5][0] <= '9' ? atoi(argv[i + 5]) : 0;
 
-			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), ms ? ms : 300, 0);
+			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), ms ? ms : 300, 0, 0);
 			i += ms ? 5 : 4;
 		} else if (strcmp(step, "drag") == 0 && left >= 6) {
-			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), atoi(argv[i + 5]), atoi(argv[i + 6]));
-			i += 6;
+			int grab = left >= 7 && argv[i + 7][0] >= '0' && argv[i + 7][0] <= '9' ? atoi(argv[i + 7]) : 0;
+
+			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), atoi(argv[i + 5]),
+			    atoi(argv[i + 6]), grab);
+			i += grab ? 7 : 6;
 		} else if (strcmp(step, "notify") == 0 && left >= 1) {
 			uint32_t status = notify_post(argv[i + 1]);
 

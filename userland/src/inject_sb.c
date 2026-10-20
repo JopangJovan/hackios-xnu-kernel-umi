@@ -27,18 +27,21 @@
  *   - Darwin notifications as a remote control, for scripts (rwtouch notify NAME):
  *       com.redwood.unlock      what the lock screen does after "swipe up to open"
  *       com.redwood.layers      write down the layers SpringBoard has on the screen: see layers()
+ *       com.redwood.switcher    open the switcher of running applications: see switcher()
  *     In any other program given this library (INJECT in build.sh) only the last of them is
  *     answered, with that program's layers.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
+#include <sys/stat.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -557,6 +560,53 @@ text_of(id object)
 	return text ? SEND(const char *, text, "UTF8String") : "-";
 }
 
+/*
+ * The switcher of running applications lays a wash of wallpaper over every card behind the front
+ * one, above the dimming: -[SBAppSwitcherPageView _createOrDestroyWallpaperOverlayView] makes it,
+ * PaperBoardUI fills it from the image provider of the wallpaper, and the result is drawn at about
+ * fifteen per cent (the layer tree: SBWallpaperEffectView at opacity 0.1497 -> PBUIFakeBlurView ->
+ * PBUIWallpaperView -> PBUISnapshotReplicaView -> a UIImageView).
+ *
+ * Here there is no picture of the wallpaper to put in it. The wallpaper itself is drawn live by
+ * PosterBoard, in another process, and hosted into SpringBoard's layer tree; SpringBoard has no
+ * bitmap of it, and nothing ever bakes one -- after three and a half minutes of an idle phone
+ * /var/mobile/Library holds sixty directories and not one of them is PaperBoard, PosterBoard or
+ * Wallpaper. So the provider hands over a placeholder: 846 x 1827 pixels of one colour,
+ * (179, 77, 179), which CoreAnimation compresses to ASTC and draws over the two cards on the left
+ * at 14.9 per cent. That is what made them purple instead of merely dimmed.
+ *
+ * The dimming itself is right and stays: two draws of a flat black at 11.4 per cent, which is the
+ * shadow one expects to see. Only the wash is left out, because a wash of a colour that is not the
+ * wallpaper's is worse than no wash at all. When something here can give PaperBoardUI a real
+ * picture of the wallpaper, this hook is what should go -- and until then switcher_wallpaper=1
+ * among the boot-args puts it back as iOS asks for it, so that whoever works on the wallpaper can
+ * see at once whether their picture arrives, without rebuilding an image to find out.
+ */
+static void (*original_switcher_wallpaper_overlay)(id self, SEL selector);
+
+static void
+switcher_wallpaper_overlay(id self, SEL selector)
+{
+	static int wanted = -1;         /* boot-arg switcher_wallpaper=1: have it back, placeholder and all */
+	static unsigned told;
+
+	if (wanted < 0) {
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		wanted = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 &&
+		    (at = strstr(args, "switcher_wallpaper=1")) != NULL && (at == args || at[-1] == ' ');
+	}
+	if (told++ == 0) {
+		say("redwood: the switcher's wash of wallpaper is %s\n", wanted ?
+		    "drawn as iOS asks (switcher_wallpaper=1)" : "left out: there is no picture of the wallpaper for it");
+	}
+	if (wanted) {
+		original_switcher_wallpaper_overlay(self, selector);
+	}
+}
+
 static void
 layer_filter(id filter, const char *what, int depth)
 {
@@ -600,7 +650,7 @@ layer_line(id layer, const char *role, int depth)
 	id compositing = SEND(id, layer, "compositingFilter"), sublayers = SEND(id, layer, "sublayers");
 	id background = SEND(id, layer, "backgroundFilters");
 	void *colour = SEND(void *, layer, "backgroundColor");
-	char more[512] = "";
+	char more[1024] = "";
 	size_t n = 0;
 
 	if (SEND(BOOL, layer, "isHidden")) {
@@ -608,8 +658,28 @@ layer_line(id layer, const char *role, int depth)
 	}
 	if (contents != NULL) {
 		id text = (id)CFCopyDescription((CFTypeRef)contents);
+		const char *from = text_of(text);
+		char flat[300];
+		size_t k = 0;
 
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " contents %.60s", text_of(text));
+		/*
+		 * What a CGImage says about itself runs over several lines -- its colour space, how big
+		 * it is, how its pixels are laid out -- and all of that is worth having on the one line,
+		 * because the size and the colour space are the first things to look at when a picture
+		 * comes out wrong. Every run of spaces and newlines becomes one space.
+		 */
+		while (from != NULL && *from != 0 && k + 1 < sizeof(flat)) {
+			if (*from == ' ' || *from == '\n' || *from == '\t' || *from == '\r') {
+				if (k > 0 && flat[k - 1] != ' ') {
+					flat[k++] = ' ';
+				}
+				from++;
+				continue;
+			}
+			flat[k++] = *from++;
+		}
+		flat[k] = 0;
+		n += (size_t)snprintf(more + n, sizeof(more) - n, " contents %s", flat);
 		CFRelease((CFTypeRef)text);
 	}
 	if (contents != NULL && class_respondsToSelector(object_getClass(layer), sel_registerName("contentsMultiplyColor")) &&
@@ -663,6 +733,15 @@ layer_line(id layer, const char *role, int depth)
 		n += (size_t)snprintf(more + n, sizeof(more) - n, " HOST of context %#x%s%s", SEND(unsigned, layer, "contextId"),
 		    SEND(BOOL, layer, "inheritsSecurity") ? " (inherits security)" : "",
 		    SEND(BOOL, layer, "rendersAsynchronously") ? " (asynchronously)" : "");
+	}
+	{
+		/* the view a layer belongs to, which is the only thing that names a layer UIKit left
+		   unnamed -- and the switcher's wash of wallpaper is such a layer */
+		id delegate = SEND(id, layer, "delegate");
+
+		if (delegate != NULL) {
+			n += (size_t)snprintf(more + n, sizeof(more) - n, " of %s", object_getClassName(delegate));
+		}
 	}
 	{
 		id keys = SEND(id, layer, "animationKeys");
@@ -764,6 +843,56 @@ layers(void)
 }
 
 /*
+ * The switcher of running applications, on the notification com.redwood.switcher (rwtouch notify).
+ * A drag up from the bottom edge is the way to it on a phone, but the touches a script puts in do
+ * not reach iOS's system gestures -- nothing comes of such a drag, not even going home -- and two
+ * presses of the home button only go home (there is no home button on a phone of this shape, and
+ * what is sent as one goes home and no more). SpringBoard opens it itself for anything that is
+ * not a gesture (a hardware keyboard, accessibility): SBMainSwitcherControllerCoordinator, which
+ * is one for the whole program, takes "activate the main switcher not interactively, from this
+ * source". The source is an analytics label; zero is "none", which is what the ones that have no
+ * gesture behind them pass.
+ * As it stands this is not enough: with three applications running it answers that it took the
+ * request (source 0, animated and not animated alike) and the screen does not change -- the
+ * application in front stays, and SpringBoard says nothing more. So the switcher still cannot be
+ * reached from a script; what is left to try is the transition with a window scene
+ * (_activateSwitcherValidatorWithEventLabel:animated:windowScene:), which is what its own
+ * gestures use.
+ */
+static void
+switcher(void)
+{
+	Class coordinator = objc_getClass("SBMainSwitcherControllerCoordinator");
+	SEL activate = sel_registerName("activateMainSwitcherNoninteractivelyWithSource:animated:");
+	id shared = coordinator != NULL ? SEND(id, coordinator, "sharedInstance") : NULL;
+	Method method = shared != NULL ? class_getInstanceMethod(object_getClass(shared), activate) : NULL;
+
+	if (method == NULL) {
+		say("redwood: the switcher: %s has no %s\n",
+		    coordinator != NULL ? "SBMainSwitcherControllerCoordinator" : "nothing", sel_getName(activate));
+		return;
+	}
+	say("redwood: the switcher: opening it (%s, %s)\n", object_getClassName(shared),
+	    method_getTypeEncoding(method) != NULL ? method_getTypeEncoding(method) : "?");
+	/*
+	 * It answers whether it took the request. The source is an analytics label and not every one
+	 * of them is allowed from every state, so they are tried in turn until one is taken.
+	 */
+	/*
+	 * Not animated: the animated one is taken and then nothing comes of it -- the transition it
+	 * starts is the gesture's to carry, and there is no gesture here.
+	 */
+	for (long source = 0; source < 10; source++) {
+		BOOL taken = ((BOOL (*)(id, SEL, long, BOOL))objc_msgSend)(shared, activate, source, NO);
+
+		say("redwood: the switcher: from source %ld: %s\n", source, taken ? "taken" : "refused");
+		if (taken) {
+			return;
+		}
+	}
+}
+
+/*
  * Control Center's glyphs whole from its first frames. Its modules and their parts fade in as it
  * comes down: opacity animations, mostly springs that take up to a second to settle at 1. While a
  * layer's opacity is below 1, the window server's OpenGL ES renderer draws the vibrant glyphs in it
@@ -842,6 +971,27 @@ control_center_fades(const char *arguments)
 	method_setImplementation(add, (IMP)add_animation_cc);
 }
 
+/*
+ * Open the tweak loader of the package manager's prefix, when there is one. Nothing here depends on
+ * it: without a prefix (or without ElleKit in it) the file is not there and this does nothing.
+ */
+#define REDWOOD_TWEAK_LOADER    "/redwood/lib/libredwood-tweaks.dylib"
+
+static void
+load_tweaks(void)
+{
+	struct stat st;
+
+	if (stat("/var/jb/usr/lib/TweakInject", &st) != 0) {
+		return;                 /* no package manager's prefix here, so no tweaks */
+	}
+	if (dlopen(REDWOOD_TWEAK_LOADER, RTLD_NOW | RTLD_GLOBAL) == NULL) {
+		say("redwood: the tweak loader %s: %s\n", REDWOOD_TWEAK_LOADER, dlerror());
+	} else {
+		say("redwood: tweaks: %s opened\n", REDWOOD_TWEAK_LOADER);
+	}
+}
+
 __attribute__((constructor))
 static void
 redwood_springboard_init(void)
@@ -868,6 +1018,14 @@ redwood_springboard_init(void)
 		});
 		return;
 	}
+	/*
+	 * The tweaks of the package manager's prefix, if one is installed: ElleKit's loader
+	 * (/var/jb/usr/lib/TweakLoader.dylib) reads /var/jb/usr/lib/TweakInject and opens the tweaks
+	 * whose Filter names this process. The kernel could insert it as well (etc/inject.conf), but
+	 * only one inserted library per program is reliable here, and SpringBoard's is this one; so
+	 * this one opens it, the way a jailbreak's own hook does.
+	 */
+	load_tweaks();
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);
 	original_set_setup_required_reason = (void (*)(id, SEL, long))replace_method("SBSetupManager",
@@ -879,6 +1037,8 @@ redwood_springboard_init(void)
 	    (IMP)lock_long_press);
 	poster_switcher = replace_method("SBMainDisplayPolicyAggregator", "_allowsCapabilityPosterSwitcherWithExplanation:",
 	    0x1c507e0fcUL, (IMP)poster_switcher_allowed);
+	original_switcher_wallpaper_overlay = (void (*)(id, SEL))replace_method("SBAppSwitcherPageView",
+	    "_createOrDestroyWallpaperOverlayView", 0x1c4af7860UL, (IMP)switcher_wallpaper_overlay);
 	/*
 	 * Battery hooks on UIDevice: these are the methods every app and SpringBoard itself calls, so
 	 * hooking them here in the SpringBoard process covers both the status bar and any app that
@@ -956,6 +1116,9 @@ redwood_springboard_init(void)
 	});
 	notify_register_dispatch("com.redwood.layers", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		layers();
+	});
+	notify_register_dispatch("com.redwood.switcher", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		switcher();
 	});
 	/*
 	 * Belt-and-suspenders unlock. The user can always swipe up to open the home screen -- that

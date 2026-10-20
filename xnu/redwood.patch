@@ -62,7 +62,7 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..44c2d6435caf 100644
+index 44274016a4cf..9cd24b42caca 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
@@ -103,20 +103,22 @@ index 44274016a4cf..44c2d6435caf 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +186,12 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
 +bsd/miscfs/apfs/apfs_deflate.c		optional apfs
 +bsd/miscfs/apfs/apfs_zbitmap.c		optional apfs
 +bsd/miscfs/apfs/apfs_lib.c		optional apfs
++bsd/miscfs/apfs/apfs_write.c		optional apfs
++bsd/miscfs/apfs/apfs_store.c		optional apfs
 +bsd/miscfs/apfs/apfs_vfsops.c		optional apfs
 +bsd/miscfs/apfs/apfs_vnops.c		optional apfs
 +bsd/miscfs/ramfs/ramfs.c			optional ramfs
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +398,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -124,7 +126,7 @@ index 44274016a4cf..44c2d6435caf 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +421,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -372,7 +374,7 @@ index 95192dd62449..b00da803b5b4 100644
  
  	/*
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 1d71c66629fb..84b1e1eaebf3 100644
+index 1d71c66629fb..3e1737c21b86 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1157,6 +1157,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -516,7 +518,7 @@ index 1d71c66629fb..84b1e1eaebf3 100644
  
  	cred = kauth_cred_proc_ref(p);
  
-@@ -3158,6 +3215,34 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
+@@ -3158,6 +3215,48 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
  		    px_persona->pspi_gmuid);
  	}
  
@@ -534,10 +536,20 @@ index 1d71c66629fb..84b1e1eaebf3 100644
 +		 *
 +		 * The thread's own credential is not touched here: the thread running this is the
 +		 * parent's, and the new process gets its credential when its image is activated.
++		 *
++		 * And the count of processes per real uid follows, as persona_proc_adopt() keeps it:
++		 * fork1() counted the new process under the parent's uid (mobile's), its exit takes
++		 * it off under the one it has then (root's). Without that, every program Sileo ran as
++		 * root took one away from root's count that had never been given -- and once Sileo's
++		 * own mv, cp and rm ran at all, a few dozen of them brought root's count to nothing,
++		 * and the next process of root's to exit panicked the kernel ("chgproccnt: lost user").
 +		 */
 +		__block kauth_cred_t new_cred = cred;
++		__block uid_t old_ruid = KAUTH_UID_NONE;
++		uid_t new_ruid = kauth_cred_getruid(cred);
 +
 +		(void)proc_update_label(p, true, ^kauth_cred_t (kauth_cred_t cur_cred) {
++			old_ruid = kauth_cred_getruid(cur_cred);
 +			if (new_cred != cur_cred) {
 +			        kauth_cred_ref(new_cred);
 +			        kauth_cred_unref(&cur_cred);
@@ -545,13 +557,17 @@ index 1d71c66629fb..84b1e1eaebf3 100644
 +			return new_cred;
 +		});
 +		kauth_cred_unref(&cred);
++		if (old_ruid != KAUTH_UID_NONE && old_ruid != new_ruid) {
++			(void)chgproccnt(new_ruid, 1);
++			(void)chgproccnt(old_ruid, -1);
++		}
 +		return 0;
 +	}
 +
  	ret = persona_proc_adopt(p, persona, cred);
  
  	kauth_cred_unref(&cred);
-@@ -5586,10 +5671,61 @@ bad:
+@@ -5586,10 +5685,75 @@ bad:
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
@@ -559,9 +575,11 @@ index 1d71c66629fb..84b1e1eaebf3 100644
 + * Bring-up aid: the sysctl kern.exec_inject holds "LIBRARY NAME NAME ..."; every program
 + * whose file name is one of the NAMEs is started with DYLD_INSERT_LIBRARIES=LIBRARY in its
 + * environment, so that dyld loads our library into it. Several such groups may follow each
-+ * other, separated by ";". launchd refuses to pass DYLD_ variables from a job description,
-+ * which is why the kernel adds this one. Set once by our init (from etc/inject.conf) before
-+ * it hands over to launchd.
++ * other, separated by ";". A program named in more than one group gets every one of those
++ * libraries, joined with ":" in the one DYLD_INSERT_LIBRARIES, so SpringBoard can carry both
++ * our window-server library and the tweak loader. launchd refuses to pass DYLD_ variables
++ * from a job description, which is why the kernel adds this one. Set once by our init (from
++ * etc/inject.conf) before it hands over to launchd.
 + */
 +static char exec_inject_conf[512];
 +SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
@@ -571,16 +589,19 @@ index 1d71c66629fb..84b1e1eaebf3 100644
 +exec_inject_env(struct image_params *imgp, char *env, size_t size)
 +{
 +	const char *name, *p = exec_inject_conf;
-+	size_t namelen;
++	size_t namelen, used;
++	bool any = false;
 +
 +	if (*p == 0 || imgp->ip_ndp == NULL) {
 +		return false;
 +	}
 +	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
 +	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	used = strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
 +	while (*p != 0) {
 +		const char *library;
 +		size_t liblen;
++		bool matched = false;
 +
 +		while (*p == ' ' || *p == ';') {
 +			p++;
@@ -596,24 +617,33 @@ index 1d71c66629fb..84b1e1eaebf3 100644
 +			while (*p != 0 && *p != ' ' && *p != ';') {
 +				p++;
 +			}
-+			if ((size_t)(p - word) == namelen && namelen != 0 && liblen != 0 && strncmp(word, name, namelen) == 0) {
-+				snprintf(env, size, "DYLD_INSERT_LIBRARIES=%.*s", (int)liblen, library);
-+				return true;
++			if (!matched && (size_t)(p - word) == namelen && namelen != 0 && liblen != 0 &&
++			    strncmp(word, name, namelen) == 0) {
++				matched = true;         /* this group names this program; its library is added once */
 +			}
 +		}
++		if (matched && liblen != 0 && used + 1 + liblen < size) {
++			if (any) {
++				env[used++] = ':';      /* dyld takes several libraries separated by ":" */
++			}
++			memcpy(env + used, library, liblen);
++			used += liblen;
++			env[used] = 0;
++			any = true;
++		}
 +	}
-+	return false;
++	return any;
 +}
 +
  __attribute__((noinline))
  static int
  exec_extract_strings(struct image_params *imgp)
  {
-+	char            inject_env[300];
++	char            inject_env[512];
  	int error = 0;
  	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
  	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-@@ -5759,6 +5895,33 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5759,6 +5923,33 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
@@ -647,7 +677,7 @@ index 1d71c66629fb..84b1e1eaebf3 100644
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
-@@ -6636,7 +6799,23 @@ handle_mac_transition:
+@@ -6636,7 +6827,23 @@ handle_mac_transition:
  	}
  
  	/* Update the process' identity version and set the security token */
@@ -672,7 +702,7 @@ index 1d71c66629fb..84b1e1eaebf3 100644
  	task_set_uniqueid(task);
  	set_security_token_task_internal(p, task);
  
-@@ -7538,6 +7717,11 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -7538,6 +7745,11 @@ process_signature(proc_t p, struct image_params *imgp)
  	}
  
  done:

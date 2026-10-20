@@ -21,12 +21,13 @@ extern char **environ;
 enum {
 	SYS_exit = 1, SYS_read = 3, SYS_write = 4, SYS_open = 5, SYS_close = 6, SYS_wait4 = 7, SYS_link = 9,
 	SYS_unlink = 10, SYS_chdir = 12, SYS_chmod = 15, SYS_chown = 16, SYS_getpid = 20, SYS_getuid = 24,
-	SYS_kill = 37, SYS_getppid = 39, SYS_dup = 41, SYS_ioctl = 54, SYS_reboot = 55, SYS_symlink = 57,
-	SYS_readlink = 58, SYS_execve = 59, SYS_msync = 65, SYS_munmap = 73, SYS_dup2 = 90, SYS_select = 93,
-	SYS_fsync = 95, SYS_socket = 97, SYS_bind = 104, SYS_gettimeofday = 116, SYS_rename = 128, SYS_mkdir = 136,
-	SYS_rmdir = 137, SYS_pread = 153, SYS_pwrite = 154, SYS_mount = 167, SYS_mmap = 197, SYS_lseek = 199,
-	SYS_ftruncate = 201, SYS_sysctlbyname = 274, SYS_stat64 = 338, SYS_fstat64 = 339, SYS_lstat64 = 340,
-	SYS_getdirentries64 = 344,
+	SYS_chflags = 34, SYS_kill = 37, SYS_getppid = 39, SYS_dup = 41, SYS_ioctl = 54, SYS_reboot = 55,
+	SYS_symlink = 57, SYS_readlink = 58, SYS_execve = 59, SYS_msync = 65, SYS_munmap = 73, SYS_dup2 = 90,
+	SYS_select = 93, SYS_fsync = 95, SYS_socket = 97, SYS_bind = 104, SYS_gettimeofday = 116,
+	SYS_rename = 128, SYS_mkdir = 136, SYS_rmdir = 137, SYS_utimes = 138, SYS_pread = 153, SYS_pwrite = 154,
+	SYS_mount = 167, SYS_mmap = 197, SYS_lseek = 199, SYS_ftruncate = 201, SYS_getxattr = 234,
+	SYS_setxattr = 236, SYS_listxattr = 240, SYS_sysctlbyname = 274, SYS_stat64 = 338, SYS_fstat64 = 339,
+	SYS_lstat64 = 340, SYS_getdirentries64 = 344, SYS_lchown = 364,
 };
 
 /*
@@ -67,6 +68,7 @@ struct sockaddr_un {
 #define MAP_FAILED      ((void *)-1)
 
 #define MNT_RDONLY      1
+#define MNT_UNION       0x00000020      /* what is not in the mounted directory is found in the one below */
 
 #define S_IFMT          0170000
 #define S_IFDIR         0040000
@@ -75,6 +77,9 @@ struct sockaddr_un {
 #define S_IFREG         0100000
 #define S_IFLNK         0120000
 #define S_IFSOCK        0140000
+#define S_IFIFO         0010000
+
+#define XATTR_NOFOLLOW  0x0001
 
 #define DT_DIR          4
 #define DT_REG          8
@@ -152,6 +157,12 @@ int     link(const char *from, const char *to);
 int     symlink(const char *target, const char *path);
 int     chmod(const char *path, int mode);
 int     chown(const char *path, int uid, int gid);
+int     lchown(const char *path, int uid, int gid);
+int     chflags(const char *path, int flags);
+int     utimes(const char *path, const struct timeval times[2]);
+ssize_t listxattr(const char *path, char *names, size_t size, int options);
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size, uint32_t position, int options);
+int     setxattr(const char *path, const char *name, const void *value, size_t size, uint32_t position, int options);
 int     ftruncate(int fd, off_t length);
 int     fsync(int fd);
 ssize_t pread(int fd, void *buf, size_t count, off_t offset);

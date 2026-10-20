@@ -1106,6 +1106,10 @@ apfs_nx_open(struct apfs_nx *nx, const struct apfs_dev *dev)
 	nx->xid = obj_xid(blk);
 	nx->block_count = le64(blk + 40);
 	memcpy(nx->uuid, blk + 72, sizeof(nx->uuid));
+	nx->xp_desc_blocks = le32(blk + 104);
+	nx->xp_data_blocks = le32(blk + 108);
+	nx->xp_desc_base = le64(blk + 112);
+	nx->xp_data_base = le64(blk + 120);
 	nx->omap_addr = le64(blk + 160);
 	{
 		uint32_t maxfs = le32(blk + 180);
@@ -1173,8 +1177,8 @@ int
 apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 {
 	const uint8_t *blk;
-	uint64_t addr, omap_oid, root_oid, fext_oid;
-	uint32_t fext_type;
+	uint64_t addr, omap_oid, root_oid, fext_oid, er_oid;
+	uint32_t fext_type, er_type;
 	int error;
 
 	if (index >= APFS_NX_MAX_FILE_SYSTEMS || nx->fs_oid[index] == 0) {
@@ -1199,11 +1203,15 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 	}
 	vol->incompat = le64(blk + 56);
 	vol->alloc_count = le64(blk + 88);
+	er_type = le32(blk + 120);
 	omap_oid = le64(blk + 128);
 	root_oid = le64(blk + 136);
+	er_oid = le64(blk + 144);
 	vol->num_files = le64(blk + 184);
 	vol->num_dirs = le64(blk + 192);
 	vol->num_symlinks = le64(blk + 200);
+	vol->num_snapshots = le64(blk + 216);
+	vol->integrity_meta_oid = le64(blk + 1024);
 	vol->fs_flags = le64(blk + 264);
 	memcpy(vol->name, blk + 704, APFS_VOLNAME_LEN);
 	vol->name[APFS_VOLNAME_LEN - 1] = '\0';
@@ -1245,7 +1253,25 @@ apfs_vol_open(struct apfs_nx *nx, uint32_t index, struct apfs_vol *vol)
 		}
 		vol->has_fext = true;
 	}
+	/*
+	 * The extent-reference tree is of no use to a reader, so it is not opened here: only
+	 * noted, and only when it is the physical tree it should be.  A volume that mounts
+	 * today goes on mounting whatever is wrong with it; not having it means no more than
+	 * that apfs_write.c will refuse to write anything here.
+	 */
+	if (er_oid != 0 && (er_type & APFS_OBJ_STORAGETYPE_MASK) == APFS_OBJ_PHYSICAL) {
+		vol->extentref_oid = er_oid;
+	}
 	return 0;
+}
+
+int
+apfs_extentref_open(struct apfs_vol *vol, struct apfs_btree *tree)
+{
+	if (vol->extentref_oid == 0) {
+		return ENOENT;
+	}
+	return btree_open(vol->nx, NULL, vol->extentref_oid, tree);
 }
 
 /* ------------------------------------------------------------------ records */
@@ -2295,6 +2321,43 @@ ext_next(struct ext_iter *it, uint64_t *logical, uint64_t *length, uint64_t *phy
 		*length = le64(rec.val) & APFS_J_FILE_EXTENT_LEN_MASK;
 		*phys = le64(rec.val + 8);
 		return 0;
+	}
+}
+
+int
+apfs_extent_at(struct apfs_vol *vol, uint64_t stream_id, uint64_t off,
+    struct apfs_extent *ext)
+{
+	struct ext_iter it;
+	uint64_t logical, length, phys;
+	int error;
+
+	error = ext_begin(vol, stream_id, off, &it);
+	if (error) {
+		return error;
+	}
+	/*
+	 * The seek lands at or before the extent wanted (a tree keyed by offset cannot be
+	 * asked for "the one containing"), so step forward until one covers `off`.
+	 */
+	for (;;) {
+		error = ext_next(&it, &logical, &length, &phys);
+		if (error) {
+			return error;
+		}
+		if (length == 0 || (length % vol->nx->block_size) != 0 ||
+		    (logical % vol->nx->block_size) != 0) {
+			return EIO;     /* an extent of APFS begins and ends on a block */
+		}
+		if (off < logical) {
+			return ENOENT;          /* a gap in the records: not a hole, damage */
+		}
+		if (off < logical + length) {
+			ext->logical = logical;
+			ext->length = length;
+			ext->phys = phys;
+			return 0;
+		}
 	}
 }
 
