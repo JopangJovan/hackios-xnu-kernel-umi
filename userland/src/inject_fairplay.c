@@ -76,6 +76,19 @@
  * Mach traps are not BSD calls and so are invisible to this trace: whatever it asks over Mach --
  * including a bootstrap check-in -- would not appear here.
  *
+ * AND A LIMIT WORTH KNOWING BEFORE ANYONE TRIES AGAIN: __sysctl and __mac_syscall were hooked here
+ * too, and neither fired, while the kernel's own trace counted 33 and 12 of them in the same life.
+ * open() and access() fire in the same build, 1300 lines of them, so the library is plainly there.
+ * The reason is the mechanism, not the names this time: dyld interposing replaces a symbol where one
+ * image calls ANOTHER image's stub, and these calls are made inside libsystem itself. USER-SPACE
+ * INTERPOSING CANNOT SEE A LIBSYSTEM-INTERNAL SYSCALL. For arguments to those, the instrument has to
+ * be the kernel: systrace already prints the call and the return, and printing the sysctl MIB and
+ * the __mac_syscall policy and request beside them is a small addition in the same place
+ * (xnu/redwood.patch, systrace_report). That is the next instrument, and it wants a kernel build.
+ * It matters here because this kernel's AMFI stand-in answers exactly two requests, 0x5a and 0x60,
+ * and returns ENOPOLICY to every other (bsd/kern/kern_minimac.c): a daemon that asks a third thing
+ * is refused in a way no file and no library hook would ever show.
+ *
  * The next instrument should therefore be on the other side of the wall: this kernel is ours, so
  * logging the system calls of the process named fairplayd.H2 sees through the inlining that defeats
  * interposing. The other way in is to read the binary, and this project has a worked path for
