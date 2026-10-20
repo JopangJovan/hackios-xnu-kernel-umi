@@ -836,6 +836,15 @@ def pool_for_full(ty, family):
     if bty == "i1":
         return [0, 1]
     if bty.startswith("i"):
+        # The exhaustive pool has 0x7FFFFFFF and -1, both of which rounding
+        # decides, but no exact midpoint between two floats -- so it could tell
+        # a wrong conversion from a right one and could not tell which rule was
+        # in use. The three added here can (see CONV_INTS), and only the convert
+        # family pays for them: INTS is the pool for every integer operation,
+        # and widening it would grow the whole exhaustive grid for one question
+        # that belongs to one family.
+        if family == "convert" and bty == "i32":
+            return INTS + [16777215, 16777217, 16777219]
         return INTS
     return DOT_FLOATS if family == "dot" else FLOATS
 
