@@ -1220,10 +1220,31 @@ def check_log(outdir, logpath, verbose):
     missing = 0
     refused = {}
     short = {}
+    half_set_aside = set()
     total = 0
     for m in manifest:
         if narrow_here and is_narrow(m["name"], m["retty"]):
             narrow_skipped.add(m["name"])
+            continue
+        # A declaration that returns half cannot be judged from a run of
+        # air_run, and this is the frontend's harness and not the shader at
+        # fault. air_run reads back through R32G32B32A32_FLOAT -- it has no
+        # 16-bit target at all -- so a half result is widened at once and NIR
+        # folds u2f16 followed by that widening into a single u2f32. The
+        # generated Adreno code for air.convert.f.f16.u.i32 is four
+        # cov.u32f32 and not one cov.u32f16, and softpipe returns
+        # 4.2949673e+09 where a half would give inf. The reference computes
+        # f16(x) and the shader computes f32(x), so comparing them says
+        # nothing about either.
+        #
+        # This used to pass unnoticed because every value large enough to show
+        # it produced an infinite expectation, and infinities were skipped
+        # without being counted: three cases of four skipped, the zero
+        # agreeing, and the declaration reported as agreeing on every case.
+        # Set aside by name now. Giving air_run a 16-bit target is the real
+        # answer and is separate work; this commit only stops the claim.
+        if parse_type(m["retty"])[0] in ("half", "f16"):
+            half_set_aside.add(m["name"])
             continue
         r = got.get(m["id"])
         if r is None:
@@ -1257,15 +1278,30 @@ def check_log(outdir, logpath, verbose):
             # parse is a NaN here, and wrap() cannot take one
             flat = [wrap(v, 32, True) if isinstance(v, int) else v for v in flat]
         st = per_decl.setdefault(m["name"], dict(exact=m["exact"], n=0, bad=[],
-                                                 worst=0, worst_case=None))
+                                                 worst=0, worst_case=None, denorm=0))
         for i, args in enumerate(m["cases"]):
             for c, exp in enumerate(m["expect"][i]):
                 idx = i * m["rn"] + c
                 if idx >= len(flat):
                     continue
-                if (isinstance(exp, float)
-                        and (math.isinf(exp)
-                             or (exp != 0.0 and abs(exp) < 1.17549435e-38))):
+                # An infinite expectation used to be skipped here along with the
+                # denormals, and that skip hid a real disagreement rather than a
+                # licensed one. The four half-returning conversions expected
+                # [0, inf, inf, inf]; every infinity was skipped, the zero
+                # agreed, and three wrong answers were reported as a declaration
+                # that agrees on every case. An infinity is as testable as any
+                # other value -- the shader has to return one too -- so it is
+                # compared now.
+                #
+                # A denormal is a different matter and still skipped: Metal
+                # compiles with air.compile.denorms_disable, so flushing one to
+                # zero is permitted and a disagreement there is not a fault.
+                # Counted rather than dropped, because that is the distinction
+                # this check keeps getting wrong.
+                if (isinstance(exp, float) and exp != 0.0
+                        and not math.isinf(exp)
+                        and abs(exp) < 1.17549435e-38):
+                    st["denorm"] += 1
                     continue
                 st["n"] += 1
                 total += 1
@@ -1328,6 +1364,25 @@ def check_log(outdir, logpath, verbose):
     if narrow_skipped:
         print("intrincheck: %d declarations left out: a narrow type (i1, i8, i16, f16) "
               "and this ran on softpipe, whose registers are 32-bit" % len(narrow_skipped))
+    # How thin a verdict is matters as much as the verdict. "Agrees on every
+    # case" over one case is not a statement about the operation, and the four
+    # half-returning conversions were exactly that: three of their four cases
+    # skipped, agreement resting on the zero. Named here rather than left for
+    # someone to work out from the totals.
+    thin = sorted(k for k, v in per_decl.items() if v["n"] and v["n"] < 3 and not v["bad"])
+    if thin:
+        print("intrincheck: %d declarations agree on fewer than 3 cases, which is "
+              "agreement about very little: %s"
+              % (len(thin), ", ".join("%s (%d)" % (k, per_decl[k]["n"]) for k in thin)))
+    if half_set_aside:
+        print("intrincheck: %d declarations set aside: they return half, and air_run reads "
+              "back through a 32-bit float target, so the half conversion is optimised away "
+              "and the reference describes an operation the shader does not perform (%s)"
+              % (len(half_set_aside), ", ".join(sorted(half_set_aside))))
+    denorm = sum(v["denorm"] for v in per_decl.values())
+    if denorm:
+        print("intrincheck: %d cases not compared: the result is a denormal and Metal "
+              "compiles with air.compile.denorms_disable" % denorm)
     print("intrincheck: %d cases in all, as RUN on %s and not as folded"
           % (total, screen or "an unnamed screen"))
     return 1 if (bad or missing or short) else 0
