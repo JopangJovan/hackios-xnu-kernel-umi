@@ -28,7 +28,13 @@
  *   argv[0] = /usr/sbin/fairplayd.H2, one argument, as Apple's own job plist asks for (ours matches
  *     it field for field but KeepAlive, which mkjobs.py drops; MachServices are all three there)
  *   open() of the CoreFoundation and containermanagerd feature flags, and of /usr/sbin/Info.plist
- *     -- CFBundle finding its own bundle, and nothing else
+ *     -- CFBundle finding its own bundle, and nothing else. WITH THE RESULTS, which is the only way
+ *     to tell "it read the flags" from "it tried and got ENOENT": the four that exist on the volume
+ *     are opened successfully (Global.plist, GlobalDisclosures.plist, Domain/CoreFoundation.plist,
+ *     Domain/containermanagerd.plist -> fd 3), and every -1 is a file a stock iPhone has not got
+ *     either (/Library/Preferences/FeatureFlags/..., Settings.plist, Profiles.plist, and
+ *     /usr/sbin/Info.plist, which no unbundled daemon has). Nothing it needs is missing from this
+ *     image: the feature flags are not the reason it leaves.
  *   NOT ONE IOServiceMatching, IOServiceGetMatchingService(s), IOServiceOpen or IOConnectCallMethod
  *   no xpc_connection_create_mach_service, no sysctlbyname, no dlopen, no stat or mkdir of its own
  *   the exit handler runs, so it leaves of its own accord -- and neither exit() nor _exit() nor
@@ -44,12 +50,33 @@
  * One guess checked and killed before it cost a run: not the platform-binary flag. iOS's own
  * binaries are ad hoc signed and this kernel marks exactly those as platform binaries
  * (bsd/kern/kern_minimac.c), so fairplayd is one here.
+ * Two warnings for whoever reads this next.
+ * AN ENTITLEMENT NAMES WHAT A PROGRAM MAY DO, NEVER WHAT IT DOES. fairplayd's signature carries
+ * com.apple.security.iokit-user-client-class = com_apple_driver_FairPlayIOKitUserClient, and on that
+ * evidence a kernel driver looked like the obvious next piece of work. It never opens one. The
+ * entitlement is permission, not behaviour, and one run of watching beat a day of writing.
+ * AND mkjobs.py DROPS KeepAlive from the job plists it makes (ours is Apple's field for field
+ * otherwise, MachServices included). Harmless here -- launchd restarts fairplayd anyway, on demand,
+ * 34 times in six minutes -- but worth knowing, because a daemon that is meant to stay resident and
+ * is not kept alive looks exactly like a daemon that quits, and two shapes with the same log have
+ * cost this project an evening once already.
+ *
  * The next instrument should therefore be on the other side of the wall: this kernel is ours, so
  * logging the system calls of the process named fairplayd.H2 sees through the inlining that defeats
- * interposing. Static reading of the binary at the offsets above is the other way in.
+ * interposing. The other way in is to read the binary, and this project has a worked path for
+ * exactly that (it is what the camera work used on CMCapture): Ghidra in ~/.local/share/ghidra,
+ * imported with -noanalysis because a full analysis runs for hours, a project under
+ * ~/ghidra-projects whose path has no dot in it, and ~/.local/share/ghidra/tools/dec.sh to
+ * decompile by symbol with the cache's island and stub names filled in; got.py, cfstr.py and
+ * callers.py beside it; "ipsw dyld" only for dump, a2s and a2f, since disass runs out of memory.
+ * The window is small: offsets 0xd9a40 to 0x8565ac of /usr/sbin/fairplayd.H2, and what to look for
+ * is an early return from main and the strings of whatever it compared against just before -- a
+ * comparison, not a failed call, since every sampled program counter is in code Apple shipped
+ * precisely so that it could not be watched from outside.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <crt_externs.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -137,10 +164,13 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 static CFMutableDictionaryRef
 watched_IOServiceMatching(const char *name)
 {
+	CFMutableDictionaryRef matching = IOServiceMatching(name);
+
 	if (ours) {
-		say("redwood: fairplayd: IOServiceMatching(\"%s\")\n", name != NULL ? name : "(null)");
+		say("redwood: fairplayd: IOServiceMatching(\"%s\") -> %s\n", name != NULL ? name : "(null)",
+		    matching != NULL ? "a dictionary" : "nothing");
 	}
-	return IOServiceMatching(name);
+	return matching;
 }
 
 static kern_return_t
@@ -214,28 +244,41 @@ watched_open(const char *path, int flags, ...)
 		mode = (mode_t)va_arg(ap, int);
 		va_end(ap);
 	}
+	int fd = open(path, flags, mode);
+
+	/*
+	 * The RESULT, not only the call: "it read the feature flags" and "it tried to and got ENOENT"
+	 * are the same line without it, and completely different findings. Every watcher here says what
+	 * came back.
+	 */
 	if (ours) {
-		say("redwood: fairplayd: open(\"%s\")\n", path != NULL ? path : "(null)");
+		say("redwood: fairplayd: open(\"%s\") -> %d%s\n", path != NULL ? path : "(null)", fd,
+		    fd < 0 ? (errno == ENOENT ? " (no such file)" : " (refused)") : "");
 	}
-	return open(path, flags, mode);
+	return fd;
 }
 
 static int
 watched_sysctlbyname(const char *name, void *out, size_t *out_size, void *in, size_t in_size)
 {
+	int result = sysctlbyname(name, out, out_size, in, in_size);
+
 	if (ours) {
-		say("redwood: fairplayd: sysctlbyname(\"%s\")\n", name != NULL ? name : "(null)");
+		say("redwood: fairplayd: sysctlbyname(\"%s\") -> %d\n", name != NULL ? name : "(null)", result);
 	}
-	return sysctlbyname(name, out, out_size, in, in_size);
+	return result;
 }
 
 static void *
 watched_dlopen(const char *path, int mode)
 {
+	void *library = dlopen(path, mode);
+
 	if (ours) {
-		say("redwood: fairplayd: dlopen(\"%s\")\n", path != NULL ? path : "(null)");
+		say("redwood: fairplayd: dlopen(\"%s\") -> %s\n", path != NULL ? path : "(null)",
+		    library != NULL ? "loaded" : dlerror());
 	}
-	return dlopen(path, mode);
+	return library;
 }
 
 /*
@@ -248,10 +291,13 @@ watched_dlopen(const char *path, int mode)
 static xpc_connection_t
 watched_xpc_connection_create_mach_service(const char *name, dispatch_queue_t queue, uint64_t flags)
 {
+	xpc_connection_t connection = xpc_connection_create_mach_service(name, queue, flags);
+
 	if (ours) {
-		say("redwood: fairplayd: xpc_connection_create_mach_service(\"%s\")\n", name != NULL ? name : "(null)");
+		say("redwood: fairplayd: xpc_connection_create_mach_service(\"%s\") -> %s\n",
+		    name != NULL ? name : "(null)", connection != NULL ? "a connection" : "nothing");
 	}
-	return xpc_connection_create_mach_service(name, queue, flags);
+	return connection;
 }
 
 static int
