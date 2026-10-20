@@ -27,7 +27,17 @@
 #                                   for at every boot -- a few megabytes, not more
 #                      RC_JOBS=<file> what the job com.redwood.demo runs: rc.jobs (default), or
 #                                   rc.jobs.unlock, which also swipes the lock screen away (for the phone,
-#                                   where nothing else can touch the screen yet)
+#                                   where nothing else can touch the screen yet).
+#                                   A job list cannot assume a shell. iOS 16.5's own root has none at all
+#                                   -- /bin is df and ps, and nothing else -- so a line beginning /bin/sh
+#                                   fails with "No such file or directory" and status 127 on a flash-root
+#                                   boot. The /var/jb/bin/sh that rc.jobs.jb and rc.jobs.sileo run is the
+#                                   package manager's prefix, which only a JB=1 image carries. And init
+#                                   runs these lines itself (src/init.c, run_command): words split on
+#                                   blanks, no quoting, no variable assignment, no redirection beyond a
+#                                   trailing ">> FILE" and "&". So a program that needs a value passed to
+#                                   it needs an option for it, not an environment variable -- which is why
+#                                   air_run grew --buffer.
 #                      GL=1         with an OpenGL ES implementation for the window server: Mesa
 #                                   (tools/mk-mesa.sh fetches and builds it) behind src/eagl.c, as
 #                                   lib/libOSMesa.8.dylib (15 MB) and lib/libredwood-gl.dylib. Where the

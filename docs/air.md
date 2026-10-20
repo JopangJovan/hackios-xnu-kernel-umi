@@ -33,6 +33,8 @@ And of the 119 distinct `air.*` operations those modules call (`tools/air/intrin
 | of those, exactly defined and agreeing on every case (45 607 cases) | 71 |
 | of those, approximate, so measured against libm and nothing concluded | 7 |
 | of those, also *run* by a Gallium driver rather than folded (softpipe, 2 586 cases) | 47 |
+| of those, run **on the phone's own Adreno** (812 cases) and agreeing there | 68 |
+| of those, **disagreeing on the Adreno** where every host engine agrees | 3 |
 | the atomics and the barrier, against kernels written for them (`atomiccheck.py`) | 10 |
 | texture operations verified exactly, on several texels each (`texopcheck.py`) | 13 |
 | texture operations with a case softpipe cannot run: a 16-bit result | 7 |
@@ -43,15 +45,77 @@ functions and not entry points at all.
 
 **What those numbers are not**, because they will be quoted without this paragraph otherwise:
 
-- **The arithmetic operations are now checked; nothing checked them against the Adreno.** 71 of
-  the corpus's declarations agree with C's own functions on every one of 45 607 cases, and 47 of
-  them agree again when *executed* by softpipe instead of folded — which is a real answer to what
-  used to be the largest hole here (section 4, item 4), and found three bugs getting there. But
-  both engines are on an x86 host. An opcode whose Adreno instruction differs from what
-  `nir_opt_constant_folding` and TGSI compute is invisible to all 48 193 of those cases, and the
-  24 narrow-type declarations softpipe cannot run at all are exactly the ones where ir3 differs
-  most from it. None of the seven shaders that have run on the phone calls an `air.*` function:
-  **no operation has been run on the GPU.**
+- **The arithmetic operations are checked; two of them have now been checked against the
+  Adreno, and the other 76 have not.** 71 of the corpus's declarations agree with C's own
+  functions on every one of 45 607 cases, and 47 of them agree again when *executed* by softpipe
+  instead of folded — which is a real answer to what used to be the largest hole here (section 4,
+  item 4), and found three bugs getting there. But those two engines are both on an x86 host. An
+  opcode whose Adreno instruction differs from what `nir_opt_constant_folding` and TGSI compute is
+  invisible to all 48 193 of those cases, and the 24 narrow-type declarations softpipe cannot run
+  at all are exactly the ones where ir3 differs most from it.
+
+  On 20 October that stopped being true. All 78 declarations ran on the phone's own Adreno
+  (`logs/080952-run.log`, section 4 item 4): **68 of the 71 exactly-defined ones agree with C on
+  every one of 812 cases, and 3 disagree** — and the 3 are the whole point of having gone there,
+  because every engine on this machine agrees with C about them.
+
+  Two things that run went better than expected. The **24 narrow-type declarations** that softpipe
+  cannot run at all — `i1`, `i8`, `i16`, `f16`, where TGSI's 32-bit registers made a verdict
+  impossible — ran on the Adreno and are among the 68 that agree. ir3 has real 16-bit registers,
+  that was the open question, and the answer is that they are right. And nothing refused to run:
+  no assertion, no fallback, no module missing from the log.
+
+  The row "run on the phone's GPU | 7" in the first table above is unaffected and still reads 7:
+  it counts modules of the 456-module corpus, and these are generated modules that are not in the
+  corpus. The two measurements are deliberately not added together.
+- **The Adreno truncates `u32 → f32` where C, NIR and softpipe round.** This is the first thing
+  found here that no engine on this machine could have found, and it is why the suite was carried
+  to the phone at all. `air.convert.f.f32.u.i32` and its 2- and 3-component forms, given
+  `0xFFFFFFFF` (4 294 967 295 unsigned), return **4 294 967 040** where C returns
+  **4 294 967 296**.
+
+  The arithmetic is worth writing out, because the two numbers look like a printing difference and
+  are not. In `binary32` the spacing between representable values in [2³¹, 2³²) is 2⁸ = 256, so the
+  neighbours of 2³² − 1 are 2³² − 256 and 2³². Their distances from it are 255 and 1, so
+  round-to-nearest gives 2³² = `0x4f800000`, which is what `(float)4294967295u` is in C, checked
+  by compiling it. The Adreno's answer, 2³² − 256, is exactly `0xFFFFFFFF & 0xFFFFFF00`: the low
+  eight bits dropped. That is truncation toward zero, not rounding. Metal's conversions are
+  OpenCL's, which require round-to-nearest-even, so this is a real divergence and not a matter of
+  taste. Only the cases where rounding decides anything differ — 1 of 4, 2 of 8 and 3 of 12 — and
+  every value that is exactly representable agrees.
+
+  **Where it comes from is settled as far as inspection can settle it, and no further.** Two of the
+  three possible culprits are eliminated by reading code rather than by guessing:
+
+  - the frontend emits `nir_u2fN`, the correct opcode (`air_intrinsics.c`, the `convert` branch);
+  - ir3 turns that into a *single* `cov.u32f32` with no compensation. For a 32-bit source
+    `create_cov` has no special case at all — the special cases there are for 8-bit sources and
+    for `f32 → u8`. The generated Adreno code for the module is five instructions, four of them
+    `cov.u32f32` reading straight out of the constant buffer, with nothing between the load and the
+    conversion.
+
+  So the truncation is the behaviour of the a6xx `cov.u32f32` instruction itself. **Whose job it is
+  to compensate is not established**, and needs the a6xx ISA documentation, which is not to hand:
+  if `cov` is specified to round, this is a hardware erratum ir3 should work around; if it is
+  specified to truncate, then every API that requires round-to-nearest — OpenCL, Metal, and Vulkan's
+  `ConvertUToF` — has to compensate, and ir3 does not. Not worked around in the frontend, because
+  the frontend is emitting the right opcode and a workaround there would hide a fault that belongs
+  to everything ir3 compiles.
+
+  **A prediction that follows and has not been tested:** the port's OpenGL ES goes through the same
+  ir3 and the same instruction, so a GLES shader converting a large `uint` to `float` on this phone
+  should truncate identically. That would place the fault beyond this frontend entirely. It is one
+  shader's worth of work and it has not been done.
+
+- **`air.fast_pow` returns NaN on the Adreno for a negative base, where softpipe returns the exact
+  value.** `fast_pow(-0.5, 1)` is `-0.5` in C and on softpipe, and NaN on the phone. This is
+  recorded rather than reported as a bug: Metal's `fast::` functions, like OpenCL's `native_`
+  ones, are explicitly undefined outside a restricted domain, and a negative base is outside it.
+  It is worth naming because it sits inside the "approximate, nothing concluded" bucket, which is
+  exactly where a real difference can hide behind a reasonable-looking ulp figure — the line says
+  "worst inf ulp", and an inf ulp is not a rounding difference. Any corpus shader that calls
+  `fast_pow` with a base that can go negative will behave differently on this phone than in any
+  test on this machine.
 - **The atomics compute the right thing and the barrier waits; whether the atomics are *atomic*
   is still open.** `tools/air/atomiccheck.py` dispatches two kernels written for the purpose
   (section 4, item 5) and all eight operations the corpus uses agree — five on device memory
@@ -555,16 +619,69 @@ Three references, each independent of the translator:
      (`32767` for a half that rounds to `32768`) to notice, not an assertion, and a check that
      had trusted the number would have recorded a frontend bug that does not exist.
 
-   **It has not run on the phone.** `--emit DIR` writes the modules, the bytes for their input
-   buffer, a `manifest.json` of what each should return, and a `run.sh` that uses only `for`,
-   `echo` and shell parameter expansion — no `sed`, no `paste` — because what runs it is a Darwin
-   userland and not this machine's shell. `--check DIR LOG` then judges the log wherever it was
-   produced, so the arithmetic reference never leaves the host and the device needs nothing but
-   `air_run`. `--cases 4` cuts it to 211 modules and 1.7 MB, which is carryable. What is missing
-   is only the carrying: getting that directory into the boot image is the flash-root machinery of
-   subsystem (2), which this work is not supposed to touch, and the phone was held by another
-   session all night. **So every number above is from an x86 host, and the bottom row of the
-   table at the top of this document still reads 7.**
+   **It has now run on the phone, and two operations of it are answered there.** `--emit DIR`
+   writes the modules, the bytes for their input buffer, a `manifest.json` of what each should
+   return, a `run.sh` for this machine and an `rc.jobs` for the device. `--check DIR LOG` then
+   judges the log wherever it was produced, so the arithmetic reference never leaves the host and
+   the device needs nothing but `air_run`. `manifest.json` is deliberately not carried: nothing on
+   the device reads it, and leaving it behind keeps the stronger claim literally true — the device
+   cannot be made to agree by reading the answer.
+
+   **The reason this took a night longer than it needed to was a sentence in this document, and
+   it was wrong.** It said that "getting that directory into the boot image is the flash-root
+   machinery of subsystem (2), which this work is not supposed to touch". It is not. `/redwood/share`
+   already existed and already carried a data file that a test reads (`pattern.bin`, which `init`
+   verifies through `read()` and `mmap()`), and `EXTRA` already carried arbitrary host files into
+   `/redwood/bin`. `EXTRA_SHARE` is ten lines of `build.sh`. A boundary the brief drew for good
+   reasons had been reached for as the reason not to look into something, and the check that would
+   have cost a minute — reading what `/redwood/share` is for — was never made. A constraint is not
+   evidence about a thing it does not cover.
+
+   **What the first run on the phone actually found was in the harness, not the GPU**
+   (`logs/074504-run.log`, 20 October 07:45). The flash root mounted, the Adreno came up, and
+   `air_run` opened it: `clearFragment01` and then two generated modules each printed
+   `on Adreno 7c+ Gen 3 (the GPU, through the kernel's msm device)`. `air.fast_sqrt.f32` returned
+   `1.44972523e-09  2.15926367e+15` and `air.dot.v4f32` returned `-inf -inf` — bit for bit what
+   the host returns for the same module over the same pattern buffer, which is the comparison
+   those two were put in the job list to make: a job line cannot set `AIR_RUN_BUFFER`, so they
+   read `air_run`'s own pattern bytes, which the host can read too, and their numbers are
+   therefore comparable without the manifest and without a shell.
+
+   The other 98 of the 100 modules carried did not run, because the job list ended with
+   `/bin/sh /redwood/share/airops/run.sh` and the answer was
+   **`/bin/sh: No such file or directory`, status 127. iOS 16.5's own root has no shell at all**
+   — `/bin` holds `df` and `ps`, and nothing else. The `/var/jb/bin/sh` that `rc.jobs.jb` and
+   `rc.jobs.sileo` run belongs to the package manager's prefix, which only a `JB=1` image carries.
+   This was asserted, not checked: a `grep` for `bin/sh` matched six `rc.jobs*` files and the
+   matches were read as `/bin/sh` without opening a line of any of them — the same shape of
+   mistake as the claim about `air_run`'s texture format a day earlier, a conclusion drawn from a
+   pattern match instead of from the code. It is now written beside `RC_JOBS` in `build.sh`,
+   because anyone writing a job list with a shell in it will meet the same 127.
+
+   So the shell was removed rather than replaced. `air_run` grew `--buffer FILE` — `AIR_RUN_BUFFER`
+   as an argument, which is the one thing `init`'s `run_command` can express — and `--emit` now
+   writes an `rc.jobs` with one line per module. On the phone 27 modules ran in 0.6 s, about 22 ms
+   each including opening the GPU, so 225 separate processes cost about five seconds and a loop
+   inside one process would buy nothing worth the refactor. (An earlier estimate of 50–150 ms per
+   module, taken from the spacing of nearby `launchd` lines, was wrong by a factor of five; the
+   figure above is from the run that executed them.)
+
+   **Two more things had to be found before the suite would report anything, and neither was in the
+   GPU.** The first was in `init` and is written up where it belongs (`userland/src/init.c`,
+   `read_whole`): three configuration files were each read with one `read()` into a fixed buffer
+   with no check, so a file longer than its buffer silently lost its tail. The job list is 21 KB
+   against a 8 KB buffer, so 94 of its 244 lines were read and about 150 modules did not run —
+   which reads exactly like a test that found nothing. Caught before a run rather than after,
+   by counting how many lines fit before claiming that 225 modules had passed.
+
+   The second is a property of the loader's log and will catch anything verbose:
+   **the log keeps the first 256 KB and the last 1 MB and drops the middle**, saying so in one
+   line. With `XL_SECS=120` and `REST=1`, iOS wrote more than a megabyte of `os_log` after the
+   suite had finished, so the suite's own output was in the dropped middle — 27 modules survived,
+   at the front. `XL_FOLLOW`'s intermediate log does not help, because the drop has already
+   happened by the time it is fetched. The cure is a short window, not a filter: a filter removes
+   lines that are already gone. `XL_SECS=30` leaves the whole run at 1.19 MB with all 225 modules
+   in it.
 
 5. **The atomics, with a kernel written to make a lost update show.** This document used to say
    that none of Apple's kernels could test an atomic and why: "a sum written by threads that never

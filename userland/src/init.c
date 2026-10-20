@@ -779,6 +779,47 @@ graft_tree(const char *from, const char *to, int top, int *made, int *linked)
 	return ok && chmod(to, mode) == 0;
 }
 
+/*
+ * A configuration file read whole into a fixed buffer, and loudly when it does not fit.
+ *
+ * Three places here read a file of ours this way, and all three used to do it with one
+ * read() and no check at all, so a file longer than its buffer simply lost its tail. What
+ * that looks like is different every time and never looks like a short read: half a program
+ * name handed to kern.exec_inject, which then matches nothing and the insertion quietly does
+ * not happen; directories of /private/var that are merely absent, which is what cost the
+ * package manager's work a long hunt for a missing /var/mobile/tmp; job lines that do not
+ * run, which reads as a test that found nothing.
+ *
+ * The loop matters as much as the size: read() is allowed to return less than it was asked
+ * for without being at the end of the file, so a single read() is not enough even when the
+ * file does fit. The buffers are still fixed -- this is an init with no allocator worth the
+ * name -- but a file that does not fit now says so instead of going quiet.
+ *
+ * The length, or -1 if there is no such file.
+ */
+static ssize_t
+read_whole(const char *path, char *buf, size_t size)
+{
+	int fd = open(path, O_RDONLY, 0);
+	size_t got = 0;
+	ssize_t n;
+	char over;
+
+	if (fd < 0) {
+		return -1;
+	}
+	while (got < size - 1 && (n = read(fd, buf + got, size - 1 - got)) > 0) {
+		got += (size_t)n;
+	}
+	/* one byte left to read means the buffer ended, not the file */
+	if (got == size - 1 && read(fd, &over, 1) > 0) {
+		printf("init: %s does not fit in %zu bytes: the rest of it is not used\n", path, size - 1);
+	}
+	close(fd);
+	buf[got] = 0;
+	return (ssize_t)got;
+}
+
 static void
 mount_writable(void)
 {
@@ -788,7 +829,6 @@ mount_writable(void)
 	int ok, fd, made = 0, files = 0;
 	const char *jb;
 	struct stat st;
-	ssize_t n;
 
 	printf("\n-- writable filesystem --\n");
 	ok = mount("ramfs", "/private/var", 0, NULL) == 0;
@@ -798,10 +838,7 @@ mount_writable(void)
 	check(ok, "mount a memory filesystem on /private/var");
 
 	/* the directories of the data volume, as listed in the template that ships with iOS (ios165/mkvarskel.py) */
-	fd = open(in_image("/etc/var.skel"), O_RDONLY, 0);
-	n = fd >= 0 ? read(fd, skeleton, sizeof(skeleton) - 1) : -1;
-	close(fd);
-	skeleton[n > 0 ? n : 0] = 0;
+	read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));
 	for (char *line = skeleton; ok && *line;) {
 		char *end = strchr(line, '\n'), *f[6];
 		int count;
@@ -1223,16 +1260,17 @@ run_command(char *line)
 static void
 run_rc(const char *path)
 {
-	static char script[8192];
-	int fd = open(path, O_RDONLY, 0);
-	ssize_t n;
+	/*
+	 * 64 KB and not 8 KB: a generated job list is one line per case, and
+	 * tools/air/intrincheck.py --emit writes 226 of them, 21 KB. At 8 KB this read the
+	 * first 94 lines and the rest was not there -- no error, no short line, simply jobs
+	 * that did not run, which looks exactly like a test that found nothing.
+	 */
+	static char script[65536];
 
-	if (fd < 0) {
+	if (read_whole(path, script, sizeof(script)) < 0) {
 		return;
 	}
-	n = read(fd, script, sizeof(script) - 1);
-	close(fd);
-	script[n > 0 ? n : 0] = 0;
 
 	printf("\n=== %s ===\n", path);
 	for (char *line = script; *line;) {
@@ -1309,15 +1347,19 @@ test_time(void)
 static void
 configure_inject(void)
 {
-	char conf[512];
-	int fd = open(in_image("/etc/inject.conf"), O_RDONLY, 0);
-	long n;
+	/*
+	 * 4 KB and not 512 bytes: the file was already 267 bytes with three insertions in it,
+	 * half the buffer, and what overflowing it does is the worst of the three places this
+	 * pattern was in. The tail is not dropped -- it is handed to kern.exec_inject as half a
+	 * program name, which then matches nothing, so the insertion simply never happens and
+	 * nothing says why.
+	 */
+	char conf[4096];
+	long n = (long)read_whole(in_image("/etc/inject.conf"), conf, sizeof(conf));
 
-	if (fd < 0) {
+	if (n < 0) {
 		return;
 	}
-	n = read(fd, conf, sizeof(conf) - 1);
-	close(fd);
 	while (n > 0 && (conf[n - 1] == '\n' || conf[n - 1] == ' ')) {
 		n--;
 	}
