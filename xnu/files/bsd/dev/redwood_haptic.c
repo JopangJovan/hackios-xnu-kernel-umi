@@ -35,16 +35,18 @@
  *              stretch of samples after a pause) a short tap (waveform 1), and one that goes on for
  *              longer than a tap the waveform Android loops for vibrations (11), until it ends -- or
  *              for HAPTIC_MAX_MS at most, after which the motor rests for as long before it plays
- *              again. The gain follows how loud iOS's waveform is: Android's own (0x80) from a third
- *              of full scale up, five eighths of it for the softest, never above it (gain_for()).
+ *              again. Gain follows how loud iOS's waveform is. Redwood tops out at its stock 0x80;
+ *              UMI tops out at 0x60 because the AW8697 trips boost protection above that. Both taper
+ *              to five eighths of their limit for the softest input (gain_for()).
  *
  * UMI selects the separate AW8697 path with umi_haptic=1..5. QUP11 is on GPIO 60/61,
  * reset GPIO 130, and the south TLMM tile is at 0x0f500000. Firmware is UMI's /vendor/firmware/aw8697_haptic.bin. Levels 1..4
  * probe, configure/load, and play a short test effect; level 5 runs the same iOS actuator service.
  *
- * Limits, whatever asks: Android's own values only (its gain 0x80, its boost and drive levels, its
- * waveforms); no effect longer than HAPTIC_MAX_MS, and the chip is told to stop and put into
- * standby when that is over whether it has stopped or not; any fault the chip reports (under-
+ * Limits, whatever asks: Android's own boost and drive levels and waveforms; its gain 0x80 on
+ * Redwood and UMI's tested-safe ceiling of 0x60. No effect is longer than HAPTIC_MAX_MS, and the
+ * chip is told to stop and put into standby when that is over whether it has stopped or not; any
+ * fault the chip reports (under-
  * voltage, over-current, over-temperature, the boost's short circuit or over-voltage), a write that
  * does not read back or a byte nobody acknowledges, and the chip is put into reset and nothing more
  * is done for the rest of the run. At the run's end (and on a panic's way out) the chip goes back
@@ -721,7 +723,7 @@ umi_configure(void)
 {
 	say("haptic: configure UMI AW8697 from its stock device tree and driver, keep it in standby\n");
 	if (!wait_standby(250) || !umi_measure_vbat() || !put(0x03, 0xff) || /* SYSINTM: polled, no IRQ path */
-	    !umi_update_bits(0x04, 0xf2, 0x01) ||                     /* SYSCTRL: RAM mode, boost, standby */
+	    !umi_update_bits(0x04, 0xf0, 0x03) ||                     /* SYSCTRL: explicitly select RAM, boost, standby */
 	    !umi_update_bits(0x2e, 0x9f, 0x40) ||                     /* PWMDBG: 24 kHz */
 	    !umi_update_bits(0x5f, 0xdf, 0x20) ||                     /* DETCTRL: stock protection mode */
 	    !umi_update_bits(0x2d, 0x7f, 0x00) ||                     /* PWMPRC: stock protection setting */
@@ -734,6 +736,7 @@ umi_configure(void)
 	    !umi_update_bits(0x47, 0xfb, 0x00) ||                     /* BST_AUTO: stock manual boost */
 	    !umi_offset_calibrate() ||
 	    !umi_update_bits(0x3a, 0xc1, 0x18) ||                     /* BSTDBG4.BST_VO = 0x0c */
+	    !put(0x5b, 0x05) ||                                       /* UMI stock resonance trim from its AW8697 calibration */
 	    !put(0x74, 0x00) || !put(0x75, 0x08) || !put(0x76, 0x03) || !put(0x77, 0xf8)) { /* BEMF thresholds */
 		return false;
 	}
@@ -945,8 +948,14 @@ play_effect(unsigned effect)
 	uint64_t began = mach_absolute_time(), ended;
 	bool done;
 	if (umi_chip) {
-		say("haptic: UMI AW8697 waveform %u is played at gain 0x80\n", effect);
-		if (!start_waveform(effect, false, 0x80) || !healthy("before UMI playback")) {
+		uint32_t gain = 0x40;
+
+		(void)PE_parse_boot_argn("haptic_gain", &gain, sizeof(gain));
+		if (umi_chip && gain > 0x60) {
+			gain = 0x60;
+		}
+		say("haptic: UMI AW8697 waveform %u is played at diagnostic gain %#x\n", effect, gain);
+		if (!start_waveform(effect, false, (uint8_t)gain) || !healthy("before UMI playback")) {
 			return false;
 		}
 		wait_ms(2);
@@ -1103,8 +1112,8 @@ umi_start_waveform(unsigned waveform, bool forever, uint8_t gain)
 	uint8_t go = 1;
 	if (!wait_standby(250) || !put(0x07, (uint8_t)waveform) || !put(0x08, 0) ||
 	    !put(0x0f, forever ? 0xf0 : 0x00) ||                        /* WAVSEQ1/2 and WAVLOOP1 */
-	    !umi_update_bits(0x3a, 0xc1, 0x18) || !put(0x39, gain) ||   /* BSTDBG4 and DATDBG */
-	    !umi_activate()) {
+	    !umi_activate() ||
+	    !umi_update_bits(0x3a, 0xc1, 0x18) || !put(0x39, gain)) {  /* BSTDBG4 and DATDBG, after RAM mode is active */
 		return false;
 	}
 	if (!regs_write(0x05, &go, 1)) {                               /* GO */
@@ -1178,13 +1187,14 @@ chip_state(void)
  * scale for most feedbacks (a tap's peak anywhere from 1000 to 33000 of 32768, a vibration's
  * about 17000), and followed in proportion (gain = Android's * peak / full scale) most of them came
  * out at a tenth of Android's gain or less: not felt at all. Android plays its own clicks and
- * vibrations at its gain, 0x80. So: Android's gain from a third of full scale up, and below that
- * down to five eighths of it for the softest -- never above Android's.
+ * vibrations at gain 0x80. UMI's AW8697 trips its stock boost protection above 0x60, so cap its
+ * top there. Use the chip's top gain from a third of full scale up, then taper down to five eighths
+ * of it for the softest effects.
  */
 static uint8_t
 gain_for(uint32_t peak)
 {
-	uint32_t top = umi_chip ? 0x80 : android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
+	uint32_t top = umi_chip ? 0x60 : android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
 
 	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
 }
