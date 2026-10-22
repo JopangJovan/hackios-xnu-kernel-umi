@@ -37,7 +37,8 @@ fi
 
 if ! skip loader; then
 	if command -v clang >/dev/null && command -v lld-link >/dev/null; then
-		xnuloader/build.sh && echo "build: loader xnuloader/loader.efi"
+		xnuloader/build.sh || die "loader build failed"
+		echo "build: loader ${LOADER_EFI:-xnuloader/loader.efi}"
 	else
 		echo "build: no clang/lld-link: using prebuilt/loader.efi"
 	fi
@@ -46,14 +47,19 @@ fi
 if ! skip images; then
 	have_userland
 	[ -d ios165/rootfs ] || die "no iOS files yet: run ios165/fetch.sh first (it downloads them from Apple to this machine)"
-	env REST=1 $USERLAND_VARS "$@" userland/build.sh
+	env REST=1 $USERLAND_VARS "$@" userland/build.sh || die "userland image build failed"
 fi
 
 if ! skip boot && [ "$KIND" = phone ]; then
 	# the UEFI with the loader inside, the way `xl enter` makes it: the loader then brings up its USB link
-	L=xnuloader/loader.efi; [ -f $L ] || L=prebuilt/loader.efi
+	L=${LOADER_EFI:-xnuloader/loader.efi}
+	if [ "$DEVICE" = umi ]; then
+		[ -f "$L" ] || die "build the UMI loader first: DEVICE=umi xnuloader/build.sh"
+	else
+		[ -f "$L" ] || L=prebuilt/loader.efi
+	fi
 	python3 xnuloader/mkpayload.py -o out/usb-payload.bin loader.efi=$L --usb > /dev/null
 	FD_BASE=$FD_BASE FD_SIZE=$FD_SIZE PAYLOAD_BASE=$PAYLOAD_BASE UEFI_FD=$UEFI_FD DTB=$DTB UEFI_TARGET=$UEFI_TARGET \
-		python3 mkxnuimg.py -p out/usb-payload.bin -o out/$DEVICE-boot.img
+		python3 mkxnuimg.py -p out/usb-payload.bin -o out/$DEVICE-boot.img || die "boot image build failed"
 	echo "build: out/$DEVICE-boot.img -- boot it with: fastboot boot out/$DEVICE-boot.img (or common/run.sh $DEVICE)"
 fi

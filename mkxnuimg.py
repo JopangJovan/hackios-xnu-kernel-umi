@@ -16,7 +16,7 @@ Another device (common/devices/<name>.conf, read by common/build.sh) sets these 
   UEFI_TARGET   Mu-Silicium device name (default redwood)    UEFI_FD, DTB   files to use instead
   FD_BASE, FD_SIZE, PAYLOAD_BASE                              addresses from its UEFI port's memory map
 """
-import argparse, gzip, os, subprocess, sys
+import argparse, gzip, os, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
@@ -34,8 +34,40 @@ ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-redwood.img'))
 ap.add_argument('--mode', default='RELEASE')
 args = ap.parse_args()
 
+# A foreign target must never fall back to redwood's firmware or fixed-address shim.
+if TARGET != 'redwood':
+    for key in ('FD_BASE', 'FD_SIZE', 'PAYLOAD_BASE'):
+        if not os.environ.get(key):
+            sys.exit(f'{TARGET}: set {key} from the UMI UEFI memory map')
+    if FD_BASE % 16 or FD_SIZE <= 0 or FD_SIZE % 16 or PAYLOAD_BASE % 0x10000:
+        sys.exit('unaligned UEFI/payload addresses or size')
+    if FD_BASE < PAYLOAD_BASE + PAYLOAD_MAX and PAYLOAD_BASE < FD_BASE + FD_SIZE:
+        sys.exit('UEFI FD overlaps payload reservation')
+
 fd_path = os.environ.get('UEFI_FD') or os.path.join(MU, f'Build/{TARGET}Pkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
-if os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
+if TARGET != 'redwood':
+    if not os.path.isfile(fd_path):
+        sys.exit(f'{TARGET}: missing UMI UEFI FD: {fd_path}; set UEFI_FD (no redwood fallback)')
+    dtb_path = os.environ.get('DTB') or os.path.join(MU, f'Resources/DTBs/{TARGET}.dtb')
+    if not os.path.isfile(dtb_path):
+        sys.exit(f'{TARGET}: missing device tree: {dtb_path}')
+    if TARGET == 'umi':
+        result = subprocess.run(['dtc', '-I', 'dtb', '-O', 'dts', dtb_path],
+                                capture_output=True, text=True)
+        if result.returncode or 'model = "Qualcomm Technologies, Inc. xiaomi umi";' not in result.stdout:
+            sys.exit('umi: DTB is not the supplied Xiaomi Mi 10 device tree')
+    # Build a shim for the supplied FD, independently of a Mu-Silicium checkout.
+    # The user-supplied UEFI must implement the XNUP loader hook and reserve its RAM.
+    with tempfile.TemporaryDirectory(prefix='hackios-shim-') as tmp:
+        obj, raw = os.path.join(tmp, 'shim.o'), os.path.join(tmp, 'shim.bin')
+        subprocess.check_call(['clang', '--target=aarch64-linux-gnu', '-c',
+            os.path.join(HERE, 'tools/bootshim.S'), f'-DFD_BASE={FD_BASE:#x}',
+            f'-DFD_SIZE={FD_SIZE:#x}', f'-DPAYLOAD_BASE={PAYLOAD_BASE:#x}', '-o', obj])
+        subprocess.check_call(['aarch64-linux-gnu-objcopy', '-O', 'binary', obj, raw])
+        shim = open(raw, 'rb').read()
+    parts = {'fd': fd_path, 'dtb': dtb_path, 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
+             'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
+elif os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
     shim_dir = os.path.join(MU, 'BootShim')
     for f in ('BootShim.elf', 'BootShim.bin'):
         try: os.unlink(os.path.join(shim_dir, f))
@@ -51,9 +83,11 @@ else:
              'dtb': os.path.join(PREBUILT, 'redwood.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
              'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
     if os.environ.get('UEFI_FD'): parts['fd'] = os.environ['UEFI_FD']
-shim = open(parts['shim'], 'rb').read()
+if TARGET == 'redwood':
+    shim = open(parts['shim'], 'rb').read()
 fd = open(parts['fd'], 'rb').read()
-assert len(fd) == FD_SIZE, hex(len(fd))
+if len(fd) != FD_SIZE:
+    sys.exit(f'FD size {len(fd):#x} differs from FD_SIZE={FD_SIZE:#x}')
 
 blob = shim + fd
 if args.payload:

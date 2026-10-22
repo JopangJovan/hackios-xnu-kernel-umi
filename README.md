@@ -1,5 +1,7 @@
 # HackiOS — XNU kernel
 
+Xiaomi Mi 10 (umi) now boots iOS 16.5 from RAM with all eight CPU cores and working touchscreen input. The UMI UEFI was built for the device and temporarily booted without flashing partitions. See [UMI build and verification notes](docs/UMI-BOOT.md).
+
 **HackiOS** boots Apple's open-source **XNU kernel** (`xnu-8796.121.2`, the kernel of iOS 16.5) on Android phone
 hardware and runs the **unmodified iOS 16.5 user space** on top of it: launchd → backboardd → SpringBoard →
 apps. Our own EFI loader, our own replacements for Apple's closed drivers, a UEFI port, and a Linux Wi-Fi driver

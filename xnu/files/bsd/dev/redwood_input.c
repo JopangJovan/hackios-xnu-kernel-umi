@@ -205,6 +205,8 @@ static const struct cdevsw touch_cdevsw = {
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
+extern void umi_touch_init(void);
+
 void
 redwood_input_init(void)
 {
@@ -216,6 +218,7 @@ redwood_input_init(void)
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	redwood_cpufreq_init();
 	redwood_virtio_input_init();
+	umi_touch_init();
 	redwood_goodix_init();
 	redwood_buttons_init();
 	redwood_battery_init();

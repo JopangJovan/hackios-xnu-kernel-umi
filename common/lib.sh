@@ -14,7 +14,10 @@ load_device() {
 	# shellcheck disable=SC1090
 	. "$conf"
 	DEVICE=$name
-	export DEVICE KIND
+	export DEVICE KIND UEFI_TARGET UEFI_FD DTB FD_BASE FD_SIZE PAYLOAD_BASE LOADER_EFI
+	if [ "$DEVICE" = umi ]; then
+		export XL_CMDLINE="${XL_CMDLINE:-$BOOTARGS}"
+	fi
 	echo "${0##*/}: device $DEVICE -- $NAME ($KIND)"
 }
 

@@ -15,7 +15,9 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
+#ifndef PAYLOAD_BASE
 #define PAYLOAD_BASE        0xF0000000ULL
+#endif
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -330,7 +332,12 @@ static void hc_take_back(const char *when);
 static void
 write_logs(const char *klog, uint64_t klog_len)
 {
+	/* The UMI bring-up keeps logs in RAM/USB; no raw partition writes. */
+#ifdef LOADER_UMI
+	efi_block_io *bio = NULL;
+#else
 	efi_block_io *bio = find_log_partition();
+#endif
 
 	compose_logs(klog, klog_len);
 	if (bio == NULL) {
@@ -551,6 +558,16 @@ static const struct platform platform_redwood = {
 	 */
 	.small_cores = 0x0f,
 	.fb_base = 0xE1000000,
+};
+
+/* UMI: GIC and MPIDR from the supplied DTB. GOP supplies the actual scanout. */
+static const struct platform platform_umi = {
+	.name = "umi", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000,
+	.cores = 8, .core_shift = 8, .small_cores = 0x0f,
+	/* Continuous splash from the older UMI port; an explicit UMI build also
+	 * accepts a relocated GOP buffer after checking its dimensions. */
+	.fb_base = 0x9C000000,
 };
 
 /*
@@ -2667,9 +2684,46 @@ print_memory_map(void)
 	}
 }
 
+static int starts_with(const char *s, const char *prefix);
+
+/* Initial UMI milestone: RAM disks, framebuffer, CPU and diagnostics only.
+ * Whitelisting also protects the unchanged prebuilt kernel from Redwood MMIO. */
+static int
+umi_bootargs_ok(const struct payload_info *pi)
+{
+	static const char *const allowed[] = {
+		"-v", "debug=", "keepsyms=", "serial=", "cpus=", "bootcpu=",
+		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umifts_scan=",
+	};
+	if (PLAT != &platform_umi) return 1;
+	if (pi->forced_base != 0) {
+		print("UMI: forced physical memory windows are disabled\n");
+		return 0;
+	}
+	for (const char *c = pi->cmdline; *c;) {
+		while (*c == ' ') c++;
+		if (!*c) break;
+		const char *end = c;
+		while (*end && *end != ' ') end++;
+		int ok = 0;
+		for (unsigned i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+			uint64_t len = str_len(allowed[i]);
+			if (starts_with(c, allowed[i]) &&
+			    (allowed[i][len - 1] == '=' || c + len == end)) ok = 1;
+		}
+		if (!ok) {
+			print("UMI: unsupported boot argument at: %s\n", c);
+			return 0;
+		}
+		c = end;
+	}
+	return 1;
+}
+
 static int
 choose_window(const struct payload_info *pi)
 {
+	if (!umi_bootargs_ok(pi)) return 0;
 	static uint8_t map_buf[65536];
 	uint64_t map_size = sizeof(map_buf), map_key, desc_size;
 	uint32_t desc_ver;
@@ -2729,8 +2783,6 @@ choose_window(const struct payload_info *pi)
  * back (panic, checkpoint, early exception); the combined log is staged and
  * written to the log partition. Returns 0 if the kernel could not be started.
  */
-static int starts_with(const char *s, const char *prefix);
-
 static int
 run_kernel(int have_checkpoint, uint64_t checkpoint)
 {
@@ -3058,6 +3110,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_u64(&w, "dram-size", win_size);
 	dt_prop_u32(&w, "debug-enabled", 1);
 	/* what MobileGestalt answers "main screen scale" from: 3 device pixels per point */
+	dt_prop_str(&w, "hackios-board", plat->name);
 	dt_prop_u32(&w, "display-scale", 3);
 	dt_prop_u32(&w, "display-rotation", 0);
 	/* how the kernel is to ask the firmware for more cores (PSCI) */
@@ -3944,10 +3997,20 @@ efi_main(efi_handle image, efi_system_table *st)
 		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
 			if (platforms[i]->fb_base == SCREEN.base)
 				PLAT = platforms[i];
+		#ifndef LOADER_UMI
 		if (PLAT == &platform_qemu_virt)
 			ramfb_phone_screen();
+#endif
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
+#ifdef LOADER_UMI
+	/* Do not turn an unknown phone framebuffer into QEMU's MMIO platform. */
+	if (GOP == NULL || SCREEN.width != 1080 || SCREEN.height != 2340) {
+		print("UMI: expected GOP 1080 x 2340; refusing kernel handoff\n");
+		return 0x8000000000000003ULL; /* EFI_UNSUPPORTED */
+	}
+	PLAT = &platform_umi;
+#endif
 	print("platform %s\n", PLAT->name);
 
 	install_exception_hook();

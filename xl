@@ -44,11 +44,20 @@
 # when the last upload was not from this copy. The record starts empty -- an upload by a copy without
 # this change leaves none -- and `run` says so rather than assuming.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
+# Device selection persists through enter/reload/run; raw xl defaults to redwood.
+if [ -n "${DEVICE:-}" ]; then
+	. common/lib.sh
+	load_device "$DEVICE"
+fi
 # the kernel and the loader built here, or else the ones that come with the repository
 K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 [ -f $K ] || K=prebuilt/mach.development.bcm2837
-L=xnuloader/loader.efi
-[ -f $L ] || L=prebuilt/loader.efi
+L=${LOADER_EFI:-xnuloader/loader.efi}
+if [ "${DEVICE:-}" = umi ]; then
+	[ -f "$L" ] || { echo 'xl: UMI loader missing; run DEVICE=umi xnuloader/build.sh' >&2; exit 1; }
+else
+	[ -f "$L" ] || L=prebuilt/loader.efi
+fi
 mkdir -p logs
 # There is one phone, whichever working copy (tools/new-workspace.sh) talks to it: the locks are
 # outside all of them.
@@ -152,7 +161,7 @@ run() { # run <oem command> <label>
 		local deadline=$(( $(date +%s) + ${XL_SECS:-8} + 100 )) followed=$(date +%s)
 		while :; do
 			result=$(FB_TIMEOUT=15 fb getvar result | grep '^result:')
-			case "$result" in ""|*running*) ;; *) break ;; esac
+			case "$result" in ""|"result:"|"result: "|*running*) ;; *) break ;; esac
 			[ "$(date +%s)" -ge "$deadline" ] && { result=; break; }
 			if [ -n "$XL_FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$XL_FOLLOW" ]; then
 				followed=$(date +%s)
