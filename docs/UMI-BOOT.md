@@ -4,6 +4,8 @@ This port boots fresh UMI UEFI, XNU and iOS 16.5 SpringBoard from RAM.
 A fresh UMI UEFI has now been built and temporarily booted on the phone.
 USB loader access and XNU handoff are verified; see [UEFI build and results](../uefi/umi/README.md).
 The bundled Redwood UEFI is incompatible and is never selected for UMI.
+The UMI device tree reports serial `UMI0XIAOMI10` (and matching MLB serial);
+the Redwood profile retains its own serial values.
 
 The first milestone is UEFI -> XNU -> iOS from RAM with a framebuffer.
 UMI power and volume buttons now have a read-only PM8150 driver, gated by
