@@ -38,6 +38,10 @@
  *              again. The gain follows how loud iOS's waveform is: Android's own (0x80) from a third
  *              of full scale up, five eighths of it for the softest, never above it (gain_for()).
  *
+ * UMI selects the separate AW8697 path with umi_haptic=1..5. It uses QUP11 on GPIO 36/37,
+ * reset GPIO 130, TLMM at 0x0f000000, and UMI's /vendor/firmware/aw8697_haptic.bin. Levels 1..4
+ * probe, configure/load, and play a short test effect; level 5 runs the same iOS actuator service.
+ *
  * Limits, whatever asks: Android's own values only (its gain 0x80, its boost and drive levels, its
  * waveforms); no effect longer than HAPTIC_MAX_MS, and the chip is told to stop and put into
  * standby when that is over whether it has stopped or not; any fault the chip reports (under-
@@ -65,7 +69,10 @@ extern void loader_log_putc(char c);
 
 static vm_offset_t tlmm;
 static uint32_t level;
-static bool broken, released, leaving;
+static bool broken, released, leaving, umi_chip;
+static bool wait_standby(unsigned ms);
+static bool start_waveform(unsigned waveform, bool forever, uint8_t gain);
+static bool umi_stop_waveform(void);
 
 /* every line to the loader's log as well (and to the console when that may be written) */
 static int say(const char *format, ...) __printflike(1, 2);
@@ -125,6 +132,7 @@ wait_ms(uint32_t ms)
 /* ---- pins ------------------------------------------------------------------------------------------ */
 
 #define TLMM_PHYS               0x0f100000UL
+#define TLMM_UMI_PHYS           0x0f000000UL
 #define TLMM_SIZE               0x100000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
@@ -136,13 +144,26 @@ wait_ms(uint32_t ms)
 #define PIN_RESET               35
 #define PIN_INT                 18
 
+static unsigned
+reset_gpio(void)
+{
+	return umi_chip ? 130 : PIN_RESET;
+}
+
+static unsigned
+interrupt_gpio(void)
+{
+	return umi_chip ? 129 : PIN_INT;
+}
+
 static void
 show_pins(void)
 {
-	static const struct {
+	const struct {
 		unsigned pin;
 		const char *what;
-	} pins[] = { { PIN_SDA, "I2C data" }, { PIN_SCL, "I2C clock" }, { PIN_RESET, "reset" }, { PIN_INT, "interrupt" } };
+	} pins[] = { { PIN_SDA, "I2C data" }, { PIN_SCL, "I2C clock" }, { reset_gpio(), "reset" },
+	    { interrupt_gpio(), "interrupt" } };
 
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
 		uint32_t cfg = rd(GPIO_CFG(pins[i].pin)), io = rd(GPIO_IO(pins[i].pin));
@@ -156,8 +177,9 @@ show_pins(void)
 static void
 reset_pin(bool high)
 {
-	wr(GPIO_IO(PIN_RESET), high ? 2 : 0);
-	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT);
+	unsigned pin = reset_gpio();
+	wr(GPIO_IO(pin), high ? 2 : 0);
+	wr(GPIO_CFG(pin), CFG_OUTPUT);
 	released = high;
 }
 
@@ -352,7 +374,7 @@ static void
 give_up(const char *why)
 {
 	broken = true;
-	say("haptic: %s: THE CHIP IS PUT INTO RESET (gpio%u low) and nothing more is done\n", why, PIN_RESET);
+	say("haptic: %s: THE CHIP IS PUT INTO RESET (gpio%u low) and nothing more is done\n", why, reset_gpio());
 	if (tlmm != 0) {
 		reset_pin(false);
 	}
@@ -433,6 +455,23 @@ static void
 show_registers(void)
 {
 	unsigned differ = 0;
+	if (umi_chip) {
+		static const uint8_t registers[] = {
+			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x07, 0x08, 0x0f, 0x20, 0x21, 0x22, 0x23, 0x24,
+			0x25, 0x26, 0x2e, 0x34, 0x39, 0x3a, 0x40, 0x41, 0x46,
+		};
+
+		for (unsigned i = 0; i < sizeof(registers); i++) {
+			uint8_t value = 0;
+			if (regs_read(registers[i], &value, 1)) {
+				say("haptic: AW8697 register %#04x = %#04x\n", registers[i], value);
+			} else {
+				say("haptic: AW8697 register %#04x NOT READ\n", registers[i]);
+				return;
+			}
+		}
+		return;
+	}
 
 	for (unsigned reg = 0; reg <= 0x7c; reg++) {
 		uint8_t value = 0;
@@ -456,6 +495,15 @@ static bool
 chip_answers(void)
 {
 	uint8_t id[2] = { 0, 0 };
+	if (umi_chip) {
+		if (!regs_read(0x00, id, 1)) {
+			say("haptic: nobody answers at %#x on the UMI QUP11 bus gpio%u/%u\n", AW_ADDRESS, PIN_SDA, PIN_SCL);
+			return false;
+		}
+		say("haptic: the chip at %#x identifies as %#04x%s\n", AW_ADDRESS, id[0], id[0] == 0x97 ? " (AW8697)" :
+		    " (not AW8697)");
+		return id[0] == 0x97;
+	}
 
 	if (!regs_read(AW_CHIPIDH, id, 2)) {
 		say("haptic: nobody answers at %#x on the bus of gpio%u/%u\n", AW_ADDRESS, PIN_SDA, PIN_SCL);
@@ -496,6 +544,94 @@ static const uint8_t android_analog[][2] = {
 	{ AW_TRIM_LRA, 0x0d },  /* Android's f0 calibration of this motor (its log: "f0_cali_data = 0x0D") */
 };
 
+/* AW8697 (UMI) uses its own register layout; these values follow the device-tree settings and
+ * the matching Linux driver's AW8697 9X path. Keep the Redwood AW86927 table untouched. */
+static bool
+umi_update_bits(uint8_t reg, uint8_t preserve, uint8_t value)
+{
+	uint8_t old;
+	return get(reg, &old) && put(reg, (uint8_t)((old & preserve) | value));
+}
+
+static bool
+umi_configure(void)
+{
+	say("haptic: configure UMI AW8697: 24 kHz PWM, boost voltage 0x0c from UMI device tree, interrupts masked\n");
+	if (!wait_standby(250) || !put(0x03, 0xff) ||                 /* SYSINTM: polled, no IRQ path */
+	    !umi_update_bits(0x2e, 0x9f, 0x40) ||                     /* PWMDBG: 24 kHz */
+	    !umi_update_bits(0x3a, 0xc1, 0x18) ||                     /* BSTDBG4: device-tree boost voltage 0x0c */
+	    !umi_update_bits(0x04, 0xf0, 0x01)) {                     /* SYSCTRL: RAM mode, standby */
+		return false;
+	}
+	return healthy("after the UMI AW8697 configuration");
+}
+
+static bool
+umi_load_waveforms(void)
+{
+	uint64_t size = 0;
+	const uint8_t *file = redwood_wifi_file("aw8697_haptic.bin", &size);
+	uint32_t sum = 0, base, length;
+	uint8_t address[2], back[64];
+
+	if (file == NULL || size < 8) {
+		say("haptic: no UMI aw8697_haptic.bin in fw/ of the small image\n");
+		return false;
+	}
+	for (uint64_t i = 2; i < size; i++) {
+		sum += file[i];
+	}
+	if ((sum & 0xffff) != (uint32_t)(file[0] << 8 | file[1])) {
+		say("haptic: UMI AW8697 firmware checksum mismatch (%#x != %#x)\n", sum & 0xffff, file[0] << 8 | file[1]);
+		return false;
+	}
+	base = (uint32_t)(file[2] << 8 | file[3]);
+	length = (uint32_t)size - 4;
+	if (base < 0x100 || (uint64_t)base + length > 0x2000) {
+		say("haptic: UMI AW8697 firmware range %#x+%#x exceeds its RAM\n", base, length);
+		return false;
+	}
+	say("haptic: UMI AW8697 RAM firmware: %u bytes from %#x\n", length, base);
+	if (!wait_standby(250) || !umi_update_bits(0x04, 0xdf, 0x20)) { /* SYSCTRL.RAMINIT */
+		give_up("UMI AW8697 RAM could not be opened");
+		return false;
+	}
+	address[0] = (uint8_t)(base >> 8);
+	address[1] = (uint8_t)base;
+	if (!put(0x21, address[0]) || !put(0x22, address[1]) ||       /* BASE_ADDRH/L */
+	    !put(0x23, (uint8_t)((base >> 2) >> 8)) || !put(0x24, (uint8_t)(base >> 2)) ||
+	    !put(0x25, (uint8_t)((base - (base >> 2)) >> 8)) || !put(0x26, (uint8_t)(base - (base >> 2))) ||
+	    !regs_write(0x40, address, 2)) {                          /* RAMADDRH/L */
+		give_up("UMI AW8697 RAM address could not be set");
+		return false;
+	}
+	for (uint32_t at = 0; at < length; at += 32) {
+		unsigned n = length - at < 32 ? length - at : 32;
+		if (!regs_write(0x42, file + 4 + at, n)) {                 /* RAMDATA */
+			give_up("UMI AW8697 RAM could not be written");
+			return false;
+		}
+	}
+	if (!regs_write(0x40, address, 2)) {
+		give_up("UMI AW8697 RAM readback address could not be set");
+		return false;
+	}
+	for (uint32_t at = 0; at < length; at += sizeof(back)) {
+		unsigned n = length - at < sizeof(back) ? length - at : sizeof(back);
+		if (!regs_read(0x42, back, n) || memcmp(back, file + 4 + at, n) != 0) {
+			say("haptic: UMI AW8697 RAM differs at %#x\n", base + at);
+			give_up("UMI AW8697 waveforms did not load");
+			return false;
+		}
+	}
+	if (!umi_update_bits(0x04, 0xdf, 0x00)) {                    /* RAMINIT off */
+		give_up("UMI AW8697 RAM could not be closed");
+		return false;
+	}
+	say("haptic: UMI AW8697 waveforms loaded and verified\n");
+	return healthy("after loading UMI AW8697 waveforms");
+}
+
 /* The analog registers opened or closed for writing (AW_TMCFG reads back as 0 either way: what tells is that the writes stick). */
 static bool
 unlock(bool open)
@@ -513,6 +649,9 @@ unlock(bool open)
 static bool
 configure(void)
 {
+	if (umi_chip) {
+		return umi_configure();
+	}
 	say("haptic: Android's configuration is written\n");
 	for (unsigned i = 0; i < sizeof(android_config) / sizeof(android_config[0]); i++) {
 		if (!put(android_config[i][0], android_config[i][1])) {
@@ -541,7 +680,7 @@ wait_standby(unsigned ms)
 	for (unsigned waited = 0; waited <= ms; waited += 2) {
 		uint8_t state = 0xff;
 
-		if (!get(AW_GLBRD5, &state)) {
+		if (!get(umi_chip ? 0x46 : AW_GLBRD5, &state)) {
 			return false;
 		}
 		states_seen |= 1u << (state & 0x0f);
@@ -563,6 +702,9 @@ static bool
 load_waveforms(void)
 {
 	uint64_t size = 0;
+	if (umi_chip) {
+		return umi_load_waveforms();
+	}
 	const uint8_t *file = redwood_wifi_file("aw8697_haptic.bin", &size);
 	uint32_t sum = 0, base, length;
 	uint8_t address[2], back[64];
@@ -626,6 +768,23 @@ play_effect(unsigned effect)
 {
 	uint64_t began = mach_absolute_time(), ended;
 	bool done;
+	if (umi_chip) {
+		say("haptic: UMI AW8697 waveform %u is played at gain 0x80\n", effect);
+		if (!start_waveform(effect, false, 0x80) || !healthy("before UMI playback")) {
+			return false;
+		}
+		wait_ms(2);
+		done = wait_standby(HAPTIC_MAX_MS);
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ended);
+		if (!done) {
+			say("haptic: UMI waveform is still playing at %u ms; stopping it\n", HAPTIC_MAX_MS);
+			if (!umi_stop_waveform()) {
+				return false;
+			}
+		}
+		say("haptic: UMI waveform returned to standby after %llu ms\n", ended / NSEC_PER_MSEC);
+		return healthy("after UMI playback");
+	}
 
 	say("haptic: waveform %u is played once, at Android's gain %#x\n", effect, android_regs[AW_PLAYCFG2]);
 	if (!wait_standby(250) || !put(AW_PLAYCFG3, 0x04) || !put(AW_WAVCFG1, (uint8_t)effect) || !put(AW_WAVCFG2, 0x00) ||
@@ -762,11 +921,47 @@ static const struct cdevsw haptic_cdevsw = {
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
+static bool
+umi_start_waveform(unsigned waveform, bool forever, uint8_t gain)
+{
+	uint8_t control, go = 1;
+	if (!wait_standby(250) || !put(0x07, (uint8_t)waveform) || !put(0x08, 0) ||
+	    !put(0x0f, forever ? 0xf0 : 0x00) ||                        /* WAVSEQ1/2 and WAVLOOP1 */
+	    !umi_update_bits(0x3a, 0xc1, 0x18) || !put(0x39, gain) ||   /* BSTDBG4 and DATDBG */
+	    !get(0x04, &control)) {
+		return false;
+	}
+	control = (uint8_t)((control & 0xf0) | 0x02);                  /* active RAM mode, boost */
+	if (!put(0x04, control) || !regs_write(0x05, &go, 1)) {        /* GO */
+		give_up("UMI AW8697 playback did not start");
+		return false;
+	}
+	return true;
+}
+
+static bool
+umi_stop_waveform(void)
+{
+	uint8_t stop = 0;
+	if (!regs_write(0x05, &stop, 1) || !wait_standby(100)) {
+		give_up("UMI AW8697 did not stop");
+		return false;
+	}
+	if (!umi_update_bits(0x04, 0xf0, 0x01) || !wait_standby(50)) {
+		give_up("UMI AW8697 did not return to standby");
+		return false;
+	}
+	return true;
+}
+
 /* Start a waveform without waiting for it: once, or (`forever') until stopped. */
 static bool
 start_waveform(unsigned waveform, bool forever, uint8_t gain)
 {
 	uint8_t go = 0x01;
+	if (umi_chip) {
+		return umi_start_waveform(waveform, forever, gain);
+	}
 
 	if (!put(AW_PLAYCFG3, 0x04) || !put(AW_WAVCFG1, (uint8_t)waveform) || !put(AW_WAVCFG2, 0x00) ||
 	    !put(AW_WAVCFG9, forever ? 0xf0 : 0x00) || !put(AW_PLAYCFG2, gain)) {
@@ -783,6 +978,9 @@ static bool
 stop_waveform(void)
 {
 	uint8_t stop = 0x02;
+	if (umi_chip) {
+		return umi_stop_waveform();
+	}
 
 	if (!regs_write(AW_PLAYCFG4, &stop, 1) || !wait_standby(50)) {
 		give_up("it does not stop");
@@ -797,7 +995,7 @@ chip_state(void)
 {
 	uint8_t state = 0xff;
 
-	return get(AW_GLBRD5, &state) ? state & 0x0f : 0xff;
+	return get(umi_chip ? 0x46 : AW_GLBRD5, &state) ? state & 0x0f : 0xff;
 }
 
 /*
@@ -811,7 +1009,7 @@ chip_state(void)
 static uint8_t
 gain_for(uint32_t peak)
 {
-	uint32_t top = android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
+	uint32_t top = umi_chip ? 0x80 : android_regs[AW_PLAYCFG2], low = top * 5 / 8, third = 32767 / 3;
 
 	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
 }
@@ -892,7 +1090,7 @@ serve(void)
 				followed = now;
 				heard_peak = 0;
 				if (peak != 0 && (gain > playing_gain + 8 || gain + 8 < playing_gain)) {
-					if (!put(AW_PLAYCFG2, gain)) {
+					if (!put(umi_chip ? 0x39 : AW_PLAYCFG2, gain)) {
 						break;
 					}
 					playing_gain = gain;
@@ -937,38 +1135,49 @@ serve(void)
 static void
 haptic_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	unsigned reset = reset_gpio();
+	tlmm = ml_io_map(umi_chip ? TLMM_UMI_PHYS : TLMM_PHYS, TLMM_SIZE);
 	say("haptic: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the reset released, registers read" :
 	    level == 3 ? "the chip configured and its waveforms loaded, nothing played" : level == 4 ? "one effect played" :
 	    "the motor for iOS");
 	show_pins();
-	if (level >= 2 && !((rd(GPIO_CFG(PIN_RESET)) & CFG_OUTPUT) && (rd(GPIO_IO(PIN_RESET)) & 2))) {
+	if ((umi_chip || level >= 2) && !((rd(GPIO_CFG(reset)) & CFG_OUTPUT) && (rd(GPIO_IO(reset)) & 2))) {
 		/* (Android's driver: the pin low, 5 ms, high, and the chip ready for I2C 8 ms later) */
-		say("haptic: the reset is released: gpio%u low for 5 ms, then high\n", PIN_RESET);
+		say("haptic: the reset is released: gpio%u low for 5 ms, then high\n", reset);
 		reset_pin(false);
 		wait_ms(5);
 		reset_pin(true);
 		wait_ms(8);
 	}
 	if (!chip_answers()) {
-		say("haptic: (the reset pin %s)\n", (rd(GPIO_CFG(PIN_RESET)) & CFG_OUTPUT) && (rd(GPIO_IO(PIN_RESET)) & 2) ?
+		say("haptic: (the reset pin %s)\n", (rd(GPIO_CFG(reset)) & CFG_OUTPUT) && (rd(GPIO_IO(reset)) & 2) ?
 		    "drives high: the chip should answer" : "does not drive high: the chip is held in reset or not powered");
 		if (released) {
 			give_up("the chip does not answer");
 		}
 	} else {
 		show_registers();
-		if (level >= 3 && configure() && load_waveforms() && level == 4) {
-			uint32_t effect = 1;
+		if (level >= 3) {
+			bool ready = configure() && load_waveforms();
 
-			PE_parse_boot_argn("haptic_effect", &effect, sizeof(effect));
-			if (effect < 1 || effect > 10) {
-				effect = 1;     /* (the short ones only) */
+			if (ready && level == 4) {
+				uint32_t effect = 1;
+
+				PE_parse_boot_argn("haptic_effect", &effect, sizeof(effect));
+				if (effect < 1 || effect > 10) {
+					effect = 1;     /* (the short ones only) */
+				}
+				(void)play_effect(effect);
+			} else if (ready && level == 5) {
+				serve();
+			} else if (!ready && !broken) {
+				give_up("configuration or waveform loading failed");
 			}
-			(void)play_effect(effect);
-		} else if (level == 5 && !broken) {
-			serve();
 		}
+	}
+	if (umi_chip && released) {
+		reset_pin(false);
+		say("haptic: UMI AW8697 held in reset after the diagnostic or service exit\n");
 	}
 	say("haptic: done\n");
 	thread_terminate(current_thread());
@@ -979,7 +1188,12 @@ redwood_haptic_init(void)
 {
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("haptic", &level, sizeof(level)) || level == 0) {
+	if (PE_parse_boot_argn("umi_haptic", &level, sizeof(level))) {
+		umi_chip = true;
+	} else if (!PE_parse_boot_argn("haptic", &level, sizeof(level))) {
+		return;
+	}
+	if (level == 0) {
 		return;
 	}
 	if (level > 5) {
