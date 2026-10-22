@@ -2694,6 +2694,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 	static const char *const allowed[] = {
 		"-v", "debug=", "keepsyms=", "serial=", "cpus=", "bootcpu=",
 		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
+		"umi_haptic=", "haptic_effect=", "haptic_gain=",
 	};
 	if (PLAT != &platform_umi) return 1;
 	if (pi->forced_base != 0) {

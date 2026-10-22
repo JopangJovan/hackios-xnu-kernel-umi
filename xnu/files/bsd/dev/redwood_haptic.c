@@ -38,8 +38,8 @@
  *              again. The gain follows how loud iOS's waveform is: Android's own (0x80) from a third
  *              of full scale up, five eighths of it for the softest, never above it (gain_for()).
  *
- * UMI selects the separate AW8697 path with umi_haptic=1..5. It uses QUP11 on GPIO 36/37,
- * reset GPIO 130, TLMM at 0x0f000000, and UMI's /vendor/firmware/aw8697_haptic.bin. Levels 1..4
+ * UMI selects the separate AW8697 path with umi_haptic=1..5. QUP11 is on GPIO 60/61,
+ * reset GPIO 130, and the south TLMM tile is at 0x0f500000. Firmware is UMI's /vendor/firmware/aw8697_haptic.bin. Levels 1..4
  * probe, configure/load, and play a short test effect; level 5 runs the same iOS actuator service.
  *
  * Limits, whatever asks: Android's own values only (its gain 0x80, its boost and drive levels, its
@@ -132,17 +132,31 @@ wait_ms(uint32_t ms)
 /* ---- pins ------------------------------------------------------------------------------------------ */
 
 #define TLMM_PHYS               0x0f100000UL
-#define TLMM_UMI_PHYS           0x0f000000UL
+#define TLMM_UMI_PHYS           0x0f500000UL
 #define TLMM_SIZE               0x100000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define CFG_PULL_UP             3
 #define CFG_OUTPUT              (1u << 9)
 
-#define PIN_SDA                 36      /* the serial engine's first pin is the data line, the second the clock */
+#define PIN_SDA                 36      /* Redwood I2C pins */
 #define PIN_SCL                 37
+#define UMI_PIN_SDA             60      /* SM8250 QUP11 pins from UMI DTB */
+#define UMI_PIN_SCL             61
 #define PIN_RESET               35
 #define PIN_INT                 18
+
+static unsigned
+data_gpio(void)
+{
+	return umi_chip ? UMI_PIN_SDA : PIN_SDA;
+}
+
+static unsigned
+clock_gpio(void)
+{
+	return umi_chip ? UMI_PIN_SCL : PIN_SCL;
+}
 
 static unsigned
 reset_gpio(void)
@@ -162,7 +176,7 @@ show_pins(void)
 	const struct {
 		unsigned pin;
 		const char *what;
-	} pins[] = { { PIN_SDA, "I2C data" }, { PIN_SCL, "I2C clock" }, { reset_gpio(), "reset" },
+	} pins[] = { { data_gpio(), "I2C data" }, { clock_gpio(), "I2C clock" }, { reset_gpio(), "reset" },
 	    { interrupt_gpio(), "interrupt" } };
 
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
@@ -207,23 +221,23 @@ level_of(unsigned pin)
 static void
 i2c_start(void)
 {
-	line(PIN_SDA, true);
-	line(PIN_SCL, true);
+	line(data_gpio(), true);
+	line(clock_gpio(), true);
 	half_bit();
-	line(PIN_SDA, false);
+	line(data_gpio(), false);
 	half_bit();
-	line(PIN_SCL, false);
+	line(clock_gpio(), false);
 	half_bit();
 }
 
 static void
 i2c_stop(void)
 {
-	line(PIN_SDA, false);
+	line(data_gpio(), false);
 	half_bit();
-	line(PIN_SCL, true);
+	line(clock_gpio(), true);
 	half_bit();
-	line(PIN_SDA, true);
+	line(data_gpio(), true);
 	half_bit();
 }
 
@@ -232,15 +246,15 @@ i2c_bit(bool out)
 {
 	bool in;
 
-	line(PIN_SDA, out);
+	line(data_gpio(), out);
 	half_bit();
-	line(PIN_SCL, true);
-	for (unsigned stretched = 0; !level_of(PIN_SCL) && stretched < 100; stretched++) {
+	line(clock_gpio(), true);
+	for (unsigned stretched = 0; !level_of(clock_gpio()) && stretched < 100; stretched++) {
 		half_bit();
 	}
 	half_bit();
-	in = level_of(PIN_SDA);
-	line(PIN_SCL, false);
+	in = level_of(data_gpio());
+	line(clock_gpio(), false);
 	return in;
 }
 
@@ -270,20 +284,20 @@ static uint32_t taken_cfg[2], taken_io[2];
 static bool
 bus_take(void)
 {
-	taken_cfg[0] = rd(GPIO_CFG(PIN_SDA));
-	taken_cfg[1] = rd(GPIO_CFG(PIN_SCL));
-	taken_io[0] = rd(GPIO_IO(PIN_SDA));
-	taken_io[1] = rd(GPIO_IO(PIN_SCL));
-	line(PIN_SDA, true);
-	line(PIN_SCL, true);
+	taken_cfg[0] = rd(GPIO_CFG(data_gpio()));
+	taken_cfg[1] = rd(GPIO_CFG(clock_gpio()));
+	taken_io[0] = rd(GPIO_IO(data_gpio()));
+	taken_io[1] = rd(GPIO_IO(clock_gpio()));
+	line(data_gpio(), true);
+	line(clock_gpio(), true);
 	half_bit();
-	if (!level_of(PIN_SDA) || !level_of(PIN_SCL)) {
-		wr(GPIO_IO(PIN_SDA), taken_io[0] & 2);
-		wr(GPIO_IO(PIN_SCL), taken_io[1] & 2);
-		wr(GPIO_CFG(PIN_SDA), taken_cfg[0]);
-		wr(GPIO_CFG(PIN_SCL), taken_cfg[1]);
-		say("haptic: the I2C bus is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n", PIN_SDA,
-		    level_of(PIN_SDA), PIN_SCL, level_of(PIN_SCL));
+	if (!level_of(data_gpio()) || !level_of(clock_gpio())) {
+		wr(GPIO_IO(data_gpio()), taken_io[0] & 2);
+		wr(GPIO_IO(clock_gpio()), taken_io[1] & 2);
+		wr(GPIO_CFG(data_gpio()), taken_cfg[0]);
+		wr(GPIO_CFG(clock_gpio()), taken_cfg[1]);
+		say("haptic: the I2C bus is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n", data_gpio(),
+		    level_of(data_gpio()), clock_gpio(), level_of(clock_gpio()));
 		return false;
 	}
 	return true;
@@ -292,10 +306,10 @@ bus_take(void)
 static void
 bus_give_back(void)
 {
-	wr(GPIO_IO(PIN_SDA), taken_io[0] & 2);
-	wr(GPIO_IO(PIN_SCL), taken_io[1] & 2);
-	wr(GPIO_CFG(PIN_SDA), taken_cfg[0]);
-	wr(GPIO_CFG(PIN_SCL), taken_cfg[1]);
+	wr(GPIO_IO(data_gpio()), taken_io[0] & 2);
+	wr(GPIO_IO(clock_gpio()), taken_io[1] & 2);
+	wr(GPIO_CFG(data_gpio()), taken_cfg[0]);
+	wr(GPIO_CFG(clock_gpio()), taken_cfg[1]);
 }
 
 #define AW_ADDRESS              0x5a
@@ -497,7 +511,7 @@ chip_answers(void)
 	uint8_t id[2] = { 0, 0 };
 	if (umi_chip) {
 		if (!regs_read(0x00, id, 1)) {
-			say("haptic: nobody answers at %#x on the UMI QUP11 bus gpio%u/%u\n", AW_ADDRESS, PIN_SDA, PIN_SCL);
+			say("haptic: nobody answers at %#x on the UMI QUP11 bus gpio%u/%u\n", AW_ADDRESS, data_gpio(), clock_gpio());
 			return false;
 		}
 		say("haptic: the chip at %#x identifies as %#04x%s\n", AW_ADDRESS, id[0], id[0] == 0x97 ? " (AW8697)" :
@@ -506,7 +520,7 @@ chip_answers(void)
 	}
 
 	if (!regs_read(AW_CHIPIDH, id, 2)) {
-		say("haptic: nobody answers at %#x on the bus of gpio%u/%u\n", AW_ADDRESS, PIN_SDA, PIN_SCL);
+		say("haptic: nobody answers at %#x on the bus of gpio%u/%u\n", AW_ADDRESS, data_gpio(), clock_gpio());
 		return false;
 	}
 	say("haptic: the chip at %#x is %#06x%s\n", AW_ADDRESS, id[0] << 8 | id[1], (id[0] << 8 | id[1]) == AW_CHIPID ? ", an AW86927" :
@@ -554,16 +568,177 @@ umi_update_bits(uint8_t reg, uint8_t preserve, uint8_t value)
 }
 
 static bool
-umi_configure(void)
+umi_soft_reset(void)
 {
-	say("haptic: configure UMI AW8697: 24 kHz PWM, boost voltage 0x0c from UMI device tree, interrupts masked\n");
-	if (!wait_standby(250) || !put(0x03, 0xff) ||                 /* SYSINTM: polled, no IRQ path */
-	    !umi_update_bits(0x2e, 0x9f, 0x40) ||                     /* PWMDBG: 24 kHz */
-	    !umi_update_bits(0x3a, 0xc1, 0x18) ||                     /* BSTDBG4: device-tree boost voltage 0x0c */
-	    !umi_update_bits(0x04, 0xf0, 0x01)) {                     /* SYSCTRL: RAM mode, standby */
+	uint8_t command = 0xaa, id = 0;
+
+	say("haptic: AW8697 software reset, then wait for its VDD and registers\n");
+	if (!regs_write(0x00, &command, 1)) {
+		say("haptic: AW8697 software reset was not acknowledged\n");
 		return false;
 	}
-	return healthy("after the UMI AW8697 configuration");
+	wait_ms(2);
+	if (!regs_read(0x00, &id, 1) || id != 0x97) {
+		say("haptic: AW8697 software reset read back chip ID %#04x, expected 0x97\n", id);
+		return false;
+	}
+	wait_ms(15);
+	return true;
+}
+
+static void
+umi_report_status(const char *when)
+{
+	uint8_t status = 0;
+
+	if (get(0x01, &status)) {
+		say("haptic: %s: AW8697 SYSST=%#04x%s\n", when, status,
+		    status & 0x20 ? " (VDD below UVLO threshold)" : "");
+	}
+}
+
+/* The stock driver clears standby-time interrupt latches after entering active mode. UVLO is
+ * checked against live SYSST only after that transition, before the GO register can start motion. */
+static bool
+umi_activate(void)
+{
+	uint8_t flags = 0, status = 0;
+
+	if (!umi_update_bits(0x04, 0xf2, 0x00)) {                   /* active RAM mode with boost */
+		return false;
+	}
+	if (!get(0x02, &flags)) {
+		give_up("standby interrupt flags could not be cleared");
+		return false;
+	}
+	say("haptic: AW8697 cleared standby interrupt flags %#04x on activation\n", flags);
+	wait_ms(3);
+	if (!get(0x01, &status)) {
+		give_up("active AW8697 status could not be read");
+		return false;
+	}
+	if (status & 0x20) {
+		say("haptic: active AW8697 SYSST=%#04x still reports UVLO; no waveform will start\n", status);
+		give_up("active-mode under-voltage");
+		return false;
+	}
+	return healthy("after UMI AW8697 activation");
+}
+
+/* Measure VBAT without starting the actuator. Xiaomi's AW8697 driver scales VBATDET as
+ * 6100 mV * code / 256; this distinguishes an actual low supply from a stale UVLO interrupt. */
+static bool
+umi_measure_vbat(void)
+{
+	uint8_t control = 0, code = 0;
+	bool measured = false, ok = true;
+
+	if (!umi_update_bits(0x04, 0xdf, 0x20)) {                   /* open RAM/measurement block */
+		return false;
+	}
+	if (!get(0x5f, &control)) {
+		ok = false;
+		goto out;
+	}
+	control = (uint8_t)((control & 0xfc) | 0x02);             /* DETCTRL.VBAT_GO */
+	if (!regs_write(0x5f, &control, 1)) {
+		say("haptic: AW8697 VBAT measurement command was not acknowledged\n");
+		ok = false;
+		goto out;
+	}
+	for (unsigned i = 0; i < 100; i++) {
+		wait_ms(1);
+		if (!get(0x5f, &control)) {
+			ok = false;
+			goto out;
+		}
+		if ((control & 0x02) == 0) {
+			measured = true;
+			break;
+		}
+	}
+	if (!get(0x62, &code)) {
+		ok = false;
+		goto out;
+	}
+	say("haptic: AW8697 VBAT measurement %s: raw=%#04x, estimated %u mV\n",
+	    measured ? "complete" : "timed out", code, 6100u * code / 256u);
+	if (!measured) {
+		ok = false;
+	}
+out:
+	if (!umi_update_bits(0x5f, 0xfd, 0x00) || !umi_update_bits(0x04, 0xdf, 0x00)) {
+		ok = false;
+	}
+	return ok;
+}
+
+/* Match the stock AW8697 driver's non-actuating ADC offset calibration. */
+static bool
+umi_offset_calibrate(void)
+{
+	uint8_t control = 0;
+	bool measured = false, ok = true;
+
+	if (!umi_update_bits(0x04, 0xdf, 0x20)) {                   /* open RAM/measurement block */
+		return false;
+	}
+	if (!get(0x5f, &control)) {
+		ok = false;
+		goto out;
+	}
+	control &= 0xfe;
+	control |= 0x01;                                           /* DETCTRL.DIAG_GO */
+	if (!regs_write(0x5f, &control, 1)) {
+		say("haptic: AW8697 offset calibration command was not acknowledged\n");
+		ok = false;
+		goto out;
+	}
+	for (unsigned i = 0; i < 100; i++) {
+		wait_ms(1);
+		if (!get(0x5f, &control)) {
+			ok = false;
+			goto out;
+		}
+		if ((control & 0x01) == 0) {
+			measured = true;
+			break;
+		}
+	}
+	say("haptic: AW8697 ADC offset calibration %s\n", measured ? "complete" : "timed out");
+	if (!measured) {
+		ok = false;
+	}
+out:
+	if (!umi_update_bits(0x5f, 0xfe, 0x00) || !umi_update_bits(0x04, 0xdf, 0x00)) {
+		ok = false;
+	}
+	return ok;
+}
+
+static bool
+umi_configure(void)
+{
+	say("haptic: configure UMI AW8697 from its stock device tree and driver, keep it in standby\n");
+	if (!wait_standby(250) || !umi_measure_vbat() || !put(0x03, 0xff) || /* SYSINTM: polled, no IRQ path */
+	    !umi_update_bits(0x04, 0xf2, 0x01) ||                     /* SYSCTRL: RAM mode, boost, standby */
+	    !umi_update_bits(0x2e, 0x9f, 0x40) ||                     /* PWMDBG: 24 kHz */
+	    !umi_update_bits(0x5f, 0xdf, 0x20) ||                     /* DETCTRL: stock protection mode */
+	    !umi_update_bits(0x2d, 0x7f, 0x00) ||                     /* PWMPRC: stock protection setting */
+	    !umi_update_bits(0x3e, 0x7f, 0x00) ||                     /* PRLVL: stock protection setting */
+	    !umi_update_bits(0x66, 0xbf, 0x40) ||                     /* ADCTEST: hardware VBAT compensation */
+	    !put(0x31, 0x30) || !put(0x32, 0xeb) || !put(0x33, 0xd4) || /* UMI's vib_bstdbg */
+	    !put(0x4d, 0x12) || !put(0x5d, 0x68) ||                   /* UMI's TSET and R_SPARE */
+	    !umi_update_bits(0x35, 0xf3, 0x0c) ||                     /* ANADBG: stock 4.65 A setting */
+	    !umi_update_bits(0x34, 0xf8, 0x05) ||                     /* BSTCFG: stock 3.5 A limit */
+	    !umi_update_bits(0x47, 0xfb, 0x00) ||                     /* BST_AUTO: stock manual boost */
+	    !umi_offset_calibrate() ||
+	    !umi_update_bits(0x3a, 0xc1, 0x18) ||                     /* BSTDBG4.BST_VO = 0x0c */
+	    !put(0x74, 0x00) || !put(0x75, 0x08) || !put(0x76, 0x03) || !put(0x77, 0xf8)) { /* BEMF thresholds */
+		return false;
+	}
+	umi_report_status("after UMI AW8697 configuration");
+	return true;                                                /* UVLO latches are checked after activation */
 }
 
 static bool
@@ -629,7 +804,8 @@ umi_load_waveforms(void)
 		return false;
 	}
 	say("haptic: UMI AW8697 waveforms loaded and verified\n");
-	return healthy("after loading UMI AW8697 waveforms");
+	umi_report_status("after loading UMI AW8697 waveforms");
+	return true;                                                /* loading is done in standby, no motor output */
 }
 
 /* The analog registers opened or closed for writing (AW_TMCFG reads back as 0 either way: what tells is that the writes stick). */
@@ -924,15 +1100,14 @@ static const struct cdevsw haptic_cdevsw = {
 static bool
 umi_start_waveform(unsigned waveform, bool forever, uint8_t gain)
 {
-	uint8_t control, go = 1;
+	uint8_t go = 1;
 	if (!wait_standby(250) || !put(0x07, (uint8_t)waveform) || !put(0x08, 0) ||
 	    !put(0x0f, forever ? 0xf0 : 0x00) ||                        /* WAVSEQ1/2 and WAVLOOP1 */
 	    !umi_update_bits(0x3a, 0xc1, 0x18) || !put(0x39, gain) ||   /* BSTDBG4 and DATDBG */
-	    !get(0x04, &control)) {
+	    !umi_activate()) {
 		return false;
 	}
-	control = (uint8_t)((control & 0xf0) | 0x02);                  /* active RAM mode, boost */
-	if (!put(0x04, control) || !regs_write(0x05, &go, 1)) {        /* GO */
+	if (!regs_write(0x05, &go, 1)) {                               /* GO */
 		give_up("UMI AW8697 playback did not start");
 		return false;
 	}
@@ -1158,7 +1333,8 @@ haptic_thread(__unused void *parameter, __unused wait_result_t result)
 	} else {
 		show_registers();
 		if (level >= 3) {
-			bool ready = configure() && load_waveforms();
+			bool reset_ok = !umi_chip || umi_soft_reset();
+			bool ready = reset_ok && configure() && load_waveforms();
 
 			if (ready && level == 4) {
 				uint32_t effect = 1;

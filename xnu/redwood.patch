@@ -1505,6 +1505,50 @@ index 1ed75eea2052..54c5e12d2271 100644
  #  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_library_validation config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_service_port_info ]
  #  MACH_RELEASE =   [ MACH_BASE config_skip_precise_user_kernel_time debugger_for_zone_info ]
  #  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace ]
+diff --git a/config/Makefile b/config/Makefile
+index b4c0ed5c682b..833e72c9cd97 100644
+--- a/config/Makefile
++++ b/config/Makefile
+@@ -66,12 +66,15 @@ endif
+ Kasan_EXPORTS := $(SRCROOT)/config/Kasan_enabled.$(KASAN_ARCH_SUFFIX).exports
+ endif
+ 
++# UMI links a device-specific subset of the XNU exports. Emit only symbols present
++# in this kernel so each generated kext symbol set matches the linked image.
+ define symbol_set_template
+ $(1)_EXPORTS := $$(addprefix $$(SOURCE)/,$$(filter $(1)%,$$(EXPORTS_FILES)))
+ $$(TARGET)/$(1).symbolset: MY_EXPORTS_ARGS := $$(foreach file,$$($(1)_EXPORTS),-export $$(file))
+ $$(TARGET)/$(1).symbolset: $$($(1)_EXPORTS) $$(TARGET)/allsymbols $$(KEXT_CREATE_SYMBOL_SET)
+ 	@$$(LOG_SYMBOLSET) "$(1)$$(Color0) ($$(ColorLF)$$(CURRENT_ARCH_CONFIG_LC)$$(Color0))"
+ 	$$(_v)$$(KEXT_CREATE_SYMBOL_SET)			\
++		-sect					\
+ 		$$(ARCH_FLAGS_$$(CURRENT_ARCH_CONFIG))	\
+ 		-import $$(TARGET)/allsymbols		\
+ 		$$(MY_EXPORTS_ARGS)			\
+@@ -119,19 +122,21 @@ $(TARGET)/allsymbols: $(OBJPATH)/$(KERNEL_FILE_NAME)
+ 
+ check_all_exports: $(TARGET)/allsymbols $(KEXT_CREATE_SYMBOL_SET)
+ 	$(_v)$(KEXT_CREATE_SYMBOL_SET)					\
++		-sect				\
+ 		$(ARCH_FLAGS_$(CURRENT_ARCH_CONFIG))			\
+ 		-import $(TARGET)/allsymbols				\
+ 		$(foreach symbolset,$(filter-out Private,$(SYMBOL_COMPONENT_LIST)),	\
+ 			-export $(SOURCE)/$(symbolset).exports		\
+ 			-export $(SOURCE)/$(symbolset).$(EXPORT_SOURCE_ARCH_CONFIG_LC).exports)	\
+-		-output /dev/null $(_vstdout)
++		-output $(TARGET)/check_all_exports.symbolset $(_vstdout)
+ 	$(_v)$(KEXT_CREATE_SYMBOL_SET)					\
++		-sect				\
+ 		$(ARCH_FLAGS_$(CURRENT_ARCH_CONFIG))			\
+ 		-import $(TARGET)/allsymbols				\
+ 		$(foreach symbolset,$(filter-out Unsupported,$(SYMBOL_COMPONENT_LIST)),	\
+ 			-export $(SOURCE)/$(symbolset).exports		\
+ 			-export $(SOURCE)/$(symbolset).$(EXPORT_SOURCE_ARCH_CONFIG_LC).exports)	\
+-		-output /dev/null $(_vstdout)
++		-output $(TARGET)/check_all_exports.symbolset $(_vstdout)
+ 
+ $(OBJPATH)/$(MD_SUPPORTED_KPI_FILENAME): $(EXPORTS_FILES)
+ 	@$(LOG_SUPPORTED_KPI) "$(CURRENT_ARCH_CONFIG_LC)"
 diff --git a/iokit/Kernel/IOPMrootDomain.cpp b/iokit/Kernel/IOPMrootDomain.cpp
 index 4a06407aea5f..69a4bcf1839d 100644
 --- a/iokit/Kernel/IOPMrootDomain.cpp
