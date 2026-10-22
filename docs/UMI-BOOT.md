@@ -6,11 +6,12 @@ USB loader access and XNU handoff are verified; see [UEFI build and results](../
 The bundled Redwood UEFI is incompatible and is never selected for UMI.
 
 The first milestone is UEFI -> XNU -> iOS from RAM with a framebuffer.
-Buttons, CPU frequency changes, GPU, Wi-Fi, sound, cameras and internal
-storage access remain unavailable in the UMI loader's boot arguments.
-The loader accepts CPU/session arguments and the gated UMI touch driver.
+UMI power and volume buttons now have a read-only PM8150 driver, gated by
+`umi_keys=1`; the loader accepts CPU/session arguments and the UMI touch and
+button drivers. CPU frequency changes, GPU, Wi-Fi, sound, cameras and internal
+storage access remain unavailable.
 Single-, four-, and eight-core boots are verified. The profile uses all eight
-cores with `bootcpu=0 cpus=8 umi_touch=1`; USB resumes after the session.
+cores with `bootcpu=0 cpus=8 umi_touch=1 umi_keys=1`; USB resumes after the session.
 A custom XNU build adds the UMI FTS521 touchscreen driver; validation results are recorded below. GPU, Wi-Fi, sound, camera and storage drivers are still pending.
 
 ## Contract with the UMI UEFI port
@@ -80,7 +81,7 @@ common/run.sh umi 300
 ```
 
 The profile selects software rendering (`GL` unset) and
-`bootcpu=0 cpus=8 umi_touch=1`.
+`bootcpu=0 cpus=8 umi_touch=1 umi_keys=1`.
 Use `-v` only for boot diagnostics: console output otherwise covers the UI.
 `DEVICE=umi ./xl enter`, `DEVICE=umi ./xl log` and `DEVICE=umi ./xl run` also
 load the profile; keep the firmware environment exported for enter/reload.
@@ -145,13 +146,31 @@ DEVICE=umi xnuloader/build.sh
 
 The kernel links before the repository's expected symbol-export check failure;
 inspect `logs/umi-xnu-build.log` and the newly linked `mach.development.bcm2837`.
-The built kernel contains the UMI touch symbols. The older prebuilt kernel
+The built kernel contains the UMI touch and button symbols. The older prebuilt kernel
 still remains available for the known four-core boot.
 
-For all eight cores use `XL_CMDLINE='bootcpu=0 cpus=8 umi_touch=1'`.
+For all eight cores use `XL_CMDLINE='bootcpu=0 cpus=8 umi_touch=1 umi_keys=1'`.
 Using core 0 for XNU pauses resident-loader USB until the timed session returns.
-`bootcpu=7 cpus=7 umi_touch=1` reserves core 0 for live logs during touch testing.
+`bootcpu=7 cpus=7 umi_touch=1 umi_keys=1` reserves core 0 for live logs during tests.
 Do not expect `xl stop` or screenshots during a core-0 session.
+
+
+## UMI external buttons
+
+`umi_keys.c` adapts the working `ios-sm8250` key path for the Xiaomi Mi 10:
+PM8150 PON PPID `0x08` reports power and volume-down; PM8150 GPIO6 PPID
+`0xc5` reports volume-up. It reads through the PMIC arbiter observer channel
+and does not change PMIC configuration. `umi_keys=1` and the UMI
+`/chosen/hackios-board` gate are both required. Button records use the same
+queue as touch, and the userland injector sends power, VolumeIncrement and
+VolumeDecrement consumer HID events to backboardd.
+
+The live iOS test on 2026-10-22 confirmed press/release detection for all
+three keys and backboardd logged the volume HID events. The user observed a
+visible response from power but not the volume keys. Control Center also
+cannot change the sound level yet, so volume adjustment remains unverified
+while the iOS audio path is incomplete; the PMIC and HID button paths are
+working. The test log is `logs/163330-run.log.live`.
 
 
 ## Eight-core result, 2026-10-22
@@ -202,11 +221,11 @@ writes succeeded, and subsequent runs verified VIN1/output-high.
 ### Combined eight-core touch test
 
 The user confirmed touch working again during the combined boot with
-`bootcpu=0 cpus=8 umi_touch=1`. This is now the default UMI profile.
+`bootcpu=0 cpus=8 umi_touch=1`. The profile now also enables UMI buttons by default.
 The 240-second verification session is recorded in
 `logs/umi-eight-core-touch-run.log`; its kernel log is collected after return.
 USB diagnostics pause while all eight cores belong to XNU. For live USB,
-override with `XL_CMDLINE='bootcpu=7 cpus=7 umi_touch=1'`.
+override with `XL_CMDLINE='bootcpu=7 cpus=7 umi_touch=1 umi_keys=1'`.
 
 
 The combined eight-core touch run returned cleanly with
