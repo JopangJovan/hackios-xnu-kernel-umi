@@ -71,8 +71,12 @@ return their logs when the timed run ends.
   reset afterward. The user confirmed hearing the tone. This validates audible
   speaker output, but does not establish each amplifier separately.
 
-The continuous iOS feeder and UMI amp lifecycle are implemented but still need
-a full iOS playback run on the phone.
+- logs/150541-run.log: the UMI boot profile enabled `adsp=1 adsp_umi=1 sound=4`.
+  The iOS `sound_test` AudioQueue tone and system sounds reached the feeder; all
+  646,144 submitted frames reached the DSP, with no dropped writes or
+  underflows. The amps followed the iOS volume at -30 dB under unity, muted
+  during silence, and shut down cleanly. The user confirmed hearing the tone.
 
-Still required: per-unit saved calibration and a full iOS playback test.
+Still required: per-unit saved calibration and microphone capture, which needs
+its own WCD938x/codec-DMA/SoundWire path.
 Microphone capture requires its own WCD938x/codec-DMA/SoundWire path.
