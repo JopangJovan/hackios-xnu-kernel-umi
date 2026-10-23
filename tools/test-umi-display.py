@@ -24,12 +24,17 @@ program = r'''
 #include <stdio.h>
 typedef uintptr_t vm_offset_t;
 #define NSEC_PER_MSEC 1000000
-static bool umi, unstable, clocks_off;
+#define NSEC_PER_USEC 1000
+static bool umi, unstable, clocks_off, command_mode;
+static uint32_t te_initial, te_idle_start, te_phase, te_written;
+static uint64_t fake_ns;
+static uint64_t mach_absolute_time(void) { return fake_ns; }
+static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns=t; }
 static unsigned frame_reads, interface_reads, writes;
 static uint32_t clock_value;
 static vm_offset_t gcc_map=1, dispcc_map=2, intf=3;
-static struct { int ok; } scan;
-static void delay_for_interval(unsigned a, unsigned b) { (void)a; (void)b; }
+static struct { int ok; uint32_t lines, shown; uint64_t line_ns, frame_ns; } scan;
+static void delay_for_interval(unsigned a, unsigned b) { fake_ns+=(uint64_t)a*b; }
 static uint32_t rd(vm_offset_t base, uint32_t offset) {
     if (base == 4) { assert(offset == 0); return clock_value; }
     if (base == gcc_map) { assert(offset == (umi ? 0xc : 4)); return clocks_off ? 0 : 1; }
@@ -38,6 +43,8 @@ static uint32_t rd(vm_offset_t base, uint32_t offset) {
         assert(offset == (umi ? 0x2080 : 0x1050)); return 1;
     }
     assert(base == 3); interface_reads++;
+    if (offset == 0x298) return te_initial + te_phase;
+    if (offset == 0x2b0) return te_written;
     if (offset == 0xac) return unstable ? frame_reads++ : 42;
     assert(offset == 0xb0); return 77;
 }
@@ -49,6 +56,8 @@ program += '\n' + defines + '\n'
 program += 'static int\n' + function('regs_alive') + '\n'
 program += 'static int\n' + function('clock_on') + '\n'
 program += 'uint32_t\n' + function('hk_display_line') + '\n'
+program += 'int hk_display_command_mode(void) { return scan.ok && command_mode; }\n'
+program += 'int\n' + function('hk_display_wait_copy') + '\n'
 program += r'''
 int main(void) {
     uint32_t frame=0;
@@ -71,6 +80,19 @@ int main(void) {
     clock_value=0;
     assert(clock_on(4, 0, "running") && clock_value == 1);
     puts("PASS: inaccessible and halted clocks rejected; running clock accepted");
+    command_mode=true; clocks_off=false; intf=3; scan.ok=1;
+    scan.lines=2352; scan.shown=te_initial=2340; te_idle_start=1250;
+    scan.line_ns=7083; scan.frame_ns=16666667; te_phase=1300; te_written=2340;
+    assert(hk_display_wait_copy(2000000, 20000000));
+    te_written=1000; fake_ns=0;
+    assert(!hk_display_wait_copy(2000000, 20000000) && fake_ns >= 20000000);
+    te_written=2340; te_phase=2300; fake_ns=0;
+    assert(!hk_display_wait_copy(2000000, 20000000));
+    te_phase=1500; fake_ns=0;
+    assert(!hk_display_wait_copy(2000000, 20000000));
+    te_phase=100; fake_ns=0;
+    assert(!hk_display_wait_copy(2000000, 20000000));
+    puts("PASS: command copy accepts idle window, rejects active DMA and TE boundary races");
     return 0;
 }
 '''

@@ -32,6 +32,9 @@
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+/* Preserve early clock/timing diagnostics in quiet boots and live loader logs. */
+extern void hk_tl(const char *, ...) __printflike(1, 2);
+#define printf hk_tl
 
 #define GCC_PHYS                hk_board_addr("gcc", 0x00100000UL)
 #define GCC_DISP_AHB_CBCR       (umi ? 0x0b00c : 0x27004)
@@ -54,6 +57,10 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 static vm_offset_t intf, gcc_map, dispcc_map;
 static struct hk_display_scan scan;
 static bool umi;
+static bool command_mode;
+static uint32_t te_initial, te_idle_start;
+
+int hk_display_command_mode(void) { return scan.ok && command_mode; }
 
 
 static inline uint32_t
@@ -121,6 +128,12 @@ hk_display_line(uint32_t *frame)
 		scan.ok = 0;
 		return 0;
 	}
+	if (command_mode) {
+		uint32_t raw = rd(intf, 0x298) & 0xffff;
+		if (frame != NULL) *frame = 0;
+		line = raw >= te_initial ? raw - te_initial : 0;
+		return line < scan.lines ? line : scan.lines - 1;
+	}
 	/* the two counters together: a frame that begins between the two reads is read again */
 	for (unsigned retry = 0; retry < 8; retry++) {
 		f = rd(intf, INTF_FRAME_COUNT);
@@ -143,6 +156,83 @@ const struct hk_display_scan *
 hk_display_scan(void)
 {
 	return scan.ok ? &scan : NULL;
+}
+
+/* The command-mode write pointer is the display DMA's progress through the
+ * framebuffer. Copy only after it finishes, with room before the next TE.
+ * Rendering/scaling must already be complete in a separate staging buffer.
+ */
+int
+hk_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns)
+{
+	uint64_t start = mach_absolute_time(), elapsed;
+	if (!hk_display_command_mode()) return 0;
+	uint64_t budget = copy_ns + copy_ns / 4 + 500000;
+	for (;;) {
+		uint32_t phase = hk_display_line(NULL);
+		if (!scan.ok) return 0;
+		uint32_t written = rd(intf, 0x2b0) & 0xffff;
+		uint64_t used = (uint64_t)phase * scan.line_ns;
+		if (phase >= te_idle_start && phase < te_idle_start + 128 && written >= scan.shown &&
+		    used < scan.frame_ns && budget < scan.frame_ns - used) return 1;
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
+		if (elapsed >= limit_ns) return 0;
+		delay_for_interval(50, NSEC_PER_USEC);
+	}
+}
+
+static int
+command_scan_start(void)
+{
+	uint32_t config = rd(intf, 0x288), refresh = rd(intf, 0x2b4);
+	te_initial = rd(intf, 0x294) & 0xffff;
+	if (!umi || !(rd(intf, 0x284) & 1) || (config & 0x180000) != 0x180000 ||
+	    refresh != 0x80000001 || te_initial != 2340) return 0;
+	uint64_t start = mach_absolute_time(), previous_time = start, first_wrap = 0, last_wrap = 0;
+	uint64_t line_time = 0, line_count = 0, elapsed;
+	uint32_t previous = rd(intf, 0x298) & 0xffff, busy_last = 0;
+	unsigned wraps = 0, busy_samples = 0, idle_samples = 0;
+	while (wraps < 4) {
+		delay_for_interval(50, NSEC_PER_USEC);
+		uint32_t raw = rd(intf, 0x298) & 0xffff;
+		uint32_t written = rd(intf, 0x2b0) & 0xffff;
+		uint64_t now = mach_absolute_time(), interval;
+		absolutetime_to_nanoseconds(now - start, &elapsed);
+		if (elapsed > 150000000 || raw < te_initial) return 0;
+		/* Do not pair the previous frame's read phase with a new DMA transfer. */
+		if ((rd(intf, 0x298) & 0xffff) < raw) continue;
+		if (raw < previous) {
+			if (wraps++ == 0) first_wrap = now;
+			last_wrap = now;
+		} else if (raw > previous) {
+			absolutetime_to_nanoseconds(now - previous_time, &interval);
+			line_time += interval;
+			line_count += raw - previous;
+		}
+		uint32_t phase = raw - te_initial;
+		if (written > 0 && written < te_initial) {
+			if (phase > busy_last) busy_last = phase;
+			busy_samples++;
+		} else if (written >= te_initial) idle_samples++;
+		previous = raw;
+		previous_time = now;
+	}
+	if (!line_count || !busy_samples || !idle_samples) return 0;
+	absolutetime_to_nanoseconds(last_wrap - first_wrap, &elapsed);
+	scan.frame_ns = elapsed / (wraps - 1);
+	scan.line_ns = line_time / line_count;
+	if (!scan.line_ns || scan.frame_ns < NSEC_PER_SEC / 120 ||
+	    scan.frame_ns > NSEC_PER_SEC / 30) return 0;
+	scan.lines = (uint32_t)(scan.frame_ns / scan.line_ns);
+	scan.shown = te_initial;
+	te_idle_start = busy_last + 32; /* margin after the last observed active DMA line */
+	if (scan.lines < scan.shown || scan.lines > 8192 || te_idle_start >= scan.lines) return 0;
+	scan.millihz = (uint32_t)(1000000000000ULL / scan.frame_ns);
+	command_mode = true;
+	scan.ok = 1;
+	printf("display: UMI command TE: %u.%03u Hz, %u ns/line, %u phase lines; DMA idle after %u; staged presentation enabled\n",
+	    scan.millihz / 1000, scan.millihz % 1000, (unsigned)scan.line_ns, scan.lines, te_idle_start);
+	return 1;
 }
 
 /*
@@ -237,8 +327,10 @@ hk_display_scan_start(void)
 	    rd(intf, INTF_TIMING_ENGINE_EN), rd(gcc, GCC_DISP_AHB_CBCR & 0xfffu),
 	    rd(dispcc, DISPCC_MDSS_AHB_CBCR), rd(dispcc, DISPCC_MDSS_CORE_GDSCR));
 	if (!(rd(intf, INTF_TIMING_ENGINE_EN) & 1)) {
-		printf("display: video timing is off; TE enable=%#x height=%#x initial=%#x count=%#x line=%#x; scan sync deferred\n",
-		    rd(intf, 0x284), rd(intf, 0x28c), rd(intf, 0x294), rd(intf, 0x2ac), rd(intf, 0x2b0));
+		printf("display: command mode: TE enable=%#x config=%#x height=%#x initial=%#x start=%#x auto=%#x\n",
+		    rd(intf, 0x284), rd(intf, 0x288), rd(intf, 0x28c), rd(intf, 0x294), rd(intf, 0x2a0), rd(intf, 0x2b4));
+		if (command_scan_start()) return 1;
+		printf("display: command TE calibration failed; scan sync deferred\n");
 		intf = 0;
 		return 0;
 	}

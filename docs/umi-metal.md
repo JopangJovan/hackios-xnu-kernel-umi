@@ -64,9 +64,26 @@ clocks and power before reading the interface, bounds unstable counter reads,
 and rejects implausible timing. When ABL leaves video timing disabled, it logs
 the command-mode TE registers and defers synchronization instead of guessing.
 
-This path compiles and passes the host register-model checks. It remains opt-in
-pending a device capture and a scrolling test. The current iOS session was left
-running at the user's request; the display change has not been loaded on it.
+The subsequent device captures confirmed command mode: video engine disabled,
+TE config `0x180088`, initial/start line 2340 and autorefresh `0x80000001`.
+The TE read counter resets every frame; the display's write pointer finishes
+its transfer and then remains at line 2340 until the next transfer.
+
+The command-mode backend measures the counter's line period and frame period
+over four TE boundaries instead of changing panel timing. The device measured
+about 59.93 Hz and 7083 ns per counter line. Composition now uses a separate
+10,108,800-byte buffer. Only the finished frame is copied to the physical
+framebuffer, early in the measured DMA-idle window, with a bounded wait and
+copy-time margin. A missed window keeps the previous complete picture.
+
+The first staged run reduced tearing but the user still saw some. The next
+run additionally restricts copies to the beginning of the idle window and
+keeps SwapEnd pending until the source surfaces have been consumed. Initial
+copies took about 1.6–1.7 ms without reported window misses. Visual confirmation
+of this final revision is pending. Logs: `logs/212845-run.log.live`.
+
+The backend compiles and passes the host register-model and boot-packaging
+checks. It remains opt-in with `fb_scan=1` while scrolling is being validated.
 
 The unfinished Wi-Fi transport is preserved in the named git stash
 `WIP UMI Wi-Fi MHI transport paused for Metal integration`; it is not included

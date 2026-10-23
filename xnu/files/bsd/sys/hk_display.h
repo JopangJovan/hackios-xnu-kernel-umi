@@ -25,6 +25,8 @@ const struct hk_display_scan *hk_display_scan(void);  /* NULL without */
 uint32_t hk_display_line(uint32_t *frame);                 /* the line being sent now (and the frame's number) */
 int hk_display_wait_lines(uint32_t first, uint32_t last, uint64_t limit_ns);
 uint64_t hk_display_next_frame_ns(void);                   /* until the next frame's first line */
+int hk_display_command_mode(void);
+int hk_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns);
 
 #ifdef __cplusplus
 }
