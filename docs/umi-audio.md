@@ -52,8 +52,13 @@ return their logs when the timed run ends.
   The firmware itself prepares AMP_EN/ADCs/boost (PWR_CTRL2 = 0x3321); host
   GLOBAL_EN is the output interlock. The heartbeat waits at 1 without audio frames.
 
-OTP trim application, board boost limits, muted power-up, fault polling, and
-reset cleanup are implemented for the capped tone test, but not yet validated
-on the phone. Still required: physical output verification, per-unit saved
-calibration, and continuous iOS PCM output integration. Microphone capture
-requires its own WCD938x/codec-DMA/SoundWire path.
+- logs/122354-run.log: both amps applied OTP map 0x8 (99 trim fields),
+  started their protection DSPs and enabled output at -40 dB digital attenuation.
+  The one-second tone returned all 59 buffers with zero errors or underflows.
+  Five amplifier status checks reported no fault; both amps acknowledged PAUSE
+  before mute, global-power disable, reset, and pin restoration. Listening
+  confirmation is still pending; successful transport does not prove audibility.
+
+Still required: physical output verification, per-unit saved calibration, and
+continuous iOS PCM output integration. Microphone capture requires its own
+WCD938x/codec-DMA/SoundWire path.
