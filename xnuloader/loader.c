@@ -2717,7 +2717,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 			if (adsp_on || end - c != 6 || c[5] != '1') ok = 0;
 			adsp_on = 1;
 		} else if (starts_with(c, "sound=")) {
-			if (sound || end - c != 7 || c[6] < '1' || c[6] > '2') ok = 0;
+			if (sound || end - c != 7 || c[6] < '1' || c[6] > '3') ok = 0;
 			sound = 1;
 		} else if (starts_with(c, "adsp_umi=")) {
 			if (adsp_umi || end - c != 10 || c[9] != '1') ok = 0;

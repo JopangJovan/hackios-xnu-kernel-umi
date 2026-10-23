@@ -2,6 +2,7 @@
 """Host-only boot packaging checks. Dummy firmware never leaves the temp directory."""
 import gzip
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -102,8 +103,9 @@ int main(void) {
     p.cmdline = "adsp=1 adsp_umi=1 sound=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "adsp_umi=1 sound=2 adsp=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "umi_amp_probe=5"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "adsp=1 adsp_umi=1 sound=3"; assert(umi_bootargs_ok(&p));
     const char *audio_bad[] = {"adsp=1 sound=1", "adsp_umi=1 sound=1", "umi_amp_probe=6",
-        "adsp=1 adsp_umi=1 sound=3", "adsp=1 adsp_umi=1 sound=4",
+        "adsp=1 adsp_umi=1 sound=4",
         "adsp=1 adsp_umi=1 sound=12", "adsp=1 adsp_umi=1 adsp_step=11 adsp_return=1"};
     for (unsigned i = 0; i < sizeof(audio_bad)/sizeof(audio_bad[0]); ++i) {
         p.cmdline = audio_bad[i]; assert(!umi_bootargs_ok(&p));
@@ -150,6 +152,18 @@ int main(void) {
         subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(cfile), '-o', str(binary)],
                        check=True, capture_output=True)
         subprocess.run([str(binary)], check=True, capture_output=True)
+
+    def test_cs35l41_otp_maps(self):
+        source = (ROOT / 'xnu/files/bsd/dev/umi_cs35l41_otp.h').read_text()
+        for number in (1, 2):
+            block = source.split(f'umi_otp_map_{number}[] = {{', 1)[1].split('};', 1)[0]
+            fields = re.findall(r'\{(0x[0-9a-fA-F]+),\s*(\d+),\s*(\d+)\}', block)
+            self.assertEqual(len(fields), 99)
+            self.assertLessEqual(80 + sum(int(size) for _, _, size in fields), 1024)
+            for reg, shift, size in fields:
+                self.assertTrue(int(reg, 16) == 0 or int(reg, 16) >= 0x2000)
+                self.assertGreater(int(size), 0)
+                self.assertLessEqual(int(shift) + int(size), 32)
 
     def test_build_failure_is_failure(self):
         self.env['UEFI_FD'] = str(self.work / 'missing.fd')

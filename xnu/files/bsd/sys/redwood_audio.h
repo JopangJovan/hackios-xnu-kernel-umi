@@ -40,6 +40,16 @@ struct redwood_audio_volume {
 #ifdef KERNEL
 #include <stdbool.h>
 
+/* UMI: execute the protection DSP with the amplifier outputs disabled. */
+bool umi_speaker_dsp_test(void);
+bool umi_speaker_prepare(void);
+bool umi_speaker_start(void);
+bool umi_speaker_healthy(void);
+void umi_speaker_stop(void);
+void umi_speaker_quiesce(void);
+
+
+
 /*
  * For drivers. A sink is offered frames as they are written and says how many it took (the
  * rest are lost); it is called from the writer's thread and must not wait.

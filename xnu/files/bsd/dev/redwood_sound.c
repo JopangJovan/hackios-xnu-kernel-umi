@@ -96,7 +96,7 @@ static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up
 
 static uint32_t level, seconds = 3, below = 240, pause_ms = 1000, gain = REDWOOD_GUARD_MAX_GAIN;
 static uint32_t guard_as = UINT32_MAX;  /* boot-arg sound_guard_as=N: the guard reckons the amplifiers at most N under (a test) */
-/* UMI currently supports the port/stream diagnostics only; its Cirrus amps need a separate driver. */
+/* UMI uses tertiary MI2S and Cirrus protection; level 3 is a capped tone test. */
 static bool umi_profile;
 static uint16_t active_port = 0x9000;
 static char last_write[96] = "nothing written";
@@ -1079,7 +1079,7 @@ play(uint32_t ms, bool amplifiers)
 		if (amplifiers && now - last_look >= 200000) {
 			last_look = now;
 			healthy_looks++;
-			if (!redwood_speaker_healthy()) {
+			if (!(umi_profile ? umi_speaker_healthy() : redwood_speaker_healthy())) {
 				ok = false;
 				tone_over = true;
 			}
@@ -1347,7 +1347,7 @@ watch(void)
 			on = false;
 		} else if (on && now - last_look >= 200000) {
 			last_look = now;
-			if (!redwood_speaker_healthy()) {
+			if (!(umi_profile ? umi_speaker_healthy() : redwood_speaker_healthy())) {
 				guard_off(true);
 				on = false;
 				given_up = true;
@@ -1390,7 +1390,9 @@ take_down(void)
 	lck_mtx_lock(&sound_lock);
 	if (running && !taken_down) {
 		taken_down = true;
-		if (!umi_profile) {
+		if (umi_profile) {
+			umi_speaker_stop();
+		} else {
 			redwood_speaker_stop();
 		}
 		stream_off();
@@ -1423,9 +1425,10 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	} else {
 		say("sound: level %u: %s, for %u s\n", level, level == 1 ? (umi_profile ? "UMI tertiary MI2S port (amps untouched)" : "the speakers' TDM port") : level == 2 ?
 		    "the port and a stream with a test tone, the amplifiers off" :
-		    "the port, a stream with a test tone, and the amplifiers", seconds);
+		    (umi_profile ? "the port, stream and protection DSP, with output disabled" :
+		    "the port, a stream with a test tone, and the amplifiers"), seconds);
 	}
-	if (level >= 3) {
+	if (level >= 3 && !umi_profile) {
 		acf = redwood_adsp_fw_file("aw882xx_acf.bin", &acf_size);
 		if (acf == NULL) {
 			say("sound: no /fw/aw882xx_acf.bin: put the phone's /vendor/etc/aw882xx_acf.bin into fw-audio/ and run SYSTEM=1 "
@@ -1460,6 +1463,13 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		goto out;
 	}
 	if (!stream_on()) {
+		goto out;
+	}
+	if (umi_profile && level == 3) {
+		announce("UMI protected speaker test: OTP trims, board limits, firmware and a capped one-second tone");
+		if (!umi_speaker_prepare() || !umi_speaker_start()) goto out;
+		say("sound: UMI QUIET TONE NOW: one second, protected output at -40 dB digital\n");
+		ok = play(1000, true);
 		goto out;
 	}
 	if (level == 4) {
@@ -1532,8 +1542,8 @@ redwood_sound_dsp_up(void)
 	uint32_t umi = 0;
 	umi_profile = PE_parse_boot_argn("adsp_umi", &umi, sizeof(umi)) && umi == 1;
 	if (umi_profile) {
-		if (level > 2) {
-			say("sound: UMI supports sound=1/2 diagnostics only; Cirrus amplifier playback is not implemented yet\n");
+		if (level > 3) {
+			say("sound: UMI supports sound=1/2 diagnostics and a capped sound=3 tone; continuous playback is not enabled\n");
 			return;
 		}
 		active_port = 0x1004;
@@ -1575,5 +1585,6 @@ redwood_sound_dsp_down(void)
 void
 redwood_sound_quiesce(void)
 {
-	redwood_speaker_quiesce();
+	if (umi_profile) umi_speaker_quiesce();
+	else redwood_speaker_quiesce();
 }

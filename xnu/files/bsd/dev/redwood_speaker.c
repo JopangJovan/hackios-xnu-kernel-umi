@@ -1397,7 +1397,9 @@ static bool
 umi_cs35l41_write(uint8_t address, uint32_t reg, uint32_t value)
 {
 	uint8_t data[4] = { value >> 24, value >> 16, value >> 8, value };
-	return umi_cs35l41_bytes(address, reg, data, sizeof(data), true);
+	bool ok = umi_cs35l41_bytes(address, reg, data, sizeof(data), true);
+	if (!ok) say("umi-audio: amp %#x register write failed at %#x (value %#x)\n", address, reg, value);
+	return ok;
 }
 
 static bool
@@ -1443,6 +1445,8 @@ umi_cs35l41_region(uint32_t type, uint32_t offset, uint32_t length, bool coeff, 
 }
 
 struct umi_cs_algorithm { uint32_t id, xm, ym; };
+static uint32_t umi_halo_xm[2], umi_cspl_xm[2];
+static bool umi_runtime_preparing;
 
 static bool
 umi_cs35l41_preload(uint8_t address)
@@ -1512,6 +1516,18 @@ umi_cs35l41_preload(uint8_t address)
 		if (!umi_cs35l41_bytes(address, 0x02800028 + i * 24, entry, sizeof(entry), false)) return false;
 		alg[i + 1] = (struct umi_cs_algorithm){ umi_be32(entry), umi_be32(entry + 8), umi_be32(entry + 16) };
 	}
+	if (umi_runtime_preparing && (fw_id != 0x400a4 || umi_be32(header + 16) != 0x300 ||
+	    algorithms != 1 || alg[1].id != 0xcd)) {
+		say("umi-audio: amp %#x protection firmware is not the validated UMI revision\n", address);
+		return false;
+	}
+	for (uint32_t i = 0; i <= algorithms; i++) {
+		if (alg[i].xm > 4082 || alg[i].ym > 2046) return false;
+	}
+	umi_halo_xm[address == 0x42] = 0x02800000 + 4 * alg[0].xm;
+	for (uint32_t i = 1; i <= algorithms; i++) {
+		if (alg[i].id == 0xcd) umi_cspl_xm[address == 0x42] = 0x02800000 + 4 * alg[i].xm;
+	}
 	say("umi-audio: amp %#x: HALO firmware %#x version %#x, %u algorithms\n", address, fw_id,
 	    umi_be32(header + 16), algorithms);
 	/* Two passes also validate every coefficient record before any tuning is applied. */
@@ -1547,6 +1563,328 @@ umi_cs35l41_preload(uint8_t address)
 	    address, coeff_name);
 	return true;
 }
+
+static bool
+umi_cs35l41_update(uint8_t a, uint32_t reg, uint32_t mask, uint32_t value)
+{
+	uint32_t old = 0, check = 0;
+	bool ok = umi_cs35l41_read(a, reg, &old) && umi_cs35l41_write(a, reg, (old & ~mask) | (value & mask)) &&
+	    umi_cs35l41_read(a, reg, &check) && (check & mask) == (value & mask);
+	if (!ok) say("umi-audio: amp %#x register update failed at %#x: old %#x, readback %#x, mask %#x, wanted %#x\n",
+	    a, reg, old, check, mask, value);
+	return ok;
+}
+
+#include "umi_cs35l41_otp.h"
+
+static bool
+umi_cs35l41_trims(uint8_t a)
+{
+	uint32_t id, words[32];
+	if (!umi_cs35l41_read(a, 0x10, &id)) return false;
+	const struct umi_cs_otp_entry *map;
+	unsigned count;
+	if (id == 1 || id == 8) {
+		map = umi_otp_map_1;
+		count = sizeof(umi_otp_map_1) / sizeof(umi_otp_map_1[0]);
+	} else if (id == 2 || id == 6) {
+		map = umi_otp_map_2;
+		count = sizeof(umi_otp_map_2) / sizeof(umi_otp_map_2[0]);
+	} else {
+		say("umi-audio: amp %#x unsupported OTP trim map %#x\n", a, id);
+		return false;
+	}
+	for (unsigned i = 0; i < 32; i++) {
+		if (!umi_cs35l41_read(a, 0x400 + 4 * i, &words[i])) return false;
+	}
+	if (!umi_cs35l41_write(a, 0x40, 0x55) || !umi_cs35l41_write(a, 0x40, 0xaa)) return false;
+	bool ok = true;
+	unsigned bit = 80; /* Maps 1/2/6/8 start at OTP word 2, bit 16. */
+	for (unsigned i = 0; i < count; i++) {
+		unsigned size = map[i].size, shift = map[i].shift;
+		if (!size || size > 32 || shift + size > 32 || bit + size > 1024) { ok = false; break; }
+		uint64_t pair = words[bit / 32];
+		if (bit % 32 + size > 32) pair |= (uint64_t)words[bit / 32 + 1] << 32;
+		uint32_t mask = (uint32_t)((1ull << size) - 1);
+		uint32_t value = (uint32_t)(pair >> (bit % 32)) & mask;
+		bit += size;
+		if (map[i].reg && !umi_cs35l41_update(a, map[i].reg, mask << shift, value << shift)) {
+			ok = false;
+			break;
+		}
+	}
+	bool lock = umi_cs35l41_write(a, 0x40, 0xcc) && umi_cs35l41_write(a, 0x40, 0x33);
+	say("umi-audio: amp %#x OTP map %#x: %u trim fields, %s\n", a, id, count, ok && lock ? "applied" : "failed");
+	return ok && lock;
+}
+
+static bool
+umi_cs35l41_board_setup(uint8_t a)
+{
+	uint32_t status = 0;
+	unsigned waited;
+	for (waited = 0; waited < 100; waited++) {
+		if (!umi_cs35l41_read(a, 0x1001c, &status)) return false;
+		if (status & 2) break;
+		wait_ms(1);
+	}
+	if (waited == 100 || !umi_cs35l41_read(a, 0x10018, &status) || (status & 0x80000000)) return false;
+	/* Rev B2 errata sequence from Xiaomi's Cirrus driver. */
+	static const struct { uint32_t reg, value; } patch[] = {
+		{0x40, 0x5555}, {0x40, 0xaaaa}, {0x4100, 0}, {0x4310, 0}, {0x4400, 0},
+		{0x381c, 0x51}, {0x02bc20e0, 0}, {0x02bc2020, 0}, {0x4854, 0x01010000},
+		{0x40, 0xcccc}, {0x40, 0x3333},
+	};
+	for (unsigned i = 0; i < sizeof(patch) / sizeof(patch[0]); i++) {
+		if (!umi_cs35l41_write(a, patch[i].reg, patch[i].value)) return false;
+	}
+	if (!umi_cs35l41_trims(a)) return false;
+	/* UMI device tree: 1 uH, 15 uF, 4000 mA peak; brownout defaults from
+	 * cs35l41_probe. Configure limits without enabling the output or boost. */
+	return umi_cs35l41_update(a, 0x3810, 0xffff, 0x2424) &&
+	    umi_cs35l41_update(a, 0x3814, 0xff03, 0x7500) &&
+	    umi_cs35l41_update(a, 0x3808, 0x7f, 0x40) &&
+	    umi_cs35l41_update(a, 0x201c, 0x1000, 0x1000) &&
+	    umi_cs35l41_write(a, 0x6404, 0x0200530e);
+}
+
+static bool
+umi_cs35l41_mailbox(uint8_t a, uint32_t cmd, uint32_t expected)
+{
+	uint32_t status = 0;
+	if (!umi_cs35l41_write(a, 0x00010814, 1u << 20) || /* IRQ2_STATUS2: clear DSP sticky */
+	    !umi_cs35l41_write(a, 0x00010014, 1u << 21) || /* IRQ1_STATUS2: clear AP sticky */
+	    !umi_cs35l41_update(a, 0x00010914, 1u << 20, 0) || /* IRQ2_MASK2 */
+	    !umi_cs35l41_write(a, 0x00013020, cmd)) return false;
+	bool ack = false;
+	for (unsigned i = 0; i < 30; i++) {
+		wait_ms(1);
+		if (!umi_cs35l41_read(a, 0x00010014, &status)) break;
+		if (status & (1u << 21)) { ack = true; break; }
+	}
+	umi_cs35l41_write(a, 0x00010014, 1u << 21);
+	umi_cs35l41_update(a, 0x00010914, 1u << 20, 1u << 20);
+	if (!umi_cs35l41_read(a, 0x00013004, &status)) return false;
+	say("umi-audio: amp %#x HALO mailbox cmd %u: ack=%u state=%u (expected %u)\n", a, cmd, ack, status, expected);
+	return ack && status == expected;
+}
+
+static bool
+umi_cs35l41_dsp_boot(uint8_t a)
+{
+	/* 48 kHz I2S slave, 16-bit RX, BCLK reference 1.536 MHz (PLL code 0x1b).
+	 * DSP-only test: GLOBAL_EN and AMP_EN remain zero, DAC is digitally muted. */
+	if (!umi_cs35l41_write(a, 0x00006000, 0x2004) ||
+	    !umi_cs35l41_update(a, 0x00002c0c, 0x1f, 3) ||
+	    !umi_cs35l41_update(a, 0x00004808, 0xff000755, 0x10000200) ||
+	    !umi_cs35l41_update(a, 0x00004840, 0x3f, 16) ||
+	    !umi_cs35l41_update(a, 0x00004820, 0x3f3f, a == 0x40 ? 1 : 0x100) ||
+	    !umi_cs35l41_write(a, 0x00004c40, 8) || !umi_cs35l41_write(a, 0x00004c44, 8) ||
+	    !umi_cs35l41_update(a, 0x00004800, 0x30000, 0x10000) ||
+	    !umi_cs35l41_update(a, 0x00002c04, 0x800, 0x800) ||
+	    !umi_cs35l41_update(a, 0x00002c04, 0x7e0, 0x1b << 5) ||
+	    !umi_cs35l41_update(a, 0x00002c04, 0x10, 0) ||
+	    !umi_cs35l41_update(a, 0x00002c04, 7, 0) ||
+	    !umi_cs35l41_update(a, 0x00002c04, 0x800, 0) ||
+	    !umi_cs35l41_update(a, 0x00002c04, 0x10010, 0x10010)) return false;
+	uint32_t xm_bank, ym_bank, xm_size, ym_size;
+	if (!umi_cs35l41_read(a, 0x025e0038, &xm_bank) || !umi_cs35l41_read(a, 0x025e003c, &ym_bank) ||
+	    !umi_cs35l41_read(a, 0x025e0010, &xm_size) || !umi_cs35l41_read(a, 0x025e0018, &ym_size) ||
+	    !xm_bank || !ym_bank || xm_size % xm_bank || ym_size % ym_bank ||
+	    xm_size / xm_bank == 0 || xm_size / xm_bank > 31 || ym_size / ym_bank == 0 || ym_size / ym_bank > 31) {
+		say("umi-audio: amp %#x invalid HALO memory-bank geometry\n", a);
+		return false;
+	}
+	say("umi-audio: amp %#x HALO geometry: XM %u/%u, YM %u/%u\n", a, xm_size, xm_bank, ym_size, ym_bank);
+	const uint32_t dsp = 0x02b80000;
+	for (unsigned i = 0; i < 8; i++) {
+		if (!umi_cs35l41_update(a, dsp + 0x80 + 8 * i, 0x1f, 1) ||
+		    !umi_cs35l41_update(a, dsp + 0x280 + 8 * i, 0x1f, 1)) return false;
+	}
+	/* Clear HALO stream arbitration before its firmware owns it. */
+	for (unsigned i = 0; i < 6; i++) {
+		for (unsigned j = 0; j < 3; j++) {
+			if (!umi_cs35l41_write(a, dsp + 0x45000 + 16 * i + 4 * j, 0)) return false;
+		}
+	}
+	for (unsigned i = 0; i < 8; i++) {
+		if (!umi_cs35l41_write(a, dsp + 0x45200 + 8 * i, 0xfc) ||
+		    !umi_cs35l41_write(a, dsp + 0x45400 + 8 * i, 0xfc) ||
+		    !umi_cs35l41_write(a, dsp + 0x45600 + 16 * i, 0xfc) ||
+		    !umi_cs35l41_write(a, dsp + 0x45604 + 16 * i, 0)) return false;
+	}
+	if (!umi_cs35l41_write(a, dsp + 0x46020, 0xffffff) ||
+	    !umi_cs35l41_write(a, dsp + 0x46008, 0) ||
+	    !umi_cs35l41_write(a, dsp + 0x43140, 0x5555) ||
+	    !umi_cs35l41_write(a, dsp + 0x43140, 0xaaaa) ||
+	    !umi_cs35l41_write(a, dsp + 0x43000, (1u << (xm_size / xm_bank)) - 1) ||
+	    !umi_cs35l41_write(a, dsp + 0x43004, (1u << (ym_size / ym_bank)) - 1)) return false;
+	static const uint32_t restricted[] = {
+		0x43008, 0x4300c, 0x43014, 0x43018, 0x4301c, 0x43020, 0x43024, 0x4302c,
+		0x43030, 0x43034, 0x43038, 0x4303c, 0x43044, 0x43048, 0x4304c, 0x43050, 0x43054, 0x4305c,
+	};
+	for (unsigned i = 0; i < sizeof(restricted) / sizeof(restricted[0]); i++) {
+		if (!umi_cs35l41_write(a, dsp + restricted[i], 0)) return false;
+	}
+	if (umi_runtime_preparing) {
+		uint32_t xm = umi_cspl_xm[a == 0x42];
+		/* Same conservative fallback calibration as Xiaomi's driver before
+		 * Android supplies the unit's saved calibration. Initial tone is capped. */
+		if (!xm || !umi_cs35l41_update(a, xm + 7 * 4, 0xffffff, 8392) ||
+		    !umi_cs35l41_update(a, xm + 8 * 4, 0xffffff, 30) ||
+		    !umi_cs35l41_update(a, xm + 9 * 4, 0xffffff, 1) ||
+		    !umi_cs35l41_update(a, xm + 10 * 4, 0xffffff, 8393) ||
+		    !umi_cs35l41_write(a, 0x4c50, 0x28) || !umi_cs35l41_write(a, 0x4c54, 0x21) ||
+		    !umi_cs35l41_write(a, 0x4c58, 0x3a) || !umi_cs35l41_write(a, 0x4c5c, 0x3b)) return false;
+	}
+	if (!umi_cs35l41_write(a, dsp + 0x43140, 0) || !umi_cs35l41_write(a, 0x02bc1000, 1)) return false;
+	wait_ms(30);
+	uint32_t power, amp;
+	if (!umi_cs35l41_read(a, 0x2014, &power) || !umi_cs35l41_read(a, 0x2018, &amp)) return false;
+	say("umi-audio: amp %#x after HALO start: global power %#x, amplifier power %#x\n", a, power, amp);
+	/* The protection firmware prepares AMP_EN/ADCs/boost itself (0x3321).
+	 * GLOBAL_EN remains the host's output interlock throughout this test. */
+	if (power & 1) return false;
+	uint32_t heartbeat1 = 0, heartbeat2 = 0, cspl_state = 0, cspl_error = 0;
+	uint32_t halo_xm = umi_halo_xm[a == 0x42], cspl_xm = umi_cspl_xm[a == 0x42];
+	if (!halo_xm || !cspl_xm || !umi_cs35l41_read(a, halo_xm + 4, &heartbeat1)) return false;
+	wait_ms(20);
+	if (!umi_cs35l41_read(a, halo_xm + 4, &heartbeat2) ||
+	    !umi_cs35l41_read(a, cspl_xm + 8, &cspl_state) || !umi_cs35l41_read(a, cspl_xm + 12, &cspl_error)) return false;
+	say("umi-audio: amp %#x HALO heartbeat %u -> %u; CSPL state %u, error %#x\n", a,
+	    heartbeat1, heartbeat2, cspl_state, cspl_error);
+	/* Audio-frame heartbeat may pause while GLOBAL_EN is zero; mailbox ACK/state changes prove execution. */
+	return umi_cs35l41_mailbox(a, 1, 1) && umi_cs35l41_mailbox(a, 2, 0);
+}
+
+static bool umi_output_ready;
+static uint32_t umi_reset_cfg, umi_reset_io;
+
+void
+umi_speaker_quiesce(void)
+{
+	if (umi_output_ready && tlmm) {
+		wr(GPIO_IO(UMI_AMP_RESET), 0);
+		__asm__ volatile("dmb oshst" ::: "memory");
+	}
+}
+
+bool
+umi_speaker_healthy(void)
+{
+	if (!umi_output_ready) return false;
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t a = i ? 0x42 : 0x40;
+		uint32_t status, error;
+		if (!umi_cs35l41_read(a, 0x10010, &status) || (status & 0x800281c0) ||
+		    !umi_cs35l41_read(a, umi_cspl_xm[i] + 12, &error) || error) {
+			say("umi-audio: amp %#x fault; both chips held in reset\n", a);
+			umi_speaker_quiesce();
+			return false;
+		}
+	}
+	return true;
+}
+
+void
+umi_speaker_stop(void)
+{
+	if (!umi_output_ready) return;
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t a = i ? 0x42 : 0x40;
+		umi_cs35l41_write(a, 0x6000, 0x2004);
+		umi_cs35l41_update(a, 0x2024, 0x10, 0x10);
+	}
+	wait_ms(5);
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t a = i ? 0x42 : 0x40;
+		umi_cs35l41_mailbox(a, 1, 1);
+		umi_cs35l41_update(a, 0x2014, 1, 0);
+	}
+	umi_speaker_quiesce();
+	spin_us(2000);
+	wr(GPIO_IO(UMI_AMP_RESET), umi_reset_io & 2);
+	wr(GPIO_CFG(UMI_AMP_RESET), umi_reset_cfg);
+	umi_output_ready = false;
+	say("umi-audio: outputs muted, global power off, shared reset and pins restored\n");
+}
+
+bool
+umi_speaker_start(void)
+{
+	if (!umi_output_ready) return false;
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t a = i ? 0x42 : 0x40;
+		/* Keep the analog mute asserted while power comes up. Firmware and
+		 * calibration are already running; the host owns GLOBAL_EN. */
+		if (!umi_cs35l41_update(a, 0x2024, 0x10, 0x10) ||
+		    !umi_cs35l41_write(a, 0x6000, 0x2004) ||
+		    !umi_cs35l41_write(a, 0x4c00, 0x32) || /* DAC from protection DSP */
+		    !umi_cs35l41_update(a, 0x6c04, 0x3e0, 18u << 5) ||
+		    !umi_cs35l41_update(a, 0x201c, 0x100010, 0x100010) ||
+		    !umi_cs35l41_write(a, 0x10010, 0xffffffff) ||
+		    !umi_cs35l41_write(a, 0x40, 0x55) || !umi_cs35l41_write(a, 0x40, 0xaa) ||
+		    !umi_cs35l41_write(a, 0x2084, 0x002f1aa0) ||
+		    !umi_cs35l41_write(a, 0x40, 0xcc) || !umi_cs35l41_write(a, 0x40, 0x33) ||
+		    !umi_cs35l41_update(a, 0x2014, 1, 1)) goto fail;
+		wait_ms(2);
+		if (!umi_cs35l41_mailbox(a, 2, 0)) goto fail;
+	}
+	if (!umi_speaker_healthy()) goto fail;
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t a = i ? 0x42 : 0x40;
+		/* Fixed initial test ceiling: -40 dB digital, 4 ms soft ramp.
+		 * The test tone itself is another 20 dB below full scale. */
+		if (!umi_cs35l41_update(a, 0x6000, 0x3fff, ((2048u - 320u) << 3) | 4u) ||
+		    !umi_cs35l41_update(a, 0x2024, 0x10, 0)) goto fail;
+	}
+	say("umi-audio: both protected outputs started at fixed -40 dB digital attenuation\n");
+	return true;
+fail:
+	umi_speaker_quiesce();
+	return false;
+}
+
+static bool
+umi_speaker_begin(bool keep)
+{
+	if (tlmm == 0) tlmm = ml_io_map(UMI_TLMM_NORTH_PHYS, TLMM_SIZE);
+	if (tlmm == 0) return false;
+	uint32_t cfg = rd(GPIO_CFG(UMI_AMP_RESET)), io = rd(GPIO_IO(UMI_AMP_RESET));
+	umi_runtime_preparing = keep;
+	wr(GPIO_IO(UMI_AMP_RESET), 0);
+	wr(GPIO_CFG(UMI_AMP_RESET), CFG_OUTPUT);
+	spin_us(2000);
+	wr(GPIO_IO(UMI_AMP_RESET), 2);
+	wait_ms(10);
+	bool ok = true;
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t a = i ? 0x42 : 0x40;
+		uint32_t id, rev;
+		if (!umi_cs35l41_read(a, 0, &id) || id != UMI_CS35L41_CHIP_ID ||
+		    !umi_cs35l41_read(a, 4, &rev) || rev != 0xb2 ||
+		    (keep && !umi_cs35l41_board_setup(a)) || !umi_cs35l41_preload(a) || !umi_cs35l41_dsp_boot(a)) {
+			say("umi-audio: amp %#x HALO startup test failed; outputs kept disabled\n", a);
+			ok = false;
+			break;
+		}
+	}
+	if (keep && ok) {
+		umi_reset_cfg = cfg;
+		umi_reset_io = io;
+		umi_output_ready = true;
+		return true;
+	}
+	wr(GPIO_IO(UMI_AMP_RESET), 0);
+	spin_us(2000);
+	wr(GPIO_IO(UMI_AMP_RESET), io & 2);
+	wr(GPIO_CFG(UMI_AMP_RESET), cfg);
+	say("umi-audio: HALO execution/mailbox test %s; both chips reset, output stages never enabled\n", ok ? "passed" : "failed");
+	return ok;
+}
+
+bool umi_speaker_dsp_test(void) { return umi_speaker_begin(false); }
+bool umi_speaker_prepare(void) { return umi_speaker_begin(true); }
 
 static void
 umi_amp_probe_thread(__unused void *parameter, __unused wait_result_t result)

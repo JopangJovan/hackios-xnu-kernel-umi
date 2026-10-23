@@ -21,12 +21,17 @@ has no /sbin/launchd and cannot boot iOS.
 - `adsp=1 adsp_umi=1 sound=1`: configure/start/stop MI2S and sample clock pins.
 - `adsp=1 adsp_umi=1 sound=2`: also map audio buffers through SMMU stream 0x1801,
   open ADM/ASM, send three seconds of PCM, and verify completion events.
+- `adsp=1 adsp_umi=1 sound=3`: apply B2 errata and OTP trims, configure UMI
+  boost limits, load the protection DSP and its tuning, then play a one-second
+  tone. Initial output is capped at -40 dB digital with a -20 dBFS tone. This
+  test uses Xiaomi's fallback calibration (8392), pending per-unit calibration.
+  The audible test still needs physical verification.
 - `umi_amp_probe=4`: reset and read the amplifier IDs.
 - `umi_amp_probe=5`: reset, validate HALO v3 and WMDR v1 files, copy protection
   firmware and per-amp coefficients into DSP memory, and verify every byte.
   DSP cores and amplifier outputs stay disabled; reset clears the test afterward.
 
-The loader rejects Redwood amplifier playback levels on UMI. Normal UMI
+The loader rejects continuous playback (`sound=4`) on UMI until the output test is validated. Normal UMI
 boot arguments retain eight cores, touch, keys, and working haptics.
 For live USB logs during tests, use bootcpu=7 cpus=7; eight-core sessions
 return their logs when the timed run ends.
@@ -42,7 +47,13 @@ return their logs when the timed run ends.
   version 0x300, one algorithm. Local firmware and both tuning files match
   the stock vendor EROFS dump.
 
-Still required for audible output: OTP trim application, board power/boost
-configuration, PLL and ASP setup, HALO MPU/rates/startup, protection mailbox
-handshake, and bounded amplifier power/volume control. Microphone capture
+- logs/121546-run.log: both HALO cores execute firmware and acknowledge PAUSE
+  (state 1) and RESUME (state 0), with CSPL error 0. GLOBAL_EN stays zero.
+  The firmware itself prepares AMP_EN/ADCs/boost (PWR_CTRL2 = 0x3321); host
+  GLOBAL_EN is the output interlock. The heartbeat waits at 1 without audio frames.
+
+OTP trim application, board boost limits, muted power-up, fault polling, and
+reset cleanup are implemented for the capped tone test, but not yet validated
+on the phone. Still required: physical output verification, per-unit saved
+calibration, and continuous iOS PCM output integration. Microphone capture
 requires its own WCD938x/codec-DMA/SoundWire path.
