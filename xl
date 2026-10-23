@@ -52,7 +52,13 @@ fi
 # the kernel and the loader built here, or else the ones that come with the repository
 K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 [ -f $K ] || K=prebuilt/mach.development.bcm2837
-L=${LOADER_EFI:-xnuloader/loader.efi}
+if [ -n "${LOADER_EFI:-}" ]; then
+	L=$LOADER_EFI
+elif [ "${DEVICE:-}" = umi ]; then
+	L=out/umi/loader.efi
+else
+	L=xnuloader/loader.efi
+fi
 if [ "${DEVICE:-}" = umi ]; then
 	[ -f "$L" ] || { echo 'xl: UMI loader missing; run DEVICE=umi xnuloader/build.sh' >&2; exit 1; }
 else
