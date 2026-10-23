@@ -2463,8 +2463,8 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 /*
  * What the vendor's driver sends at this point (a6xx_hfi_start; Linux the same with fewer
  * levels): the table of speeds of the 3D core with the supply level each needs -- the phone's
- * three lowest (UMI: 305, 400, 441.6 MHz at levels 64, 128, 144; Redwood: 315, 450, 550 MHz at
- * levels 64, 128, 192) -- and of the
+ * stock levels (UMI: 305 through 587 MHz, ending at nominal level 256;
+ * Redwood: 315, 450, 550 MHz at levels 64, 128, 192) -- and of the
  * GMU itself; the table of bus bandwidth votes, of which Linux gets by with the one for "off"
  * (a6xx_hfi.c: adreno_7c3_build_bw_table); "start"; and the speed wanted now. Then the request
  * to keep the 3D core powered while we use it (a6xx_gmu_oob_set), and its registers can be read.
@@ -2474,7 +2474,9 @@ step_core_power(void)
 {
 	struct adreno_speed { uint32_t khz, level; };
 	static const struct adreno_speed redwood_speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
-	static const struct adreno_speed umi_speeds[] = { { 0, 0 }, { 305000, 64 }, { 400000, 128 }, { 441600, 144 } };
+	static const struct adreno_speed umi_speeds[] = {
+		{ 0, 0 }, { 305000, 64 }, { 400000, 128 }, { 441600, 144 }, { 525000, 192 }, { 587000, 256 }
+	};
 	const struct adreno_speed *speeds = umi_a650 ? umi_speeds : redwood_speeds;
 	uint32_t speed_count = umi_a650 ? (uint32_t)(sizeof(umi_speeds) / sizeof(umi_speeds[0])) :
 	    (uint32_t)(sizeof(redwood_speeds) / sizeof(redwood_speeds[0]));
@@ -2488,8 +2490,8 @@ step_core_power(void)
 		return false;
 	}
 	if (umi_a650) {
-		/* Begin at the stock minimum; the panel and window server can raise it later. */
-		vote[2] = 1;
+		/* Stock 587 MHz OPP: RPMh nominal level 256, with its MX dependency. */
+		vote[2] = speed_count - 1;
 	}
 	if (!rpmh_resource("gfx.lvl", gfx, &gfx_levels) || !rpmh_resource("cx.lvl", cx, &cx_levels) ||
 	    !rpmh_resource("mx.lvl", mx, &mx_levels)) {
@@ -2511,8 +2513,10 @@ step_core_power(void)
 	    !rail_vote(48, cx, cx_levels, mx, mx_levels, &perf.gmu[1].vote)) {  /* "minimum SVS", the vendor's choice */
 		return false;
 	}
-	printf("adreno: %u: votes: 3D core %#x %#x %#x %#x, GMU %#x %#x\n", step, perf.gpu[0].vote, perf.gpu[1].vote,
-	    perf.gpu[2].vote, perf.gpu[3].vote, perf.gmu[0].vote, perf.gmu[1].vote);
+	for (unsigned i = 0; i < perf.gpu_levels; i++) {
+		printf("adreno: %u: 3D core level %u: %u kHz, rail vote %#x\n", step, i, perf.gpu[i].khz, perf.gpu[i].vote);
+	}
+	printf("adreno: %u: GMU votes %#x %#x\n", step, perf.gmu[0].vote, perf.gmu[1].vote);
 
 	bw.levels = 1;
 	bw.ddr_commands = 3;

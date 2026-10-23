@@ -6,6 +6,14 @@ create an OpenGL ES 3.2 Mesa 25.0.7 `FD650` context for CoreAnimation and render
 the interface through the GPU.
 The user confirmed taps, swipes and graphics work together in this session.
 
+## GPU clock
+
+Normal UMI boots select the stock 587 MHz operating point, at RPMh nominal
+level 256 with the corresponding MX rail dependency. The table also includes
+305, 400, 441.6 and 525 MHz. This is a fixed selection, without automatic
+frequency scaling. The GMU accepted the 587 MHz vote and the full hardware
+drawing diagnostic passed at that setting.
+
 ## Verified on the phone
 
 - Kona clock and CX power setup, SMMU programming, firmware loading and readback.
