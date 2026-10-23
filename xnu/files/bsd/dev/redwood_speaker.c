@@ -1758,7 +1758,9 @@ umi_cs35l41_dsp_boot(uint8_t a)
 }
 
 static bool umi_output_ready;
+static bool umi_output_on, umi_reset_asserted;
 static uint32_t umi_reset_cfg, umi_reset_io;
+static uint32_t umi_volume_attenuation = 320; /* register starts at -40 dB */
 
 void
 umi_speaker_quiesce(void)
@@ -1766,6 +1768,8 @@ umi_speaker_quiesce(void)
 	if (umi_output_ready && tlmm) {
 		wr(GPIO_IO(UMI_AMP_RESET), 0);
 		__asm__ volatile("dmb oshst" ::: "memory");
+		umi_reset_asserted = true;
+		umi_output_on = false;
 	}
 }
 
@@ -1789,7 +1793,7 @@ umi_speaker_healthy(void)
 void
 umi_speaker_stop(void)
 {
-	if (!umi_output_ready) return;
+	if (!umi_output_ready || !umi_output_on || umi_reset_asserted) return;
 	for (unsigned i = 0; i < 2; i++) {
 		uint8_t a = i ? 0x42 : 0x40;
 		umi_cs35l41_write(a, 0x6000, 0x2004);
@@ -1801,18 +1805,34 @@ umi_speaker_stop(void)
 		umi_cs35l41_mailbox(a, 1, 1);
 		umi_cs35l41_update(a, 0x2014, 1, 0);
 	}
-	umi_speaker_quiesce();
-	spin_us(2000);
+	umi_output_on = false;
+	say("umi-audio: outputs muted and global power off; HALO protection remains ready\n");
+}
+
+/* Keep the amp's DSP and calibration loaded across brief silences. iOS may
+ * start a new stream at any time; only the run's final teardown resets chips. */
+void
+umi_speaker_shutdown(void)
+{
+	if (!umi_output_ready) return;
+	umi_speaker_stop();
+	if (!umi_reset_asserted) {
+		wr(GPIO_IO(UMI_AMP_RESET), 0);
+		__asm__ volatile("dmb oshst" ::: "memory");
+		spin_us(2000);
+	}
 	wr(GPIO_IO(UMI_AMP_RESET), umi_reset_io & 2);
 	wr(GPIO_CFG(UMI_AMP_RESET), umi_reset_cfg);
 	umi_output_ready = false;
-	say("umi-audio: outputs muted, global power off, shared reset and pins restored\n");
+	umi_reset_asserted = false;
+	say("umi-audio: shared reset and I2C pins restored\n");
 }
 
 bool
 umi_speaker_start(void)
 {
-	if (!umi_output_ready) return false;
+	if (!umi_output_ready || umi_reset_asserted) return false;
+	if (umi_output_on) return umi_speaker_healthy();
 	for (unsigned i = 0; i < 2; i++) {
 		uint8_t a = i ? 0x42 : 0x40;
 		/* Keep the analog mute asserted while power comes up. Firmware and
@@ -1831,6 +1851,7 @@ umi_speaker_start(void)
 		if (!umi_cs35l41_mailbox(a, 2, 0)) goto fail;
 	}
 	if (!umi_speaker_healthy()) goto fail;
+	umi_volume_attenuation = 320;
 	for (unsigned i = 0; i < 2; i++) {
 		uint8_t a = i ? 0x42 : 0x40;
 		/* Fixed initial test ceiling: -40 dB digital, 4 ms soft ramp.
@@ -1838,11 +1859,49 @@ umi_speaker_start(void)
 		if (!umi_cs35l41_update(a, 0x6000, 0x3fff, ((2048u - 320u) << 3) | 4u) ||
 		    !umi_cs35l41_update(a, 0x2024, 0x10, 0)) goto fail;
 	}
+	umi_output_on = true;
 	say("umi-audio: both protected outputs started at fixed -40 dB digital attenuation\n");
 	return true;
 fail:
 	umi_speaker_quiesce();
 	return false;
+}
+
+/* CS35L41 digital volume is centered at 0 dB in code 2048, in 1/8 dB
+ * steps. The kernel's sound_below and the iOS slider are both attenuation;
+ * keep the digital stage at or below unity and ramp in 6 dB steps. */
+bool
+umi_speaker_volume(uint32_t below, uint32_t step_ms)
+{
+	uint32_t target_attenuation = below > 2048 ? 2048 : below;
+	if (target_attenuation == 0) target_attenuation = 1;
+
+	if (!umi_output_ready || !umi_output_on || umi_reset_asserted) return false;
+	for (;;) {
+		uint32_t next = umi_volume_attenuation;
+		if (next > target_attenuation) {
+			next = next - target_attenuation > 48 ? next - 48 : target_attenuation;
+		} else if (next < target_attenuation) {
+			next = target_attenuation - next > 48 ? next + 48 : target_attenuation;
+		} else {
+			break;
+		}
+		uint32_t code = 2048 - next;
+		for (unsigned i = 0; i < 2; i++) {
+			uint8_t a = i ? 0x42 : 0x40;
+			if (!umi_cs35l41_update(a, 0x6000, 0x3fff, (code << 3) | 4u)) {
+				umi_speaker_quiesce();
+				return false;
+			}
+		}
+		umi_volume_attenuation = next;
+		if (step_ms) wait_ms(step_ms);
+		if (step_ms >= 10 && !umi_speaker_healthy()) return false;
+	}
+	if (!umi_speaker_healthy()) return false;
+	say("umi-audio: digital volume at -%u.%03u dB (under unity gain)\n",
+	    target_attenuation / 8, target_attenuation % 8 * 125);
+	return true;
 }
 
 static bool
@@ -1872,6 +1931,8 @@ umi_speaker_begin(bool keep)
 	if (keep && ok) {
 		umi_reset_cfg = cfg;
 		umi_reset_io = io;
+		umi_output_on = false;
+		umi_reset_asserted = false;
 		umi_output_ready = true;
 		return true;
 	}

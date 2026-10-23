@@ -2686,8 +2686,8 @@ print_memory_map(void)
 
 static int starts_with(const char *s, const char *prefix);
 
-/* Initial UMI milestone: RAM disks, framebuffer, CPU and diagnostics only.
- * Whitelisting also protects the unchanged prebuilt kernel from Redwood MMIO. */
+/* UMI boot-argument gate: keep device-specific tests explicit and protect
+ * the unchanged prebuilt kernel from Redwood MMIO. */
 static int
 umi_bootargs_ok(const struct payload_info *pi)
 {
@@ -2717,7 +2717,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 			if (adsp_on || end - c != 6 || c[5] != '1') ok = 0;
 			adsp_on = 1;
 		} else if (starts_with(c, "sound=")) {
-			if (sound || end - c != 7 || c[6] < '1' || c[6] > '3') ok = 0;
+			if (sound || end - c != 7 || c[6] < '1' || c[6] > '4') ok = 0;
 			sound = 1;
 		} else if (starts_with(c, "adsp_umi=")) {
 			if (adsp_umi || end - c != 10 || c[9] != '1') ok = 0;

@@ -26,13 +26,20 @@ has no /sbin/launchd and cannot boot iOS.
   tone. Initial output is capped at -40 dB digital with a -20 dBFS tone. This
   test uses Xiaomi's fallback calibration (8392), pending per-unit calibration.
   Physical audibility was confirmed with the repeat test below.
+- `adsp=1 adsp_umi=1 sound=4`: route the iOS audio plug-in's stereo PCM ring
+  through UMI MI2S and both protected CS35L41 amps. The amps start muted, ramp
+  to `sound_below` plus the iOS volume attenuation, then stop after three
+  seconds of silence. HALO protection stays loaded across short pauses and is
+  reset when the audio path shuts down. The default `sound_below` keeps the
+  digital output 30 dB under unity at maximum iOS volume.
 - `umi_amp_probe=4`: reset and read the amplifier IDs.
 - `umi_amp_probe=5`: reset, validate HALO v3 and WMDR v1 files, copy protection
   firmware and per-amp coefficients into DSP memory, and verify every byte.
   DSP cores and amplifier outputs stay disabled; reset clears the test afterward.
 
-The loader rejects continuous playback (`sound=4`) on UMI until the output test is validated. Normal UMI
-boot arguments retain eight cores, touch, keys, and working haptics.
+Continuous playback is now enabled for UMI. Add `adsp=1 adsp_umi=1 sound=4`
+when starting iOS; the normal boot profile does not enable the ADSP by itself.
+This output path does not implement microphone capture.
 For live USB logs during tests, use bootcpu=7 cpus=7; eight-core sessions
 return their logs when the timed run ends.
 
@@ -64,6 +71,8 @@ return their logs when the timed run ends.
   reset afterward. The user confirmed hearing the tone. This validates audible
   speaker output, but does not establish each amplifier separately.
 
-Still required: per-unit saved calibration and
-continuous iOS PCM output integration. Microphone capture requires its own
-WCD938x/codec-DMA/SoundWire path.
+The continuous iOS feeder and UMI amp lifecycle are implemented but still need
+a full iOS playback run on the phone.
+
+Still required: per-unit saved calibration and a full iOS playback test.
+Microphone capture requires its own WCD938x/codec-DMA/SoundWire path.

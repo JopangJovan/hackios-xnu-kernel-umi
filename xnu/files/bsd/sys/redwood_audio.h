@@ -44,8 +44,10 @@ struct redwood_audio_volume {
 bool umi_speaker_dsp_test(void);
 bool umi_speaker_prepare(void);
 bool umi_speaker_start(void);
+bool umi_speaker_volume(uint32_t below, uint32_t step_ms);
 bool umi_speaker_healthy(void);
 void umi_speaker_stop(void);
+void umi_speaker_shutdown(void);
 void umi_speaker_quiesce(void);
 
 

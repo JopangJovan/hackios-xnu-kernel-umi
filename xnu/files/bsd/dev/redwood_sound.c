@@ -1263,6 +1263,32 @@ guard_level(uint32_t level_below)
 	redwood_guard_attenuation(level_below < guard_as ? level_below : guard_as);
 }
 
+static uint32_t
+sound_attenuation(uint32_t extra)
+{
+	uint32_t base = below > 2048 ? 2048 : below;
+	return extra > 2048 - base ? 2048 : base + extra;
+}
+
+static bool
+speaker_set_volume(uint32_t attenuation, uint32_t step_ms)
+{
+	return umi_profile ? umi_speaker_volume(attenuation, step_ms) : redwood_speaker_volume(attenuation, step_ms);
+}
+
+static bool
+speaker_start(void)
+{
+	return umi_profile ? umi_speaker_start() : redwood_speaker_start();
+}
+
+static void
+speaker_stop(void)
+{
+	if (umi_profile) umi_speaker_stop();
+	else redwood_speaker_stop();
+}
+
 /*
  * The amplifiers are off. The guard goes on at their level all the same: what it lets through now reaches them
  * 160 ms later, behind the periods queued at the DSP, and if that is sound, they will have been started by then
@@ -1308,22 +1334,22 @@ watch(void)
 			if (muted) {
 				guard_off(true);
 				if (on) {
-					redwood_speaker_stop();
+					speaker_stop();
 					on = false;
 				}
-			} else if (on && !redwood_speaker_volume(below + extra, 1)) {
+			} else if (on && !speaker_set_volume(sound_attenuation(extra), 1)) {
 				guard_off(true);
 				on = false;
 				given_up = true;
 			} else if (!given_up) {
-				guard_level(below + extra);
+				guard_level(sound_attenuation(extra));
 			}
 		}
 		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
 			say_when("iOS plays: the amplifiers are started");
 			starts++;
 			ios_peak = 0;
-			if (!redwood_speaker_start() || !redwood_speaker_volume(below + extra, 1)) {
+			if (!speaker_start() || !speaker_set_volume(sound_attenuation(extra), 1)) {
 				say("sound: THE AMPLIFIERS DID NOT START; iOS's sound goes on to the DSP, unheard\n");
 				guard_off(true);
 				given_up = true;
@@ -1343,7 +1369,7 @@ watch(void)
 			say("sound: what iOS wrote while they were on peaked at %u%% of full scale (%u)\n", ios_peak * 100 / 32768,
 			    ios_peak);
 			guard_off(false);
-			redwood_speaker_stop();
+			speaker_stop();
 			on = false;
 		} else if (on && now - last_look >= 200000) {
 			last_look = now;
@@ -1351,7 +1377,7 @@ watch(void)
 				guard_off(true);
 				on = false;
 				given_up = true;
-			} else if (now - last_monitor >= 1000000) {
+			} else if (!umi_profile && now - last_monitor >= 1000000) {
 				/* the amplifiers' temperature and the battery as they see it, every second: a reduction if Android's table asks for one */
 				uint32_t wanted;
 
@@ -1391,7 +1417,7 @@ take_down(void)
 	if (running && !taken_down) {
 		taken_down = true;
 		if (umi_profile) {
-			umi_speaker_stop();
+			umi_speaker_shutdown();
 		} else {
 			redwood_speaker_stop();
 		}
@@ -1475,12 +1501,15 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	if (level == 4) {
 		thread_t feeder;
 
-		announce("the amplifiers, set up from Android's Music profile, powered down until iOS plays");
-		if (!redwood_speaker_prepare(acf, acf_size)) {
-			goto out;
+		announce(umi_profile ? "UMI CS35L41 protection, powered down until iOS plays" :
+		    "the amplifiers, set up from Android's Music profile, powered down until iOS plays");
+		if (umi_profile) {
+			if (!umi_speaker_prepare()) goto out;
+		} else {
+			if (!redwood_speaker_prepare(acf, acf_size)) goto out;
+			redwood_adsp_fw_free(acf, acf_size);
+			acf = NULL;
 		}
-		redwood_adsp_fw_free(acf, acf_size);
-		acf = NULL;
 		feeder_runs = true;
 		if (kernel_thread_start(feeder_thread, NULL, &feeder) != KERN_SUCCESS) {
 			feeder_runs = false;
@@ -1542,8 +1571,8 @@ redwood_sound_dsp_up(void)
 	uint32_t umi = 0;
 	umi_profile = PE_parse_boot_argn("adsp_umi", &umi, sizeof(umi)) && umi == 1;
 	if (umi_profile) {
-		if (level > 3) {
-			say("sound: UMI supports sound=1/2 diagnostics and a capped sound=3 tone; continuous playback is not enabled\n");
+		if (level > 4) {
+			say("sound: UMI supports sound levels 1 through 4\n");
 			return;
 		}
 		active_port = 0x1004;
@@ -1555,6 +1584,7 @@ redwood_sound_dsp_up(void)
 	}
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));
 	PE_parse_boot_argn("sound_below", &below, sizeof(below));
+	if (below > 2048) below = 2048;
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("sound_guard_as", &guard_as, sizeof(guard_as));
 	PE_parse_boot_argn("sound_gain", &gain, sizeof(gain));
