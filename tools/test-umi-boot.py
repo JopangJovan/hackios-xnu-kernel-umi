@@ -99,6 +99,15 @@ int main(void) {
     assert(umi_bootargs_ok(&p));
     p.cmdline = ""; assert(umi_bootargs_ok(&p));
     p.cmdline = "bootcpu=0 cpus=8 umi_touch=1 umifts_scan=1"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "adsp=1 adsp_umi=1 sound=1"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "adsp_umi=1 sound=2 adsp=1"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "umi_amp_probe=5"; assert(umi_bootargs_ok(&p));
+    const char *audio_bad[] = {"adsp=1 sound=1", "adsp_umi=1 sound=1", "umi_amp_probe=6",
+        "adsp=1 adsp_umi=1 sound=3", "adsp=1 adsp_umi=1 sound=4",
+        "adsp=1 adsp_umi=1 sound=12", "adsp=1 adsp_umi=1 adsp_step=11 adsp_return=1"};
+    for (unsigned i = 0; i < sizeof(audio_bad)/sizeof(audio_bad[0]); ++i) {
+        p.cmdline = audio_bad[i]; assert(!umi_bootargs_ok(&p));
+    }
     const char *bad[] = {"gpu=1", "-v gpu=1", "wifi_step=1", "ufs=2",
         "ufs_write=1", "touchscreen=1", "cpufreq=1", "adsp=1", "-vfoo", "cam=5"};
     for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); ++i) {
@@ -111,6 +120,32 @@ int main(void) {
 }
 '''
         cfile, binary = self.work / 'args.c', self.work / 'args'
+        cfile.write_text(harness)
+        subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(cfile), '-o', str(binary)],
+                       check=True, capture_output=True)
+        subprocess.run([str(binary)], check=True, capture_output=True)
+
+    def test_cs35l41_memory_windows(self):
+        source = (ROOT / 'xnu/files/bsd/dev/redwood_speaker.c').read_text()
+        start = source.index('static bool\numi_cs35l41_region(')
+        end = source.index('\n}\n', start) + 3
+        harness = '#include <stdbool.h>\n#include <stdint.h>\n#include <assert.h>\n'
+        harness += source[start:end]
+        harness += r'''
+int main(void) {
+    uint32_t reg;
+    assert(umi_cs35l41_region(0x10, 0, 18960, false, &reg) && reg == 0x03800000);
+    assert(umi_cs35l41_region(0x12, 0, 6132, false, &reg) && reg == 0x02c00000);
+    assert(!umi_cs35l41_region(0xf0, 0x2014, 4, false, &reg));
+    assert(!umi_cs35l41_region(0x10, 0xffffffff, 20, false, &reg));
+    assert(!umi_cs35l41_region(0x11, 0, 4, false, &reg));
+    assert(!umi_cs35l41_region(0x12, 0, 6144, false, &reg));
+    assert(!umi_cs35l41_region(6, 0x1ff4, 8, true, &reg));
+    assert(!umi_cs35l41_region(6, 1, 4, true, &reg));
+    return 0;
+}
+'''
+        cfile, binary = self.work / 'cirrus.c', self.work / 'cirrus'
         cfile.write_text(harness)
         subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(cfile), '-o', str(binary)],
                        check=True, capture_output=True)

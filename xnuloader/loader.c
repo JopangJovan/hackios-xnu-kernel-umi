@@ -2694,8 +2694,9 @@ umi_bootargs_ok(const struct payload_info *pi)
 	static const char *const allowed[] = {
 		"-v", "debug=", "keepsyms=", "serial=", "cpus=", "bootcpu=",
 		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
-		"umi_haptic=", "haptic_effect=", "haptic_gain=",
+		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 	};
+	int adsp_umi = 0, adsp_step = 0, adsp_return = 0, umi_amp_probe = 0, adsp_on = 0, sound = 0;
 	if (PLAT != &platform_umi) return 1;
 	if (pi->forced_base != 0) {
 		print("UMI: forced physical memory windows are disabled\n");
@@ -2712,11 +2713,47 @@ umi_bootargs_ok(const struct payload_info *pi)
 			if (starts_with(c, allowed[i]) &&
 			    (allowed[i][len - 1] == '=' || c + len == end)) ok = 1;
 		}
+		if (starts_with(c, "adsp=")) {
+			if (adsp_on || end - c != 6 || c[5] != '1') ok = 0;
+			adsp_on = 1;
+		} else if (starts_with(c, "sound=")) {
+			if (sound || end - c != 7 || c[6] < '1' || c[6] > '2') ok = 0;
+			sound = 1;
+		} else if (starts_with(c, "adsp_umi=")) {
+			if (adsp_umi || end - c != 10 || c[9] != '1') ok = 0;
+			adsp_umi = 1;
+		} else if (starts_with(c, "adsp_step=")) {
+			uint32_t n = 0;
+			if (adsp_step || end - c <= 10) ok = 0;
+			for (const char *v = c + 10; v < end && ok; v++) {
+				if (*v < '0' || *v > '9' || n > 11) {
+					ok = 0;
+					break;
+				}
+				n = n * 10 + (uint32_t)(*v - '0');
+			}
+			if (n == 0 || n > 11) ok = 0;
+			adsp_step = 1;
+		} else if (starts_with(c, "adsp_return=")) {
+			if (adsp_return || end - c != 13 || c[12] != '1') ok = 0;
+			adsp_return = 1;
+		} else if (starts_with(c, "umi_amp_probe=")) {
+			if (umi_amp_probe || end - c != 15 || c[14] < '1' || c[14] > '5') ok = 0;
+			umi_amp_probe = 1;
+		}
 		if (!ok) {
 			print("UMI: unsupported boot argument at: %s\n", c);
 			return 0;
 		}
 		c = end;
+	}
+	if ((adsp_on && !adsp_umi) || (sound && (!adsp_on || !adsp_umi)) || (adsp_on && adsp_step)) {
+		print("UMI: audio tests require adsp=1 adsp_umi=1, without diagnostic steps\n");
+		return 0;
+	}
+	if (adsp_step && (!adsp_umi || !adsp_return)) {
+		print("UMI: ADSP diagnostics require adsp_umi=1 and adsp_return=1\n");
+		return 0;
 	}
 	return 1;
 }

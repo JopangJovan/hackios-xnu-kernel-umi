@@ -63,7 +63,8 @@
  * before this one is started; one that was shut down without having said it stopped is not
  * started again unless adsp_again=1 (the Wi-Fi DSP reset the phone, twice, when that was tried).
  *
- * More boot-args: adsp_new=K (steps K on have not been seen to work, and wait adsp_pause=MS after
+ * More boot-args: adsp_umi=1 selects the Mi 10's PAS memory range (0x8bb00000, 37 MB; from its
+ * reserved-memory node); adsp_new=K (steps K on have not been seen to work, and wait adsp_pause=MS after
  * each announcement, default 2200: what the loader needs to note the end of the log), adsp_wait=S
  * (how long step 7 watches for "up", default 10), adsp_keep=1, adsp_again=1, adsp_return=1 (back
  * to the loader when the steps are over).
@@ -325,6 +326,7 @@ struct smem_item {
 #define ITEM_SMP2P_OURS         429
 #define ITEM_SMP2P_THEIRS       443
 #define ITEM_CRASH_REASON       423
+#define ITEM_GLINK_OUR_QUEUE    479
 
 static const volatile uint8_t *smem;
 
@@ -961,9 +963,15 @@ step_survey(void)
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+#define REDWOOD_ADSP_MEMORY     0x86700000u     /* Redwood: reserved-memory adsp@86700000 */
+#define REDWOOD_ADSP_SIZE       0x04000000u
+#define UMI_ADSP_MEMORY         0x8bb00000u     /* Mi 10: reserved-memory pil_adsp_region@8bb00000 */
+#define UMI_ADSP_SIZE           0x02500000u
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
+
+/* Selected only by adsp_umi=1; Redwood remains the default profile. */
+static uint32_t adsp_memory = REDWOOD_ADSP_MEMORY;
+static uint32_t adsp_memory_size = REDWOOD_ADSP_SIZE;
 
 
 /*
@@ -992,7 +1000,7 @@ root_file(const char *name, uint64_t *size)
 	VATTR_INIT(&attributes);
 	VATTR_WANTED(&attributes, va_data_size);
 	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size == 0 ||
-	    attributes.va_data_size > ADSP_MEMORY_SIZE) {
+	    attributes.va_data_size > adsp_memory_size) {
 		vnode_put(vnode);
 		return NULL;
 	}
@@ -1057,6 +1065,7 @@ image_file(const char *name, uint64_t *size)
 
 
 #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)
+#define MDT_RELOCATABLE         (1u << 27)
 #define MAX_SEGMENTS            48
 
 struct elf_segment {
@@ -1072,7 +1081,7 @@ static struct {
 		const uint8_t *file;
 	} segment[MAX_SEGMENTS];
 	unsigned segments;
-	uint32_t size;
+	uint32_t size, segment_base;
 } image;
 
 /* The image's files given back, if they were read into memory of ours. */
@@ -1103,8 +1112,10 @@ step_firmware(void)
 {
 	struct elf_segment segment;
 	const uint8_t *header;
-	uint64_t size = 0, files = 0;
-	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
+	uint64_t size = 0, files = 0, highest = 0;
+	uint32_t count, hashes = 0, lowest = ~0u;
+	unsigned loadable = 0;
+	bool relocatable = false;
 
 	announce("find the audio DSP's image in the small image or on the root, and check it against its own header");
 	image_forget();
@@ -1121,8 +1132,10 @@ step_firmware(void)
 		    header[1], header[2], header[3], count, size);
 		goto fail;
 	}
+	/* Qualcomm's relocatable MDTs use segment addresses relative to their lowest segment. PAS
+	 * memory setup relocates that span into the reserved carveout from the device tree. */
 	for (uint32_t i = 0; i < count; i++) {
-		char name[16];
+		uint64_t end;
 
 		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
 		if (MDT_HASH(segment.flags)) {
@@ -1131,46 +1144,72 @@ step_firmware(void)
 		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
 			continue;
 		}
-		if (segment.paddr < ADSP_MEMORY || segment.file_size > segment.memory_size ||
-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)ADSP_MEMORY + ADSP_MEMORY_SIZE) {
-			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
+		if (segment.file_size > segment.memory_size) {
+			printf("adsp: %u: segment %u has %u file bytes but only %u memory bytes\n", step, i, segment.file_size,
 			    segment.memory_size);
 			goto fail;
 		}
-		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
-		image.segment[image.segments].file_size = segment.file_size;
-		image.segment[image.segments].memory_size = segment.memory_size;
-		image.segment[image.segments].file = NULL;
+		relocatable |= (segment.flags & MDT_RELOCATABLE) != 0;
+		end = (uint64_t)segment.paddr + segment.memory_size;
+		if (end > UINT32_MAX) {
+			printf("adsp: %u: segment %u wraps the firmware address space\n", step, i);
+			goto fail;
+		}
+		if (segment.paddr < lowest) {
+			lowest = segment.paddr;
+		}
+		if (end > highest) {
+			highest = end;
+		}
+		loadable++;
+	}
+	image.segment_base = relocatable ? lowest : adsp_memory;
+	if (loadable == 0 || lowest < image.segment_base || highest < image.segment_base ||
+	    highest - image.segment_base > adsp_memory_size ||
+	    ((highest - image.segment_base + 0xfff) & ~0xfffull) > adsp_memory_size) {
+		printf("adsp: %u: the image span %#x..%#llx (%s) does not fit the DSP's %#x-byte carveout at %#x\n", step, lowest,
+		    highest, relocatable ? "relocatable" : "fixed", adsp_memory_size, adsp_memory);
+		goto fail;
+	}
+	image.size = (uint32_t)((highest - image.segment_base + 0xfff) & ~0xfffull);
+	for (uint32_t i = 0; i < count; i++) {
+		char name[16];
+
+		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
+		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
+			continue;
+		}
+		unsigned s = image.segments++;
+		image.segment[s].at = segment.paddr - image.segment_base;
+		image.segment[s].file_size = segment.file_size;
+		image.segment[s].memory_size = segment.memory_size;
+		image.segment[s].file = NULL;
 		if (segment.file_size != 0) {
 			uint64_t file_size = 0;
 
 			snprintf(name, sizeof(name), "adsp.b%02u", i);
-			image.segment[image.segments].file = image_file(name, &file_size);
-			if (image.segment[image.segments].file == NULL) {
+			image.segment[s].file = image_file(name, &file_size);
+			if (image.segment[s].file == NULL) {
 				goto fail;
 			}
 			if (file_size != segment.file_size) {
 				printf("adsp: %u: fw/%s has %llu bytes, the header says %u\n", step, name, file_size, segment.file_size);
-				image.segments++;               /* (for its file to be given back) */
 				goto fail;
 			}
 			files += file_size;
 		}
-		lowest = segment.paddr < lowest ? segment.paddr : lowest;
-		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
-		image.segments++;
 	}
-	if (image.segments == 0 || lowest != ADSP_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
+	if (image.segments != loadable || 52 + 32 * count + (uint64_t)hashes != size) {
 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
 		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
-	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
-	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
-	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
+	printf("adsp: %u: the image is whole (%s, %s MDT): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, "
+	    "span %#x from %#x relocated into the DSP's %#x-byte carveout at %#x\n", step,
+	    from_root ? "from /fw on the root" : "from the small image", relocatable ? "relocatable" : "fixed", size, hashes,
+	    image.segments, files, image.size, image.segment_base, adsp_memory_size, adsp_memory);
 	return true;
 fail:
 	image_forget();
@@ -1417,12 +1456,12 @@ step_header(void)
 	printf("adsp: %u: TRUSTZONE ACCEPTS THE AUDIO DSP'S SIGNATURE FROM THIS KERNEL\n", step);
 
 	announce("tell TrustZone where the image will be");
-	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP, ADSP_MEMORY, image.size, &answer);
+	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP, adsp_memory, image.size, &answer);
 	if (result != 0 || answer != 0) {
 		printf("adsp: %u: TRUSTZONE DOES NOT TAKE THE PLACE: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
 	}
-	printf("adsp: %u: TrustZone takes the place: %#x bytes at %#x\n", step, image.size, ADSP_MEMORY);
+	printf("adsp: %u: TrustZone takes the place: %#x bytes at %#x\n", step, image.size, adsp_memory);
 	return true;
 }
 
@@ -1441,45 +1480,66 @@ segment_word(unsigned s, uint32_t at)
 	return word;
 }
 
+static uint8_t
+segment_byte(unsigned s, uint32_t at)
+{
+	return at < image.segment[s].file_size ? image.segment[s].file[at] : 0;
+}
+
 static bool
 step_image(void)
 {
-	volatile uint64_t *dsp_memory;
+	volatile uint8_t *dsp_memory;
 	uint64_t written = 0, cleared = 0, wrong = 0;
 
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the audio DSP's memory (0x86700000, 64 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
-	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
-	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, ADSP_MEMORY);
+	announce("put the image's segments into the audio DSP's reserved memory, with zeroes where a segment is longer than its "
+	    "file, and read them back");
+	dsp_memory = (volatile uint8_t *)ml_io_map_unmappable(adsp_memory, adsp_memory_size, VM_WIMG_WCOMB);
+	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, adsp_memory);
 	for (unsigned s = 0; s < image.segments; s++) {
-		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
+		uint32_t at = image.segment[s].at, i = 0, size = image.segment[s].memory_size;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
-			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
-			return false;
+		/* Keep exact segment boundaries. Most MDTs are word-aligned, but the UMI image ends
+		 * one read-only segment on a four-byte boundary, before its separate BSS segment. */
+		while (i < size && ((at + i) & 7)) {
+			dsp_memory[at + i] = segment_byte(s, i);
+			i++;
 		}
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
-			to[i / 8] = segment_word(s, i);
+		for (; i + 8 <= size; i += 8) {
+			volatile uint64_t *to = (volatile uint64_t *)(dsp_memory + at + i);
+
+			*to = segment_word(s, i);
+		}
+		for (; i < size; i++) {
+			dsp_memory[at + i] = segment_byte(s, i);
 		}
 		written += image.segment[s].file_size;
 		cleared += image.segment[s].memory_size - image.segment[s].file_size;
 	}
 	settle();
 	for (unsigned s = 0; s < image.segments; s++) {
-		volatile uint64_t *from = dsp_memory + image.segment[s].at / 8;
+		uint32_t at = image.segment[s].at, i = 0, size = image.segment[s].memory_size;
 
-		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
-			wrong += from[i / 8] != segment_word(s, i);
+		while (i < size && ((at + i) & 7)) {
+			wrong += dsp_memory[at + i] != segment_byte(s, i);
+			i++;
+		}
+		for (; i + 8 <= size; i += 8) {
+			volatile uint64_t *from = (volatile uint64_t *)(dsp_memory + at + i);
+
+			wrong += *from != segment_word(s, i);
+		}
+		for (; i < size; i++) {
+			wrong += dsp_memory[at + i] != segment_byte(s, i);
 		}
 	}
-	printf("adsp: %u: %u segments, %llu bytes written and %llu cleared; read back, %llu words of eight bytes differ\n", step,
+	printf("adsp: %u: %u segments, %llu bytes written and %llu cleared; read back, %llu bytes differ\n", step,
 	    image.segments, written, cleared, wrong);
 	settle();
-	ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
+	ml_io_unmap((vm_offset_t)dsp_memory, adsp_memory_size);
 	image_written = wrong == 0;
 	image_forget();                         /* (it is in the DSP's memory now: what was read of the root, given back) */
 	return image_written;
@@ -1491,21 +1551,21 @@ static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
 #define LOCK_OWNER              0x000
 #define LOCK_US                 1u
 
-/* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one (redwood_wifi.c: our_item_make()). */
+/* An item made in the partition, as Linux's qcom_smem_alloc_private() makes one. */
 static bool
-our_item_make(uint32_t partition)
+smem_private_item_make(uint32_t partition, uint32_t item, uint32_t bytes)
 {
 	struct smem_partition header;
 	struct smem_entry entry;
-	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
+	const uint32_t item_size = (bytes + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
 	uint32_t owner = ~0u, at;
 	bool made = false;
 
 	lck_mtx_lock(&redwood_smem_alloc_lock);         /* (the Wi-Fi's start allocates under the same hardware lock) */
 	need(&smem_lock);
 	printf("adsp: %u: about to take the lock (%#x), write an entry for item %u with %u bytes behind it at the partition's mark, "
-	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, ITEM_SMP2P_OURS, item_size, need_bytes);
-	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
+	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, item, item_size, need_bytes);
+	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock for item %u", step, item);
 	for (uint32_t ms = 0; ms <= 1000; ms++) {
 		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
 		owner = rd(smem_lock.base + LOCK_OWNER);
@@ -1525,9 +1585,12 @@ our_item_make(uint32_t partition)
 		goto out;
 	}
 	for (at = sizeof(header); at < header.free_uncached;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
-		    entry.size > header.size) {
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > header.size) {
 			break;
+		}
+		if (entry.item == item) {
+			printf("adsp: %u: item %u appeared while the allocation lock was held: nothing is written\n", step, item);
+			goto out;
 		}
 		at += sizeof(entry) + entry.padding_header + entry.size;
 	}
@@ -1540,9 +1603,9 @@ our_item_make(uint32_t partition)
 		printf("adsp: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need_bytes, header.free_cached - at);
 		goto out;
 	}
-	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
+	smem_poke(partition + at, SMEM_CANARY | item << 16);
 	smem_poke(partition + at + 4, item_size);
-	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));
+	smem_poke(partition + at + 8, item_size - bytes);
 	smem_poke(partition + at + 12, 0);
 	settle();
 	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need_bytes);
@@ -1553,6 +1616,74 @@ out:
 	printf("adsp: %u: the lock is released (it reads %u)\n", step, rd(smem_lock.base + LOCK_OWNER));
 	lck_mtx_unlock(&redwood_smem_alloc_lock);
 	return made;
+}
+
+/* Our SMP2P item and GLINK's 16 KiB host-to-DSP queue are private items in this partition. */
+static bool
+our_item_make(uint32_t partition)
+{
+	return smem_private_item_make(partition, ITEM_SMP2P_OURS, sizeof(struct smp2p));
+}
+
+/* Repair a malformed old entry only when its allocation is exactly the requested size. */
+static bool
+smem_private_item_repair_padding(uint32_t partition, uint32_t item, uint32_t bytes)
+{
+	struct smem_partition header;
+	struct smem_entry entry;
+	const uint32_t item_size = (bytes + 7) & ~7u, expected_padding = item_size - bytes;
+	uint32_t owner = ~0u, at;
+	bool repaired = false;
+
+	lck_mtx_lock(&redwood_smem_alloc_lock);
+	need(&smem_lock);
+	for (uint32_t ms = 0; ms <= 1000; ms++) {
+		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
+		owner = rd(smem_lock.base + LOCK_OWNER);
+		if (owner == LOCK_US) {
+			break;
+		}
+		sleep_ms(1);
+	}
+	if (owner != LOCK_US) {
+		printf("adsp: %u: cannot inspect item %u: shared-memory lock stays with processor %u\n", step, item, owner);
+		goto out;
+	}
+	if (!smem_peek(partition, &header, sizeof(header)) || header.free_uncached > header.free_cached ||
+	    header.free_cached > header.size) {
+		printf("adsp: %u: cannot inspect item %u: the partition's marks make no sense\n", step, item);
+		goto out;
+	}
+	for (at = sizeof(header); at < header.free_uncached;) {
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.size > header.size) {
+			break;
+		}
+		if (entry.item == item) {
+			if (entry.size != item_size || entry.padding_header != 0 || entry.padding_data > entry.size) {
+				printf("adsp: %u: item %u cannot be repaired safely: allocation %u bytes, padding %u/%u\n", step, item,
+				    entry.size, entry.padding_header, entry.padding_data);
+				goto out;
+			}
+			if (entry.padding_data != expected_padding) {
+				printf("adsp: %u: correcting item %u padding from %u to %u bytes; its allocation remains %u bytes\n", step,
+				    item, entry.padding_data, expected_padding, entry.size);
+				smem_poke(partition + at + 8, expected_padding | (uint32_t)entry.padding_header << 16);
+				settle();
+			}
+			repaired = true;
+			break;
+		}
+		at += sizeof(entry) + entry.padding_header + entry.size;
+	}
+	if (!repaired) {
+		printf("adsp: %u: item %u was not found in this private partition to repair\n", step, item);
+	}
+out:
+	if (owner == LOCK_US) {
+		wr(smem_lock.base + LOCK_OWNER, 0);
+	}
+	lck_mtx_unlock(&redwood_smem_alloc_lock);
+	return repaired;
 }
 
 static void glink_reset(void);
@@ -1610,6 +1741,39 @@ step_our_item(void)
 		return false;
 	}
 	show_words("our item reads back", &ours);
+	{
+		uint32_t queue_size = 0, queue = smem_item(ITEM_GLINK_OUR_QUEUE, &queue_size);
+
+		if (queue != 0) {
+			if (queue_size != 0x4000) {
+				printf("adsp: %u: GLINK's host queue (item %u) reads as %u bytes; checking its private allocation\n", step,
+				    ITEM_GLINK_OUR_QUEUE, queue_size);
+				if (!smem_private_item_repair_padding(partition, ITEM_GLINK_OUR_QUEUE, 0x4000)) {
+					return false;
+				}
+				queue = smem_item(ITEM_GLINK_OUR_QUEUE, &queue_size);
+				if (queue == 0 || queue_size != 0x4000) {
+					printf("adsp: %u: GLINK's host queue (item %u) remains the wrong size (%u; expected 16384)\n", step,
+					    ITEM_GLINK_OUR_QUEUE, queue_size);
+					return false;
+				}
+			}
+			printf("adsp: %u: GLINK's host queue (item %u) is already there, at %#lx, %u bytes\n", step,
+			    ITEM_GLINK_OUR_QUEUE, SMEM_PHYS + queue, queue_size);
+		} else {
+			if (!smem_private_item_make(partition, ITEM_GLINK_OUR_QUEUE, 0x4000)) {
+				return false;
+			}
+			queue = smem_item(ITEM_GLINK_OUR_QUEUE, &queue_size);
+			if (queue == 0 || queue_size != 0x4000) {
+				printf("adsp: %u: GLINK's host queue (item %u) did not read back at 16384 bytes\n", step,
+				    ITEM_GLINK_OUR_QUEUE);
+				return false;
+			}
+			printf("adsp: %u: made GLINK's host queue (item %u), at %#lx, %u bytes\n", step,
+			    ITEM_GLINK_OUR_QUEUE, SMEM_PHYS + queue, queue_size);
+		}
+	}
 	glink_reset();
 	return true;
 }
@@ -1763,7 +1927,6 @@ step_start(void)
 /* ---- GLINK (redwood_wifi.c; items 478 to 480 of our partition with the audio DSP) ------------------- */
 
 #define ITEM_GLINK_DESCRIPTOR   478
-#define ITEM_GLINK_OUR_QUEUE    479
 #define ITEM_GLINK_THEIR_QUEUE  480
 #define GLINK_OUR_TAIL          0
 #define GLINK_OUR_HEAD          4
@@ -3195,9 +3358,14 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 void
 redwood_adsp_init(void)
 {
-	uint32_t on = 0;
+	uint32_t on = 0, umi = 0;
 	thread_t thread;
 
+	if (PE_parse_boot_argn("adsp_umi", &umi, sizeof(umi)) && umi != 0) {
+		adsp_memory = UMI_ADSP_MEMORY;
+		adsp_memory_size = UMI_ADSP_SIZE;
+		printf("adsp: Mi 10 profile: PAS memory %#x, %#x bytes (adsp_umi=1)\n", adsp_memory, adsp_memory_size);
+	}
 	PE_parse_boot_argn("adsp_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
 		return;

@@ -1,6 +1,8 @@
 /*
  * The phone's sound, step 3: what the audio DSP's services are told so that the speakers play.
- * Every address and number below belongs to the POCO X5 Pro (redwood), and nothing here happens
+ * The default profile is the POCO X5 Pro (redwood). With adsp_umi=1, sound=1/2 use
+ * UMI's tertiary MI2S port (0x1004), SD1, 16-bit stereo at 48 kHz, without touching its
+ * CS35L41 amplifiers. Nothing here happens
  * unless boot-arg sound=N asks for it, with adsp=1 (redwood_adsp.c), which starts the DSP and
  * calls redwood_sound_dsp_up() once its audio services are up.
  *
@@ -94,6 +96,9 @@ static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up
 
 static uint32_t level, seconds = 3, below = 240, pause_ms = 1000, gain = REDWOOD_GUARD_MAX_GAIN;
 static uint32_t guard_as = UINT32_MAX;  /* boot-arg sound_guard_as=N: the guard reckons the amplifiers at most N under (a test) */
+/* UMI currently supports the port/stream diagnostics only; its Cirrus amps need a separate driver. */
+static bool umi_profile;
+static uint16_t active_port = 0x9000;
 static char last_write[96] = "nothing written";
 
 /* ---- what is said: to the loader's log as well, as it happens ---------------------------------------- */
@@ -209,29 +214,39 @@ static struct block tlmm = { "pin controller", 0x0f100000, 0x100000 };
 #define CFG_8MA                 (3u << 6)
 #define CFG_OUTPUT              (1u << 9)
 
-static const struct {
+struct sound_pin {
 	unsigned pin;
 	const char *name;
 	uint32_t cfg, io;               /* Android's active state */
-} tdm_pins[] = {
+};
+static const struct sound_pin redwood_pins[] = {
 	{ 97, "gpio97 (bit clock)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 100, "gpio100 (frame sync)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 98, "gpio98 (data in)", CFG_MI2S0 | CFG_8MA, 0 },
 	{ 99, "gpio99 (data out)", CFG_MI2S0 | CFG_8MA, 0 },
 };
-#define TDM_PINS                (sizeof(tdm_pins) / sizeof(tdm_pins[0]))
+/* Kona: GPIO133/135 use mux 1; GPIO137 uses mux 3 for mi2s2_data1.
+ * All three are in TLMM WEST (0x0f100000), as in pinctrl-kona.c. */
+static const struct sound_pin umi_pins[] = {
+	{ 133, "gpio133 (MI2S2 bit clock)", (1u << 2) | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 135, "gpio135 (MI2S2 word select)", (1u << 2) | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 137, "gpio137 (MI2S2 SD1)", (3u << 2) | CFG_8MA, 0 },
+};
+static const struct sound_pin *tdm_pins = redwood_pins;
+static unsigned pin_count = sizeof(redwood_pins) / sizeof(redwood_pins[0]);
+#define TDM_PINS 4
 static uint32_t found_cfg[TDM_PINS], found_io[TDM_PINS];
 static bool pins_taken;
 
 static void
 pins_on(void)
 {
-	for (unsigned i = 0; i < TDM_PINS; i++) {
+	for (unsigned i = 0; i < pin_count; i++) {
 		found_cfg[i] = get(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin));
 		found_io[i] = get(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin));
 	}
 	pins_taken = true;
-	for (unsigned i = 0; i < TDM_PINS; i++) {
+	for (unsigned i = 0; i < pin_count; i++) {
 		put(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin), tdm_pins[i].io);
 		put(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin), tdm_pins[i].cfg);
 	}
@@ -243,7 +258,7 @@ pins_off(void)
 	if (!pins_taken) {
 		return;
 	}
-	for (unsigned i = 0; i < TDM_PINS; i++) {
+	for (unsigned i = 0; i < pin_count; i++) {
 		put(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin), found_cfg[i]);
 		put(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin), found_io[i] & 2);
 		get(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin));
@@ -326,6 +341,7 @@ command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const
 #define AFE_PORT_CMD_SET_PARAM_V2               0x000100efu
 #define AFE_SVC_CMD_SET_PARAM                   0x000100f3u
 #define AFE_MODULE_AUDIO_DEV_INTERFACE          0x0001020cu
+#define AFE_PARAM_ID_I2S_CONFIG                 0x0001020du
 #define AFE_PARAM_ID_TDM_CONFIG                 0x0001029du
 #define AFE_MODULE_TDM                          0x0001028au
 #define AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG   0x00010297u
@@ -376,6 +392,13 @@ struct afe_tdm {
 	uint32_t slot_mask;
 } __attribute__((packed));
 
+struct afe_i2s {
+	uint32_t version;
+	uint16_t bits, channel_mode, stereo, ws_source;
+	uint32_t rate;
+	uint16_t data_format, reserved;
+} __attribute__((packed));
+
 struct afe_slot_mapping {
 	uint32_t version;
 	uint16_t channels, bits;
@@ -408,7 +431,7 @@ afe_port_param(const char *what, uint32_t module, uint32_t param, const void *da
 	struct afe_param *p = (struct afe_param *)(packet + 16);
 
 	bzero(packet, sizeof(packet));
-	*(uint16_t *)packet = PORT;
+	*(uint16_t *)packet = active_port;
 	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
 	p->module = module;
 	p->param = param;
@@ -423,6 +446,13 @@ static bool
 afe_clock(bool on)
 {
 	struct afe_clock_set clock = { 1, CLOCK_PRI_TDM_IBIT, RATE * SLOT_BITS * SLOTS, CLOCK_INVERT_COUPLE_NO, 0, on };
+	if (umi_profile) {
+		clock.id = 0x104; /* Q6AFE_LPASS_CLK_ID_TER_MI2S_IBIT */
+		clock.hz = RATE * 16 * 2;
+		clock.attribute = 1; /* COUPLE_NO, without TDM's inversion */
+		return afe_service_param(on ? "UMI tertiary MI2S clock: 1.536 MHz, on" : "UMI tertiary MI2S clock, off",
+		    AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
+	}
 
 	return afe_service_param(on ? "the TDM bit clock (0x200) at 3.072 MHz, on" : "the TDM bit clock, off", AFE_MODULE_CLOCK_SET,
 	           AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
@@ -443,7 +473,24 @@ afe_on(void)
 	};
 	struct afe_slot_mapping mapping = { .version = 1, .channels = 2, .bits = PORT_BITS, .align = 0,
 		                            .offsets = { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
-	uint16_t start[2] = { PORT, 0 };
+	uint16_t start[2] = { active_port, 0 };
+
+	if (umi_profile) {
+		/* Stock UMI: TERT_MI2S_RX, SD1, stereo S16_LE, internal WS, 48 kHz. */
+		struct afe_i2s i2s = { 1, 16, 2, 1, 1, RATE, 0, 0 };
+		announce("UMI tertiary MI2S port 0x1004: stereo 16-bit, SD1, 48 kHz");
+		if (!afe_port_param("UMI I2S configuration", AFE_MODULE_AUDIO_DEV_INTERFACE,
+		    AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s))) {
+			return false;
+		}
+		clock_on = afe_clock(true);
+		if (!clock_on) {
+			return false;
+		}
+		port_on = command("UMI port 0x1004, started", APR_SVC_AFE, 0,
+		    AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+		return port_on;
+	}
 
 	announce("the DSP is asked for the TDM interface's bit clock, the group, the port and its start (AFE)");
 	clock_on = afe_clock(true);
@@ -470,11 +517,11 @@ afe_on(void)
 static void
 afe_off(void)
 {
-	uint16_t stop[2] = { PORT, 0 };
+	uint16_t stop[2] = { active_port, 0 };
 	struct afe_group_enable disable = { GROUP, 0 };
 
 	if (port_on) {
-		command("the port 0x9000, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
+		command(umi_profile ? "UMI port 0x1004, stopped" : "the port 0x9000, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
 		port_on = false;
 	}
 	if (group_on) {
@@ -858,7 +905,7 @@ stream_on(void)
 		uint16_t channels, bits;
 		uint32_t rate;
 		uint8_t map[8];
-	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, PORT, 0xffff, ADM_TOPOLOGY_NONE, 2, ADM_BITS, RATE,
+	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, active_port, 0xffff, ADM_TOPOLOGY_NONE, 2, ADM_BITS, RATE,
 		                           { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
 	struct {
 		uint32_t matrix, sessions;
@@ -888,7 +935,7 @@ stream_on(void)
 	mapped = true;
 	map_handle = answer.words[0];
 	say("sound: our %u KB at %#llx are the DSP's handle %#x\n", BUFFER_BYTES / 1024, buffer_address, map_handle);
-	if (!command("a device path to the port: playback, no processing, 2 channels of 24 bits at 48 kHz", APR_SVC_ADM, PORT,
+	if (!command("a device path to the port: playback, no processing, 2 channels of 24 bits at 48 kHz", APR_SVC_ADM, active_port,
 	    ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &answer)) {
 		return false;
 	}
@@ -1343,7 +1390,9 @@ take_down(void)
 	lck_mtx_lock(&sound_lock);
 	if (running && !taken_down) {
 		taken_down = true;
-		redwood_speaker_stop();
+		if (!umi_profile) {
+			redwood_speaker_stop();
+		}
 		stream_off();
 		afe_off();
 		pins_off();
@@ -1372,7 +1421,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	if (level == 4) {
 		say("sound: level 4: what iOS plays, through the port, a stream and the amplifiers, until the run ends\n");
 	} else {
-		say("sound: level %u: %s, for %u s\n", level, level == 1 ? "the speakers' TDM port" : level == 2 ?
+		say("sound: level %u: %s, for %u s\n", level, level == 1 ? (umi_profile ? "UMI tertiary MI2S port (amps untouched)" : "the speakers' TDM port") : level == 2 ?
 		    "the port and a stream with a test tone, the amplifiers off" :
 		    "the port, a stream with a test tone, and the amplifiers", seconds);
 	}
@@ -1394,16 +1443,17 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		ok = false;
 		redwood_adsp_apr_events(events);
 	}
-	announce("the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
+	announce(umi_profile ? "UMI MI2S2 pins: GPIO133 SCK, GPIO135 WS, GPIO137 SD1" :
+	    "the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
 	pins_on();
 	if (!afe_on()) {
 		goto out;
 	}
 	sleep_ms(20);
-	pin_activity(97, "the bit clock (gpio97)", &changes, &ones);
-	pin_activity(100, "the frame sync (gpio100)", &sync_changes, &sync_ones);
-	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE TDM CLOCK AND FRAME SYNC RUN at the pins" :
-	    "THE PINS DO NOT SHOW A RUNNING TDM CLOCK");
+	pin_activity(umi_profile ? 133 : 97, "the bit clock", &changes, &ones);
+	pin_activity(umi_profile ? 135 : 100, "the frame sync", &sync_changes, &sync_ones);
+	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE AUDIO CLOCK AND FRAME SYNC RUN at the pins" :
+	    "THE PINS DO NOT SHOW A RUNNING AUDIO CLOCK");
 	if (level == 1) {
 		sleep_ms(seconds * 1000);
 		ok = true;
@@ -1478,6 +1528,17 @@ redwood_sound_dsp_up(void)
 
 	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
 		return;
+	}
+	uint32_t umi = 0;
+	umi_profile = PE_parse_boot_argn("adsp_umi", &umi, sizeof(umi)) && umi == 1;
+	if (umi_profile) {
+		if (level > 2) {
+			say("sound: UMI supports sound=1/2 diagnostics only; Cirrus amplifier playback is not implemented yet\n");
+			return;
+		}
+		active_port = 0x1004;
+		tdm_pins = umi_pins;
+		pin_count = sizeof(umi_pins) / sizeof(umi_pins[0]);
 	}
 	if (level > 4) {
 		level = 4;

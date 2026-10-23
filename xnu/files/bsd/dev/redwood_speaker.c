@@ -1197,10 +1197,481 @@ probe_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/*
+ * UMI uses Cirrus CS35L41 amplifiers on QUPv3 SE3 (I2C addresses 0x40 and 0x42),
+ * not Redwood's AW88261 devices on GPIOs 12/13. This boot-arg is a read-only
+ * staged diagnostics. umi_amp_probe=1 reads TLMM without changing pins,
+ * =2 writes back the unchanged GPIO119 config, =3 briefly releases the SE3
+ * pins and checks their levels, and =4 uses the stock CS35L41 reset pulse
+ * before reading IDs. Pins are restored.
+ */
+#define UMI_I2C_SDA             119
+#define UMI_I2C_SCL             120
+#define UMI_AMP_IRQ_RCV         112
+#define UMI_AMP_IRQ_SPK         113
+#define UMI_AMP_RESET           114
+#define UMI_TLMM_NORTH_PHYS     0x0f900000UL /* SM8250 GPIO119/120 are on TLMM NORTH */
+#define UMI_CS35L41_DEVID       0x00000000u
+#define UMI_CS35L41_REVID       0x00000004u
+#define UMI_CS35L41_CHIP_ID     0x00035a40u
+
+static uint32_t umi_saved_cfg[2], umi_saved_io[2];
+static uint32_t umi_amp_probe_level;
+
+static void
+umi_i2c_line(unsigned pin, bool release)
+{
+	/* GPIO function, 2 mA, no internal pull; the SE3 bus has board pull-ups. */
+	wr(GPIO_IO(pin), 0);
+	wr(GPIO_CFG(pin), release ? 0 : CFG_OUTPUT);
+}
+
+static bool
+umi_i2c_level(unsigned pin)
+{
+	return (rd(GPIO_IO(pin)) & 1) != 0;
+}
+
+static bool
+umi_i2c_bus_take(void)
+{
+	unsigned pins[2] = { UMI_I2C_SDA, UMI_I2C_SCL };
+	for (unsigned i = 0; i < 2; i++) {
+		umi_saved_cfg[i] = rd(GPIO_CFG(pins[i]));
+		umi_saved_io[i] = rd(GPIO_IO(pins[i]));
+	}
+	umi_i2c_line(UMI_I2C_SDA, true);
+	umi_i2c_line(UMI_I2C_SCL, true);
+	spin_us(10);
+	if (!umi_i2c_level(UMI_I2C_SDA) || !umi_i2c_level(UMI_I2C_SCL)) {
+		for (unsigned i = 0; i < 2; i++) {
+			wr(GPIO_IO(pins[i]), umi_saved_io[i] & 2);
+			wr(GPIO_CFG(pins[i]), umi_saved_cfg[i]);
+		}
+		return false;
+	}
+	return true;
+}
+
+static void
+umi_i2c_bus_give(void)
+{
+	unsigned pins[2] = { UMI_I2C_SDA, UMI_I2C_SCL };
+	for (unsigned i = 0; i < 2; i++) {
+		wr(GPIO_IO(pins[i]), umi_saved_io[i] & 2);
+		wr(GPIO_CFG(pins[i]), umi_saved_cfg[i]);
+	}
+}
+
+static void
+umi_i2c_start(void)
+{
+	umi_i2c_line(UMI_I2C_SDA, true);
+	umi_i2c_line(UMI_I2C_SCL, true);
+	spin_us(5);
+	umi_i2c_line(UMI_I2C_SDA, false);
+	spin_us(5);
+	umi_i2c_line(UMI_I2C_SCL, false);
+	spin_us(5);
+}
+
+static void
+umi_i2c_stop(void)
+{
+	umi_i2c_line(UMI_I2C_SDA, false);
+	spin_us(5);
+	umi_i2c_line(UMI_I2C_SCL, true);
+	spin_us(5);
+	umi_i2c_line(UMI_I2C_SDA, true);
+	spin_us(5);
+}
+
+static bool
+umi_i2c_bit(bool output)
+{
+	umi_i2c_line(UMI_I2C_SDA, output);
+	spin_us(5);
+	umi_i2c_line(UMI_I2C_SCL, true);
+	for (unsigned waited = 0; !umi_i2c_level(UMI_I2C_SCL) && waited < 100; waited++) {
+		spin_us(5);
+	}
+	spin_us(5);
+	bool input = umi_i2c_level(UMI_I2C_SDA);
+	umi_i2c_line(UMI_I2C_SCL, false);
+	return input;
+}
+
+static bool
+umi_i2c_write_byte(uint8_t byte)
+{
+	for (int bit = 7; bit >= 0; bit--) {
+		umi_i2c_bit((byte >> bit) & 1);
+	}
+	return !umi_i2c_bit(true);
+}
+
+static uint8_t
+umi_i2c_read_byte(bool more)
+{
+	uint8_t byte = 0;
+	for (int bit = 7; bit >= 0; bit--) {
+		byte = (uint8_t)(byte << 1 | umi_i2c_bit(true));
+	}
+	umi_i2c_bit(!more);
+	return byte;
+}
+
+static bool
+umi_cs35l41_read(uint8_t address, uint32_t reg, uint32_t *value)
+{
+	bool ack = false;
+	if (!umi_i2c_bus_take()) {
+		say("umi-audio: SE3 bus is not idle (GPIO119=%u, GPIO120=%u); left untouched\n",
+		    umi_i2c_level(UMI_I2C_SDA), umi_i2c_level(UMI_I2C_SCL));
+		return false;
+	}
+
+	umi_i2c_start();
+	ack = umi_i2c_write_byte((uint8_t)(address << 1));
+	for (int shift = 24; ack && shift >= 0; shift -= 8) {
+		ack = umi_i2c_write_byte((uint8_t)(reg >> shift));
+	}
+	if (ack) {
+		umi_i2c_start();
+		ack = umi_i2c_write_byte((uint8_t)(address << 1 | 1));
+	}
+	if (ack) {
+		*value = (uint32_t)umi_i2c_read_byte(true) << 24;
+		*value |= (uint32_t)umi_i2c_read_byte(true) << 16;
+		*value |= (uint32_t)umi_i2c_read_byte(true) << 8;
+		*value |= umi_i2c_read_byte(false);
+	}
+	umi_i2c_stop();
+	umi_i2c_bus_give();
+	return ack;
+}
+
+/* UMI firmware staging follows Cirrus wmfw.h/wm_adsp.c: HALO v3 packed
+ * memories and WMDR coefficients. Only DSP memory is written in this test;
+ * the core and output stages remain disabled after reset. */
+extern const uint8_t *redwood_image_file(const char *, const char *, uint64_t *, int *);
+
+static uint32_t umi_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static uint32_t umi_be32(const uint8_t *p)
+{
+	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+static bool
+umi_cs35l41_bytes(uint8_t address, uint32_t reg, uint8_t *bytes, uint32_t length, bool write)
+{
+	if (length == 0 || length > 60 || (length & 3) || (reg & 3) || !umi_i2c_bus_take()) {
+		return false;
+	}
+	umi_i2c_start();
+	bool ack = umi_i2c_write_byte(address << 1);
+	for (int shift = 24; ack && shift >= 0; shift -= 8) {
+		ack = umi_i2c_write_byte(reg >> shift);
+	}
+	if (!write && ack) {
+		umi_i2c_start();
+		ack = umi_i2c_write_byte(address << 1 | 1);
+	}
+	for (uint32_t i = 0; ack && i < length; i++) {
+		if (write) {
+			ack = umi_i2c_write_byte(bytes[i]);
+		} else {
+			bytes[i] = umi_i2c_read_byte(i + 1 < length);
+		}
+	}
+	umi_i2c_stop();
+	umi_i2c_bus_give();
+	return ack;
+}
+
+static bool
+umi_cs35l41_write(uint8_t address, uint32_t reg, uint32_t value)
+{
+	uint8_t data[4] = { value >> 24, value >> 16, value >> 8, value };
+	return umi_cs35l41_bytes(address, reg, data, sizeof(data), true);
+}
+
+static bool
+umi_cs35l41_memory(uint8_t address, uint32_t reg, const uint8_t *data, uint32_t length)
+{
+	uint8_t chunk[60], readback[60];
+	for (uint32_t done = 0; done < length;) {
+		uint32_t n = length - done;
+		if (n > sizeof(chunk)) n = sizeof(chunk);
+		memcpy(chunk, data + done, n);
+		if (!umi_cs35l41_bytes(address, reg + done, chunk, n, true) ||
+		    !umi_cs35l41_bytes(address, reg + done, readback, n, false) || memcmp(chunk, readback, n)) {
+			say("umi-audio: amp %#x memory verification failed at %#x\n", address, reg + done);
+			return false;
+		}
+		done += n;
+		/* Give the scheduler a chance between I2C bursts. */
+		wait_ms(1);
+	}
+	return true;
+}
+
+/* Explicit memory windows: no firmware record may address amplifier controls. */
+static bool
+umi_cs35l41_region(uint32_t type, uint32_t offset, uint32_t length, bool coeff, uint32_t *reg)
+{
+	uint32_t base, limit, scale;
+	switch (type) {
+	case 0x10: base = 0x03800000; limit = 0x4fec; scale = 5; break;
+	case 0x11: base = 0x02000000; limit = 0x2ff4; scale = 3; break;
+	case 0x12: base = 0x02c00000; limit = 0x17f4; scale = 3; break;
+	case 5: base = 0x02800000; limit = 0x3ff8; scale = 4; break;
+	case 6: base = 0x03400000; limit = 0x1ff8; scale = 4; break;
+	default: return false;
+	}
+	uint64_t at = (uint64_t)offset * scale;
+	if (type == 0x11 || type == 0x12) at &= ~3ull;
+	if ((type == 0x10 && length % 20) || ((type == 0x11 || type == 0x12) && length % 12)) return false;
+	if (coeff) at = offset; /* WMDR's offset is already in bytes. */
+	if ((at & 3) || (length & 3) || length == 0 || at > limit || length > limit - at) return false;
+	*reg = base + (uint32_t)at;
+	return true;
+}
+
+struct umi_cs_algorithm { uint32_t id, xm, ym; };
+
+static bool
+umi_cs35l41_preload(uint8_t address)
+{
+	uint64_t size = 0, coeff_size = 0;
+	const uint8_t *fw = NULL;
+	for (unsigned retry = 0; retry < 100 && fw == NULL; retry++) {
+		fw = redwood_image_file("fw/cs35l41", "cs35l41-dsp1-spk-prot-revb2.wmfw", &size, NULL);
+		if (fw == NULL) wait_ms(100);
+	}
+	const char *coeff_name = address == 0x42 ? "cs35l41-dsp1-spk-prot-RCV-revb2.bin" :
+	    "cs35l41-dsp1-spk-prot-revb2.bin";
+	const uint8_t *coeff = redwood_image_file("fw/cs35l41", coeff_name, &coeff_size, NULL);
+	if (!fw || size < 40 || size > 128 * 1024 || memcmp(fw, "WMFW", 4) || umi_le32(fw + 4) != 40 ||
+	    fw[10] != 4 || fw[11] != 3 || !coeff || coeff_size < 16 || coeff_size > 64 * 1024 ||
+	    memcmp(coeff, "WMDR", 4) || umi_le32(coeff + 4) != 16 || coeff[11] != 1) {
+		say("umi-audio: amp %#x: missing or unsupported HALO v3 / WMDR v1 firmware\n", address);
+		return false;
+	}
+	/* Validate the entire WMFW before touching the chip. */
+	unsigned regions = 0;
+	for (uint64_t p = 40; p < size;) {
+		if (size - p < 8) return false;
+		uint32_t hdr = umi_le32(fw + p), length = umi_le32(fw + p + 4), reg;
+		uint32_t type = hdr >> 24;
+		if (length > size - p - 8) return false;
+		if (type == 0xf2 || type == 0xfe || type == 0xff) {
+			/* Control descriptions and text, never register writes. */
+		} else if (!umi_cs35l41_region(type, hdr & 0xffffff, length, false, &reg)) {
+			say("umi-audio: invalid firmware memory record type %#x offset %#x length %u\n", type, hdr & 0xffffff, length);
+			return false;
+		} else {
+			regions++;
+		}
+		p += 8 + length;
+	}
+	uint32_t value;
+	if (!regions || !umi_cs35l41_read(address, 0x0001001c, &value) || !(value & 2) ||
+	    !umi_cs35l41_read(address, 0x00010018, &value) || (value & 0x80000000) ||
+	    !umi_cs35l41_read(address, 0x00002014, &value) || (value & 1) ||
+	    !umi_cs35l41_write(address, 0x02bc1000, 0) ||
+	    !umi_cs35l41_read(address, 0x02bc1000, &value) || value != 0) {
+		say("umi-audio: amp %#x: OTP/core/power prerequisites failed\n", address);
+		return false;
+	}
+	say("umi-audio: amp %#x: loading %u HALO memory regions, with full readback; output remains disabled\n", address, regions);
+	for (uint64_t p = 40; p < size;) {
+		uint32_t hdr = umi_le32(fw + p), length = umi_le32(fw + p + 4), reg;
+		if (umi_cs35l41_region(hdr >> 24, hdr & 0xffffff, length, false, &reg)) {
+			if (!umi_cs35l41_memory(address, reg, fw + p + 8, length)) return false;
+			say("umi-audio: amp %#x: verified %u firmware bytes at %#x\n", address, length, reg);
+		}
+		p += 8 + length;
+	}
+	uint8_t header[40];
+	if (!umi_cs35l41_bytes(address, 0x02800000, header, sizeof(header), false)) return false;
+	uint32_t algorithms = umi_be32(header + 36), fw_id = umi_be32(header + 12);
+	if ((umi_be32(header + 4) >> 16) != 3 || algorithms > 16) {
+		say("umi-audio: amp %#x: unexpected HALO algorithm header (block %#x, count %u)\n", address,
+		    umi_be32(header + 4), algorithms);
+		return false;
+	}
+	struct umi_cs_algorithm alg[17];
+	alg[0] = (struct umi_cs_algorithm){ fw_id, umi_be32(header + 20), umi_be32(header + 28) };
+	for (uint32_t i = 0; i < algorithms; i++) {
+		uint8_t entry[24];
+		if (!umi_cs35l41_bytes(address, 0x02800028 + i * 24, entry, sizeof(entry), false)) return false;
+		alg[i + 1] = (struct umi_cs_algorithm){ umi_be32(entry), umi_be32(entry + 8), umi_be32(entry + 16) };
+	}
+	say("umi-audio: amp %#x: HALO firmware %#x version %#x, %u algorithms\n", address, fw_id,
+	    umi_be32(header + 16), algorithms);
+	/* Two passes also validate every coefficient record before any tuning is applied. */
+	for (unsigned pass = 0; pass < 2; pass++) {
+		for (uint64_t p = 16; p < coeff_size;) {
+			if (coeff_size - p < 20) return false;
+			uint32_t offset = coeff[p] | (uint32_t)coeff[p + 1] << 8;
+			uint32_t type = coeff[p + 2] | (uint32_t)coeff[p + 3] << 8;
+			uint32_t id = umi_le32(coeff + p + 4), length = umi_le32(coeff + p + 16), reg = 0;
+			if (length > coeff_size - p - 20) return false;
+			if (type != 0xfe00 && type != 0xff00) {
+				uint32_t a;
+				for (a = 0; a <= algorithms && alg[a].id != id; a++) {}
+				if (a > algorithms) {
+					say("umi-audio: amp %#x: coefficient algorithm %#x missing\n", address, id);
+					return false;
+				}
+				uint32_t base = type == 5 || type == 0x11 ? alg[a].xm : alg[a].ym;
+				uint64_t at = (uint64_t)base * (type == 5 || type == 6 ? 4 : 3);
+				if (type == 0x11 || type == 0x12) at &= ~3ull;
+				at += offset;
+				if (at > UINT32_MAX || !umi_cs35l41_region(type, (uint32_t)at, length, true, &reg)) return false;
+				if (pass) {
+					if (!umi_cs35l41_memory(address, reg, coeff + p + 20, length)) return false;
+					say("umi-audio: amp %#x: verified %u tuning bytes at %#x\n", address, length, reg);
+				}
+			}
+			p = (p + 20 + length + 3) & ~3ull;
+			if (p > coeff_size) return false;
+		}
+	}
+	say("umi-audio: amp %#x: protection firmware and %s verified in DSP memory; core stopped, speaker disabled\n",
+	    address, coeff_name);
+	return true;
+}
+
+static void
+umi_amp_probe_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	static const struct { uint8_t address; const char *name; } amps[] = {
+		{ 0x40, "speaker amp" },
+		{ 0x42, "receiver amp" },
+	};
+	uint32_t devid, revid;
+
+	say("umi-audio: probe stage %u starting; mapping UMI TLMM NORTH at %#llx\n", umi_amp_probe_level,
+	    (uint64_t)UMI_TLMM_NORTH_PHYS);
+	if (tlmm == 0) {
+		tlmm = ml_io_map(UMI_TLMM_NORTH_PHYS, TLMM_SIZE);
+	}
+	if (tlmm == 0) {
+		say("umi-audio: TLMM mapping failed\n");
+		thread_terminate(current_thread());
+		return;
+	}
+	static const unsigned pins[] = {
+		UMI_AMP_IRQ_RCV, UMI_AMP_IRQ_SPK, UMI_AMP_RESET, UMI_I2C_SDA, UMI_I2C_SCL,
+	};
+	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+		unsigned pin = pins[i];
+		say("umi-audio: GPIO%u cfg=%#x io=%#x\n", pin, rd(GPIO_CFG(pin)), rd(GPIO_IO(pin)));
+	}
+	if (umi_amp_probe_level == 1) {
+		say("umi-audio: passive GPIO read complete; no pins changed\n");
+		thread_terminate(current_thread());
+		return;
+	}
+	if (umi_amp_probe_level == 2) {
+		uint32_t before = rd(GPIO_CFG(UMI_I2C_SDA));
+		say("umi-audio: harmless same-value GPIO119 config write, value=%#x\n", before);
+		wr(GPIO_CFG(UMI_I2C_SDA), before);
+		say("umi-audio: GPIO119 config readback=%#x\n", rd(GPIO_CFG(UMI_I2C_SDA)));
+		say("umi-audio: same-value write check complete; no pin state changed\n");
+		thread_terminate(current_thread());
+		return;
+	}
+	if (umi_amp_probe_level == 3) {
+		bool idle = umi_i2c_bus_take();
+		bool sda = umi_i2c_level(UMI_I2C_SDA), scl = umi_i2c_level(UMI_I2C_SCL);
+		if (idle) {
+			say("umi-audio: SE3 lines released high (GPIO119=%u, GPIO120=%u); restoring pins\n", sda, scl);
+			umi_i2c_bus_give();
+		} else {
+			say("umi-audio: SE3 lines stayed low after release (GPIO119=%u, GPIO120=%u); pins restored\n", sda, scl);
+		}
+		say("umi-audio: pin-release check complete; no I2C transaction sent\n");
+		thread_terminate(current_thread());
+		return;
+	}
+	uint32_t reset_cfg = 0, reset_io = 0;
+	if (umi_amp_probe_level >= 4) {
+		reset_cfg = rd(GPIO_CFG(UMI_AMP_RESET));
+		reset_io = rd(GPIO_IO(UMI_AMP_RESET));
+		say("umi-audio: pulsing shared CS35L41 reset GPIO%u low 2 ms, then high; saved cfg=%#x io=%#x\n",
+		    UMI_AMP_RESET, reset_cfg, reset_io);
+		wr(GPIO_IO(UMI_AMP_RESET), 0);
+		wr(GPIO_CFG(UMI_AMP_RESET), CFG_OUTPUT);
+		__asm__ volatile("dmb oshst" ::: "memory");
+		spin_us(2000);
+		wr(GPIO_IO(UMI_AMP_RESET), 2);
+		__asm__ volatile("dmb oshst" ::: "memory");
+		spin_us(10000);
+		say("umi-audio: reset released; GPIO%u cfg=%#x io=%#x\n", UMI_AMP_RESET,
+		    rd(GPIO_CFG(UMI_AMP_RESET)), rd(GPIO_IO(UMI_AMP_RESET)));
+	}
+	say("umi-audio: read-only CS35L41 ID probe on SE3; amplifier registers are not written\n");
+	for (unsigned i = 0; i < sizeof(amps) / sizeof(amps[0]); i++) {
+		if (!umi_cs35l41_read(amps[i].address, UMI_CS35L41_DEVID, &devid)) {
+			say("umi-audio: %s at 0x%02x did not acknowledge the ID read\n", amps[i].name, amps[i].address);
+			continue;
+		}
+		if (!umi_cs35l41_read(amps[i].address, UMI_CS35L41_REVID, &revid)) {
+			say("umi-audio: %s at 0x%02x answered, but the revision read failed (ID %#x)\n",
+			    amps[i].name, amps[i].address, devid);
+			continue;
+		}
+		say("umi-audio: %s at 0x%02x: DEVID=%#x REVID=%#x%s\n", amps[i].name, amps[i].address,
+		    devid, revid, devid == UMI_CS35L41_CHIP_ID ? " (CS35L41 confirmed)" : " (unexpected chip ID)");
+	}
+	if (umi_amp_probe_level == 5) {
+		for (unsigned i = 0; i < sizeof(amps) / sizeof(amps[0]); i++) {
+			if (!umi_cs35l41_read(amps[i].address, UMI_CS35L41_DEVID, &devid) || devid != UMI_CS35L41_CHIP_ID ||
+			    !umi_cs35l41_read(amps[i].address, UMI_CS35L41_REVID, &revid) || revid != 0xb2 ||
+			    !umi_cs35l41_preload(amps[i].address)) {
+				say("umi-audio: amp %#x firmware staging failed; stopping before playback\n", amps[i].address);
+				break;
+			}
+		}
+		/* Clear staged DSP memory and leave reset state as found. */
+		wr(GPIO_IO(UMI_AMP_RESET), 0);
+		spin_us(2000);
+	}
+	say("umi-audio: probe complete; SE3 pins restored\n");
+	if (umi_amp_probe_level >= 4) {
+		wr(GPIO_IO(UMI_AMP_RESET), reset_io & 2);
+		wr(GPIO_CFG(UMI_AMP_RESET), reset_cfg);
+		__asm__ volatile("dmb oshst" ::: "memory");
+		say("umi-audio: reset pin restored to cfg=%#x io=%#x\n", rd(GPIO_CFG(UMI_AMP_RESET)),
+		    rd(GPIO_IO(UMI_AMP_RESET)));
+	}
+	thread_terminate(current_thread());
+}
+
 void
 redwood_speaker_init(void)
 {
 	thread_t thread;
+	uint32_t umi_amp_probe = 0;
+
+	if (PE_parse_boot_argn("umi_amp_probe", &umi_amp_probe, sizeof(umi_amp_probe))) {
+		if (umi_amp_probe >= 1 && umi_amp_probe <= 5) {
+			umi_amp_probe_level = umi_amp_probe;
+		}
+		if (umi_amp_probe_level != 0) {
+			if (kernel_thread_start(umi_amp_probe_thread, NULL, &thread) == KERN_SUCCESS) {
+				thread_deallocate(thread);
+			}
+		}
+		return;
+	}
 
 	if (!PE_parse_boot_argn("speaker_probe", &probe_level, sizeof(probe_level)) || probe_level == 0) {
 		return;
