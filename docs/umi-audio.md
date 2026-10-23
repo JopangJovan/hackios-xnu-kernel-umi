@@ -25,7 +25,7 @@ has no /sbin/launchd and cannot boot iOS.
   boost limits, load the protection DSP and its tuning, then play a one-second
   tone. Initial output is capped at -40 dB digital with a -20 dBFS tone. This
   test uses Xiaomi's fallback calibration (8392), pending per-unit calibration.
-  The audible test still needs physical verification.
+  Physical audibility was confirmed with the repeat test below.
 - `umi_amp_probe=4`: reset and read the amplifier IDs.
 - `umi_amp_probe=5`: reset, validate HALO v3 and WMDR v1 files, copy protection
   firmware and per-amp coefficients into DSP memory, and verify every byte.
@@ -57,8 +57,13 @@ return their logs when the timed run ends.
   The one-second tone returned all 59 buffers with zero errors or underflows.
   Five amplifier status checks reported no fault; both amps acknowledged PAUSE
   before mute, global-power disable, reset, and pin restoration. Listening
-  confirmation is still pending; successful transport does not prove audibility.
+  confirmation was obtained in the repeat test below.
 
-Still required: physical output verification, per-unit saved calibration, and
+- logs/122721-run.log: repeated the same capped one-second tone. All 59
+  buffers returned without errors or underflows, and outputs were muted and
+  reset afterward. The user confirmed hearing the tone. This validates audible
+  speaker output, but does not establish each amplifier separately.
+
+Still required: per-unit saved calibration and
 continuous iOS PCM output integration. Microphone capture requires its own
 WCD938x/codec-DMA/SoundWire path.
