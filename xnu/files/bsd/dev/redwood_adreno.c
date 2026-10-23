@@ -570,6 +570,8 @@ cx_is_on(void)
 	return (rd(gpucc.base + GPUCC_CX_GDSCR) | rd(gpucc.base + GPUCC_CX_HW_CTRL)) & GDSC_POWER_ON;
 }
 
+static bool cx_should_be_stopped;
+
 static void stale_stop(void);
 
 /*
@@ -608,6 +610,7 @@ step_cx_power(void)
 		return false;
 	}
 	put(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
+	cx_should_be_stopped = true;
 	for (int i = 0; i < 500 && !cx_is_on(); i++) {
 		sleep_us(100);
 	}
@@ -3165,7 +3168,7 @@ static void
 gpu_block_stop(void)
 {
 	uint32_t slumber[3] = { 0, 0, 0 };
-	bool power_off = false;
+	bool power_off = cx_should_be_stopped;
 
 	step = 0;
 	newest_step = ~0u;
@@ -3247,6 +3250,9 @@ gpu_block_stop(void)
 		get(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR);
 		get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
 		cx_off = !cx_is_on();
+		if (cx_off) {
+			cx_should_be_stopped = false;
+		}
 	}
 }
 
