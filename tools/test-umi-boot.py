@@ -107,6 +107,7 @@ int main(void) {
     p.cmdline = "adsp=1 adsp_umi=1 sound=4"; assert(umi_bootargs_ok(&p));
     p.cmdline = "gpu=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "gpu=1 metal=1"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "gpu=1 metal=1 fb_scan=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "bootcpu=0 cpus=8 umi_touch=1 umi_keys=1 umi_haptic=5 adsp=1 adsp_umi=1 sound=4 gpu=1 metal=1";
     assert(umi_bootargs_ok(&p));
     const char *audio_bad[] = {"adsp=1 sound=1", "adsp_umi=1 sound=1", "umi_amp_probe=6",
@@ -115,6 +116,7 @@ int main(void) {
         p.cmdline = audio_bad[i]; assert(!umi_bootargs_ok(&p));
     }
     const char *bad[] = {"metal=1", "gpu=1 metal=2", "gpu=1 metal=1 metal=1",
+        "fb_scan=2", "fb_scan=12",
         "gpu=1 adreno=21 adreno_return=1", "wifi_step=1", "ufs=2",
         "ufs_write=1", "touchscreen=1", "cpufreq=1", "adsp=1", "-vfoo", "cam=5"};
     for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); ++i) {

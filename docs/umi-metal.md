@@ -51,6 +51,23 @@ boot-volume entries to their source files and reads all 62,474 system-volume
 entries, including the Metal bundle, audio plug-in and UMI firmware.
 Hardware validation of the newly integrated Metal driver is still required.
 
+## First device boot and tearing
+
+The user confirmed that the integrated build boots and works on UMI. Scrolling
+and app transitions still show horizontal tearing, also present before the Metal
+update. The default profile has no panel scan synchronization enabled.
+
+The opt-in `fb_scan=1` path now selects UMI/Kona's GCC display AHB register
+`0x0010b00c`, DISPCC AHB `0x0af02080`, MDSS GDSC `0x0af03000`, and DSI0
+interface `0x0ae6b800`, from the UMI device tree and Kona clock driver. It checks
+clocks and power before reading the interface, bounds unstable counter reads,
+and rejects implausible timing. When ABL leaves video timing disabled, it logs
+the command-mode TE registers and defers synchronization instead of guessing.
+
+This path compiles and passes the host register-model checks. It remains opt-in
+pending a device capture and a scrolling test. The current iOS session was left
+running at the user's request; the display change has not been loaded on it.
+
 The unfinished Wi-Fi transport is preserved in the named git stash
 `WIP UMI Wi-Fi MHI transport paused for Metal integration`; it is not included
 in this integration. Previous local images and the previous XNU build are kept

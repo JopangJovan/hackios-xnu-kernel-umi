@@ -26,6 +26,7 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <sys/hk_display.h>
 #include <sys/hk_board.h>
 #include <sys/systm.h>
@@ -33,11 +34,11 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 #define GCC_PHYS                hk_board_addr("gcc", 0x00100000UL)
-#define GCC_DISP_AHB_CBCR       0x27004
+#define GCC_DISP_AHB_CBCR       (umi ? 0x0b00c : 0x27004)
 #define DISPCC_PHYS             hk_board_addr("dispcc", 0x0af00000UL)    /* dt: clock-controller@af00000 */
-#define DISPCC_MDSS_CORE_GDSCR  0x1004          /* dt: disp_cc_mdss_core_gdsc */
-#define DISPCC_MDSS_AHB_CBCR    0x1050
-#define INTF1_PHYS              hk_board_addr("intf", 0x0ae36000UL)    /* dt: mdss_dsi0's mdp_intf_base */
+#define DISPCC_MDSS_CORE_GDSCR  (umi ? 0x3000 : 0x1004)
+#define DISPCC_MDSS_AHB_CBCR    (umi ? 0x2080 : 0x1050)
+#define INTF1_PHYS              hk_board_addr("intf", umi ? 0x0ae6b800UL : 0x0ae36000UL)
 #define CBCR_ENABLE             (1u << 0)
 #define CBCR_OFF                (1u << 31)
 #define GDSC_POWER_ON           (1u << 31)
@@ -52,6 +53,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 static vm_offset_t intf, gcc_map, dispcc_map;
 static struct hk_display_scan scan;
+static bool umi;
 
 
 static inline uint32_t
@@ -63,7 +65,9 @@ rd(vm_offset_t base, uint32_t offset)
 static inline void
 wr(vm_offset_t base, uint32_t offset, uint32_t value)
 {
+	__asm__ volatile("dmb oshst" ::: "memory");
 	*(volatile uint32_t *)(base + offset) = value;
+	__asm__ volatile("dsb osh" ::: "memory");
 }
 
 /*
@@ -76,9 +80,12 @@ wr(vm_offset_t base, uint32_t offset, uint32_t value)
 static int
 regs_alive(void)
 {
-	return (rd(gcc_map, GCC_DISP_AHB_CBCR & 0xfffu) & CBCR_ENABLE) &&
-	       (rd(dispcc_map, DISPCC_MDSS_CORE_GDSCR) & GDSC_POWER_ON) &&
-	       !(rd(dispcc_map, DISPCC_MDSS_AHB_CBCR) & CBCR_OFF);
+	uint32_t v = rd(gcc_map, GCC_DISP_AHB_CBCR & 0xfffu);
+	if (v == UINT32_MAX || !(v & CBCR_ENABLE) || (v & CBCR_OFF)) return 0;
+	v = rd(dispcc_map, DISPCC_MDSS_CORE_GDSCR);
+	if (v == UINT32_MAX || !(v & GDSC_POWER_ON)) return 0;
+	v = rd(dispcc_map, DISPCC_MDSS_AHB_CBCR);
+	return v != UINT32_MAX && (v & CBCR_ENABLE) && !(v & CBCR_OFF);
 }
 
 /* one bus clock on (and left on); 1 if it runs */
@@ -86,13 +93,14 @@ static int
 clock_on(vm_offset_t base, uint32_t cbcr, const char *name)
 {
 	uint32_t v = rd(base, cbcr);
+	if (v == UINT32_MAX) return 0;
 
-	if (!(v & CBCR_ENABLE)) {
+	if (!(v & CBCR_ENABLE) || (v & CBCR_OFF)) {
 		wr(base, cbcr, v | CBCR_ENABLE);
 		delay_for_interval(10, NSEC_PER_MSEC);
 		v = rd(base, cbcr);
 	}
-	if (!(v & CBCR_ENABLE)) {
+	if (!(v & CBCR_ENABLE) || (v & CBCR_OFF)) {
 		printf("display: the %s clock does not take (%#x): no scan to go by\n", name, v);
 		return 0;
 	}
@@ -114,10 +122,17 @@ hk_display_line(uint32_t *frame)
 		return 0;
 	}
 	/* the two counters together: a frame that begins between the two reads is read again */
-	do {
+	for (unsigned retry = 0; retry < 8; retry++) {
 		f = rd(intf, INTF_FRAME_COUNT);
 		line = rd(intf, INTF_LINE_COUNT);
-	} while (rd(intf, INTF_FRAME_COUNT) != f);
+		if (rd(intf, INTF_FRAME_COUNT) == f) {
+			if (frame != NULL) *frame = f;
+			return line;
+		}
+	}
+	/* A broken counter must not trap the presenter in an unbounded retry. */
+	intf = 0;
+	scan.ok = 0;
 	if (frame != NULL) {
 		*frame = f;
 	}
@@ -145,6 +160,8 @@ hk_display_wait_lines(uint32_t first, uint32_t last, uint64_t limit_ns)
 	for (;;) {
 		uint32_t line = hk_display_line(NULL);
 		uint64_t ahead_ns;
+
+		if (!scan.ok) return 0;
 
 		if (line >= first && line < last) {
 			return 1;
@@ -193,11 +210,19 @@ hk_display_scan_start(void)
 	if (!PE_parse_boot_argn("fb_scan", &on, sizeof(on)) || on != 1) {
 		return 0;
 	}
+	DTEntry chosen;
+	const void *board;
+	unsigned board_size;
+	umi = SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+	    SecureDTGetProperty(chosen, "hackios-board", &board, &board_size) == kSuccess &&
+	    board_size == 4 && memcmp(board, "umi", 4) == 0;
 	gcc = gcc_map = ml_io_map(GCC_PHYS + (GCC_DISP_AHB_CBCR & ~0xfffu), 0x1000);
-	dispcc = dispcc_map = ml_io_map(DISPCC_PHYS, 0x2000);
+	if (!gcc) return 0;
 	if (!clock_on(gcc, GCC_DISP_AHB_CBCR & 0xfffu, "display clock controller's bus")) {
 		return 0;
 	}
+	dispcc = dispcc_map = ml_io_map(DISPCC_PHYS, umi ? 0x4000 : 0x2000);
+	if (!dispcc) return 0;
 	if (!(rd(dispcc, DISPCC_MDSS_CORE_GDSCR) & GDSC_POWER_ON)) {
 		printf("display: the display block has no power (the firmware did not leave the panel on?): no scan to go by\n");
 		return 0;
@@ -206,6 +231,17 @@ hk_display_scan_start(void)
 		return 0;
 	}
 	intf = ml_io_map(INTF1_PHYS, 0x1000);
+	if (!intf) return 0;
+	printf("display: %s scan registers at %#lx, engine=%#x; GCC AHB=%#x DISPCC AHB=%#x GDSC=%#x\n",
+	    umi ? "UMI/Kona" : "Yupik", (unsigned long)INTF1_PHYS,
+	    rd(intf, INTF_TIMING_ENGINE_EN), rd(gcc, GCC_DISP_AHB_CBCR & 0xfffu),
+	    rd(dispcc, DISPCC_MDSS_AHB_CBCR), rd(dispcc, DISPCC_MDSS_CORE_GDSCR));
+	if (!(rd(intf, INTF_TIMING_ENGINE_EN) & 1)) {
+		printf("display: video timing is off; TE enable=%#x height=%#x initial=%#x count=%#x line=%#x; scan sync deferred\n",
+		    rd(intf, 0x284), rd(intf, 0x28c), rd(intf, 0x294), rd(intf, 0x2ac), rd(intf, 0x2b0));
+		intf = 0;
+		return 0;
+	}
 	hsync = rd(intf, INTF_HSYNC_CTL) >> 16;
 	period = rd(intf, INTF_VSYNC_PERIOD);
 	v0 = rd(intf, INTF_DISPLAY_V_START);
@@ -219,19 +255,28 @@ hk_display_scan_start(void)
 	scan.shown = (v1 - v0 + 1) / hsync;
 	/* the rate the panel is really sent at: the counters 100 ms apart */
 	l0 = hk_display_line(&f0);
+	if (!intf) return 0;
 	t0 = mach_absolute_time();
 	delay_for_interval(100, NSEC_PER_MSEC);
 	l1 = hk_display_line(&f1);
+	if (!intf) return 0;
 	t1 = mach_absolute_time();
 	absolutetime_to_nanoseconds(t1 - t0, &ns);
 	gone = (uint64_t)(f1 - f0) * scan.lines + l1 - l0;
-	if (f1 == f0 || gone == 0 || ns == 0 || scan.lines < scan.shown || scan.shown == 0) {
+	if (f1 == f0 || gone == 0 || ns == 0 || scan.lines < scan.shown || scan.shown == 0 ||
+	    scan.lines > 65535 || scan.shown > 8192 || l0 >= scan.lines || l1 >= scan.lines) {
 		printf("display: the scan counters do not move (frame %u -> %u, line %u -> %u): no scan to go by\n", f0, f1, l0, l1);
 		intf = 0;
 		return 0;
 	}
 	scan.line_ns = ns / gone;
 	scan.frame_ns = scan.line_ns * scan.lines;
+	if (scan.line_ns == 0 || scan.frame_ns < NSEC_PER_SEC / 240 ||
+	    scan.frame_ns > NSEC_PER_SEC / 20) {
+		printf("display: implausible scan period %llu ns; scan sync deferred\n", scan.frame_ns);
+		intf = 0;
+		return 0;
+	}
 	scan.millihz = (uint32_t)(1000000000000ULL / scan.frame_ns);
 	scan.ok = 1;
 	printf("display: the panel's scan: %u lines a frame (%u shown), %u.%03u frames a second, %llu ns a line; "
