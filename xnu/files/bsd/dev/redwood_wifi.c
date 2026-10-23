@@ -3977,11 +3977,11 @@ redwood_wifi_dsp_is_up(void)
 }
 
 /*
- * ath11k asks for files by the names Linux's firmware tree has ("ath11k/WCN6750/hw1.0/board.bin");
- * this phone has what Android's driver loads (fw-wifi/, see userland/build.sh): its board's own
- * data file and regulatory database, which are what the two names below stand for. The others
- * it asks for first and can do without (a container of several boards' data, a table of the
- * firmware's features) are not there.
+ * ath11k asks by its Linux firmware-tree names. Redwood maps board.bin and regdb.bin to the
+ * files for its WCN6750. UMI maps QCA6390's amss.bin, m3.bin, board.bin, and regdb.bin to the
+ * vendor files bundled under fw/qca6390. QCA's board-2.bin is absent; ath11k falls back to
+ * board.bin, which CNSS supplies as bdwlan.elf. This resolves files only; UMI's PCIe/MHI path
+ * still has to start the radio before ath11k can use them.
  */
 const uint8_t *
 redwood_wifi_driver_file(const char *name, uint64_t *size)
