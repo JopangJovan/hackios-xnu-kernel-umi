@@ -37,8 +37,8 @@ has no /sbin/launchd and cannot boot iOS.
   firmware and per-amp coefficients into DSP memory, and verify every byte.
   DSP cores and amplifier outputs stay disabled; reset clears the test afterward.
 
-Continuous playback is now enabled for UMI. Add `adsp=1 adsp_umi=1 sound=4`
-when starting iOS; the normal boot profile does not enable the ADSP by itself.
+The UMI `xl run` defaults now enable `adsp=1 adsp_umi=1 sound=4` alongside
+touch, keys and haptics. Set `XL_CMDLINE` explicitly to override those defaults.
 This output path does not implement microphone capture.
 For live USB logs during tests, use bootcpu=7 cpus=7; eight-core sessions
 return their logs when the timed run ends.

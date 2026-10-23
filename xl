@@ -24,8 +24,8 @@
 #   xl state            where is the phone right now
 #
 # Logs land in logs/. Environment for `run`:
-#   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
-#               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls)
+#   XL_CMDLINE  extra kernel boot-args; Redwood defaults to "-v". UMI defaults to touch, keys,
+#               haptics and protected iOS speaker playback (XL_CMDLINE="" for none)
 #   XL_SECS     seconds after which the kernel returns to the loader on its own (default 8)
 #   XL_SB_DELAY seconds SpringBoard waits before it starts (default 8; see userland/src/inject_sb.c)
 #               Among XL_CMDLINE, for the phone: bootcpu=7 runs the kernel on the biggest core instead of
@@ -145,7 +145,11 @@ run() { # run <oem command> <label>
 		fi
 		# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
 		# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
-		local args=${XL_CMDLINE--v}
+		local default_args=-v
+		if [ "${DEVICE:-redwood}" = umi ]; then
+			default_args='umi_touch=1 umi_keys=1 umi_haptic=5 adsp=1 adsp_umi=1 sound=4'
+		fi
+		local args=${XL_CMDLINE-$default_args}
 		case " $args " in
 		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
 		esac
