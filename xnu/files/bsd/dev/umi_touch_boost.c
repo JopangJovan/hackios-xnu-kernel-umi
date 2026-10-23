@@ -1,11 +1,13 @@
 /* UMI stock always-on boost: PM8150B GPIO5. Only VIN1/output-high
  * are writable, after checking the inherited peripheral and apps ownership.
- * All accesses run on the single UMI touch thread. */
+ * All accesses run on the single UMI touch thread and share the PMIC bus
+ * lock with the button and other SPMI drivers. */
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
 #include <kern/clock.h>
 #include <machine/machine_routines.h>
+#include <sys/redwood_input.h>
 /* Preserve hardware diagnostics in the USB log even in quiet UI boots. */
 extern void redwood_tl(const char *, ...) __printflike(1, 2);
 #define printf redwood_tl
@@ -42,17 +44,21 @@ static int done(vm_offset_t base)
 static int read_reg(unsigned reg, uint8_t *value)
 {
     if (poisoned || (reg != 5 && reg != 0x40 && reg != 0x41 && reg != 0x44 && reg != 0x46)) return EINVAL;
+    redwood_spmi_lock();
     wr(obs, 0, (1u << 27) | (reg << 4));
     int err = done(obs);
     if (!err) *value = rd(obs, 0x18);
+    redwood_spmi_unlock();
     return err;
 }
 static int write_reg(unsigned reg, uint8_t value)
 {
     if (poisoned || !((reg == 0x41 && value == 1) || (reg == 0x44 && value == 0x80))) return EINVAL;
+    redwood_spmi_lock();
     wr(channel, 0x10, value);
     wr(channel, 0, reg << 4);
     int err = done(channel);
+    redwood_spmi_unlock();
     uint8_t actual = 0;
     if (!err) err = read_reg(reg, &actual);
     if (!err && actual != value) { poisoned = true; err = EIO; }
@@ -82,10 +88,13 @@ int umi_touch_boost_enable(void)
     if (!err) err = read_reg(0x46, &enable);
     if (err) return err;
     printf("UMI boost: subtype=%#x mode=%#x vin=%u out=%#x en=%#x apid=%u\n", subtype, mode, vin, output, enable, apid);
-    if (subtype != 0x11 || mode != 1 || vin > 1 || enable != 0x80 || (output != 0 && output != 0x80)) return ENXIO;
-    if (output == 0x80) return vin == 1 ? 0 : ENXIO;
+    /* LV/MV GPIO source 1 is the inherited paired-GPIO source. Select the
+     * same direct output-high configuration used by the working cold boot. */
+    if (subtype != 0x11 || mode != 1 || vin > 1 || enable != 0x80 ||
+        (output != 0 && output != 1 && output != 0x80)) return ENXIO;
     if (vin != 1) err = write_reg(0x41, 1);
-    if (!err) err = write_reg(0x44, 0x80);
+    if (!err && output != 0x80) err = write_reg(0x44, 0x80);
     if (!err) delay(5000);
+    if (!err) printf("UMI boost: VIN1 and direct output-high verified\n");
     return err;
 }

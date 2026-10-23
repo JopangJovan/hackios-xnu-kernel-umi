@@ -4217,7 +4217,8 @@ out:
  * Boot-arg gpu=1: is this the phone, and is its GPU's firmware in the small image? Then the
  * GPU is started and kept for the system to draw with, which is what
  * "adreno=21 adreno_skip=0x1c00 adreno_pause=0 adreno_keep=1" asks for at length: the steps
- * that only look (10 to 12) left out, no pauses, no watch. Anywhere else -- QEMU, whose machine
+ * that only look (10 to 12) left out on Redwood, no pauses, no watch. UMI keeps those steps
+ * for its validated cold-boot SCM/PAS setup. Anywhere else -- QEMU, whose machine
  * has its peripherals elsewhere -- not one register of the above is touched.
  */
 #define QUALCOMM_SOC_BASE       0x00400000ul    /* the peripheral base used by UMI and Redwood */
@@ -4283,7 +4284,8 @@ redwood_adreno_init(void)
 		}
 		by_itself = true;
 		last_step = 21;
-		skip_steps = 1u << 10 | 1u << 11 | 1u << 12;
+		/* UMI cold boots need the validated SCM/PAS setup before step 19's shutdown. */
+		skip_steps = umi_a650 ? 0 : (1u << 10 | 1u << 11 | 1u << 12);
 		pause_ms = 0;
 		watch_seconds = 0;
 		keep = 1;

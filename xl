@@ -159,7 +159,7 @@ run() { # run <oem command> <label>
 		# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
 		local default_args=-v
 		if [ "${DEVICE:-redwood}" = umi ]; then
-			default_args='umi_touch=1 umi_keys=1 umi_haptic=5 adsp=1 adsp_umi=1 sound=4'
+			default_args='umi_touch=1 umi_keys=1 umi_haptic=5 adsp=1 adsp_umi=1 sound=4 gpu=1'
 		fi
 		local args=${XL_CMDLINE-$default_args}
 		case " $args " in
