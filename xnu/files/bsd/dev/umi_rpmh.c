@@ -8,8 +8,8 @@
 #include <machine/machine_routines.h>
 
 /* Preserve hardware diagnostics in the USB log even in quiet UI boots. */
-extern void redwood_tl(const char *, ...) __printflike(1, 2);
-#define printf redwood_tl
+extern void hk_tl(const char *, ...) __printflike(1, 2);
+#define printf hk_tl
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 int umi_rpmh_vreg_enable(const char *res, unsigned mv);
 

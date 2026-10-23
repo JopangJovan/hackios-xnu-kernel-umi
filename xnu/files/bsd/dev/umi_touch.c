@@ -8,11 +8,11 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 
-#include <sys/redwood_input.h>
+#include <sys/hk_input.h>
 #include <pexpert/device_tree.h>
 /* Preserve hardware diagnostics in the USB log even in quiet UI boots. */
-extern void redwood_tl(const char *, ...) __printflike(1, 2);
-#define printf redwood_tl
+extern void hk_tl(const char *, ...) __printflike(1, 2);
+#define printf hk_tl
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
 extern int umi_rpmh_vreg_enable(const char *, unsigned);
@@ -86,12 +86,12 @@ touch_report(uint32_t mask, const int *x, const int *y)
 		uint32_t bit = 1u << id;
 		if (mask & bit) {
 			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
-				redwood_touch_post((st.active & bit) ? REDWOOD_TOUCH_MOVE : REDWOOD_TOUCH_DOWN, id, (uint32_t)x[id] * 65535u / TOUCH_MAX_X, (uint32_t)y[id] * 65535u / TOUCH_MAX_Y);
+				hk_touch_post((st.active & bit) ? HK_TOUCH_MOVE : HK_TOUCH_DOWN, id, (uint32_t)x[id] * 65535u / TOUCH_MAX_X, (uint32_t)y[id] * 65535u / TOUCH_MAX_Y);
 			}
 			st.x[id] = x[id];
 			st.y[id] = y[id];
 		} else if (st.active & bit) {
-			redwood_touch_post(REDWOOD_TOUCH_UP, id, (uint32_t)st.x[id] * 65535u / TOUCH_MAX_X, (uint32_t)st.y[id] * 65535u / TOUCH_MAX_Y);
+			hk_touch_post(HK_TOUCH_UP, id, (uint32_t)st.x[id] * 65535u / TOUCH_MAX_X, (uint32_t)st.y[id] * 65535u / TOUCH_MAX_Y);
 		}
 	}
 	st.active = mask;

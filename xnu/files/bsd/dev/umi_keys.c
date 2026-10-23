@@ -5,7 +5,7 @@
  *
  * PMIC access is read-only: the only MMIO write issues an extended read on
  * the PMIC arbiter's observer channel. The driver's only effects are button
- * records posted to /dev/redwood-touch.
+ * records posted to /dev/hackios-touch.
  */
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
@@ -14,12 +14,12 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
-#include <sys/redwood_input.h>
+#include <sys/hk_input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
-extern void redwood_tl(const char *, ...) __printflike(1, 2);
+extern void hk_tl(const char *, ...) __printflike(1, 2);
 
 #define UMI_ARB_CORE_PA       0x0c440000UL
 #define UMI_ARB_CNFG_PA       0x0c40a000UL
@@ -93,7 +93,7 @@ keys_read(uint16_t apid, uint16_t address, uint8_t *value)
 	uint32_t offset = 0x80u * apid; /* EE 0 observer, one 0x80-byte window per APID */
 	uint64_t deadline, now;
 	clock_interval_to_deadline(2, NSEC_PER_MSEC, &deadline);
-	redwood_spmi_lock();
+	hk_spmi_lock();
 	__asm__ volatile("dmb oshst" ::: "memory");
 	keys_write(arb_observer, offset + OBS_COMMAND,
 	    OBS_READ_LONG | ((uint32_t)(address & 0xffu) << 4));
@@ -104,12 +104,12 @@ keys_read(uint16_t apid, uint16_t address, uint8_t *value)
 			if (okay) {
 				*value = (uint8_t)keys_reg(arb_observer, offset + OBS_DATA0);
 			}
-			redwood_spmi_unlock();
+			hk_spmi_unlock();
 			return okay;
 		}
 		now = mach_absolute_time();
 	} while (now < deadline);
-	redwood_spmi_unlock();
+	hk_spmi_unlock();
 	return false;
 }
 
@@ -126,11 +126,11 @@ static void
 keys_post(unsigned key, bool down)
 {
 	static const uint32_t button[] = {
-	    REDWOOD_BUTTON_LOCK, REDWOOD_BUTTON_VOLUME_UP, REDWOOD_BUTTON_VOLUME_DOWN
+	    HK_BUTTON_LOCK, HK_BUTTON_VOLUME_UP, HK_BUTTON_VOLUME_DOWN
 	};
-	redwood_tl("UMI keys: %s %s\n", key == 0 ? "power" : key == 1 ? "volume-up" : "volume-down",
+	hk_tl("UMI keys: %s %s\n", key == 0 ? "power" : key == 1 ? "volume-up" : "volume-down",
 	    down ? "pressed" : "released");
-	redwood_touch_post(down ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, button[key], 0, 0);
+	hk_touch_post(down ? HK_BUTTON_DOWN : HK_BUTTON_UP, button[key], 0, 0);
 }
 
 static void
@@ -147,7 +147,7 @@ keys_thread(__unused void *arg, __unused wait_result_t result)
 		int current[3] = { !!(pon & 1u), !(gpio & 1u), !!(pon & 2u) };
 		if (!pon_ok || !gpio_ok) {
 			if ((errors++ % 250u) == 0) {
-				redwood_tl("UMI keys: PMIC read error (PON=%d GPIO6=%d)\n", pon_ok, gpio_ok);
+				hk_tl("UMI keys: PMIC read error (PON=%d GPIO6=%d)\n", pon_ok, gpio_ok);
 			}
 		} else {
 			errors = 0;
@@ -189,7 +189,7 @@ umi_keys_init(void)
 	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 	    SecureDTGetProperty(chosen, "hackios-board", &board, &size) != kSuccess ||
 	    size != 4 || memcmp(board, "umi", 4) != 0) {
-		redwood_tl("UMI keys: board mismatch; driver not started\n");
+		hk_tl("UMI keys: board mismatch; driver not started\n");
 		return;
 	}
 	keys_started = true;
@@ -197,13 +197,13 @@ umi_keys_init(void)
 	arb_cnfg = ml_io_map(UMI_ARB_CNFG_PA, 0x1000);
 	arb_observer = ml_io_map(UMI_ARB_OBSERVER_PA, 0x10000);
 	if (!arb_core || !arb_cnfg || !arb_observer) {
-		redwood_tl("UMI keys: PMIC arbiter mapping failed\n");
+		hk_tl("UMI keys: PMIC arbiter mapping failed\n");
 		return;
 	}
 	uint32_t version = keys_reg(arb_core, ARB_VERSION);
 	uint32_t channels = keys_reg(arb_core, ARB_FEATURES) & 0x7ffu;
 	if (version < 0x50000000u || version >= 0x70000000u || channels == 0 || channels > 512) {
-		redwood_tl("UMI keys: unsupported PMIC arbiter version=%#x channels=%u\n", version, channels);
+		hk_tl("UMI keys: unsupported PMIC arbiter version=%#x channels=%u\n", version, channels);
 		return;
 	}
 	pon_apid = keys_find_apid(UMI_PON_PPID, channels);
@@ -215,15 +215,15 @@ umi_keys_init(void)
 	unsigned direction = subtype >= 0x10u && subtype <= 0x13u ? mode & 3u : (mode >> 4) & 7u;
 	if (!mode_ok || !enable_ok || !subtype_ok || subtype < 0x10u || subtype > 0x13u ||
 	    !(enable & 0x80u) || (direction != 0 && direction != 2)) {
-		redwood_tl("UMI keys: GPIO6 is not confirmed enabled as input; volume-up withheld\n");
+		hk_tl("UMI keys: GPIO6 is not confirmed enabled as input; volume-up withheld\n");
 		gpio_apid = UMI_NO_APID;
 	}
-	redwood_tl("UMI keys: arbiter=%#x channels=%u PON-APID=%u GPIO6-APID=%u\n",
+	hk_tl("UMI keys: arbiter=%#x channels=%u PON-APID=%u GPIO6-APID=%u\n",
 	    version, channels, pon_apid, gpio_apid);
 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
 	if (kr == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {
-		redwood_tl("UMI keys: kernel_thread_start failed %d\n", kr);
+		hk_tl("UMI keys: kernel_thread_start failed %d\n", kr);
 	}
 }

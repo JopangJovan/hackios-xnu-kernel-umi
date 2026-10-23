@@ -7,10 +7,10 @@
 #include <sys/errno.h>
 #include <kern/clock.h>
 #include <machine/machine_routines.h>
-#include <sys/redwood_input.h>
+#include <sys/hk_input.h>
 /* Preserve hardware diagnostics in the USB log even in quiet UI boots. */
-extern void redwood_tl(const char *, ...) __printflike(1, 2);
-#define printf redwood_tl
+extern void hk_tl(const char *, ...) __printflike(1, 2);
+#define printf hk_tl
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 int umi_touch_boost_enable(void);
 static vm_offset_t core, cfg, obs, channel;
@@ -44,21 +44,21 @@ static int done(vm_offset_t base)
 static int read_reg(unsigned reg, uint8_t *value)
 {
     if (poisoned || (reg != 5 && reg != 0x40 && reg != 0x41 && reg != 0x44 && reg != 0x46)) return EINVAL;
-    redwood_spmi_lock();
+    hk_spmi_lock();
     wr(obs, 0, (1u << 27) | (reg << 4));
     int err = done(obs);
     if (!err) *value = rd(obs, 0x18);
-    redwood_spmi_unlock();
+    hk_spmi_unlock();
     return err;
 }
 static int write_reg(unsigned reg, uint8_t value)
 {
     if (poisoned || !((reg == 0x41 && value == 1) || (reg == 0x44 && value == 0x80))) return EINVAL;
-    redwood_spmi_lock();
+    hk_spmi_lock();
     wr(channel, 0x10, value);
     wr(channel, 0, reg << 4);
     int err = done(channel);
-    redwood_spmi_unlock();
+    hk_spmi_unlock();
     uint8_t actual = 0;
     if (!err) err = read_reg(reg, &actual);
     if (!err && actual != value) { poisoned = true; err = EIO; }

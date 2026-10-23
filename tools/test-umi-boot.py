@@ -104,13 +104,18 @@ int main(void) {
     p.cmdline = "adsp_umi=1 sound=2 adsp=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "umi_amp_probe=5"; assert(umi_bootargs_ok(&p));
     p.cmdline = "adsp=1 adsp_umi=1 sound=3"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "adsp=1 adsp_umi=1 sound=4"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "gpu=1"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "gpu=1 metal=1"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "bootcpu=0 cpus=8 umi_touch=1 umi_keys=1 umi_haptic=5 adsp=1 adsp_umi=1 sound=4 gpu=1 metal=1";
+    assert(umi_bootargs_ok(&p));
     const char *audio_bad[] = {"adsp=1 sound=1", "adsp_umi=1 sound=1", "umi_amp_probe=6",
-        "adsp=1 adsp_umi=1 sound=4",
         "adsp=1 adsp_umi=1 sound=12", "adsp=1 adsp_umi=1 adsp_step=11 adsp_return=1"};
     for (unsigned i = 0; i < sizeof(audio_bad)/sizeof(audio_bad[0]); ++i) {
         p.cmdline = audio_bad[i]; assert(!umi_bootargs_ok(&p));
     }
-    const char *bad[] = {"gpu=1", "-v gpu=1", "wifi_step=1", "ufs=2",
+    const char *bad[] = {"metal=1", "gpu=1 metal=2", "gpu=1 metal=1 metal=1",
+        "gpu=1 adreno=21 adreno_return=1", "wifi_step=1", "ufs=2",
         "ufs_write=1", "touchscreen=1", "cpufreq=1", "adsp=1", "-vfoo", "cam=5"};
     for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); ++i) {
         p.cmdline = bad[i]; assert(!umi_bootargs_ok(&p));
@@ -128,7 +133,7 @@ int main(void) {
         subprocess.run([str(binary)], check=True, capture_output=True)
 
     def test_cs35l41_memory_windows(self):
-        source = (ROOT / 'xnu/files/bsd/dev/redwood_speaker.c').read_text()
+        source = (ROOT / 'xnu/files/bsd/dev/hk_speaker.c').read_text()
         start = source.index('static bool\numi_cs35l41_region(')
         end = source.index('\n}\n', start) + 3
         harness = '#include <stdbool.h>\n#include <stdint.h>\n#include <assert.h>\n'

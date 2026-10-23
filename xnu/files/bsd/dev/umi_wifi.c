@@ -10,7 +10,7 @@
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-extern void redwood_tl(const char *, ...) __printflike(1, 2);
+extern void hk_tl(const char *, ...) __printflike(1, 2);
 extern void loader_return(void);
 bool umi_wifi_init(void);
 
@@ -60,23 +60,23 @@ umi_wifi_survey(void)
 	vm_offset_t gcc = ml_io_map(0x00100000, 0x80000);
 	vm_offset_t gpio = ml_io_map(0x0f500000, 0x80000);
 	if (!gcc || !gpio) {
-		redwood_tl("UMI Wi-Fi: GCC/TLMM mapping failed\n");
+		hk_tl("UMI Wi-Fi: GCC/TLMM mapping failed\n");
 		return false;
 	}
-	redwood_tl("UMI Wi-Fi: QCA6390 on PCIe0; read-only GCC/TLMM survey\n");
+	hk_tl("UMI Wi-Fi: QCA6390 on PCIe0; read-only GCC/TLMM survey\n");
 	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
-		redwood_tl("UMI Wi-Fi: GCC %s (%#x) = %#x\n", clocks[i].name,
+		hk_tl("UMI Wi-Fi: GCC %s (%#x) = %#x\n", clocks[i].name,
 		    0x00100000 + clocks[i].offset, umi_wifi_read(gcc, clocks[i].offset));
 	}
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
-		redwood_tl("UMI Wi-Fi: GPIO%u %s cfg=%#x io=%#x\n", pins[i].pin, pins[i].name,
+		hk_tl("UMI Wi-Fi: GPIO%u %s cfg=%#x io=%#x\n", pins[i].pin, pins[i].name,
 		    umi_wifi_read(gpio, pins[i].pin * 0x1000),
 		    umi_wifi_read(gpio, pins[i].pin * 0x1000 + 4));
 	}
 	return true;
 }
 
-/* Return true for UMI even when disabled: never enter Redwood's WPSS path. */
+/* Return true for UMI even when disabled: never enter HK's WPSS path. */
 bool
 umi_wifi_init(void)
 {
@@ -87,10 +87,10 @@ umi_wifi_init(void)
 	PE_parse_boot_argn("umi_wifi_step", &step, sizeof(step));
 	PE_parse_boot_argn("umi_wifi_return", &back, sizeof(back));
 	if (step == 1 && back == 1) {
-		redwood_tl("UMI Wi-Fi: survey %s; returning to loader\n", umi_wifi_survey() ? "passed" : "failed");
+		hk_tl("UMI Wi-Fi: survey %s; returning to loader\n", umi_wifi_survey() ? "passed" : "failed");
 		loader_return();
 	} else if (step || (PE_parse_boot_argn("wifi", &enabled, sizeof(enabled)) && enabled)) {
-		redwood_tl("UMI Wi-Fi: QCA6390 requires the UMI PCIe/MHI driver; diagnostic: umi_wifi_step=1 umi_wifi_return=1\n");
+		hk_tl("UMI Wi-Fi: QCA6390 requires the UMI PCIe/MHI driver; diagnostic: umi_wifi_step=1 umi_wifi_return=1\n");
 	}
 	return true;
 }
