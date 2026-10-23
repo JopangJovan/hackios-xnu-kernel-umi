@@ -1,7 +1,9 @@
 /*
- * The GPU of the POCO X5 Pro (redwood), an Adreno 642L, woken step by step up to a picture that
- * it fills and the panel shows. Every address below belongs to this phone, and nothing here is
- * touched unless a boot-arg asks for it.
+ * The GPU of the POCO X5 Pro (Redwood, Adreno 642L/Yupik) or Xiaomi Mi 10 (UMI,
+ * Adreno 650/Kona), woken step by step toward a picture that it fills and the panel shows.
+ * The profile is selected from the matching firmware bundled with the boot image. Every
+ * address below belongs to one of those phones, and nothing here is touched unless a boot-arg
+ * asks for it.
  *
  * Boot-arg gpu=1, on the phone and with the GPU's firmware in the small image: the GPU is
  * started while the system starts and kept for the window server to draw with (the service
@@ -33,16 +35,17 @@
  *              and which firmware images it says it authenticates
  *  12  asks    TrustZone to check the signature of the GPU's "zap shader", the signed image
  *              without which the 3D core stays locked in secure mode: its header goes from the
- *              small image (fw/a660_zap.mdt) into memory of ours that TrustZone is pointed at
+ *              small image (fw/a650_zap.mdt on UMI, fw/a660_zap.mdt on Redwood) into memory
+ *              of ours that TrustZone is pointed at
  *  13  writes  page tables for the memory the GMU's firmware asks for, and the SMMU: a
  *              translation context with those tables, and the GMU's requests sent through it
- *  14  writes  the GMU's firmware (fw/a660_gmu.bin) into its own memory and into that memory
+ *  14  writes  the matching GMU firmware into its own memory and into that memory
  *  15  writes  the GMU's configuration, and lets its processor out of reset: the firmware runs
  *  16  writes  the GMU's connection to RPMh; starts its message queues ("HFI")
  *  17  talks   to the GMU: the tables it needs, and the request to power the 3D core, whose
  *              registers are then read
  *  18  writes  the 3D core's translation context, with its ring and its microcode
- *              (fw/a660_sqe.fw) in it
+ *              (fw/a650_sqe.fw on UMI, fw/a660_sqe.fw on Redwood) in it
  *  19  asks    TrustZone to load the zap shader (and first to give up the one a kernel before
  *              this one may have left; the stop at the end of a run asks for that too)
  *  20  writes  the 3D core's registers; starts its command processor and gives it its first
@@ -53,9 +56,10 @@
  * switched off: nothing of the GPU block outlives the run (its SMMU contexts point into this
  * kernel's memory), and the next one starts from what the phone's own start leaves.
  *
- * The firmware is the phone's own, from /vendor/firmware of its Android. There is no register that holds the chip ID (0x06030500,
- * "qcom,chipid" in the device tree): the fuses of step 2 are all the hardware says about
- * itself, and the GMU's version is a property of its firmware.
+ * The firmware is the phone's own, from /vendor/firmware of its Android. There is no register
+ * that holds the device-tree chip ID (0x06030500 on Redwood, 0x06050002 on UMI): the fuses of
+ * step 2 are all the hardware says about itself, and the GMU's version is a property of its
+ * firmware.
  *
  * More boot-args:
  *   adreno_only=K      step K alone (what steps 6 to 10 need, they check for themselves: within
@@ -83,10 +87,10 @@
  * The system does not go on starting until all of this is over, so that the end of the log is
  * ours; the touch screen driver's start would talk across it (leave touchscreen=1 out).
  *
- * Addresses are from the phone's own device tree ("dt:" below; the nodes qcom,kgsl-3d0@3d00000,
- * qcom,gmu@3d69000, clock-controller@3d90000, qcom,gdsc@3d9106c, kgsl-smmu@3da0000,
- * qfprom@780000), register layouts from Linux, where SC7280 is this SoC: drivers/clk/qcom/
- * {gcc,gpucc}-sc7280.c, gdsc.c, clk-rcg2.c, drivers/gpu/drm/msm/adreno/a6xx_gmu.c with
+ * Addresses are from each phone's own device tree ("dt:" below; the nodes qcom,kgsl-3d0@3d00000,
+ * qcom,gmu@3d6a000, clock-controller@3d90000, qcom,gdsc@3d9106c, kgsl-smmu@3da0000,
+ * qfprom@780000), register layouts from Linux: Yupik/Kona GPUCC and GCC drivers, gdsc.c,
+ * clk-rcg2.c, drivers/gpu/drm/msm/adreno/a6xx_gmu.c with
  * registers/adreno/a6xx{,_gmu}.xml, drivers/iommu/arm/arm-smmu/arm-smmu.h, drivers/soc/qcom/
  * cmd-db.c, drivers/firmware/qcom/qcom_scm{,-smc}.c, drivers/soc/qcom/mdt_loader.c. The phone's
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
@@ -111,6 +115,8 @@ static uint32_t speed_bin;              /* which of the GPUs of this kind the fu
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
+static bool umi_a650;                   /* the UMI is A650/Kona; Redwood is A660/Yupik */
+static bool gpu_profile_known;
 
 /*
  * The kernel's log reaches the loader when a run is over, and a run that ends in a reset
@@ -275,12 +281,12 @@ wait_for(struct block *b, uint32_t offset, uint32_t mask, uint32_t value, uint32
 /* ---- step 1: the clocks from outside, and RPMh's names ------------------------------------------------ */
 
 /*
- * dt: clock-controller@100000 (qcom,yupik-gcc). The GPU's clocks there, by the names the GPU's
+ * dt: clock-controller@100000 (qcom,yupik-gcc on Redwood; qcom,kona-gcc on UMI). The GPU's clocks there, by the names the GPU's
  * nodes give them: gcc_gpu_memnoc_gfx and gcc_gpu_snoc_dvm_gfx (its two bus connections),
  * "axi_clk" = gcc_ddrss_gpu_axi (memory), gcc_gpu_cfg_ahb (the registers of its clock controller);
  * and the two taps of the 600 MHz PLL that its clock controller takes as inputs. None of them is
  * among that node's protected-clocks, the ones the hypervisor keeps to itself. Offsets:
- * gcc-sc7280.c. The touch screen driver uses this controller too.
+ * gcc-yupik.c and gcc-kona.c. The touch screen driver uses this controller too.
  */
 static struct block gcc = { "gcc", 0x00100000, 0x80000 };
 #define GCC_PLL_VOTE            0x52000         /* bit 15: gcc_gpu_gpll0_clk_src (600 MHz), bit 16: ..._div_clk_src (300 MHz) */
@@ -288,6 +294,7 @@ static struct block gcc = { "gcc", 0x00100000, 0x80000 };
 #define GCC_GPU_CFG_AHB_CBCR    0x71004
 #define GCC_GPU_MEMNOC_GFX_CBCR 0x7100c
 #define GCC_GPU_SNOC_DVM_GFX_CBCR 0x71018
+#define GCC_GPU_MISC            0x71028
 #define GCC_DDRSS_GPU_AXI_CBCR  0x71154
 #define CBCR_ENABLE             (1u << 0)       /* a clock's control register: on */
 #define CBCR_OFF                (1u << 31)      /* ... and whether it is in fact off */
@@ -393,6 +400,7 @@ step_outside(void)
 	get(&gcc, "gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR);
 	get(&gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR);
 	get(&gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX_CBCR);
+	get(&gcc, "gpu_misc", GCC_GPU_MISC);
 	get(&gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR);
 
 	announce("look up the GPU's supply rails in the boot loader's list of RPMh resources (memory at 0x80860000)");
@@ -405,10 +413,9 @@ step_outside(void)
 /* ---- step 2: the fuses ------------------------------------------------------------------------------- */
 
 /*
- * dt: qfprom@780000 with gpu_speed_bin@1e9 (two bytes, 8 bits from bit 5) and gpu_gaming_bin@1f5
- * (bit 5). Linux has the same cell 0x4000 further on, in the error-corrected copy of the fuses
- * (sc7280.dtsi: efuse@784000), and that is the copy it reads under this hypervisor on sibling
- * boards; so that one first.
+ * dt: qfprom@780000. Redwood exposes gpu_speed_bin@1e9 and gpu_gaming_bin@1f5; UMI exposes its
+ * corrected three-bit speed bin at @419b. Linux has the Redwood cell 0x4000 further on in the
+ * error-corrected copy of the fuses (efuse@784000), which this hypervisor allows us to read.
  */
 static struct block qfprom = { "qfprom", 0x00780000, 0x7000 };
 #define QFPROM_CORRECTED        0x4000
@@ -435,6 +442,16 @@ step_fuses(void)
 {
 	uint32_t bin, gaming;
 
+	if (umi_a650) {
+		/* UMI's stock DTS exposes the corrected three-bit cell at 0x419b. */
+		announce("read the UMI Adreno 650 speed-bin fuse (qfprom gpu_speed_bin@419b)");
+		bin = get8(&qfprom, "corrected speed bin", 0x419b) >> 5 & 7;
+		speed_bin = bin;
+		printf("adreno: %u: UMI Adreno 650 speed bin %u (three-bit DTS cell)\n", step, bin);
+		get8(&qfprom, "raw speed bin", 0x19b);
+		return true;
+	}
+
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
@@ -455,9 +472,9 @@ step_fuses(void)
 /* ---- step 3: the GPU's clock controller ----------------------------------------------------------------- */
 
 /*
- * dt: clock-controller@3d90000 (qcom,yupik-gpucc), 0x9000 long; offsets: gpucc-sc7280.c. Its
- * registers answer only while gcc_gpu_cfg_ahb runs, which Linux turns on for good when it
- * starts (gcc-sc7280.c, the end of the probe function).
+ * dt: clock-controller@3d90000 (qcom,yupik-gpucc on Redwood; qcom,gpucc-kona on UMI),
+ * 0x9000 long; offsets: gpucc-yupik.c and gpucc-kona.c. Its registers answer only while
+ * gcc_gpu_cfg_ahb runs, which Linux turns on when it starts.
  */
 static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
 #define GPUCC_PLL0_MODE         0x0000          /* the 3D core's PLL: bit 31 locked, bit 0 output on; +4: times 19.2 MHz */
@@ -476,8 +493,15 @@ static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
 #define GPUCC_HUB_RCGR          0x117c          /* gpu_cc_hub_clk_src */
 #define GPUCC_HUB_CX_INT_CBCR   0x1204          /* gpu_cc_hub_cx_int_clk */
 #define GPUCC_CX_HW_CTRL        0x1540          /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
-#define GPUCC_GX_DOMAIN_MISC    0x158c          /* dt: gpu_gx_domain_addr */
+#define GPUCC_GX_DOMAIN_MISC_REDWOOD 0x158c     /* qcom,yupik-gpucc */
+#define GPUCC_GX_DOMAIN_MISC_UMI 0x1508         /* UMI DTS: syscon@3d91508 */
 #define GPUCC_SMMU_VOTE_CBCR    0x5000          /* gpu_cc_hlos1_vote_gpu_smmu_clk: our vote for the SMMU's clock */
+
+static uint32_t
+gpucc_gx_domain_misc(void)
+{
+	return umi_a650 ? GPUCC_GX_DOMAIN_MISC_UMI : GPUCC_GX_DOMAIN_MISC_REDWOOD;
+}
 
 #define GDSC_SW_COLLAPSE        (1u << 0)       /* a power switch's control register (gdsc.c): off, by software */
 #define GDSC_HW_CONTROL         (1u << 1)       /* something else than software operates it */
@@ -499,24 +523,28 @@ step_gpucc(void)
 	get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
 	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
 	get(&gpucc, "gx_sw_reset", GPUCC_GX_SW_RESET);
-	get(&gpucc, "gx_domain_misc", GPUCC_GX_DOMAIN_MISC);
-	get(&gpucc, "pll0 mode", GPUCC_PLL0_MODE);
-	get(&gpucc, "pll0 multiplier", GPUCC_PLL0_MODE + 4);
+	get(&gpucc, "gx_domain_misc", gpucc_gx_domain_misc());
+	if (!umi_a650) {
+		get(&gpucc, "pll0 mode", GPUCC_PLL0_MODE);
+		get(&gpucc, "pll0 multiplier", GPUCC_PLL0_MODE + 4);
+	}
 	get(&gpucc, "pll1 mode", GPUCC_PLL1_MODE);
 	get(&gpucc, "pll1 multiplier", GPUCC_PLL1_MODE + 4);
 	get(&gpucc, "gmu_clk_src command", GPUCC_GMU_RCGR);
 	get(&gpucc, "gmu_clk_src source", GPUCC_GMU_RCGR + 4);
-	get(&gpucc, "hub_clk_src command", GPUCC_HUB_RCGR);
-	get(&gpucc, "hub_clk_src source", GPUCC_HUB_RCGR + 4);
 	get(&gpucc, "cxo_aon", GPUCC_CXO_AON_CBCR);
 	get(&gpucc, "gx_gmu", GPUCC_GX_GMU_CBCR);
 	get(&gpucc, "ahb", GPUCC_AHB_CBCR);
 	get(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR);
 	get(&gpucc, "cxo", GPUCC_CXO_CBCR);
-	get(&gpucc, "cb", GPUCC_CB_CBCR);
-	get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
-	get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
 	get(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR);
+	if (!umi_a650) {
+		get(&gpucc, "hub_clk_src command", GPUCC_HUB_RCGR);
+		get(&gpucc, "hub_clk_src source", GPUCC_HUB_RCGR + 4);
+		get(&gpucc, "cb", GPUCC_CB_CBCR);
+		get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
+		get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
+	}
 	return true;
 }
 
@@ -660,6 +688,10 @@ step_clocks(void)
 		return false;
 	}
 	announce("in the global clock controller: ask for the 300 MHz tap for the GPU; the GPU's bus and memory clocks on");
+	if (umi_a650) {
+		/* gpucc-kona.c performs this during probe before enabling the A650 clocks. */
+		set(&gcc, "gpu_misc", GCC_GPU_MISC, 3);
+	}
 	set(&gcc, "pll votes", GCC_PLL_VOTE, GCC_PLL_VOTE_GPU_DIV);
 	if (!clock_on(&gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR, false) ||
 	    !clock_on(&gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX_CBCR, true) ||
@@ -667,23 +699,26 @@ step_clocks(void)
 		return false;
 	}
 
-	announce("in the GPU's clock controller: the GMU's clock to 200 MHz, the hub's to 150 MHz");
+	announce(umi_a650 ? "in Kona GPUCC: set the GMU clock to the stock 200 MHz rate" :
+	    "in the GPU's clock controller: the GMU's clock to 200 MHz, the hub's to 150 MHz");
 	if (!clock_source("gmu_clk_src", GPUCC_GMU_RCGR, RCG_GPLL0_DIV(3)) ||       /* 300 MHz / 1.5 */
-	    !clock_source("hub_clk_src", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4))) {       /* 300 MHz / 2 */
+	    (!umi_a650 && !clock_source("hub_clk_src", GPUCC_HUB_RCGR, RCG_GPLL0_DIV(4)))) { /* 300 MHz / 2 */
 		return false;
 	}
 
-	announce("in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
-	if (!clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false) ||
+	announce(umi_a650 ? "in Kona GPUCC: enable A650 GMU, AHB, crystal, and SMMU clocks" :
+	    "in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
+	if ((!umi_a650 && !clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false)) ||
 	    !clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) ||
 	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
-	    !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true) ||
-	    !clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true) ||
+	    (!umi_a650 && !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true)) ||
+	    (!umi_a650 && !clock_on(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR, true)) ||
 	    !clock_on(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) ||
 	    !clock_on(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR, false)) {
 		return false;
 	}
-	return measure_clocks();
+	/* Kona does not expose the Yupik GPUCC debug mux used by measure_clocks(). */
+	return umi_a650 ? true : measure_clocks();
 }
 
 /*
@@ -885,7 +920,8 @@ cx_ready(void)
 /* ---- step 6: the first words from the GPU block ------------------------------------------------------- */
 
 /*
- * dt: qcom,gmu "kgsl_gmu_reg" at 0x3d6a000, 0x34000 long. Offsets in a6xx_gmu.xml are in words.
+ * dt: qcom,gmu "kgsl_gmu_reg" at 0x3d6a000 (0x34000 on Redwood, 0x30000 on UMI). Offsets
+ * in a6xx_gmu.xml are in words.
  */
 static struct block gmu = { "gmu", 0x03d6a000, 0x34000 };
 #define GMU_WORD(n)             (4u * (n))
@@ -957,12 +993,15 @@ step_first_words(void)
 		get(&gmu, "dtcm, where firmware has its versions", GMU_DTCM_VERSIONS + 4 * i);
 	}
 
-	announce("read the GPU's bus interface (0x3d0f000) and the CX odds and ends (0x3d9e000)");
+	announce(umi_a650 ? "read the UMI GPU bus interface (0x3d0f000)" :
+	    "read the GPU's bus interface (0x3d0f000) and the CX odds and ends (0x3d9e000)");
 	get(&gbif, "scache_cntl0", GBIF_SCACHE_CNTL0);
 	get(&gbif, "halt", GBIF_HALT);
 	get(&gbif, "halt_ack", GBIF_HALT_ACK);
-	get(&cx_misc, "system_cache_cntl_0", CX_MISC_SYSTEM_CACHE_CNTL_0);
-	get(&cx_misc, "system_cache_cntl_1", CX_MISC_SYSTEM_CACHE_CNTL_1);
+	if (!umi_a650) {
+		get(&cx_misc, "system_cache_cntl_0", CX_MISC_SYSTEM_CACHE_CNTL_0);
+		get(&cx_misc, "system_cache_cntl_1", CX_MISC_SYSTEM_CACHE_CNTL_1);
+	}
 	return true;
 }
 
@@ -1028,9 +1067,11 @@ step_rscc(void)
 /* ---- steps 8 and 9: the SMMU --------------------------------------------------------------------------- */
 
 /*
- * dt: kgsl-smmu@3da0000 (qcom,qsmmu-v500: an Arm MMU-500), 0x20000 long, with "qcom,skip-init":
- * the vendor's driver leaves its stream table as it finds it. Its streams (dt: qcom,kgsl-iommu
- * and qcom,gmu, "iommus"): 0 the GPU, 1 its low-priority twin, 2 secure content, 5 the GMU.
+ * dt: kgsl-smmu@3da0000 (qcom,qsmmu-v500: an Arm MMU-500), 0x20000 long on Redwood and
+ * 0x10000 on UMI, with "qcom,skip-init": the vendor's driver leaves its stream table as it
+ * finds it. Redwood's IDs are 0 (GPU), 1 (low-priority GPU), 2 (secure content), and 5 (GMU).
+ * UMI's iommus cells specify GPU user ID 0/mask 0x401, secure ID 2/mask 0x400, GMU user ID
+ * 4/mask 0x400, and GMU kernel ID 5/mask 0x400. The IDs and masks are not context-bank IDs.
  * The global registers here are the ones the hypervisor imitates; offsets: arm-smmu.h.
  */
 static struct block smmu = { "smmu", 0x03da0000, 0x20000 };
@@ -1097,8 +1138,8 @@ step_smmu(void)
 }
 
 /*
- * Only context 0, the one both the vendor's driver and Linux give the GPU itself: of the others
- * at least one belongs to TrustZone (secure content), and not all can be expected to answer.
+ * Context bank 0 is the GPU address space this driver uses. Of the other contexts at least one
+ * belongs to TrustZone (secure content), and not all can be expected to answer.
  */
 static bool
 step_smmu_context(void)
@@ -1184,7 +1225,7 @@ step_gmu_memory(void)
 
 #define SMMU_S2CR_FAULT         (2u << 16)
 #define SMMU_SMR_VALID          (1u << 31)
-#define SMMU_STREAM_MASK        0x400           /* dt: the second cell of every "iommus" of this SMMU */
+#define SMMU_STREAM_MASK_REDWOOD 0x400          /* Redwood's GPU and GMU stream match mask */
 #define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)       /* our tables alone decide; weakest defaults */
 #define SMMU_CBA2R(n)           (0x800 + 4 * (n))                       /* in the second page, like CBAR */
 #define SMMU_CBA2R_64_BIT       1
@@ -1407,19 +1448,16 @@ space_faulted(const struct gpu_space *space)
 	return true;
 }
 
-/*
- * One more stream through a context that is on. A match is taken only as the device tree has
- * it, a stream and the mask 0x400: one entry for streams 0 and 1 (mask 0x401) reads back 0.
- */
+/* Add a stream ID/mask pair to a context that is already enabled. */
 static bool
-space_stream(struct gpu_space *space, uint32_t match, uint32_t stream)
+space_stream(struct gpu_space *space, uint32_t match, uint32_t stream, uint32_t mask)
 {
 	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
-	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
-	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
+	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | mask << 16 | stream);
+	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | mask << 16 | stream) ||
 	    (get(&smmu, "s2cr", SMMU_S2CR(match)) & 0x300ff) != space->context) {
-		printf("adreno: %u: the SMMU did not take what was written: stream %u is not going through context %u\n", step,
-		    stream, space->context);
+		printf("adreno: %u: the SMMU did not take what was written: stream ID %u/mask %#x is not going through context %u\n",
+		    step, stream, mask, space->context);
 		return false;
 	}
 	return true;
@@ -1427,7 +1465,7 @@ space_stream(struct gpu_space *space, uint32_t match, uint32_t stream)
 
 /* Give a context our tables and send a stream through it; `match` is the entry of the stream table to use. */
 static bool
-space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
+space_on(struct gpu_space *space, uint32_t match, uint32_t stream, uint32_t mask)
 {
 	uint32_t context = smmu_context(space);
 	uint64_t root = space->tables[0].phys | (uint64_t)space->context << 48;        /* tagged with the context's number */
@@ -1456,17 +1494,17 @@ space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
 	}
 	put(&smmu, "cb sctlr", context + SMMU_CB_SCTLR, SMMU_SCTLR_ON | space->control);
 	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
-	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
+	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | mask << 16 | stream);
 
 	/* the global ones are the hypervisor's to grant: see what it made of them */
-	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
+	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | mask << 16 | stream) ||
 	    (get(&smmu, "s2cr", SMMU_S2CR(match)) & 0x300ff) != space->context ||
 	    (get(&smmu, "cbar", smmu_page + SMMU_CBAR(space->context)) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
 	    !(get(&smmu, "cb sctlr", context + SMMU_CB_SCTLR) & 1) ||
 	    get(&smmu, "cb ttbr0, low", context + SMMU_CB_TTBR0) != (uint32_t)root ||
 	    get(&smmu, "cb ttbr0, high", context + SMMU_CB_TTBR0 + 4) != (uint32_t)(root >> 32)) {
-		printf("adreno: %u: the SMMU did not take what was written: stream %u is not going through context %u\n", step,
-		    stream, space->context);
+		printf("adreno: %u: the SMMU did not take what was written: stream ID %u/mask %#x is not going through context %u\n",
+		    step, stream, mask, space->context);
 		return false;
 	}
 	get(&smmu, "cb tcr", context + SMMU_CB_TCR);
@@ -1627,10 +1665,52 @@ image_file(const char *directory, const char *name, uint64_t *size)
 	return NULL;
 }
 
+enum gpu_firmware_kind { GPU_FW_GMU, GPU_FW_SQE, GPU_FW_ZAP_MDT, GPU_FW_ZAP_B02 };
+
+static const char *
+gpu_firmware_name(enum gpu_firmware_kind kind)
+{
+	static const char *const umi[] = { "a650_gmu.bin", "a650_sqe.fw", "a650_zap.mdt", "a650_zap.b02" };
+	static const char *const redwood[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+
+	return umi_a650 ? umi[kind] : redwood[kind];
+}
+
+/* Pick a GPU only from the firmware set bundled with this boot. No profile means no MMIO. */
+static bool
+gpu_profile_select(void)
+{
+	uint64_t size;
+	bool was_quiet = image_asked_quietly;
+
+	if (gpu_profile_known) {
+		return true;
+	}
+	image_asked_quietly = true;
+	if (image_file("fw", "a650_gmu.bin", &size) != NULL) {
+		umi_a650 = true;
+		qfprom.size = 0x5000;               /* stock DTS qfprom@780000 */
+		gmu.size = 0x30000;                 /* stock DTS qcom,gmu@3d6a000 */
+		smmu.size = 0x10000;                 /* stock DTS qcom,kgsl-iommu@3da0000 */
+		gpu_profile_known = true;
+	} else if (image_file("fw", "a660_gmu.bin", &size) != NULL) {
+		umi_a650 = false;
+		gpu_profile_known = true;
+	}
+	image_asked_quietly = was_quiet;
+	if (!gpu_profile_known) {
+		printf("adreno: no supported A650/Kona or A660/Yupik firmware set is present; GPU registers were not touched\n");
+		return false;
+	}
+	printf("adreno: GPU profile: %s\n", umi_a650 ? "UMI Adreno 650 / Kona" : "Redwood Adreno 642L / Yupik");
+	return true;
+}
+
 /*
  * The first of the three calls with which Linux has a zap shader loaded (mdt_loader.c:
  * qcom_mdt_pas_init, qcom_scm.c: qcom_scm_pas_init_image): TrustZone is given the image's header --
- * the ELF header and the block of hashes and certificates, which is all of the file a660_zap.mdt
+ * the ELF header and the block of hashes and certificates, which is all of the matching a650_zap.mdt
+ * (UMI) or a660_zap.mdt (Redwood)
  * -- and checks the signature. Nothing of the GPU is involved, so it can be asked now. The other
  * two (where the image will be, and "authenticate and start") need the 3D core powered.
  *
@@ -1648,7 +1728,7 @@ zap_header(uint64_t *phys)
 	uint64_t size = 0;
 	uint32_t segments, hashes;
 
-	header = image_file("fw", "a660_zap.mdt", &size);
+	header = image_file("fw", gpu_firmware_name(GPU_FW_ZAP_MDT), &size);
 	if (header == NULL) {
 		return false;
 	}
@@ -1682,7 +1762,7 @@ step_zap_signature(void)
 	uint64_t header = 0, answer = ~0ull;
 	int32_t result;
 
-	announce("find the zap shader's header, fw/a660_zap.mdt, in the small image that came with the kernel");
+	announce("find the zap shader's header in the small image that came with the kernel");
 	if (!zap_header(&header)) {
 		return false;
 	}
@@ -1714,7 +1794,9 @@ step_zap_signature(void)
 #define GMU_LOG_ADDRESS         0x60002000u     /* after the two pages the firmware asks for at 0x60000000 */
 #define GMU_LOG_SIZE            0x4000u
 #define GMU_HFI_ADDRESS         0x60006000u
-#define GMU_STREAM              5
+#define GMU_STREAM_REDWOOD      5
+#define GMU_STREAM_UMI          4               /* dt: gmu_user iommus = <SMMU 4 0x400> */
+#define GMU_STREAM_MASK_UMI     0x400
 #define GMU_MATCH               1               /* entry of the stream table; 0 is kept for the 3D core */
 
 struct gmu_firmware_block {
@@ -1723,6 +1805,8 @@ struct gmu_firmware_block {
 #define GMU_FIRMWARE_NEEDS      1               /* types of blocks without data: memory wanted, value = bytes */
 #define GMU_FIRMWARE_NEEDS_KEPT 7
 
+/* Context bank 1 is our GMU user address space, separate from the GPU's bank 0.
+ * UMI's iommus specifier 4/0x400 is a stream ID/mask pair, not a context number. */
 static struct gpu_space gmu_space = { .name = "the GMU", .context = 1 };
 static struct gpu_block gmu_blocks[12], gmu_log, gmu_hfi;
 static unsigned gmu_block_count;
@@ -1743,8 +1827,8 @@ step_gmu_space(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("find the GMU's firmware, fw/a660_gmu.bin, in the small image, and make the memory it asks for");
-	gmu_firmware = image_file("fw", "a660_gmu.bin", &gmu_firmware_size);
+	announce("find this GPU's GMU firmware in the small image, and make the memory it asks for");
+	gmu_firmware = image_file("fw", gpu_firmware_name(GPU_FW_GMU), &gmu_firmware_size);
 	if (gmu_firmware == NULL) {
 		return false;
 	}
@@ -1773,13 +1857,15 @@ step_gmu_space(void)
 		return false;
 	}
 
-	announce("give the SMMU's context 1 these tables and send the GMU's requests (stream 5) through it: the first "
+	announce(umi_a650 ? "give the GMU user address space its tables and route stream ID 4/mask 0x400 through it" :
+	    "give the SMMU's context 1 these tables and send the GMU's requests (stream 5) through it: the first "
 	    "writes to the SMMU, the global ones (cbar, cba2r, s2cr, smr) through the hypervisor");
 	if (!smmu_layout()) {
 		return false;
 	}
 	gmu_space_is_on = true;         /* whatever of it has been written by the time something fails is taken back */
-	return space_on(&gmu_space, GMU_MATCH, GMU_STREAM);
+	return space_on(&gmu_space, GMU_MATCH, umi_a650 ? GMU_STREAM_UMI : GMU_STREAM_REDWOOD,
+	    umi_a650 ? GMU_STREAM_MASK_UMI : SMMU_STREAM_MASK_REDWOOD);
 }
 
 /* ---- step 14: the GMU's firmware ----------------------------------------------------------------------- */
@@ -1875,7 +1961,14 @@ step_gmu_firmware(void)
 #define GMU_RSCC_CONTROL_REQ    GMU_WORD(0x9307)
 #define GMU_AO_AHB_FENCE_CTRL   GMU_WORD(0x9310)
 #define GMU_AHB_FENCE_RANGE_0   GMU_WORD(0x9311)
-#define GMU_CHIP                0x06035000      /* dt qcom,chipid 0x06030500 the way the firmware wants it */
+#define GMU_CHIP_REDWOOD        0x06035000      /* qcom,chipid 0x06030500 in the GMU's format */
+#define GMU_CHIP_UMI            0x06050200      /* qcom,chipid 0x06050002 decoded as core/major/minor/patch */
+
+static uint32_t
+gmu_chip_id(void)
+{
+	return umi_a650 ? GMU_CHIP_UMI : GMU_CHIP_REDWOOD;
+}
 #define GMU_STARTED_MASK        0x1ff           /* of fw_init_result, for firmware newer than core 0x20010004 */
 #define GMU_STARTED             0x100
 #define GMU_FAILED              0xe00
@@ -1957,7 +2050,7 @@ step_gmu_start(void)
 	put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
 	put(&gbif, "halt", GBIF_HALT, 0);
 	put(&gmu, "pwr_col_cp_resp", GMU_PWR_COL_CP_RESP, 0);
-	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, GMU_CHIP);
+	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, gmu_chip_id());
 	put(&gmu, "pwr_col_cp_msg", GMU_PWR_COL_CP_MSG, GMU_LOG_ADDRESS | (GMU_LOG_SIZE / 4096 - 1));
 	put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
 	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
@@ -2180,9 +2273,11 @@ gmu_post_mortem(void)
 	rscc_show();
 	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
 	get(&gpucc, "gx_sw_reset", GPUCC_GX_SW_RESET);
-	get(&gpucc, "gx_domain_misc", GPUCC_GX_DOMAIN_MISC);
-	get(&gpucc, "pll0 mode", GPUCC_PLL0_MODE);
-	get(&gpucc, "pll0 multiplier", GPUCC_PLL0_MODE + 4);
+	get(&gpucc, "gx_domain_misc", gpucc_gx_domain_misc());
+	if (!umi_a650) {
+		get(&gpucc, "pll0 mode", GPUCC_PLL0_MODE);
+		get(&gpucc, "pll0 multiplier", GPUCC_PLL0_MODE + 4);
+	}
 	get(&gpucc, "pll1 mode", GPUCC_PLL1_MODE);
 	get(&gpucc, "pll1 multiplier", GPUCC_PLL1_MODE + 4);
 	get(&gmu, "rpmh_power_state", GMU_RPMH_POWER_STATE);
@@ -2274,7 +2369,8 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 /*
  * What the vendor's driver sends at this point (a6xx_hfi_start; Linux the same with fewer
  * levels): the table of speeds of the 3D core with the supply level each needs -- the phone's
- * three lowest (dt: qcom,gpu-pwrlevels: 315, 450, 550 MHz at "levels" 64, 128, 192) -- and of the
+ * three lowest (UMI: 305, 400, 441.6 MHz at levels 64, 128, 144; Redwood: 315, 450, 550 MHz at
+ * levels 64, 128, 192) -- and of the
  * GMU itself; the table of bus bandwidth votes, of which Linux gets by with the one for "off"
  * (a6xx_hfi.c: adreno_7c3_build_bw_table); "start"; and the speed wanted now. Then the request
  * to keep the 3D core powered while we use it (a6xx_gmu_oob_set), and its registers can be read.
@@ -2282,9 +2378,12 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 static bool
 step_core_power(void)
 {
-	static const struct {
-		uint32_t khz, level;
-	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	struct adreno_speed { uint32_t khz, level; };
+	static const struct adreno_speed redwood_speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	static const struct adreno_speed umi_speeds[] = { { 0, 0 }, { 305000, 64 }, { 400000, 128 }, { 441600, 144 } };
+	const struct adreno_speed *speeds = umi_a650 ? umi_speeds : redwood_speeds;
+	uint32_t speed_count = umi_a650 ? (uint32_t)(sizeof(umi_speeds) / sizeof(umi_speeds[0])) :
+	    (uint32_t)(sizeof(redwood_speeds) / sizeof(redwood_speeds[0]));
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
 	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
@@ -2294,12 +2393,16 @@ step_core_power(void)
 	if (!cx_ready() || !gmu_talks) {
 		return false;
 	}
+	if (umi_a650) {
+		/* Begin at the stock minimum; the panel and window server can raise it later. */
+		vote[2] = 1;
+	}
 	if (!rpmh_resource("gfx.lvl", gfx, &gfx_levels) || !rpmh_resource("cx.lvl", cx, &cx_levels) ||
 	    !rpmh_resource("mx.lvl", mx, &mx_levels)) {
 		printf("adreno: %u: RPMh's list lacks one of the rails\n", step);
 		return false;
 	}
-	perf.gpu_levels = sizeof(speeds) / sizeof(speeds[0]);
+	perf.gpu_levels = speed_count;
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
 		perf.gpu[i].khz = speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
@@ -2338,6 +2441,9 @@ step_core_power(void)
 	if (PE_parse_boot_argn("adreno_speed", &speed, sizeof(speed)) && speed >= 1 && speed < perf.gpu_levels) {
 		vote[2] = speed;
 	}
+	if (vote[2] >= perf.gpu_levels) {
+		vote[2] = 1;
+	}
 	core_khz = speeds[vote[2]].khz;
 	printf("adreno: %u: the speed wanted: %u MHz\n", step, core_khz / 1000);
 	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted; "
@@ -2371,8 +2477,12 @@ step_core_power(void)
 	if (!hfi_send("\"start\"", HFI_START, start, 1)) {
 		return false;
 	}
-	printf("adreno: %u: measured: the 3D core's clock runs at %u Hz (%u MHz was asked for), the GMU's in it at %u Hz\n", step,
-	    measure_quietly(GPUCC_DEBUG_GX_GFX3D), core_khz / 1000, measure_quietly(GPUCC_DEBUG_GX_GMU));
+	if (umi_a650) {
+		printf("adreno: %u: UMI Kona has no Yupik GPUCC debug mux; the GMU granted %u MHz\n", step, core_khz / 1000);
+	} else {
+		printf("adreno: %u: measured: the 3D core's clock runs at %u Hz (%u MHz was asked for), the GMU's in it at %u Hz\n",
+		    step, measure_quietly(GPUCC_DEBUG_GX_GFX3D), core_khz / 1000, measure_quietly(GPUCC_DEBUG_GX_GMU));
+	}
 
 	announce("read registers of the 3D core itself (0x3d00000): the first time it has power");
 	get(&gpu, "rbbm_status", RBBM_STATUS);
@@ -2387,14 +2497,16 @@ step_core_power(void)
 
 /*
  * The 3D core takes its orders as words in a ring of memory, which a small processor inside it
- * ("SQE", with microcode of its own: a660_sqe.fw) reads up to where a register says we have
- * written. Like the GMU it reaches memory through the SMMU: stream 0, to which this gives
- * context 0, with tables of ours that hold the ring, the microcode and later what is drawn into.
+ * ("SQE", with microcode of its own) reads up to where a register says we have written. Like
+ * the GMU it reaches memory through the SMMU: this gives its UMI or Redwood stream match a
+ * context with tables of ours that hold the ring, the microcode and later what is drawn into.
  * What is written to the core's registers before its processor is started, and in what order,
  * is Linux's a6xx_gpu.c hw_init for this GPU, less what only matters once it draws (clock gating,
  * the protection of registers against user programs' commands, counters).
  */
-#define CORE_STREAM             0
+#define CORE_STREAM_REDWOOD     0
+#define CORE_STREAM_UMI         0               /* dt: gfx3d_user iommus = <SMMU 0 0x401> */
+#define CORE_STREAM_MASK_UMI    0x401
 #define CORE_MATCH              0
 #define PTE_CORE                (PTE_GMU | PTE_UNPRIVILEGED)
 #define PTE_READ_ONLY           (1ull << 7)     /* Linux gives the core its microcode so (MSM_BO_GPU_READONLY) */
@@ -2557,14 +2669,19 @@ step_core_space(void)
 {
 	const uint8_t *microcode;
 	uint64_t size = 0;
-	uint32_t stream1 = 1;
+	uint32_t stream1 = umi_a650 ? 0 : 1;
 
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
 	PE_parse_boot_argn("adreno_stream1", &stream1, sizeof(stream1));
-	announce("make the 3D core's memory: its ring, its microcode (fw/a660_sqe.fw), a page to try writing to");
-	microcode = image_file("fw", "a660_sqe.fw", &size);
+	if (umi_a650 && stream1 != 0) {
+		printf("adreno: %u: UMI secondary-stream probing is disabled; GPU user stream is ID 0/mask 0x401\n",
+		    step);
+		return false;
+	}
+	announce("make the 3D core's memory: its ring, its SQE microcode, and a page to try writing to");
+	microcode = image_file("fw", gpu_firmware_name(GPU_FW_SQE), &size);
 	if (microcode == NULL || size < 8 || size > 0x40000 ||
 	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
 	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
@@ -2576,7 +2693,8 @@ step_core_space(void)
 
 	announce("give the SMMU's context 0 these tables and send the 3D core's requests (stream 0) through it");
 	core_space_is_on = true;
-	if (!space_on(&core_space, CORE_MATCH, CORE_STREAM)) {
+	if (!space_on(&core_space, CORE_MATCH, umi_a650 ? CORE_STREAM_UMI : CORE_STREAM_REDWOOD,
+	    umi_a650 ? CORE_STREAM_MASK_UMI : SMMU_STREAM_MASK_REDWOOD)) {
 		return false;
 	}
 	if (stream1 == 2) {
@@ -2584,12 +2702,12 @@ step_core_space(void)
 			return false;
 		}
 		second_space_is_on = true;
-		if (!space_on(&second_space, SECOND_MATCH, 1)) {
+		if (!space_on(&second_space, SECOND_MATCH, 1, SMMU_STREAM_MASK_REDWOOD)) {
 			return false;
 		}
 	} else if (stream1 == 1) {
 		second_stream_is_on = true;
-		if (!space_stream(&core_space, SECOND_MATCH, 1)) {
+		if (!space_stream(&core_space, SECOND_MATCH, 1, SMMU_STREAM_MASK_REDWOOD)) {
 			return false;
 		}
 	}
@@ -2603,8 +2721,8 @@ step_core_space(void)
  * The rest of what Linux does with the zap shader (mdt_loader.c: qcom_mdt_pas_init,
  * qcom_mdt_load; adreno_gpu.c: zap_shader_load_mdt): after the header (step 12), TrustZone is
  * told where the image will be -- the two pages the device tree reserves for it
- * (reserved-memory gpu_micro_code@8b71a000, the zap-shader node's memory-region) --, the image's
- * one segment (the file a660_zap.b02, relocatable: at the start of that memory) is put there,
+ * (Redwood 0x8b71a000, UMI pil_gpu_region@8681a000) --, the image's one segment (a650_zap.b02
+ * on UMI, a660_zap.b02 on Redwood, relocatable: at the start of that memory) is put there,
  * and TrustZone is asked to authenticate it and run it. The vendor's driver does this before it
  * starts the 3D core's command processor (a6xx_rb_start: a6xx_microcode_load), Linux after;
  * this phone's own order is kept. Once that is done the memory is TrustZone's, and nothing
@@ -2620,10 +2738,17 @@ step_core_space(void)
  * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
  * boot-arg adreno_zap=0 for the second and later runs of a started phone; nothing reads it now.
  */
-#define ZAP_MEMORY              0x8b71a000ull
+#define ZAP_MEMORY_REDWOOD      0x8b71a000ull
+#define ZAP_MEMORY_UMI          0x8681a000ull       /* UMI DTS pil_gpu_region@8681a000 */
 #define ZAP_MEMORY_SIZE         0x2000u
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
+
+static uint64_t
+zap_memory_phys(void)
+{
+	return umi_a650 ? ZAP_MEMORY_UMI : ZAP_MEMORY_REDWOOD;
+}
 
 /* TrustZone is to give the zap shader up, and its memory with it. */
 static bool
@@ -2640,7 +2765,7 @@ step_zap_load(void)
 {
 	const uint8_t *segment;
 	volatile uint8_t *memory;
-	uint64_t size = 0, header = 0, answer = ~0ull;
+	uint64_t size = 0, header = 0, answer = ~0ull, zap_phys = zap_memory_phys();
 
 	if (!cx_ready() || !core_is_on) {
 		return false;
@@ -2648,7 +2773,7 @@ step_zap_load(void)
 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
 	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
-	segment = image_file("fw", "a660_zap.b02", &size);
+	segment = image_file("fw", gpu_firmware_name(GPU_FW_ZAP_B02), &size);
 	if (segment == NULL || size == 0 || size > 0x1000) {
 		return false;
 	}
@@ -2664,7 +2789,7 @@ step_zap_load(void)
 		zap_is_loaded = true;
 		return true;
 	}
-	if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY, 0x1000,
+	if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, zap_phys, 0x1000,
 	    &answer) != 0 || answer != 0) {
 		printf("adreno: %u: TrustZone does not take the place (%#llx): TAKEN TO MEAN THAT IT KEEPS A ZAP SHADER FROM "
 		    "BEFORE, which is used as it is\n", step, answer);
@@ -2672,11 +2797,11 @@ step_zap_load(void)
 		return true;
 	}
 	/* (the memory is looked at only now: TrustZone has just said that it is not its own) */
-	memory = (volatile uint8_t *)ml_io_map_wcomb(ZAP_MEMORY, ZAP_MEMORY_SIZE);
+	memory = (volatile uint8_t *)ml_io_map_wcomb(zap_phys, ZAP_MEMORY_SIZE);
 	printf("adreno: %u: the reserved memory begins %02x %02x %02x %02x, the zap shader %02x %02x %02x %02x\n", step,
 	    memory[0], memory[1], memory[2], memory[3], segment[0], segment[1], segment[2], segment[3]);
-	printf("adreno: %u: about to write %llu bytes at %#llx\n", step, size, ZAP_MEMORY);
-	snprintf(last_write, sizeof(last_write), "step %u wrote the zap shader into memory at %#llx", step, ZAP_MEMORY);
+	printf("adreno: %u: about to write %llu bytes at %#llx\n", step, size, zap_phys);
+	snprintf(last_write, sizeof(last_write), "step %u wrote the zap shader into memory at %#llx", step, zap_phys);
 	hold(true);
 	for (uint64_t i = 0; i < 0x1000; i++) {
 		memory[i] = i < size ? segment[i] : 0;
@@ -2986,10 +3111,14 @@ stale_stop(void)
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
 	}
 	if (smmu_layout()) {
-		for (uint32_t match = 0; match < 3; match++) {
-			put(&smmu, "smr", SMMU_SMR(match), 0);
-			put(&smmu, "s2cr", SMMU_S2CR(match), SMMU_S2CR_FAULT);
-			put(&smmu, "cb sctlr", (smmu_pages + match) * smmu_page + SMMU_CB_SCTLR, 0);
+		uint32_t matches[] = { CORE_MATCH, GMU_MATCH, SECOND_MATCH };
+		uint32_t contexts[] = { core_space.context, gmu_space.context, second_space.context };
+		uint32_t count = umi_a650 ? 2 : 3;
+
+		for (uint32_t i = 0; i < count; i++) {
+			put(&smmu, "smr", SMMU_SMR(matches[i]), 0);
+			put(&smmu, "s2cr", SMMU_S2CR(matches[i]), SMMU_S2CR_FAULT);
+			put(&smmu, "cb sctlr", (smmu_pages + contexts[i]) * smmu_page + SMMU_CB_SCTLR, 0);
 		}
 	}
 	put(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR, rd(gpucc.base + GPUCC_CX_GDSCR) | GDSC_SW_COLLAPSE);
@@ -3170,7 +3299,14 @@ redwood_adreno_quiesce(void)
  * (redwood_gpu_recover() below, which says what is done and which source says so). Without it
  * such a submission is only reported, and the GPU stays stopped.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
+#define GPU_CHIP_ID_REDWOOD     0x06030500ull   /* dt: qcom,chipid */
+#define GPU_CHIP_ID_UMI         0x06050002ull   /* UMI stock DTS: Adreno 650 */
+
+static uint64_t
+gpu_chip_id(void)
+{
+	return umi_a650 ? GPU_CHIP_ID_UMI : GPU_CHIP_ID_REDWOOD;
+}
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
@@ -3346,10 +3482,10 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 0;
 		return true;
 	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+		*value = umi_a650 ? 1179648 : 512 * 1024;       /* KGSL's UMI device-info: 0x120000 bytes */
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
-		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
+		*value = gpu_chip_id() | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
 		*value = core_khz * 1000ull;
@@ -3361,7 +3497,7 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 1;
 		return true;
 	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+		*value = umi_a650 ? 16 : 14;                    /* qcom,highest-bank-bit */
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
@@ -3981,21 +4117,28 @@ out:
  * that only look (10 to 12) left out, no pauses, no watch. Anywhere else -- QEMU, whose machine
  * has its peripherals elsewhere -- not one register of the above is touched.
  */
-#define REDWOOD_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin (its "redwood") */
+#define QUALCOMM_SOC_BASE       0x00400000ul    /* the peripheral base used by UMI and Redwood */
 
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
 
 static bool
 start_by_itself(void)
 {
-	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+	const char *files[4];
 	const char *missing = NULL;
 	uint64_t size;
 
-	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
-		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phone, and this is not it\n");
+	if (pe_arm_get_soc_base_phys() != QUALCOMM_SOC_BASE) {
+		printf("adreno: THE GPU IS NOT STARTED: unsupported SoC peripheral base\n");
 		return false;
 	}
+	if (!gpu_profile_select()) {
+		return false;
+	}
+	files[0] = gpu_firmware_name(GPU_FW_GMU);
+	files[1] = gpu_firmware_name(GPU_FW_SQE);
+	files[2] = gpu_firmware_name(GPU_FW_ZAP_MDT);
+	files[3] = gpu_firmware_name(GPU_FW_ZAP_B02);
 	image_asked_quietly = true;
 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]) && missing == NULL; i++) {
 		if (image_file("fw", files[i], &size) == NULL) {
@@ -4004,8 +4147,8 @@ start_by_itself(void)
 	}
 	image_asked_quietly = false;
 	if (missing != NULL) {
-		printf("adreno: THE GPU IS NOT STARTED: the small image has no fw/%s (the phone's /vendor/firmware/%s goes into "
-		    "fw-gpu/); the system draws with its software renderer\n", missing, missing);
+		printf("adreno: THE GPU IS NOT STARTED: the small image has no fw/%s (the matching vendor firmware belongs in "
+		    "fw-gpu/); the system draws with its software renderer\n", missing);
 		return false;
 	}
 	return true;
@@ -4041,6 +4184,9 @@ redwood_adreno_init(void)
 		pause_ms = 0;
 		watch_seconds = 0;
 		keep = 1;
+	}
+	if (!gpu_profile_known && !gpu_profile_select()) {
+		return;
 	}
 	PE_parse_boot_argn("adreno_skip", &skip_steps, sizeof(skip_steps));
 	if (PE_parse_boot_argn("adreno_only", &only, sizeof(only)) && only > 0 && only <= STEPS) {

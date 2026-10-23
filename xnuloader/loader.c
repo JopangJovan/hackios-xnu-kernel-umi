@@ -2695,8 +2695,10 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"-v", "debug=", "keepsyms=", "serial=", "cpus=", "bootcpu=",
 		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
+		"adreno=", "adreno_pause=", "adreno_return=",
 	};
 	int adsp_umi = 0, adsp_step = 0, adsp_return = 0, umi_amp_probe = 0, adsp_on = 0, sound = 0;
+	int adreno = 0, adreno_return = 0;
 	if (PLAT != &platform_umi) return 1;
 	if (pi->forced_base != 0) {
 		print("UMI: forced physical memory windows are disabled\n");
@@ -2740,6 +2742,32 @@ umi_bootargs_ok(const struct payload_info *pi)
 		} else if (starts_with(c, "umi_amp_probe=")) {
 			if (umi_amp_probe || end - c != 15 || c[14] < '1' || c[14] > '5') ok = 0;
 			umi_amp_probe = 1;
+		} else if (starts_with(c, "adreno=")) {
+			uint32_t n = 0;
+			if (adreno || end - c <= 7) ok = 0;
+			for (const char *v = c + 7; v < end && ok; v++) {
+				if (*v < '0' || *v > '9' || n > 22) {
+					ok = 0;
+					break;
+				}
+				n = n * 10 + (uint32_t)(*v - '0');
+			}
+			if (n == 0 || n > 22) ok = 0;
+			adreno = 1;
+		} else if (starts_with(c, "adreno_pause=")) {
+			uint32_t n = 0;
+			if (end - c <= 13) ok = 0;
+			for (const char *v = c + 13; v < end && ok; v++) {
+				if (*v < '0' || *v > '9' || n > 5000) {
+					ok = 0;
+					break;
+				}
+				n = n * 10 + (uint32_t)(*v - '0');
+			}
+			if (n > 5000) ok = 0;
+		} else if (starts_with(c, "adreno_return=")) {
+			if (adreno_return || end - c != 15 || c[14] != '1') ok = 0;
+			adreno_return = 1;
 		}
 		if (!ok) {
 			print("UMI: unsupported boot argument at: %s\n", c);
@@ -2753,6 +2781,10 @@ umi_bootargs_ok(const struct payload_info *pi)
 	}
 	if (adsp_step && (!adsp_umi || !adsp_return)) {
 		print("UMI: ADSP diagnostics require adsp_umi=1 and adsp_return=1\n");
+		return 0;
+	}
+	if (adreno && !adreno_return) {
+		print("UMI: early GPU diagnostics require adreno_return=1\n");
 		return 0;
 	}
 	return 1;
