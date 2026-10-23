@@ -23,8 +23,8 @@
  *   3  reads   the GPU's own clock controller, as the boot loader left it
  *   4  writes  the "CX" power switch on: the half of the GPU block that is not the 3D core --
  *              the power management processor ("GMU"), the bus interface, the GPU's SMMU
- *   5  writes  the clocks of that half on, and measures with the SoC's frequency counter whether
- *              they run: the control register of one of them does not say
+ *   5  writes  the clocks of that half on, and on Redwood measures with the SoC's frequency
+ *              counter whether they run; Kona uses the AHB clock status and later register reads
  *   6  reads   the first words from the GPU block itself: registers of the GMU (among them a
  *              counter that should be seen counting) and of the bus interface
  *   7  reads   the GMU's own channel to RPMh
@@ -891,7 +891,7 @@ measure_clocks(void)
 
 /*
  * What every later step stands on: CX powered, the GMU's clock running by its control register,
- * and the register bus's clock running by measurement (see above).
+ * and the register bus clock validated by the Yupik frequency counter or Kona's AHB status.
  */
 static bool
 cx_ready(void)
@@ -906,6 +906,17 @@ cx_ready(void)
 		printf("adreno: %u: needs CX on (it is %s) and the GMU's clock running (cx_gmu %#x): steps 4 and 5\n", step,
 		    cx_is_on() ? "on" : "off", gmu_clock);
 		return false;
+	}
+	if (umi_a650) {
+		uint32_t ahb = rd(gpucc.base + GPUCC_AHB_CBCR);
+
+		if ((ahb & (CBCR_ENABLE | CBCR_OFF)) != CBCR_ENABLE) {
+			printf("adreno: %u: Kona's GPU AHB clock is not reported running (gpu_cc_ahb %#x)\n", step, ahb);
+			return false;
+		}
+		printf("adreno: %u: Kona's GPU AHB clock reports enabled (gpu_cc_ahb %#x); validating with register reads\n",
+		    step, ahb);
+		return true;
 	}
 	ahb_hz = measure_quietly(GPUCC_DEBUG_AHB);
 	if (ahb_hz == MEASURE_FAILED) {
