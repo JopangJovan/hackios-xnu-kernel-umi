@@ -2696,9 +2696,11 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 		"gpu=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
+		"umi_wifi_step=", "umi_wifi_return=",
 	};
 	int adsp_umi = 0, adsp_step = 0, adsp_return = 0, umi_amp_probe = 0, adsp_on = 0, sound = 0;
 	int gpu = 0, adreno = 0, adreno_fine = 0, adreno_return = 0;
+	int umi_wifi_step = 0, umi_wifi_return = 0;
 	if (PLAT != &platform_umi) return 1;
 	if (pi->forced_base != 0) {
 		print("UMI: forced physical memory windows are disabled\n");
@@ -2742,6 +2744,12 @@ umi_bootargs_ok(const struct payload_info *pi)
 		} else if (starts_with(c, "umi_amp_probe=")) {
 			if (umi_amp_probe || end - c != 15 || c[14] < '1' || c[14] > '5') ok = 0;
 			umi_amp_probe = 1;
+		} else if (starts_with(c, "umi_wifi_step=")) {
+			if (umi_wifi_step || end - c != 15 || c[14] != '1') ok = 0;
+			umi_wifi_step = 1;
+		} else if (starts_with(c, "umi_wifi_return=")) {
+			if (umi_wifi_return || end - c != 17 || c[16] != '1') ok = 0;
+			umi_wifi_return = 1;
 		} else if (starts_with(c, "gpu=")) {
 			if (gpu || end - c != 5 || c[4] != '1') ok = 0;
 			gpu = 1;
@@ -2795,6 +2803,10 @@ umi_bootargs_ok(const struct payload_info *pi)
 	}
 	if (gpu && adreno) {
 		print("UMI: choose gpu=1 for iOS or adreno=N for a diagnostic\n");
+		return 0;
+	}
+	if (umi_wifi_step != umi_wifi_return) {
+		print("UMI: Wi-Fi diagnostics require umi_wifi_step=1 umi_wifi_return=1\n");
 		return 0;
 	}
 	return 1;

@@ -1270,6 +1270,7 @@ extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
  * is in fw-wifi/ there --, found in the memory of the RAM disk itself (see redwood_adreno.c).
  */
 extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern bool umi_wifi_is_board(void);
 static const uint8_t *
 image_file(const char *name, uint64_t *size)
 {
@@ -3986,9 +3987,23 @@ const uint8_t *
 redwood_wifi_driver_file(const char *name, uint64_t *size)
 {
 	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	static const char *const umi_files[][2] = {
+		{ "amss.bin", "qca6390/amss20.bin" },
+		{ "m3.bin", "qca6390/m3.bin" },
+		{ "board.bin", "qca6390/bdwlan.elf" },
+		{ "regdb.bin", "qca6390/regdb.bin" },
+	};
 	const char *last = strrchr(name, '/');
 
 	last = last == NULL ? name : last + 1;
+	if (umi_wifi_is_board()) {
+		for (unsigned i = 0; i < sizeof(umi_files) / sizeof(umi_files[0]); i++) {
+			if (strcmp(last, umi_files[i][0]) == 0) {
+				return image_file(umi_files[i][1], size);
+			}
+		}
+		return NULL;
+	}
 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
 		if (strcmp(last, files[i][0]) == 0) {
 			return image_file(files[i][1], size);
@@ -4259,12 +4274,17 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
  * Called while the system starts, before there is a root file system. With wifi_step=N the start
  * waits until the steps are over (see redwood_adreno_init()); with wifi=1 it does not.
  */
+extern bool umi_wifi_init(void);
+
 void
 redwood_wifi_init(void)
 {
 	uint32_t on = 0, back = 0, done = 0;
 	uint64_t size = 0;
 	thread_t thread;
+	if (umi_wifi_init()) {
+		return;
+	}
 
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
