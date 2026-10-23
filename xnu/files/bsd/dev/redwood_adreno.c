@@ -711,6 +711,13 @@ step_clocks(void)
 
 	announce(umi_a650 ? "in Kona GPUCC: enable A650 GMU, AHB, crystal, and SMMU clocks" :
 	    "in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
+	if (umi_a650) {
+		/* gpucc-kona.c installs these wake/sleep delays before enabling CX GMU. */
+		if ((set(&gpucc, "cx_gmu wake/sleep delays", GPUCC_CX_GMU_CBCR, 0xff0) & 0xff0) != 0xff0) {
+			printf("adreno: %u: Kona's GMU clock did not accept its wake/sleep delays\n", step);
+			return false;
+		}
+	}
 	if ((!umi_a650 && !clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false)) ||
 	    !clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) ||
 	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
@@ -1809,7 +1816,7 @@ step_zap_signature(void)
 #define GMU_LOG_SIZE            0x4000u
 #define GMU_HFI_ADDRESS         0x60006000u
 #define GMU_STREAM_REDWOOD      5
-#define GMU_STREAM_UMI          4               /* dt: gmu_user iommus = <SMMU 4 0x400> */
+#define GMU_STREAM_UMI          5               /* dt: gmu_kernel iommus = <SMMU 5 0x400> */
 #define GMU_STREAM_MASK_UMI     0x400
 #define GMU_MATCH               1               /* entry of the stream table; 0 is kept for the 3D core */
 
@@ -1819,8 +1826,9 @@ struct gmu_firmware_block {
 #define GMU_FIRMWARE_NEEDS      1               /* types of blocks without data: memory wanted, value = bytes */
 #define GMU_FIRMWARE_NEEDS_KEPT 7
 
-/* Context bank 1 is our GMU user address space, separate from the GPU's bank 0.
- * UMI's iommus specifier 4/0x400 is a stream ID/mask pair, not a context number. */
+/* Context bank 1 is our GMU kernel address space, separate from the GPU's bank 0.
+ * Firmware, HFI and the log use gmu_kernel (SID 5), not gmu_user (SID 4).
+ * The iommus specifier is a stream ID/mask pair, not a context number. */
 static struct gpu_space gmu_space = { .name = "the GMU", .context = 1 };
 static struct gpu_block gmu_blocks[12], gmu_log, gmu_hfi;
 static unsigned gmu_block_count;
@@ -1828,6 +1836,7 @@ static const uint8_t *gmu_firmware;
 static uint64_t gmu_firmware_size;
 static bool gmu_space_is_on, gmu_runs, gmu_talks, core_is_on, rsc_awake, cx_off;
 static void gmu_post_mortem(void);
+static bool gmu_rpmh_prepare(void);
 
 static bool
 in_tcm(uint32_t address)
@@ -1871,15 +1880,18 @@ step_gmu_space(void)
 		return false;
 	}
 
-	announce(umi_a650 ? "give the GMU user address space its tables and route stream ID 4/mask 0x400 through it" :
+	announce(umi_a650 ? "give the GMU kernel address space its tables and route stream ID 5/mask 0x400 through it" :
 	    "give the SMMU's context 1 these tables and send the GMU's requests (stream 5) through it: the first "
 	    "writes to the SMMU, the global ones (cbar, cba2r, s2cr, smr) through the hypervisor");
 	if (!smmu_layout()) {
 		return false;
 	}
 	gmu_space_is_on = true;         /* whatever of it has been written by the time something fails is taken back */
-	return space_on(&gmu_space, GMU_MATCH, umi_a650 ? GMU_STREAM_UMI : GMU_STREAM_REDWOOD,
-	    umi_a650 ? GMU_STREAM_MASK_UMI : SMMU_STREAM_MASK_REDWOOD);
+	if (!space_on(&gmu_space, GMU_MATCH, umi_a650 ? GMU_STREAM_UMI : GMU_STREAM_REDWOOD,
+	    umi_a650 ? GMU_STREAM_MASK_UMI : SMMU_STREAM_MASK_REDWOOD)) {
+		return false;
+	}
+	return gmu_rpmh_prepare();
 }
 
 /* ---- step 14: the GMU's firmware ----------------------------------------------------------------------- */
@@ -2010,6 +2022,8 @@ step_gmu_start(void)
 {
 	static const uint8_t priority[HFI_QUEUES] = { 10, 10, 40 };
 	uint32_t result = 0;
+	uint32_t fence_range = umi_a650 ? ((1u << 31) | (0xau << 18) | 0xa0u) :
+	    ((1u << 31) | ((0xau << 2) << 18) | 0x8a0u);
 
 	if (!cx_ready() || !gmu_space_is_on) {
 		return false;
@@ -2060,7 +2074,7 @@ step_gmu_start(void)
 	put(&gmu, "cm3_boot_config", GMU_CM3_BOOT_CONFIG, 2);
 	put(&gmu, "hfi_qtbl_addr", GMU_HFI_QTBL_ADDR, GMU_HFI_ADDRESS);
 	put(&gmu, "hfi_qtbl_info", GMU_HFI_QTBL_INFO, 1);
-	put(&gmu, "ahb_fence_range_0", GMU_AHB_FENCE_RANGE_0, 1u << 31 | (0xa << 2) << 18 | 0x8a0);
+	put(&gmu, "ahb_fence_range_0", GMU_AHB_FENCE_RANGE_0, fence_range);
 	put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
 	put(&gbif, "halt", GBIF_HALT, 0);
 	put(&gmu, "pwr_col_cp_resp", GMU_PWR_COL_CP_RESP, 0);
@@ -2075,6 +2089,11 @@ step_gmu_start(void)
 
 	gmu_runs = true;
 	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 0);
+	printf("adreno: %u: GMU reset-release store issued\n", step);
+	/* KGSL completes the reset request before polling the firmware result. */
+	__asm__ volatile ("dsb sy" : : : "memory");
+	printf("adreno: %u: GMU reset-release store completed; polling firmware initialization\n", step);
+	result = get(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT);
 	for (int i = 0; i < 5000 && (result & GMU_STARTED_MASK) != GMU_STARTED && !(result & GMU_FAILED); i++) {
 		sleep_us(100);
 		result = rd(gmu.base + GMU_CM3_FW_INIT_RESULT);
@@ -2111,6 +2130,67 @@ static struct block pdc = { "pdc", 0x0b290000, 0x10000 };       /* dt: qcom,gmu 
 #define RSCC_HIDDEN_TCS_CMD0_DATA (4 * 0x00e)
 #define RSCC_OVERRIDE_START_ADDR (4 * 0x100)
 
+/*
+ * Xiaomi's A650 KGSL path prepares RPMh before it starts the GMU. On UMI, the always-on
+ * processor owns the PDC power sequence and TCS tables; the AP enables the GPU PDC interface
+ * and supplies the A650 RSCC sleep/wake program.
+ */
+static bool
+gmu_rpmh_prepare(void)
+{
+	static const uint32_t program[5] = { 0xeaaae5a0, 0xe1a1ebab, 0xa2e0a581, 0xecac82e2, 0x0020edad };
+	static const uint32_t hidden[3] = { 0, 0, 0x80000000 };
+	uint32_t wrong = 0;
+
+	if (!umi_a650) {
+		return true;
+	}
+	announce("prepare UMI's A650 RSCC and AOP-managed PDC before starting the GMU");
+	put(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0, 1u << 24);
+	put(&rscc, "pdc_slave_id_drv0", RSCC_PDC_SLAVE_ID_DRV0, 1);
+	put(&rscc, "hidden_tcs_cmd0_data", RSCC_HIDDEN_TCS_CMD0_DATA, hidden[0]);
+	put(&rscc, "hidden_tcs_cmd0_addr", RSCC_HIDDEN_TCS_CMD0_ADDR, 0);
+	put(&rscc, "hidden_tcs_cmd1_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 2, hidden[1]);
+	put(&rscc, "hidden_tcs_cmd1_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 2, 0);
+	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, hidden[2]);
+	put(&rscc, "hidden_tcs_cmd2_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 4, 0);
+	put(&rscc, "override_start_addr", RSCC_OVERRIDE_START_ADDR, 0);
+	put(&rscc, "pdc_seq_start_addr", RSCC_PDC_SEQ_START_ADDR, 0x4520);
+	put(&rscc, "pdc_match_value_lo", RSCC_PDC_MATCH_VALUE_LO, 0x4510);
+	put(&rscc, "pdc_match_value_hi", RSCC_PDC_MATCH_VALUE_HI, 0x4514);
+	for (unsigned i = 0; i < 5; i++) {
+		put(&rscc, "seq_mem_drv0", RSCC_SEQ_MEM_0_DRV0 + 4 * i, program[i]);
+	}
+	for (unsigned i = 0; i < 5; i++) {
+		if (get(&rscc, "seq_mem_drv0", RSCC_SEQ_MEM_0_DRV0 + 4 * i) != program[i]) {
+			wrong++;
+		}
+	}
+	for (unsigned i = 0; i < 3; i++) {
+		if (get(&rscc, "hidden_tcs_cmd_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * i * 2) != hidden[i]) {
+			wrong++;
+		}
+	}
+	if (get(&rscc, "pdc_slave_id_drv0", RSCC_PDC_SLAVE_ID_DRV0) != 1 ||
+	    get(&rscc, "pdc_seq_start_addr", RSCC_PDC_SEQ_START_ADDR) != 0x4520 ||
+	    get(&rscc, "pdc_match_value_lo", RSCC_PDC_MATCH_VALUE_LO) != 0x4510 ||
+	    get(&rscc, "pdc_match_value_hi", RSCC_PDC_MATCH_VALUE_HI) != 0x4514) {
+		wrong++;
+	}
+	put(&pdc, "gpu_seq_start_addr", PDC_GPU_SEQ_START_ADDR, 0);
+	put(&pdc, "gpu_enable", PDC_GPU_ENABLE, 0x80000001);
+	if (get(&pdc, "gpu_seq_start_addr", PDC_GPU_SEQ_START_ADDR) != 0 ||
+	    get(&pdc, "gpu_enable", PDC_GPU_ENABLE) != 0x80000001) {
+		wrong++;
+	}
+	if (wrong != 0) {
+		printf("adreno: %u: the A650 RSCC/PDC setup differs from the requested values in %u readbacks; not starting the GMU\n",
+		    step, wrong);
+		return false;
+	}
+	return true;
+}
+
 static bool
 step_gmu_queues(void)
 {
@@ -2129,7 +2209,7 @@ step_gmu_queues(void)
 
 	announce("give the GMU's RPMh channel its sleep and wake program (rscc, 0x3de0000), unless it has it");
 	if (get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0) == program[0] &&
-	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == 0x80000021) {
+	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == 0x80000000) {
 		goto programmed;
 	}
 	put(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0, 1u << 24);
@@ -2138,7 +2218,7 @@ step_gmu_queues(void)
 	put(&rscc, "hidden_tcs_cmd0_addr", RSCC_HIDDEN_TCS_CMD0_ADDR, 0);
 	put(&rscc, "hidden_tcs_cmd1_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 2, 0);
 	put(&rscc, "hidden_tcs_cmd1_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 2, 0);
-	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, 0x80000021);    /* a650 and later */
+	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, 0x80000000);    /* A650 */
 	put(&rscc, "hidden_tcs_cmd2_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 4, 0);
 	put(&rscc, "override_start_addr", RSCC_OVERRIDE_START_ADDR, 0);
 	put(&rscc, "pdc_seq_start_addr", RSCC_PDC_SEQ_START_ADDR, 0x4520);
@@ -2865,25 +2945,31 @@ step_core_start(void)
 	put(&gpu, "uche_cache_ways", UCHE_CACHE_WAYS, 0x4);
 	put(&gpu, "cp_roq_thresholds_2", CP_ROQ_THRESHOLDS_2, 0x02000140);
 	put(&gpu, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x8040362c);
-	put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
+	if (!umi_a650) {
+		put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
+	}
 	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
-	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00200200);
+	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, umi_a650 ? 0x00300200 : 0x00200200);
 	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
 	/*
 	 * How textures in the GPU's own tiled and compressed layouts are laid out in memory (Linux's
-	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config for this GPU: highest bank bit 14, and the
+	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config: highest bank bit 16 on UMI, 14 on Redwood, and the
 	 * rest as below); Mesa is told the same (redwood_gpu_parameter()).
 	 */
-	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | 1u << 1);
-	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 1u << 1);
-	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | 1u << 1);
-	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 1u << 21);
+	uint32_t bank = umi_a650 ? 3 : 1; /* highest_bank_bit - 13; 32-byte minimum access */
+	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | bank << 1);
+	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), bank << 1);
+	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | bank << 1);
+	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), bank << 21);
 	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
 	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
 	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
 	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
-	put(&gpu, "cp_chicken_dbg", CP_CHICKEN_DBG, 1);
-	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
+	if (!umi_a650) {
+		/* LPAC/HLSQ settings for the Redwood generation, absent on A650. */
+		put(&gpu, "cp_chicken_dbg", CP_CHICKEN_DBG, 1);
+		put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
+	}
 	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
 	put(&gpu, "rb_dbg_eco_cntl", RB_DBG_ECO_CNTL, 0x04100000);     /* Mesa's value for this GPU */
 	/*

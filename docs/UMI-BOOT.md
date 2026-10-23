@@ -16,6 +16,9 @@ Single-, four-, and eight-core boots are verified. The profile uses all eight
 cores with `bootcpu=0 cpus=8 umi_touch=1 umi_keys=1`; USB resumes after the session.
 A custom XNU build adds the UMI FTS521 touchscreen driver; validation results are recorded below. GPU, Wi-Fi, sound, camera and storage drivers are still pending.
 
+GPU diagnostics now pass through drawing a picture on the panel; see
+[UMI Adreno 650 progress and diagnostic commands](umi-gpu.md).
+
 ## Contract with the UMI UEFI port
 
 - Expose an AArch64 UEFI environment and GOP with 1080 x 2340 pixels.
