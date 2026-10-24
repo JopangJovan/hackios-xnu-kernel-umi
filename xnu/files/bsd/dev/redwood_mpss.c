@@ -988,7 +988,24 @@ rpmh_command(const char *name, uint32_t value)
 static bool
 ipa_clock(bool on)
 {
-	return rpmh_command("IP0", BCM_VOTE(on, on ? 0x3fffu : 0));
+	bool ok = rpmh_command("IP0", BCM_VOTE(on, on ? 0x3fffu : 0));
+
+	/*
+	 * The buses on the IPA's way to memory, voted for as Android's driver does while the IPA is on (its
+	 * ipa3_enable_clks(): "ICC Voting for BW", the paths ipa_to_llcc, llcc_to_ebi1 and appss_to_ipa of the
+	 * device tree): the BCMs of the sc7280 interconnect driver on that way -- SN8 (aggre2 noc, the IPA's
+	 * master), SH0 (gem noc to the last-level cache), MC0 and ACV (the memory controller) -- all in the
+	 * command database. Whether a NoC that nobody votes for stays clocked for the IPA's own traffic is
+	 * what this tells (modem_ipa_bus=0: not voted).
+	 */
+	if (!option("modem_ipa_bus_off")) {
+		static const char *const buses[] = { "SN8", "SH0", "MC0", "ACV" };
+
+		for (unsigned b = 0; b < sizeof(buses) / sizeof(buses[0]); b++) {
+			rpmh_command(buses[b], BCM_VOTE(on, on ? 0x3fffu : 0));
+		}
+	}
+	return ok;
 }
 
 /* ---- step 1: the shared memory --------------------------------------------------------------------- */
@@ -2294,7 +2311,7 @@ ipa_firmware_load(void)
 		}
 	}
 	{
-		struct block gsi = { "gsi", 0x01e04000, 0x1000 };
+		struct block gsi = { "gsi", 0x01e04000, 0xc000 };       /* GSI_CFG at 0, MCS_CFG at 0xb000 (the panic of cycle 26: 0x1000 mapped) */
 
 		need(&gsi);
 		tell("mpss: %u: GSI_CFG %#x (bit 0 GSI enable, 1 MCS enable, 2 double MCS clock, 3 uC is MCS, 4 power collapse, 5 bypass matrix off, "
@@ -4734,8 +4751,52 @@ ipa_host_receive(__unused void *context, uint32_t node, uint32_t port, const voi
 		printf("mpss: ipa: the modem says its IPA driver is up\n");
 		ipa_init_complete();
 		break;
+	case IPA_QMI_INSTALL_FILTER_RULE: {
+		/*
+		 * The modem's uplink filter rules, to be installed in the IPA by the application processor. Android
+		 * answers with the rules' ids echoed (TLV 0x11: a count and the ids), which is what is done here; the
+		 * rules themselves go nowhere yet. The rules come in TLV 0x15 as a count and that many structures of
+		 * 173 bytes each on the wire (ipa_filter_spec_ex_type_v01 as ipa_qmi_service_v01.c encodes it: the
+		 * arrays inside are of fixed length), the id at byte 168 of each (byte 163 in cycle 28 made the modem assert on the ids).
+		 */
+		uint16_t size = 0;
+		const uint8_t *list = qmi_tlv(m, length, 0x15, &size);
+		uint8_t answer[7 + 7 + 3 + 1 + 4 * 64];
+		unsigned at = 7, count = list != NULL && size >= 1 ? list[0] : 0;
+
+		if (list == NULL || size != 1 + count * 173 || count > 64) {
+			ipa_qmi_result(ipa_host_port, node, port, QMI_RESPONSE, transaction, message);
+			printf("mpss: ipa: the modem's filter rules (%u, %u bytes) are not of the shape this knows: answered with success alone\n",
+			    count, size);
+			break;
+		}
+		answer[0] = QMI_RESPONSE;
+		answer[1] = (uint8_t)transaction;
+		answer[2] = (uint8_t)(transaction >> 8);
+		answer[3] = (uint8_t)message;
+		answer[4] = (uint8_t)(message >> 8);
+		answer[at++] = 2;                       /* the result: success */
+		answer[at++] = 4;
+		answer[at++] = 0;
+		answer[at++] = 0;
+		answer[at++] = 0;
+		answer[at++] = 0;
+		answer[at++] = 0;
+		answer[at++] = 0x11;                    /* the ids */
+		answer[at++] = (uint8_t)(1 + 4 * count);
+		answer[at++] = (uint8_t)((1 + 4 * count) >> 8);
+		answer[at++] = (uint8_t)count;
+		for (unsigned r = 0; r < count; r++) {
+			memcpy(answer + at, list + 1 + r * 173 + 168, 4);   /* ip_type 4, filter_rule 150, action 4, valid 1, route index 4, valid 1, mux id 4 */
+			at += 4;
+		}
+		answer[5] = (uint8_t)(at - 7);
+		answer[6] = (uint8_t)((at - 7) >> 8);
+		qrtr_send(ipa_host_port, node, port, answer, at);
+		printf("mpss: ipa: the modem's %u filter rules taken (not installed), their ids answered\n", count);
+		break;
+	}
 	case IPA_QMI_CONFIG:
-	case IPA_QMI_INSTALL_FILTER_RULE:
 	case IPA_QMI_FILTER_INSTALLED_NOTIF:
 	default:
 		/*
