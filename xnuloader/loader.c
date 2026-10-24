@@ -2736,6 +2736,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 		"gpu=", "metal=", "fb_scan=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=",
+		"glcopy=1",
 	};
 	int adsp_umi = 0, adsp_step = 0, adsp_return = 0, umi_amp_probe = 0, adsp_on = 0, sound = 0;
 	int gpu = 0, metal = 0, adreno = 0, adreno_fine = 0, adreno_return = 0;
