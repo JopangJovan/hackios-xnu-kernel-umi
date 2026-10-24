@@ -86,6 +86,7 @@ class UmiBoot(unittest.TestCase):
         harness = r'''#include <stdint.h>
 #include <string.h>
 #include <assert.h>
+#include <stdio.h>
 #define str_len strlen
 static int print(const char *fmt, ...) { (void)fmt; return 0; }
 struct platform { int unused; };
@@ -106,8 +107,19 @@ int main(void) {
     p.cmdline = "adsp=1 adsp_umi=1 sound=3"; assert(umi_bootargs_ok(&p));
     p.cmdline = "adsp=1 adsp_umi=1 sound=4"; assert(umi_bootargs_ok(&p));
     p.cmdline = "gpu=1"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "cpufreq=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "gpu=1 metal=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "gpu=1 metal=1 fb_scan=1"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "wifi=1 wifi_mac=02:11:22:33:44:55"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "umi_wifi_step=10 umi_wifi_return=1 wifi_mac=02:11:22:33:44:55";
+    assert(umi_bootargs_ok(&p));
+    const char *wifi_bad[] = {"wifi=2", "wifi=1 wifi=1", "umi_wifi_step=10",
+        "umi_wifi_step=11 umi_wifi_return=1", "umi_wifi_step=10 umi_wifi_return=1 wifi=1",
+        "wifi=1 wifi_mac=02:11:22:33:44", "wifi=1 wifi_mac=02:11:22:33:44:gg",
+        "wifi=1 wifi_mac=02-11:22:33:44:55"};
+    for (unsigned i = 0; i < sizeof(wifi_bad)/sizeof(wifi_bad[0]); ++i) {
+        p.cmdline = wifi_bad[i]; assert(!umi_bootargs_ok(&p));
+    }
     p.cmdline = "bootcpu=0 cpus=8 umi_touch=1 umi_keys=1 umi_haptic=5 adsp=1 adsp_umi=1 sound=4 gpu=1 metal=1";
     assert(umi_bootargs_ok(&p));
     const char *audio_bad[] = {"adsp=1 sound=1", "adsp_umi=1 sound=1", "umi_amp_probe=6",
@@ -118,9 +130,10 @@ int main(void) {
     const char *bad[] = {"metal=1", "gpu=1 metal=2", "gpu=1 metal=1 metal=1",
         "fb_scan=2", "fb_scan=12",
         "gpu=1 adreno=21 adreno_return=1", "wifi_step=1", "ufs=2",
-        "ufs_write=1", "touchscreen=1", "cpufreq=1", "adsp=1", "-vfoo", "cam=5"};
+        "ufs_write=1", "touchscreen=1", "adsp=1", "-vfoo", "cam=5"};
     for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); ++i) {
-        p.cmdline = bad[i]; assert(!umi_bootargs_ok(&p));
+        p.cmdline = bad[i];
+        if (umi_bootargs_ok(&p)) { fprintf(stderr, "accepted invalid arguments: %s\n", p.cmdline); return 1; }
     }
     p.cmdline = "-v"; p.forced_base = 0xc0000000;
     assert(!umi_bootargs_ok(&p));
@@ -132,7 +145,8 @@ int main(void) {
         cfile.write_text(harness)
         subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(cfile), '-o', str(binary)],
                        check=True, capture_output=True)
-        subprocess.run([str(binary)], check=True, capture_output=True)
+        result = subprocess.run([str(binary)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_cs35l41_memory_windows(self):
         source = (ROOT / 'xnu/files/bsd/dev/hk_speaker.c').read_text()

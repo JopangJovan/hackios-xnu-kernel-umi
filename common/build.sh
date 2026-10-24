@@ -22,8 +22,13 @@ if ! skip kernel; then
 	if [ -d "${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk" ] && command -v clang >/dev/null; then
 		[ -d xnu-src ] || xnu/apply.sh
 		[ -x xnu-deps/host/bin/ld64 ] || xnu-deps/setup.sh
-		# Wi-Fi radio driver (phones with a WCN6750): fetched and built once
-		[ "$WIFI_ATH11K" = 1 ] && [ ! -f xnu-deps/build/ath11k/out/ath11k.o ] && { tools/mk-ath11k.sh && tools/mk-wlfw.sh; }
+		# Rebuild the adapter too: an existing object may still contain a different device's bus code.
+		if [ "$WIFI_ATH11K" = 1 ]; then
+			tools/mk-ath11k.sh || die "ath11k build failed"
+			if [ -d "${XNU_SRC:-xnu-src/xnu-8796.121.2}/BUILD/obj/DEVELOPMENT_ARM64_${MACHINE:-BCM2837}/bsd/DEVELOPMENT" ]; then
+				tools/mk-wlfw.sh || die "WLFW diagnostic tables failed"
+			fi
+		fi
 		# the export check fails after the kernel is linked, on purpose (xnu/README.md): judge by the file
 		touch out/.kernel-start
 		./xnu-build.sh -j"$(nproc)" -k > out/kernel-build.log 2>&1 || true

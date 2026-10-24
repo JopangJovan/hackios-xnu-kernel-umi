@@ -1,11 +1,12 @@
 # UMI QCA6390 Wi-Fi bring-up
 
-Wi-Fi is not working in iOS yet. UMI uses QCA6390 (`17cb:1101`) on
+UMI uses QCA6390 (`17cb:1101`) on
 PCIe0. Redwood's WCN6750 WPSS/GLINK startup cannot start this chip.
 
-The current work adds gated PCIe, MHI firmware, and QRTR/IPCR diagnostics.
-Normal UMI boots still skip the Redwood radio startup. These diagnostics do
-not yet provide an iOS network interface.
+Firmware startup, calibration, ath11k copy engines, WMI initialization, and
+hardware scanning work. `wifi=1` now starts the UMI driver in the background
+and offers its station to the existing iOS Apple80211 bridge. Joining and
+Internet access through iOS are being verified.
 
 ## Board information
 
@@ -44,7 +45,7 @@ mode setting is not applied to the SMPS supplies.
 ## Diagnostics
 
 All diagnostics require `umi_wifi_return=1` and return to the resident
-loader. The loader accepts only steps 1 through 9. They must run in a temporary
+loader. The loader accepts only steps 1 through 10. They must run in a temporary
 RAM boot, using the UMI loader and UMI DTB.
 
 - `umi_wifi_step=1`: read GCC and the NORTH TLMM GPIO registers only.
@@ -76,6 +77,9 @@ RAM boot, using the UMI loader and UMI DTB.
 - `umi_wifi_step=9`: continue step 8 by requesting cold-boot calibration,
   with a bounded 60-second wait for calibration completion or firmware ready.
   Calibration backing memory remains mapped until the endpoint is reset.
+- `umi_wifi_step=10`: let ath11k perform the QMI exchange and calibration,
+  restart firmware while preserving CAL, initialize CE/WMI, scan, and stop.
+  Unlike steps 7–9, the real driver handles the firmware protocol here.
 
 Every hardware poll is bounded. PCIe apertures are accessed only after GDSC
 and clock readiness; configuration reads follow link and iATU readiness;
@@ -160,8 +164,40 @@ the iOS network interface.
 Step 9 completed on hardware (`logs/175915-run.log`) with `cal_done=0`:
 firmware accepted mode 7 and reported both `COLD_BOOT_CAL_DONE` and
 `FW_READY` about 3.9 seconds after WLFW setup began. The diagnostic
-returned `errno=0` and restored the SMMU after endpoint reset. Reusing
-this CAL allocation across firmware restart still needs integration.
+returned `errno=0` and restored the SMMU after endpoint reset.
+
+Step 10 completed on hardware (`logs/182319-run.log`): ath11k reached WMI
+unified ready, registered its radio, created a station, and received 15 scan
+frames representing 11 nearby access points. The scan completed in about
+two seconds and the diagnostic returned zero. This uses QCA6390's dynamic
+PCI register window, CE MSI base vector 3 and DP base vector 14. MSI
+descriptors are configured, while CE/DP and MHI service use polling.
+
+The driver reserves stock DDR/CAL/M3 mappings before allocating its 64 MiB
+DMA pool. QMI memory responses and M3 information use those reserved
+addresses. After calibration, endpoint reset and MHI restart preserve the
+CAL backing; ath11k then advertises `cal_done=1` on the second startup.
+Trying to enter mission mode directly after calibration causes recovery.
+
+A full iOS boot (`logs/184054-run.log.live`) reached the home screen with
+FTS touch initialized, audio enabled, firmware restarted successfully, and
+the station offered to iOS. `wifid` started and `configd` found its network
+service for en0. Joining a network and Internet access await the phone test.
+
+For a normal session, `wifi=1` publishes en0 before starting the background
+thread, then exposes the station to Settings once ath11k is ready. The UMI
+profile now builds ath11k and includes `wifid`. `xl` supplies the locally
+captured Android interface address from ignored `out/umi-wifi/mac`; this
+device-specific value is not committed.
+
+The build recipe recompiles the adapter even when an older ath11k object
+already exists, so a cached Redwood object cannot silently replace UMI support.
+
+Concurrent audio and Wi-Fi exhausted XNU's 8 MiB permanent MMIO submap.
+The port now reserves 32 MiB of virtual space there. Panic teardown resets
+the endpoint before restoring the saved SMMU context, avoiding a stale owner
+on the next RAM boot. The SMMU page-table allocation also covers the full
+existing 256 MiB aperture instead of stopping at 60 MiB.
 
 The cold PBL capture differs from Android mission mode: `MHIVER` reads
 `0xdeadbeef`, `MHICFG=0x00800080`, BHI major version is 1 and BHI EE is 0.
@@ -183,11 +219,10 @@ This establishes available ownership slots; it does not validate DMA.
 
 ## Remaining integration
 
-The next phase needs production MSI/event servicing, persistent calibration
-memory across firmware restart, QCA6390 PCI register windowing and bus
-operations, and the iOS network bridge. The current `wifi/lx/src/lx_bus.c` is
-specialized for WCN6750 and must not access this endpoint using Redwood's
-fixed windows.
+Remaining work includes iOS join/Internet validation, interrupt servicing
+instead of polling, and recovery during a running session. Firmware mode-off
+currently times out during driver removal; the final endpoint reset still
+stops DMA before SMMU restoration.
 
 Firmware is already packaged in `userland/root/fw/qca6390/`:
 `amss20.bin`, `m3.bin`, `bd_j1gl.elf`, and `regdb.bin`.

@@ -3287,3 +3287,17 @@ index 3ebc295117a3..de101eafc83b 100755
  def find_non_ascii(s):
      for c in s:
          if ord(c) >= 0x80: return True
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+index 18ef2f0..26697f0 100644
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,8 @@
+
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+
+-#define IO_MAP_SIZE            (8ul << 20)
++/* Qualcomm peripherals use permanent mappings for PCIe, GPU and audio. */
++#define IO_MAP_SIZE            (32ul << 20)
+
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;

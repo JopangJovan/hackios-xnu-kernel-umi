@@ -3609,7 +3609,7 @@ smmu_look(void)
  */
 #define RADIO_ADDRESSES         0xa0000000ull
 #define RADIO_ADDRESSES_SIZE    0x10000000u
-#define RADIO_TABLES            32              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
+#define RADIO_TABLES            130             /* root + second level + 128 third-level tables: the full 256 MiB aperture */
 #define RADIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11) /* a page; for requests of either
 	                                                                                  * privilege; shared, accessed, not
 	                                                                                  * global: Linux's for a device */
@@ -3661,6 +3661,10 @@ static struct {
 	uint32_t table_count;
 	uint64_t next;                  /* of the radio's addresses, the first not handed out (from RADIO_ADDRESSES) */
 } radio_space;
+static struct {
+	bool valid;
+	uint32_t offsets[9], saved[9], cbar, cba2r;
+} umi_saved_smmu;
 static struct block apps_smmu_second = { "apps smmu", 0, 0x1000 };              /* the second page: a word per context */
 static struct block apps_smmu_context = { "apps smmu, the radio's context", 0, 0x1000 };
 
@@ -3913,6 +3917,11 @@ hk_wifi_umi_smmu_run(int (*action)(void *), void *context)
 		saved[i] = rd(apps_smmu_context.base + offsets[i]);
 	uint32_t cbar = rd(apps_smmu_second.base + SMMU_CBAR(radio_space.context));
 	uint32_t cba2r = rd(apps_smmu_second.base + SMMU_CBA2R(radio_space.context));
+	memcpy(umi_saved_smmu.offsets, offsets, sizeof(offsets));
+	memcpy(umi_saved_smmu.saved, saved, sizeof(saved));
+	umi_saved_smmu.cbar = cbar;
+	umi_saved_smmu.cba2r = cba2r;
+	umi_saved_smmu.valid = true;
 	bool accepted = radio_space_on();
 	if (accepted && action) {
 		/* The valid SMR reserves ownership while coherent allocations take
@@ -3942,11 +3951,32 @@ hk_wifi_umi_smmu_run(int (*action)(void *), void *context)
 	    action ? "protected DMA" : "empty", accepted, restored, RADIO_STREAM);
 	if (accepted && restored && !action) error = 0;
 	if (!restored) error = EIO;
+	umi_saved_smmu.valid = false;
 out:
 	radio_space.found = false;
 	pause_ms = old_pause;
 	lck_mtx_unlock(&hk_smmu_lock);
 	return error;
+}
+
+/* All other kernel threads are stopped during panic teardown; the endpoint
+ * owner must assert reset before calling. Do not acquire a stopped thread's lock. */
+void
+hk_wifi_umi_smmu_quiesce(void)
+{
+	if (!umi_smmu_client || !umi_saved_smmu.valid) return;
+	wr(apps_smmu.base + SMMU_SMR(radio_space.match), radio_space.old_smr);
+	wr(apps_smmu.base + SMMU_S2CR(radio_space.match), radio_space.old_s2cr);
+	wr(apps_smmu_context.base + SMMU_CB_SCTLR, 0);
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (unsigned i = 1; i < 9; i++)
+		wr(apps_smmu_context.base + umi_saved_smmu.offsets[i], umi_saved_smmu.saved[i]);
+	wr(apps_smmu_second.base + SMMU_CBAR(radio_space.context), umi_saved_smmu.cbar);
+	wr(apps_smmu_second.base + SMMU_CBA2R(radio_space.context), umi_saved_smmu.cba2r);
+	wr(apps_smmu_context.base + SMMU_CB_SCTLR, umi_saved_smmu.saved[0]);
+	__asm__ volatile("dsb sy" ::: "memory");
+	radio_space.on = false;
+	umi_saved_smmu.valid = false;
 }
 
 int
@@ -4250,6 +4280,11 @@ static bool(*const steps[])(void) = {
 void
 hk_wifi_stop(void)
 {
+	if (umi_wifi_is_board()) {
+		hk_apple80211_summary();
+		umi_wifi_stop();
+		return;
+	}
 	/* (a radio that is still on its way up is let get there first, or fail: half a minute at the most) */
 	for (unsigned ms = 0; whole_runs && ms < 40000; ms += 10) {
 		sleep_ms(10);
@@ -4279,6 +4314,10 @@ void
 hk_wifi_quiesce(void)
 {
 	hk_apple80211_summary();           /* (also when the run is ended from the phone: five fingers) */
+	if (umi_wifi_is_board()) {
+		umi_wifi_quiesce();
+		return;
+	}
 	if (!dsp_started || dirty) {
 		return;
 	}

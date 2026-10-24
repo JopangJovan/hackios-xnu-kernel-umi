@@ -6,6 +6,10 @@
  * driver would have their interrupts -- and it is where the driver's calls into the parts not
  * yet built are given something to do.
  *
+ * UMI selects QCA6390 on PCIe, uses the serialized dynamic BAR window and
+ * its stock CE/DP MSI offsets, and restarts MHI after cold-boot calibration.
+ * Its kernel transport supplies fixed firmware memory and retains CAL across reset.
+ *
  * Where this stage ends: qmi.c has its exchange with the firmware, core.c starts the firmware
  * in mission mode and has ce.c and hal.c set up the copy engines' rings, htc.c connects its
  * services over them and wmi.c has the firmware say what the radio is ("service ready") and,
@@ -46,6 +50,8 @@
 
 static struct {
 	unsigned how;				/* wifi_lx */
+	bool umi;
+	struct mutex window_lock;
 	bool mission;				/* the firmware has been asked for mission mode, and for no other since */
 	bool closed;				/* the driver has stopped the bus: the registers are not touched again */
 	unsigned reads, writes, said, refused;
@@ -161,6 +167,12 @@ ath11k_dbg_dump(struct ath11k_base *ab, enum ath11k_debug_mask mask, const char 
 static u32
 window(struct ath11k_base *ab, u32 offset)
 {
+	if (bus.umi) {
+		if (offset < ATH11K_PCI_WINDOW_START) return offset;
+		iowrite32(0x40000000u | ((offset >> 19) & 0x3f), (u8 *)ab->mem + 0x310c);
+		ioread32((u8 *)ab->mem + 0x310c);
+		return ATH11K_PCI_WINDOW_START + (offset & 0x7ffff);
+	}
 	if (offset < ATH11K_PCI_WINDOW_START) {
 		return (offset);
 	}
@@ -184,6 +196,7 @@ refused(struct ath11k_base *ab, u32 offset)
 {
 	bool known = offset < ATH11K_PCI_WINDOW_START || (offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK ||
 	    (offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) < ATH11K_PCI_WINDOW_RANGE_MASK;
+	if (bus.umi) known = !(offset & 3) && offset < 0x02000000;
 
 	if (known && bus.mission && !bus.closed) {
 		return (false);
@@ -251,7 +264,9 @@ bus_read32(struct ath11k_base *ab, u32 offset)
 	}
 	bus.reads++;
 	if (bus.how >= 2 && ab->mem != NULL) {
+		if (bus.umi) mutex_lock(&bus.window_lock);
 		value = ioread32((u8 *)ab->mem + window(ab, offset));
+		if (bus.umi) mutex_unlock(&bus.window_lock);
 	}
 	if (bus.said < SAID_FIRST) {
 		say_repeats();
@@ -272,11 +287,13 @@ bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
 	if (said_write(offset, value)) {
 		bus.said++;
 		printf("lx: %s the chip's %#x (at +%#x of its block): %#x\n", bus.how >= 2 ? "about to write" : "NOT WRITTEN (wifi_lx=1):",
-		    offset, window(ab, offset), value);
+		    offset, bus.umi ? (offset < 0x80000 ? offset : 0x80000 + (offset & 0x7ffff)) : window(ab, offset), value);
 	}
 	if (bus.how >= 2 && ab->mem != NULL) {
+		if (bus.umi) mutex_lock(&bus.window_lock);
 		__asm __volatile("dsb sy");	/* (what was written to a ring is in memory before the radio is told of it) */
 		iowrite32(value, (u8 *)ab->mem + window(ab, offset));
+		if (bus.umi) mutex_unlock(&bus.window_lock);
 	}
 }
 
@@ -370,6 +387,50 @@ int
 lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id, size_t largest,
     const struct qmi_elem_info *ei, const void *structure)
 {
+	if (bus.umi && msg_id == QMI_WLANFW_RESPOND_MEM_REQ_V01) {
+		struct qmi_wlanfw_respond_mem_req_msg_v01 response =
+		    *(const struct qmi_wlanfw_respond_mem_req_msg_v01 *)structure;
+		struct ath11k_qmi *wlfw = container_of(qmi, struct ath11k_qmi, handle);
+		if (response.mem_seg_len != 2) return -EINVAL;
+		for (unsigned i = 0; i < response.mem_seg_len; i++) {
+			void *memory;
+			unsigned long long address;
+			if (lx_os_radio_firmware_memory(response.mem_seg[i].type, response.mem_seg[i].size,
+			    &memory, &address)) return -EINVAL;
+			response.mem_seg[i].addr = address;
+			wlfw->target_mem[i].vaddr = memory;
+			wlfw->target_mem[i].paddr = address;
+		}
+		return qmi_send_request(qmi, sq, txn, msg_id, largest, ei, &response);
+	}
+	if (bus.umi && msg_id == QMI_WLANFW_M3_INFO_REQ_V01) {
+		struct qmi_wlanfw_m3_info_req_msg_v01 m3 =
+		    *(const struct qmi_wlanfw_m3_info_req_msg_v01 *)structure;
+		struct ath11k_qmi *wlfw = container_of(qmi, struct ath11k_qmi, handle);
+		void *memory;
+		unsigned long long address;
+		if (!wlfw->m3_mem.vaddr || lx_os_radio_firmware_memory(3, m3.size, &memory, &address)) return -EINVAL;
+		if (memory != wlfw->m3_mem.vaddr) memcpy(memory, wlfw->m3_mem.vaddr, m3.size);
+		__asm __volatile("dsb osh" ::: "memory");
+		wlfw->m3_mem.vaddr = memory;
+		wlfw->m3_mem.paddr = address;
+		m3.addr = address;
+		return qmi_send_request(qmi, sq, txn, msg_id, largest, ei, &m3);
+	}
+	if (bus.umi && msg_id == QMI_WLANFW_HOST_CAP_REQ_V01) {
+		struct qmi_wlanfw_host_cap_req_msg_v01 host =
+		    *(const struct qmi_wlanfw_host_cap_req_msg_v01 *)structure;
+		host.num_clients_valid = 1;
+		host.num_clients = 1;
+		host.nm_modem_valid = 0;
+		host.mem_cfg_mode_valid = 0;
+		host.wake_msi_valid = 1;
+		unsigned long long address;
+		unsigned data;
+		if (!lx_os_irq_msi(&address, &data)) return -ENXIO;
+		host.wake_msi = data + 13;
+		return qmi_send_request(qmi, sq, txn, msg_id, largest, ei, &host);
+	}
 	if (msg_id == QMI_WLANFW_WLAN_MODE_REQ_V01) {
 		u32 mode = ((const struct qmi_wlanfw_wlan_mode_req_msg_v01 *)structure)->mode;
 
@@ -480,7 +541,8 @@ bus_get_user_msi_vector(struct ath11k_base *ab, char *user, int *count, u32 *use
 		if (strcmp(user, msi_users[i].name) == 0) {
 			*count = (int)msi_users[i].num_vectors;
 			*base_vector = msi_users[i].base_vector;
-			*user_base_data = msi_users[i].base_vector + ab->pci.msi.ep_base_data;
+			if (bus.umi) *base_vector = i == 0 ? 3 : 14;
+			*user_base_data = *base_vector + ab->pci.msi.ep_base_data;
 			return (0);
 		}
 	}
@@ -588,6 +650,7 @@ bus_power_up(struct ath11k_base *ab)
 static void
 bus_power_down(struct ath11k_base *ab, bool is_suspend)
 {
+	if (bus.umi) lx_os_rproc_shutdown();
 }
 
 /* pcic.c: ath11k_pcic_ext_irq_enable(): the data path's rings are set up, and are looked at from here on */
@@ -726,6 +789,8 @@ lx_start(void)
 	int ret;
 
 	bus.how = lx_os_option("wifi_lx");
+	bus.umi = lx_os_option("wifi_umi") != 0;
+	if (bus.umi) mutex_init(&bus.window_lock);
 	if (lx_prepare() != 0) {
 		lx_tell("lx: no thread, or no memory the radio can be given\n");
 		return (ENOMEM);
@@ -747,7 +812,7 @@ lx_start(void)
 	device.kobj.name = "wifi";
 
 	/* ahb.c: ath11k_ahb_probe(), for this chip */
-	ab = ath11k_core_alloc(&device, 0, ATH11K_BUS_AHB);
+	ab = ath11k_core_alloc(&device, 0, bus.umi ? ATH11K_BUS_PCI : ATH11K_BUS_AHB);
 	if (ab == NULL) {
 		return (ENOMEM);
 	}
@@ -771,9 +836,29 @@ lx_start(void)
 			lx_tell("lx: wifi_irq: the radio cannot be shown where to raise an interrupt: the rings are looked at, as before\n");
 		}
 	}
-	ab->hw_rev = ATH11K_HW_WCN6750_HW10;
+	if (bus.umi) {
+		unsigned long long address;
+		unsigned data;
+		if (!lx_os_irq_msi(&address, &data)) return ENXIO;
+		ab->pci.msi.addr_lo = (u32)address;
+		ab->pci.msi.addr_hi = (u32)(address >> 32);
+		ab->pci.msi.ep_base_data = data;
+		set_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags);
+		ab->hif.ops = &bus_ops_irq; /* MSI descriptors, with polling until IRQ integration. */
+		ab->mem = lx_os_map_registers(0x60300000, 0x100000);
+		ab->mem_len = 0x100000;
+		ab->mem_ce = ab->mem;
+		if (!ab->mem) return ENOMEM;
+	}
+	ab->hw_rev = bus.umi ? ATH11K_HW_QCA6390_HW20 : ATH11K_HW_WCN6750_HW10;
 	ab->fw_mode = ATH11K_FIRMWARE_MODE_NORMAL;
-	if ((ret = ath11k_core_pre_init(ab)) != 0 || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
+	ret = ath11k_core_pre_init(ab);
+	if (!ret && bus.umi) {
+		ab->hw_params.supports_regdb = true;
+		ab->hw_params.coldboot_cal_mm = true;
+		ab->hw_params.cbcal_restart_fw = true;
+	}
+	if (ret || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
 		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
 		return (-ret);
 	}
@@ -787,6 +872,10 @@ lx_start(void)
 	if ((ret = ath11k_core_init(ab)) != 0) {
 		lx_tell("lx: the driver's start fails: %d\n", ret);
 		return (-ret);
+	}
+	if (bus.umi && (ret = ath11k_qmi_fwreset_from_cold_boot(ab)) != 0) {
+		ath11k_qmi_deinit_service(ab);
+		return -ret;
 	}
 
 	/*

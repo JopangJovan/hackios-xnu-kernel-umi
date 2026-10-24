@@ -35,6 +35,10 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern kern_return_t thread_terminate(thread_t thread);
 extern void thread_set_thread_name(thread_t thread, const char *name);
+extern bool umi_wifi_is_board(void);
+extern bool umi_wifi_radio_running(void);
+extern int umi_wifi_radio_boot(void);
+extern void umi_wifi_radio_reset(void);
 
 #define say hk_wifi_say
 
@@ -233,6 +237,15 @@ lx_os_random(void *buffer, unsigned long size)
 unsigned
 lx_os_option(const char *name)
 {
+	if (umi_wifi_is_board()) {
+		if (strcmp(name, "wifi_umi") == 0) return 1;
+		if (strcmp(name, "wifi_lx") == 0) return 2;
+		if (strcmp(name, "wifi_irq") == 0) return 0;
+		if (strcmp(name, "wifi_scan") == 0) return umi_wifi_normal_session() ? 0 : 1;
+		if (strcmp(name, "wifi_station") == 0) return umi_wifi_normal_session() ? 1 : 0;
+		if (strcmp(name, "wifi_ba") == 0 || strcmp(name, "wifi_wide") == 0) return 1;
+		if (strcmp(name, "wifi_quiet") == 0) return 1;
+	}
 	return hk_wifi_option(name);
 }
 
@@ -253,7 +266,14 @@ lx_os_firmware(const char *name, const void **data, unsigned long *size)
 int
 lx_os_rproc_boot(void)
 {
+	if (umi_wifi_is_board()) return umi_wifi_radio_boot();
 	return hk_wifi_dsp_is_up() ? 0 : ENXIO;
+}
+
+void
+lx_os_rproc_shutdown(void)
+{
+	if (umi_wifi_is_board()) umi_wifi_radio_reset();
 }
 
 int

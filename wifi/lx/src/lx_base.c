@@ -755,8 +755,8 @@ iounmap(void *address)
  * or the other way round. The first part of it is handed out for good, a stretch at a time
  * (rings); the rest is slots of one size, taken and given back (buffers).
  */
-#define POOL_SIZE	(44u << 20)
-#define POOL_RINGS	(12u << 20)		/* (the data path's rings and link descriptors come to about 6 MB) */
+#define POOL_SIZE	(64u << 20)
+#define POOL_RINGS	(24u << 20) /* UMI also allocates WLAN firmware DDR, CAL, and M3 here. */
 #define POOL_SLOT	4096u
 #define POOL_SLOTS	((POOL_SIZE - POOL_RINGS) / POOL_SLOT)
 
@@ -764,6 +764,7 @@ static struct {
 	uint8_t *memory;
 	unsigned long long address;		/* the radio's, of the first byte */
 	uint32_t rings_used;
+	uint32_t size, rings_size, slots;
 	uint32_t free_slots[POOL_SLOTS], free_count;
 } pool;
 
@@ -773,22 +774,25 @@ lx_pool_init(void)
 	if (pool.memory != NULL) {
 		return (0);
 	}
-	pool.memory = lx_os_radio_memory(POOL_SIZE, &pool.address);
+	pool.size = lx_os_option("wifi_umi") ? POOL_SIZE : 44u << 20;
+	pool.rings_size = lx_os_option("wifi_umi") ? POOL_RINGS : 12u << 20;
+	pool.slots = (pool.size - pool.rings_size) / POOL_SLOT;
+	pool.memory = lx_os_radio_memory(pool.size, &pool.address);
 	if (pool.memory == NULL) {
 		return (ENOMEM);
 	}
-	for (uint32_t i = 0; i < POOL_SLOTS; i++) {
-		pool.free_slots[i] = POOL_SLOTS - 1 - i;
+	for (uint32_t i = 0; i < pool.slots; i++) {
+		pool.free_slots[i] = pool.slots - 1 - i;
 	}
-	pool.free_count = POOL_SLOTS;
-	printf("lx: %u MB for the radio to read and write; it knows them from %#llx on\n", POOL_SIZE >> 20, pool.address);
+	pool.free_count = pool.slots;
+	printf("lx: %u MB for the radio to read and write; it knows them from %#llx on\n", pool.size >> 20, pool.address);
 	return (0);
 }
 
 static bool
 in_pool(const void *memory, size_t size)
 {
-	return ((const uint8_t *)memory >= pool.memory && (const uint8_t *)memory + size <= pool.memory + POOL_SIZE);
+	return ((const uint8_t *)memory >= pool.memory && (const uint8_t *)memory + size <= pool.memory + pool.size);
 }
 
 void *
@@ -799,7 +803,7 @@ linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle
 	size = roundup2(size, 64);
 	lx_os_lock();
 	at = pool.rings_used;
-	if (pool.memory == NULL || at + size > POOL_RINGS) {
+	if (pool.memory == NULL || at + size > pool.rings_size) {
 		lx_os_unlock();
 		printf("lx: no room for %zu more bytes of rings\n", size);
 		return (NULL);
@@ -848,7 +852,7 @@ pmap_kextract(vm_offset_t va)
 dma_addr_t
 lkpi_dma_map_phys(struct device *dev, vm_paddr_t address, size_t length, enum dma_data_direction direction, unsigned long attributes)
 {
-	if (address < pool.address || address + length > pool.address + POOL_SIZE) {
+	if (address < pool.address || address + length > pool.address + pool.size) {
 		printf("lx: memory is given to the radio that it cannot reach (%zu bytes)\n", length);
 		return (DMA_MAPPING_ERROR);
 	}
@@ -898,7 +902,7 @@ linuxkpi_dev_alloc_skb(size_t size, gfp_t gfp)
 	skb->prev = skb->next = skb;
 	skb->shinfo = (struct skb_shared_info *)((uint8_t *)skb + roundup2(sizeof(struct sk_buff), 64));
 	skb->truesize = size + NET_SKB_PAD;
-	skb->head = skb->data = pool.memory + POOL_RINGS + (size_t)slot * POOL_SLOT;
+	skb->head = skb->data = pool.memory + pool.rings_size + (size_t)slot * POOL_SLOT;
 	skb_reset_tail_pointer(skb);
 	skb->end = skb->head + size + NET_SKB_PAD;
 	skb_reserve(skb, NET_SKB_PAD);
@@ -911,9 +915,9 @@ linuxkpi_kfree_skb(struct sk_buff *skb)
 	if (skb == NULL) {
 		return;
 	}
-	if (in_pool(skb->head, 1) && skb->head >= pool.memory + POOL_RINGS) {
+	if (in_pool(skb->head, 1) && skb->head >= pool.memory + pool.rings_size) {
 		lx_os_lock();
-		pool.free_slots[pool.free_count++] = (uint32_t)((skb->head - (pool.memory + POOL_RINGS)) / POOL_SLOT);
+		pool.free_slots[pool.free_count++] = (uint32_t)((skb->head - (pool.memory + pool.rings_size)) / POOL_SLOT);
 		lx_os_unlock();
 	}
 	lkpi_kfree(skb->m);
@@ -1219,7 +1223,7 @@ void
 lx_memory_say(void)
 {
 	lx_tell("lx: memory: %ld pieces of the kernel's out, %ld KB; of the radio's %u MB: %u KB of rings, %u of %u buffers out\n",
-	    allocations, allocated >> 10, POOL_SIZE >> 20, pool.rings_used >> 10, POOL_SLOTS - pool.free_count, POOL_SLOTS);
+	    allocations, allocated >> 10, pool.size >> 20, pool.rings_used >> 10, pool.slots - pool.free_count, pool.slots);
 }
 
 int

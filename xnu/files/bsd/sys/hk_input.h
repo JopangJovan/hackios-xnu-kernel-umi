@@ -103,9 +103,14 @@ bool hk_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *add
 bool hk_wifi_radio_map_at(uint64_t physical, uint64_t size, unsigned long long address); /* memory shown at a stock IOVA */
 bool hk_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
 int hk_wifi_umi_smmu_test(void); /* gated UMI diagnostic, PCIe bus mastering must remain off */
+bool umi_wifi_is_board(void);
+bool umi_wifi_normal_session(void);
+void umi_wifi_stop(void);
+void umi_wifi_quiesce(void);
 /* The gated action runs under an owned, verified context. It must hold the
  * endpoint in reset before returning, including on error. Buffers stay wired. */
 int hk_wifi_umi_smmu_run(int (*action)(void *), void *context);
+void hk_wifi_umi_smmu_quiesce(void); /* panic path, only after endpoint reset */
 bool hk_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
 /* the network to join (fw/network of the small image): name and passphrase, buffer sizes in and lengths out */
 bool hk_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);

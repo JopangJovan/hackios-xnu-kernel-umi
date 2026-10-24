@@ -4,6 +4,8 @@
  * umi_wifi_step=2 explicitly powers and enumerates PCIe0, without enabling DMA.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
+#include <os/atomic_private.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <libkern/libkern.h>
@@ -65,6 +67,34 @@ struct umi_qrtr_state {
 
 static struct umi_qrtr_state umi_qrtr;
 static uint8_t umi_qrtr_tx_packet[UMI_QRTR_PACKET_MAX];
+static LCK_GRP_DECLARE(umi_wifi_lck_grp, "umi-wifi");
+static LCK_MTX_DECLARE(umi_mhi_lock, &umi_wifi_lck_grp);
+static bool umi_poll_wanted, umi_poll_finished;
+static struct umi_pcie *umi_active_pcie;
+static bool umi_normal_session, umi_service_wanted, umi_service_finished = true;
+static struct {
+	unsigned type;
+	unsigned long size;
+	unsigned long long address;
+	void *memory;
+} umi_firmware_memory[] = {
+	{ 1, 0x5e0000, 0xa1000000, NULL },
+	{ 4, 0xd8000, 0xa1600000, NULL },
+	{ 3, 0x411bc, 0xa1880000, NULL },
+};
+
+int
+lx_os_radio_firmware_memory(unsigned type, unsigned long size, void **memory, unsigned long long *address)
+{
+	for (unsigned i = 0; i < sizeof(umi_firmware_memory) / sizeof(umi_firmware_memory[0]); i++) {
+		if (umi_firmware_memory[i].type != type) continue;
+		if (umi_firmware_memory[i].size != size || !umi_firmware_memory[i].memory) return EINVAL;
+		*memory = umi_firmware_memory[i].memory;
+		*address = umi_firmware_memory[i].address;
+		return 0;
+	}
+	return ENODEV;
+}
 
 static uint32_t
 umi_qrtr_get_le32(const uint8_t *p)
@@ -225,18 +255,23 @@ static struct hk_qrtr_port *
 umi_qrtr_open(hk_qrtr_receive_t receive, hk_qrtr_server_t server, void *context)
 {
 	struct hk_qrtr_port *port = &umi_qrtr.port;
-	if (port->active || receive == NULL) return NULL;
+	lck_mtx_lock(&umi_mhi_lock);
+	if (port->active || receive == NULL) {
+		lck_mtx_unlock(&umi_mhi_lock);
+		return NULL;
+	}
 	memset(port, 0, sizeof(*port));
 	port->active = true;
 	port->number = umi_qrtr.next_port++;
 	port->receive = receive;
 	port->server = server;
 	port->context = context;
+	lck_mtx_unlock(&umi_mhi_lock);
 	return port;
 }
 
 static int
-umi_qrtr_send(struct hk_qrtr_port *port, uint32_t node, uint32_t dst_port,
+umi_qrtr_send_locked(struct hk_qrtr_port *port, uint32_t node, uint32_t dst_port,
 	const void *data, size_t length)
 {
 	if (port != &umi_qrtr.port || !port->active || umi_qrtr.mhi == NULL ||
@@ -284,7 +319,17 @@ umi_qrtr_send(struct hk_qrtr_port *port, uint32_t node, uint32_t dst_port,
 }
 
 static int
-umi_qrtr_lookup(struct hk_qrtr_port *port, uint32_t service, uint32_t version,
+umi_qrtr_send(struct hk_qrtr_port *port, uint32_t node, uint32_t dst_port,
+	const void *data, size_t length)
+{
+	lck_mtx_lock(&umi_mhi_lock);
+	int error = umi_qrtr_send_locked(port, node, dst_port, data, length);
+	lck_mtx_unlock(&umi_mhi_lock);
+	return error;
+}
+
+static int
+umi_qrtr_lookup_locked(struct hk_qrtr_port *port, uint32_t service, uint32_t version,
 	uint32_t instance)
 {
 	if (port != &umi_qrtr.port || !port->active) return EINVAL;
@@ -306,7 +351,16 @@ umi_qrtr_lookup(struct hk_qrtr_port *port, uint32_t service, uint32_t version,
 }
 
 static int
-umi_qrtr_poll(struct hk_qrtr_port *port, uint32_t timeout_ms)
+umi_qrtr_lookup(struct hk_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance)
+{
+	lck_mtx_lock(&umi_mhi_lock);
+	int error = umi_qrtr_lookup_locked(port, service, version, instance);
+	lck_mtx_unlock(&umi_mhi_lock);
+	return error;
+}
+
+static int
+umi_qrtr_poll_locked(struct hk_qrtr_port *port, uint32_t timeout_ms)
 {
 	unsigned received = 0;
 	if (port != &umi_qrtr.port || !port->active || umi_qrtr.mhi == NULL)
@@ -315,10 +369,36 @@ umi_qrtr_poll(struct hk_qrtr_port *port, uint32_t timeout_ms)
 	return error ? error : umi_qrtr_flush_resume();
 }
 
+static int
+umi_qrtr_poll(struct hk_qrtr_port *port, uint32_t timeout_ms)
+{
+	lck_mtx_lock(&umi_mhi_lock);
+	int error = umi_qrtr_poll_locked(port, timeout_ms);
+	lck_mtx_unlock(&umi_mhi_lock);
+	return error;
+}
+
+static void
+umi_wifi_poll_thread(__unused void *argument)
+{
+	while (os_atomic_load(&umi_poll_wanted, acquire)) {
+		int error = umi_qrtr_poll(&umi_qrtr.port, 1);
+		if (error && error != EINVAL && error != EBUSY) {
+			hk_tl("UMI Wi-Fi: background MHI polling failed: %d\n", error);
+			break;
+		}
+		struct timespec pause = { .tv_sec = 0, .tv_nsec = NSEC_PER_MSEC };
+		msleep(&umi_poll_wanted, NULL, PZERO, "umi-ipcr", &pause);
+	}
+	os_atomic_store(&umi_poll_finished, true, release);
+}
+
 static void
 umi_qrtr_close(struct hk_qrtr_port *port)
 {
+	lck_mtx_lock(&umi_mhi_lock);
 	if (port == &umi_qrtr.port) memset(port, 0, sizeof(*port));
+	lck_mtx_unlock(&umi_mhi_lock);
 }
 
 static const struct hk_qrtr_ops umi_qrtr_ops = {
@@ -350,6 +430,21 @@ bool
 umi_wifi_is_board(void)
 {
 	return umi_wifi_is_umi();
+}
+
+bool
+umi_wifi_normal_session(void)
+{
+	return umi_normal_session;
+}
+
+bool
+umi_wifi_radio_running(void)
+{
+	lck_mtx_lock(&umi_mhi_lock);
+	bool running = umi_qrtr.mhi && umi_qrtr.mhi->ipcr_started && !umi_qrtr.mhi->poisoned;
+	lck_mtx_unlock(&umi_mhi_lock);
+	return running;
 }
 
 static bool
@@ -533,11 +628,70 @@ umi_mhi_sync(void *context, const struct umi_mhi_dma *dma)
 
 struct umi_fw_test { struct umi_pcie *pcie; unsigned step; };
 
+void
+umi_wifi_radio_reset(void)
+{
+	lck_mtx_lock(&umi_mhi_lock);
+	if (umi_active_pcie && umi_qrtr.mhi) {
+		umi_pcie_quiesce(umi_active_pcie);
+		umi_qrtr.mhi->ipcr_started = false;
+		for (unsigned i = 0; i < UMI_QRTR_SERVICE_MAX; i++) {
+			if (!umi_qrtr.services[i].valid) continue;
+			struct umi_qrtr_service service = umi_qrtr.services[i];
+			umi_qrtr.services[i].valid = false;
+			umi_qrtr_notify(&service, false);
+		}
+		umi_qrtr.resume_pending = false;
+		hk_tl("UMI Wi-Fi: endpoint reset; firmware and CAL allocations retained\n");
+	}
+	lck_mtx_unlock(&umi_mhi_lock);
+}
+
+int
+umi_wifi_radio_boot(void)
+{
+	lck_mtx_lock(&umi_mhi_lock);
+	struct umi_mhi *mhi = umi_qrtr.mhi;
+	struct umi_pcie *pcie = umi_active_pcie;
+	int error = ENXIO;
+	if (!mhi || !pcie) goto out;
+	if (mhi->ipcr_started && !mhi->poisoned) { error = 0; goto out; }
+	const struct umi_mhi_io *mhi_io = mhi->io;
+	const struct umi_pcie_io *pcie_io = pcie->io;
+	if (!mhi_io || !pcie_io) goto out;
+	memset(pcie, 0, sizeof(*pcie));
+	error = umi_pcie_enumerate(pcie, pcie_io);
+	if (error) goto out;
+	memset(mhi, 0, sizeof(*mhi));
+	error = umi_mhi_probe(mhi, mhi_io);
+	if (!error) error = umi_pcie_prepare_radio(pcie);
+	unsigned long long msi_address = 0;
+	uint32_t data = 0, spi = 0;
+	if (!error && !hk_wifi_radio_msi(&msi_address, &data, &spi)) error = ENOMEM;
+	if (!error) error = umi_pcie_setup_mhi_msi(pcie, msi_address, data);
+	if (!error) error = umi_pcie_enable_dma(pcie);
+	uint64_t size = 0;
+	const uint8_t *firmware = hk_wifi_driver_file("amss.bin", &size);
+	if (!error && (!firmware || size < 512u * 1024u)) error = ENOENT;
+	if (!error) error = umi_mhi_download_sbl(mhi, firmware, size);
+	if (!error) error = umi_mhi_prepare_ready(mhi);
+	if (!error) error = umi_mhi_download_amss(mhi, firmware, size);
+	if (!error) error = umi_mhi_wait_mission(mhi);
+	if (!error) error = umi_mhi_start_ipcr(mhi);
+	if (!error) error = umi_mhi_send_qrtr_hello(mhi);
+	if (error) umi_pcie_quiesce(pcie);
+	hk_tl("UMI Wi-Fi: post-calibration firmware restart returned %d\n", error);
+out:
+	lck_mtx_unlock(&umi_mhi_lock);
+	return error;
+}
+
 static int
 umi_wifi_firmware_diagnostic(void *context)
 {
 	struct umi_fw_test *test = context;
 	struct umi_pcie *pcie = test->pcie;
+	umi_active_pcie = pcie;
 	memset(&umi_qrtr, 0, sizeof(umi_qrtr));
 	umi_qrtr.next_port = UMI_QRTR_PORT_FIRST;
 	const struct umi_mhi_io io = {
@@ -579,17 +733,46 @@ umi_wifi_firmware_diagnostic(void *context)
 		    error, received);
 	if (!error && test->step >= 7) {
 		hk_qmi_set_transport(&umi_qrtr_ops);
-		bool queried = hk_wlfw_query(test->step);
-		hk_tl("UMI Wi-Fi: QCA6390 WLFW step %u %s\n", test->step,
-		    queried ? "completed" : "failed");
+		if (test->step >= 10) {
+			for (unsigned i = 0; i < sizeof(umi_firmware_memory) / sizeof(umi_firmware_memory[0]); i++) {
+				umi_firmware_memory[i].memory = lx_os_radio_memory_at(umi_firmware_memory[i].size,
+				    umi_firmware_memory[i].address);
+				if (!umi_firmware_memory[i].memory) { error = ENOMEM; break; }
+			}
+			os_atomic_store(&umi_poll_finished, false, relaxed);
+			os_atomic_store(&umi_poll_wanted, true, release);
+			if (!error) error = lx_os_thread("umi-ipcr", umi_wifi_poll_thread, NULL);
+			if (!error) {
+				error = hk_lx_start();
+				if (!error && umi_normal_session) {
+					hk_tl("UMI Wi-Fi: station ready for iOS Wi-Fi requests\n");
+					while (os_atomic_load(&umi_service_wanted, acquire) &&
+					    !os_atomic_load(&umi_poll_finished, acquire)) {
+						struct timespec pause = { .tv_sec = 0, .tv_nsec = 100 * NSEC_PER_MSEC };
+						msleep(&umi_service_wanted, NULL, PZERO, "umi-wifi", &pause);
+					}
+					hk_lx_stop();
+				}
+				os_atomic_store(&umi_poll_wanted, false, release);
+				while (!os_atomic_load(&umi_poll_finished, acquire)) {
+					struct timespec pause = { .tv_sec = 0, .tv_nsec = NSEC_PER_MSEC };
+					msleep(&umi_poll_finished, NULL, PZERO, "umi-ipcr-end", &pause);
+				}
+			}
+			hk_tl("UMI Wi-Fi: ath11k diagnostic returned %d\n", error);
+		} else {
+			bool queried = hk_wlfw_query(test->step);
+			hk_tl("UMI Wi-Fi: QCA6390 WLFW step %u %s\n", test->step,
+			    queried ? "completed" : "failed");
+			if (!queried) error = EIO;
+		}
 		hk_qmi_set_transport(NULL);
-		if (!queried) error = EIO;
 	}
 	hk_qmi_set_transport(NULL);
 	umi_qrtr.mhi = NULL;
 	uint32_t ee = UINT32_MAX;
-	if (mhi.io) (void)umi_mhi_execution_environment(&mhi, &ee);
-	if (error && mhi.io) {
+	if (mhi.io && pcie->enumerated) (void)umi_mhi_execution_environment(&mhi, &ee);
+	if (error && mhi.io && pcie->enumerated) {
 		hk_tl("UMI Wi-Fi: BHI error=%#x debug=%#x/%#x/%#x\n",
 		    umi_mhi_read(NULL, mhi.bhi + 0x30), umi_mhi_read(NULL, mhi.bhi + 0x34),
 		    umi_mhi_read(NULL, mhi.bhi + 0x38), umi_mhi_read(NULL, mhi.bhi + 0x3c));
@@ -598,7 +781,40 @@ umi_wifi_firmware_diagnostic(void *context)
 	    test->step, error, ee);
 	/* The SMMU owner requires reset propagation before restoring translation. */
 	umi_pcie_quiesce(pcie);
+	umi_active_pcie = NULL;
 	return error;
+}
+
+static int umi_wifi_pcie_diagnostic(unsigned step);
+
+static void
+umi_wifi_service_thread(__unused void *argument)
+{
+	int error = umi_wifi_pcie_diagnostic(10);
+	hk_tl("UMI Wi-Fi: service stopped, errno=%d\n", error);
+	os_atomic_store(&umi_service_finished, true, release);
+}
+
+void
+umi_wifi_stop(void)
+{
+	os_atomic_store(&umi_service_wanted, false, release);
+	wakeup(&umi_service_wanted);
+	for (unsigned i = 0; i < 400 && !os_atomic_load(&umi_service_finished, acquire); i++) {
+		struct timespec pause = { .tv_sec = 0, .tv_nsec = 100 * NSEC_PER_MSEC };
+		msleep(&umi_service_finished, NULL, PZERO, "umi-wifi-end", &pause);
+	}
+	if (!os_atomic_load(&umi_service_finished, acquire) && umi_active_pcie)
+		umi_pcie_quiesce(umi_active_pcie); /* SMMU restoration follows after other cores stop. */
+}
+
+/* The panic path cannot take a mutex held by a stopped kernel thread. */
+void
+umi_wifi_quiesce(void)
+{
+	os_atomic_store(&umi_service_wanted, false, release);
+	if (umi_active_pcie) umi_pcie_quiesce(umi_active_pcie);
+	hk_wifi_umi_smmu_quiesce();
 }
 
 static int
@@ -640,14 +856,28 @@ umi_wifi_init(void)
 	}
 	PE_parse_boot_argn("umi_wifi_step", &step, sizeof(step));
 	PE_parse_boot_argn("umi_wifi_return", &back, sizeof(back));
+	PE_parse_boot_argn("wifi", &enabled, sizeof(enabled));
+	if (!step && enabled == 1) {
+		umi_normal_session = true;
+		os_atomic_store(&umi_service_finished, false, relaxed);
+		os_atomic_store(&umi_service_wanted, true, release);
+		hk_lx_net_early();
+		int error = lx_os_thread("umi-wifi", umi_wifi_service_thread, NULL);
+		if (error) {
+			os_atomic_store(&umi_service_finished, true, release);
+			os_atomic_store(&umi_service_wanted, false, release);
+		}
+		hk_tl("UMI Wi-Fi: background startup requested, errno=%d\n", error);
+		return true;
+	}
 	if (step == 1 && back == 1) {
 		hk_tl("UMI Wi-Fi: survey %s; returning to loader\n", umi_wifi_survey() ? "passed" : "failed");
 		loader_return();
-	} else if (step >= 2 && step <= 9 && back == 1) {
+	} else if (step >= 2 && step <= 10 && back == 1) {
 		int error = umi_wifi_pcie_diagnostic(step);
 		hk_tl("UMI Wi-Fi: PCIe diagnostic errno=%d; endpoint reset; returning to loader\n", error);
 		loader_return();
-	} else if (step || (PE_parse_boot_argn("wifi", &enabled, sizeof(enabled)) && enabled)) {
+	} else if (step || enabled) {
 		hk_tl("UMI Wi-Fi: QCA6390 requires the UMI PCIe/MHI driver; diagnostic: umi_wifi_step=1 umi_wifi_return=1\n");
 	}
 	return true;

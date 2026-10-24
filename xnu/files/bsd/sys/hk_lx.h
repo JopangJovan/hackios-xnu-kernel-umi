@@ -26,6 +26,8 @@ void	 lx_os_free(void *memory, unsigned long size);
  */
 void	*lx_os_radio_memory(unsigned long size, unsigned long long *address);
 void	*lx_os_radio_memory_at(unsigned long size, unsigned long long address);
+/* UMI's preallocated stock WLAN regions: DDR=1, M3=3, CAL=4. */
+int	 lx_os_radio_firmware_memory(unsigned type, unsigned long size, void **memory, unsigned long long *address);
 void	*lx_os_map_registers(unsigned long long physical, unsigned long size);	/* never unmapped */
 
 /* ---- saying things ---- */
@@ -57,6 +59,7 @@ unsigned lx_os_option(const char *name);
 int	 lx_os_firmware(const char *name, const void **data, unsigned long *size);
 /* the processor that runs the radio's firmware: started, and up when this returns; 0 or an errno */
 int	 lx_os_rproc_boot(void);
+void	 lx_os_rproc_shutdown(void);
 /* the radio's own address (six bytes), if the machine has one for it: 1, or 0 and nothing written */
 int	 lx_os_radio_address(unsigned char *address);
 /*

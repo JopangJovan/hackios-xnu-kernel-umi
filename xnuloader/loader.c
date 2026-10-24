@@ -300,6 +300,7 @@ static char out_buf[2 * 1024 * 1024];
 static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
 static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
 static uint64_t staged_len;
+static uint64_t completed_log_len;
 
 static void
 compose_logs(const char *klog, uint64_t klog_len)
@@ -322,6 +323,7 @@ compose_logs(const char *klog, uint64_t klog_len)
 		n += sizeof(end) - 1;
 	}
 	staged_len = n;
+	completed_log_len = klog != NULL ? n : 0;
 }
 
 static int hc_list_is_uefis(void);
@@ -2737,13 +2739,13 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"touch_lat=1", "cpuload=1000",
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
-		"umi_wifi_step=", "umi_wifi_return=",
+		"umi_wifi_step=", "umi_wifi_return=", "wifi_mac=", "wifi=1",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};
 	int adsp_umi = 0, adsp_step = 0, adsp_return = 0, umi_amp_probe = 0, adsp_on = 0, sound = 0;
 	int gpu = 0, metal = 0, cpufreq = 0, fb_filter = 0, fb_threads = 0, fbscale = 0, adreno = 0, adreno_fine = 0, adreno_return = 0;
-	int umi_wifi_step = 0, umi_wifi_return = 0;
+	int umi_wifi_step = 0, umi_wifi_return = 0, wifi_mac = 0, wifi_on = 0;
 	if (PLAT != &platform_umi) return 1;
 	if (pi->forced_base != 0) {
 		print("UMI: forced physical memory windows are disabled\n");
@@ -2788,11 +2790,28 @@ umi_bootargs_ok(const struct payload_info *pi)
 			if (umi_amp_probe || end - c != 15 || c[14] < '1' || c[14] > '5') ok = 0;
 			umi_amp_probe = 1;
 		} else if (starts_with(c, "umi_wifi_step=")) {
-			if (umi_wifi_step || end - c != 15 || c[14] < '1' || c[14] > '9') ok = 0;
+			uint32_t n = 0;
+			if (umi_wifi_step || end - c <= 14) ok = 0;
+			for (const char *v = c + 14; v < end && ok; v++) {
+				if (*v < '0' || *v > '9' || n > 10) { ok = 0; break; }
+				n = n * 10 + (uint32_t)(*v - '0');
+			}
+			if (n == 0 || n > 10) ok = 0;
 			umi_wifi_step = 1;
 		} else if (starts_with(c, "umi_wifi_return=")) {
 			if (umi_wifi_return || end - c != 17 || c[16] != '1') ok = 0;
 			umi_wifi_return = 1;
+		} else if (starts_with(c, "wifi=")) {
+			if (wifi_on || end - c != 6 || c[5] != '1') ok = 0;
+			wifi_on = 1;
+		} else if (starts_with(c, "wifi_mac=")) {
+			if (wifi_mac || end - c != 26) ok = 0;
+			for (unsigned i = 0; i < 17 && ok; i++) {
+				char h = c[9 + i];
+				if (i % 3 == 2 ? h != ':' : !((h >= '0' && h <= '9') ||
+				    (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) ok = 0;
+			}
+			wifi_mac = 1;
 		} else if (starts_with(c, "gpu=")) {
 			if (gpu || end - c != 5 || c[4] != '1') ok = 0;
 			gpu = 1;
@@ -2878,8 +2897,8 @@ umi_bootargs_ok(const struct payload_info *pi)
 		print("UMI: metal=1 requires gpu=1\n");
 		return 0;
 	}
-	if (umi_wifi_step != umi_wifi_return) {
-		print("UMI: Wi-Fi diagnostics require umi_wifi_step=1..9 umi_wifi_return=1\n");
+	if (umi_wifi_step != umi_wifi_return || (umi_wifi_step && wifi_on)) {
+		print("UMI: Wi-Fi diagnostics require umi_wifi_step=1..10 umi_wifi_return=1\n");
 		return 0;
 	}
 	return 1;
@@ -3987,6 +4006,7 @@ fb_command(char *cmd)
 			uint64_t cp = selftest ? CHECKPOINT_SELFTEST : parse_number(arg, 10);
 
 			set_result("running", cp, 0);
+			completed_log_len = 0;
 			fb_reply("OKAY", "");
 			log_len = 0;
 			print("== XNULOADER run (usb) ==\n");
@@ -4000,11 +4020,17 @@ fb_command(char *cmd)
 			}
 		} else if (starts_with(cmd, "oem memmap")) {
 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
+			completed_log_len = 0;
 			print_memory_map();
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem log")) {
 			if (busy) {
 				compose_live_log(running_live, running_slide);
+			} else if (completed_log_len) {
+				/* Keep the full completed kernel log: the console echo can
+				 * exceed log_buf, and a final live poll must not replace it. */
+				staged_data = out_buf;
+				staged_len = completed_log_len;
 			} else {
 				compose_logs(NULL, 0);
 			}
