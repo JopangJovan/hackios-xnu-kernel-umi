@@ -2734,13 +2734,13 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"-v", "debug=", "keepsyms=", "serial=", "cpus=", "bootcpu=",
 		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
-		"gpu=", "metal=", "fb_scan=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
+		"gpu=", "metal=", "fb_scan=", "fb_filter=", "fb_threads=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};
 	int adsp_umi = 0, adsp_step = 0, adsp_return = 0, umi_amp_probe = 0, adsp_on = 0, sound = 0;
-	int gpu = 0, metal = 0, adreno = 0, adreno_fine = 0, adreno_return = 0;
+	int gpu = 0, metal = 0, fb_filter = 0, fb_threads = 0, adreno = 0, adreno_fine = 0, adreno_return = 0;
 	int umi_wifi_step = 0, umi_wifi_return = 0;
 	if (PLAT != &platform_umi) return 1;
 	if (pi->forced_base != 0) {
@@ -2799,6 +2799,21 @@ umi_bootargs_ok(const struct payload_info *pi)
 			metal = 1;
 		} else if (starts_with(c, "fb_scan=")) {
 			if (end - c != 9 || c[8] != '1') ok = 0;
+		} else if (starts_with(c, "fb_filter=")) {
+			if (fb_filter || end - c != 11 || (c[10] != '0' && c[10] != '1')) ok = 0;
+			fb_filter = 1;
+		} else if (starts_with(c, "fb_threads=")) {
+			uint32_t n = 0;
+			if (fb_threads || end - c <= 11) ok = 0;
+			for (const char *v = c + 11; v < end && ok; v++) {
+				if (*v < '0' || *v > '9' || n > 8) {
+					ok = 0;
+					break;
+				}
+				n = n * 10 + (uint32_t)(*v - '0');
+			}
+			if (n == 0 || n > 8) ok = 0;
+			fb_threads = 1;
 		} else if (starts_with(c, "adreno=")) {
 			uint32_t n = 0;
 			if (adreno || end - c <= 7) ok = 0;
