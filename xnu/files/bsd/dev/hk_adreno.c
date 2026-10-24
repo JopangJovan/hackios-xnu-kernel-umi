@@ -3753,6 +3753,18 @@ hk_gpu_to_memory(void *start, uint64_t size)
 	to_memory((vm_offset_t)start, size);
 }
 
+/* A GPU writer can leave stale lines in this CPU's cache after its fence is done. */
+void
+hk_gpu_from_memory(void *start, uint64_t size)
+{
+	vm_offset_t first = (vm_offset_t)start & ~(vm_offset_t)63;
+	vm_offset_t end = (vm_offset_t)start + size;
+	for (vm_offset_t line = first; line < end; line += 64) {
+		__asm__ volatile ("dc ivac, %0" : : "r" (line));
+	}
+	settle();
+}
+
 /* How far the 3D core has got. */
 bool
 hk_gpu_done(uint32_t fence)

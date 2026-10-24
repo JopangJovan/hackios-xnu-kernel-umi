@@ -60,6 +60,7 @@ bool hk_gpu_map(uint64_t address, uint64_t phys, bool read_only);
 void hk_gpu_mapped(void);
 void hk_gpu_unmap(uint64_t address, uint64_t size);
 void hk_gpu_to_memory(void * start, uint64_t size);
+void hk_gpu_from_memory(void * start, uint64_t size);
 uint32_t hk_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool hk_gpu_done(uint32_t fence);
@@ -194,6 +195,7 @@ struct hk_worked {
 #define MSM_BO_GPU_READONLY     0x00000002
 #define MSM_PREP_NOSYNC         0x04
 #define MSM_SUBMIT_CMD_BUF      1
+#define MSM_SUBMIT_BO_WRITE     0x0002
 #define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
 
 #define GPU_BUFFERS             8192            /* a client's, at most */
@@ -258,12 +260,34 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 bool
 MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 {
-	uint32_t fence = surface->drawn;
 	bool done = true;
 
-	if (fence != 0 && gGPULock != NULL) {
+	if (gGPULock != NULL) {
 		IOLockLock(gGPULock);
-		done = !hk_gpu_ready() || gpuWait(fence, milliseconds);
+		uint32_t fence = surface->drawn;
+		bool ready = hk_gpu_ready();
+		bool stable = fence == 0 || !ready;
+		done = stable;
+		/* Waiting drops gGPULock; if the surface was submitted again, wait for its fence too. */
+		for (unsigned retry = 0; ready && fence != 0 && retry < 4; retry++) {
+			done = gpuWait(fence, milliseconds);
+			if (!done) break;
+			uint32_t latest = surface->drawn;
+			if (latest == fence) {
+				stable = true;
+				break;
+			}
+			fence = latest;
+			if (fence == 0) {
+				stable = true;
+				break;
+			}
+		}
+		if (done && ready && !stable) done = false;
+		if (done && ready && stable && surface->gpu_written) {
+			hk_gpu_from_memory(surface->kpixels, surface->info.allocSize);
+			surface->gpu_written = false;
+		}
 		IOLockUnlock(gGPULock);
 	}
 	return done;
@@ -974,7 +998,8 @@ HKGPUUserClient::submit(struct msm_gem_submit * request)
 		if (b->surface != NULL) {
 			uint32_t seed = b->surface->shared()->seed;
 
-			if (seed == b->seed && !b->seen && began - b->pushed < again) {
+			if (seed == b->seed && !b->seen && began - b->pushed < again &&
+			    !(bos[i].flags & MSM_SUBMIT_BO_WRITE)) {
 				continue;
 			}
 			b->seed = seed;
@@ -1050,6 +1075,9 @@ HKGPUUserClient::submit(struct msm_gem_submit * request)
 			b->fence = request->fence;
 			if (b->surface != NULL) {
 				b->surface->drawn = request->fence;
+				if (bos[i].flags & MSM_SUBMIT_BO_WRITE) {
+					b->surface->gpu_written = true;
+				}
 			}
 		}
 	}

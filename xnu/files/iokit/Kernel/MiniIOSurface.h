@@ -118,6 +118,7 @@ public:
 	mach_vm_address_t               clientAddress;  /* ... and where it is there */
 	uint8_t *                       kpixels;        /* where the pixel memory starts in the kernel, either way */
 	uint32_t                        drawn;          /* the GPU's last submission that names the pixels (0: none; HKGPU.cpp) */
+	bool                            gpu_written;    /* CPU cache lines may be stale after that submission */
 	struct minisurf_result          info;           /* addresses not filled in */
 	struct minisurf_plane           planes[MINISURF_MAX_PLANES];
 	OSDictionary *                  values;
@@ -128,6 +129,8 @@ public:
 	virtual bool
 	init(void) APPLE_KEXT_OVERRIDE
 	{
+		drawn = 0;
+		gpu_written = false;
 		return OSObject::init();
 	}
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
