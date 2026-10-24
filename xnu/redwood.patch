@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..9cd24b42caca 100644
+index 44274016a4cf..08878fedb36e 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,39 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -91,19 +91,21 @@ index 44274016a4cf..9cd24b42caca 100644
 +bsd/dev/redwood_mic.c		standard
 +bsd/dev/redwood_wifi.c		standard
 +bsd/dev/redwood_adsp.c		standard
++bsd/dev/redwood_mpss.c		standard
 +bsd/dev/redwood_image.c		standard
 +bsd/dev/redwood_virtio_blk.c	standard
 +bsd/dev/redwood_sparse.c	standard
 +bsd/dev/redwood_apfs_check.c	optional apfs
 +bsd/dev/redwood_sound.c		standard
 +bsd/dev/redwood_qmi.c		standard
++bsd/dev/redwood_nas.c		standard
 +bsd/dev/redwood_wlfw.c		standard
 +bsd/dev/redwood_lx.c		standard
 +bsd/dev/redwood_sta.c		standard
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +188,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -118,7 +120,7 @@ index 44274016a4cf..9cd24b42caca 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +402,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -126,7 +128,7 @@ index 44274016a4cf..9cd24b42caca 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +425,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1865,7 +1867,7 @@ index 5bd6f23dd10c..14e0f17409f5 100644
  ifneq ($(filter T6000 T8101 VMAPPLE T6000 T8101 VMAPPLE,$(CURRENT_MACHINE_CONFIG)),)
  	LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
 diff --git a/makedefs/MakeInc.top b/makedefs/MakeInc.top
-index 0316792a3f42..bbef0a4b26d4 100644
+index 0316792a3f42..b9c195b09cd1 100644
 --- a/makedefs/MakeInc.top
 +++ b/makedefs/MakeInc.top
 @@ -285,7 +285,7 @@ endif
@@ -1873,7 +1875,7 @@ index 0316792a3f42..bbef0a4b26d4 100644
  # $(warning VARIANT_CONFIGS is $(VARIANT_CONFIGS))
  
 -MEMORY_SIZE := $(shell /usr/sbin/sysctl -n hw.memsize)
-+MEMORY_SIZE := $(shell awk '/MemTotal/{printf "%d", $$2*1024}' /proc/meminfo)
++MEMORY_SIZE := $(shell if [ -r /proc/meminfo ]; then awk '/MemTotal/{printf "%d", $$2*1024}' /proc/meminfo; else sysctl -n hw.memsize; fi)
  
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)

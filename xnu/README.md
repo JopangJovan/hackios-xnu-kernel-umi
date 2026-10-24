@@ -6,7 +6,7 @@
 - `files/` — новые файлы по их путям в дереве XNU (37 файлов);
 - `apply.sh` — берёт исходники у Apple и накладывает всё это; `export.sh` — обратное действие.
 
-Собирается на Linux стоковым clang, без macOS и Xcode.
+Собирается на Linux стоковым clang, без macOS и Xcode, — и на macOS с Xcode (ниже, «Сборка на macOS»).
 
 ## Сборка
 
@@ -40,6 +40,16 @@ xnu-deps/setup.sh        # ~30 с: исходники зависимостей, 
   сгенерированные по списку неопределённых символов линкера. Если набор изменится:
   `xnu-deps/gen-iig-stubs.py xnu-deps/iig-impl/undefined-all.txt xnu-deps/iig-impl qemu/kernel.syms`, затем `rm -rf BUILD`.
 - Для `qemu/sym.py` после пересборки: `nm -n …/mach.development.bcm2837.unstripped > qemu/kernel.syms`.
+
+## Сборка на macOS
+
+Те же три команды. theos не нужен: `xnu-deps/setup.sh` на Darwin сам складывает `xnu-deps/theos-mac`
+(ссылки на cctools из Xcode, iPhoneOS16.5.sdk из github.com/theos/sdks частичным клоном, ~220 МБ)
+и берёт mig, unifdef и csh системные. Нужны Xcode (проверено с 26.5, Apple clang 21) и MacPorts с
+coreutils (`gstat`, `gtimeout` — для `xl`). `host/bin/ld64` там — обёртка, а не ссылка: ld из Xcode
+ищет себя по имени, под которым вызван. Ядро, собранное так, загружается на телефоне и возвращается в
+загрузчик как и собранное на Linux. `xl` на Mac берёт `flock`, `timeout`, `stat` и platform-tools из
+`tools/macos-bin` (см. README там).
 
 ## Работа с деревом
 
@@ -79,6 +89,8 @@ xnu-deps/setup.sh        # ~30 с: исходники зависимостей, 
 | `bsd/dev/redwood_adreno.c`, `iokit/Kernel/RedwoodGPU.cpp` | GPU телефона (Adreno 642L): пошаговое включение (`adreno=N`: питание, GMU, zap-шейдер, микрокод), буферы и очередь команд; клиент IOKit с подмножеством msm DRM для Mesa |
 | `bsd/dev/redwood_wifi.c`, `bsd/sys/redwood_qrtr.h` | Wi-Fi телефона (WCN6750), начало пути (`wifi=N`): общая память процессоров Qualcomm (SMEM: чтение и выделение под её замком), сигнальные биты между нами и процессором Wi-Fi (SMP2P, обе стороны), почтовый ящик процессора питания, загрузка прошивки процессора Wi-Fi, его запуск через TrustZone и остановка по просьбе, GLINK (очереди в общей памяти, канал IPCRTR) и QRTR поверх него; `redwood_qrtr.h` — порт датаграмм для остального ядра (открыть, послать, найти службу, закрыть) |
 | `bsd/dev/redwood_qmi.c`, `bsd/sys/redwood_qmi.h` | QMI — протокол сообщений служб на процессорах Qualcomm: кодирование по таблицам, запросы с ответами, оповещения; интерфейс как у Linux (`qmi_*`), чтобы `qmi.c` из ath11k собирался без правок, реализация своя; проверяется на компьютере (`tools/qmi-test/run.sh`) |
+| `bsd/dev/redwood_nas.c`, `bsd/sys/redwood_nas.h` | клиент QMI NAS поверх заданного QRTR: регистрация в сети и уровень сигнала; не показывает сигнал без регистрации. Проверка на компьютере: `tools/qmi-test/run-nas.sh`. Для работы на телефоне требуются отдельный транспорт MPSS и подключение к CoreTelephony |
+| `bsd/dev/redwood_mpss.c` | модем (MPSS): путь аудио-DSP с числами модема (`modem=N`, `modem_step=N`): прошивка из `/fw`, TrustZone (образ 4), шины CX/MSS, SMP2P, GLINK, QRTR с портами для QMI; наша служба RMTFS (QMI 14: файловые системы модема из разделов UFS, в памяти, без записи на флеш) и сервис имён QRTR; DMS «online» и клиент NAS → `sysctl kern.redwood.cellular_*`. Проверено: модем стартует и отвечает; RMTFS ещё не проверен (docs/cellular.md) |
 | `bsd/dev/redwood_wlfw.c` | временная замена `qmi.c` из ath11k: разговор со службой прошивки Wi-Fi вручную, в его порядке и его сообщениями (шаг 15 `wifi=N`); описания сообщений берутся из исходников ath11k при сборке (`tools/mk-wlfw.sh`) и в git не попадают |
 | `bsd/dev/redwood_audio.c`, `redwood_virtio_sound.c`, `redwood_speaker.c` | звук: `/dev/redwood-audio` (куда наше устройство вывода в mediaserverd пишет то, что играет iOS), запись его в память, virtio-sound для QEMU; первый взгляд на усилители динамиков телефона |
 | `bsd/pthread/pthread_kext_static.c` | pthread kext, слинкованный в ядро |

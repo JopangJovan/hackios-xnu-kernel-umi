@@ -39,7 +39,7 @@ unzbm_all() { # unzbm_all DIR: expand every LZBITMAP file below DIR
 	find "$1" -type f -name '*:com.apple.decmpfs' | sed 's/:com\.apple\.decmpfs$//' | tr '\n' '\0' | xargs -0 -r -n 200 $UNZBM
 	local left
 	left=$(find "$1" -name '*:com.apple.*' | wc -l)
-	[ "$left" = 0 ] || { echo "fetch.sh: $left files in $1 are still compressed"; exit 1; }
+	[ "$left" -eq 0 ] || { echo "fetch.sh: $left files in $1 are still compressed"; exit 1; }
 }
 
 # --- the root filesystem --------------------------------------------------------------------------
@@ -82,7 +82,7 @@ if [ ! -f .done-cryptex ]; then
 	unzbm_all cryptex.cache
 	mv cryptex.cache/System/Library/Caches/com.apple.dyld $CACHE
 	rm -rf cryptex.cache
-	[ "$(ls $CACHE | wc -l)" = 43 ] || { echo "fetch.sh: the dyld shared cache is incomplete"; exit 1; }
+	[ "$(ls $CACHE | wc -l)" -eq 43 ] || { echo "fetch.sh: the dyld shared cache is incomplete"; exit 1; }
 	touch .done-cryptex
 	[ -n "$KEEP" ] || rm -f cryptex-os.dmg
 fi

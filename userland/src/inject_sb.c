@@ -1066,6 +1066,38 @@ redwood_springboard_init(void)
 	    snapshot_format ? "as JPEG" : "NOT changed", original_lock_long_press ? "checked" : "NOT checked",
 	    battery_lvl ? "from QG" : "NOT replaced", battery_st ? "from QG" : "NOT replaced",
 	    poster_switcher ? "not offered" : "NOT withheld");
+	/*
+	 * Cellular, a survey first (the modem's bars come from the kernel: sysctl kern.redwood.cellular_*,
+	 * bsd/dev/redwood_mpss.c): where UIKit makes the status bar's cellular entry from the raw data,
+	 * and with which signature -- said in the log with the unslid address, for the hook to come.
+	 */
+	{
+		static const char *const classes[] = { "_UIStatusBarDataCellularEntry", "_UIStatusBarData", "_UIStatusBarDataEntry" };
+		const char *selector = "_cellularEntryWithData:signalStrengthEnabled:serviceEnabled:dataNetworkEnabled:serviceString:"
+		    "serviceCrossfadeString:serviceBadgeString:serviceContentType:dataNetworkType:gsmSignalStrengthRaw:"
+		    "gsmSignalStrengthBars:callForwardingType:lowDataModeActive:";
+
+		for (unsigned c = 0; c < sizeof(classes) / sizeof(classes[0]); c++) {
+			Class cls = objc_getClass(classes[c]);
+			Method plus = cls ? class_getClassMethod(cls, sel_registerName(selector)) : NULL;
+			Method minus = cls ? class_getInstanceMethod(cls, sel_registerName(selector)) : NULL;
+
+			if (plus) {
+				say("redwood: cellular: +[%s %s] at %#lx, types \"%s\"\n", classes[c], selector,
+				    (uintptr_t)method_getImplementation(plus) - slide, method_getTypeEncoding(plus));
+			}
+			if (minus) {
+				say("redwood: cellular: -[%s %s] at %#lx, types \"%s\"\n", classes[c], selector,
+				    (uintptr_t)method_getImplementation(minus) - slide, method_getTypeEncoding(minus));
+			}
+			if (cls && !plus && !minus) {
+				say("redwood: cellular: %s has no such method\n", classes[c]);
+			}
+		}
+		say("redwood: cellular: the kernel says up=%d registered=%d bars=%d dbm=%d radio=%d\n", sysctl_int("kern.redwood.cellular_up"),
+		    sysctl_int("kern.redwood.cellular_registered"), sysctl_int("kern.redwood.cellular_bars"),
+		    sysctl_int("kern.redwood.cellular_dbm"), sysctl_int("kern.redwood.cellular_radio"));
+	}
 	say("redwood: battery UI: shows%% %s, set-shows%% %s, bolt %s, chargePercent %s, setChargePercent %s, lockscreen ring %s\n",
 	    original_battery_view_shows_percentage ? "ok" : "NO",
 	    original_battery_view_set_shows_percentage ? "ok" : "NO",

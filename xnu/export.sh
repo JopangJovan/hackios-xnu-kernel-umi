@@ -26,7 +26,7 @@ mkdir "$HERE/files.new"
 while IFS= read -r f; do
 	[ -f "$f" ] || [ -L "$f" ] || continue      # added in a commit, deleted since
 	mkdir -p "$HERE/files.new/$(dirname "$f")"
-	cp -P --preserve=mode "$f" "$HERE/files.new/$f"
+	if [ "$(uname)" = Darwin ]; then cp -pP "$f" "$HERE/files.new/$f"; else cp -P --preserve=mode "$f" "$HERE/files.new/$f"; fi
 done < "$HERE/files.list"
 rm -rf "$HERE/files" "$HERE/files.list"
 mv "$HERE/files.new" "$HERE/files"

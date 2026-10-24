@@ -224,4 +224,5 @@ redwood_input_init(void)
 	redwood_adreno_init();
 	redwood_wifi_init();
 	redwood_adsp_init();
+	redwood_mpss_init();
 }
