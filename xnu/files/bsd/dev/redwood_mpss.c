@@ -5340,6 +5340,7 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 			"illegal", "READY" };
 		unsigned at = 8, slots = v[8], first_card = ~0u;
 
+		tell("mpss: uim: the primary GW application is slot %u application %u (0xff: none)\n", v[1], v[0]);
 		at = 9;
 		for (unsigned slot = 0; slot < slots && at + 6 <= size; slot++) {
 			unsigned card = v[at], apps = v[at + 5];
@@ -5350,15 +5351,18 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 				first_card = card;
 			}
 			at += 6;
-			for (unsigned a = 0; a < apps && at + 13 <= size; a++) {
-				unsigned type = v[at], state = v[at + 1], aid = v[at + 12];
+			for (unsigned a = 0; a < apps && at + 7 <= size; a++) {
+				/* libqmi's "UIM Card Status": type, state, personalization state, feature, retries, unblock retries, the AID
+				 * (a length and the bytes), UPIN replaces PIN1, PIN1 state, PIN1 retries, PUK1 retries, PIN2 state, retries, PUK2 */
+				unsigned type = v[at], state = v[at + 1], aid = v[at + 6], pin = at + 7 + aid;
 
-				tell("mpss: uim:   application %u: type %u, state %u (%s), PIN1 state %u, retries %u\n", a, type, state,
-				    state < 8 ? app_states[state] : "?", v[at + 6], v[at + 7]);
+				tell("mpss: uim:   application %u: type %u, state %u (%s), PIN1 state %u (0 unknown, 1 enabled not verified, 2 enabled verified, "
+				    "3 disabled, 4 blocked, 5 permanently blocked), retries %u\n", a, type, state, state < 8 ? app_states[state] : "?",
+				    pin + 1 < size ? v[pin + 1] : 0, pin + 2 < size ? v[pin + 2] : 0);
 				if (card == 1 && state == 7 && sim_slot_ready == 0) {
 					sim_slot_ready = slot + 1;
 				}
-				at += 13 + aid;
+				at += 7 + aid + 7;
 			}
 		}
 		/*
