@@ -1725,20 +1725,23 @@ step_our_item(void)
 	}
 	show_words("our item reads back", &ours);
 	/*
-	 * The IPA's item (dt of Linux: qcom,smem-id 497, qcom,smem-size 0x2000 of the IPA): memory the
-	 * application processor's IPA driver allocates in this partition for the modem's filter tables.
-	 * There is no IPA driver here, but the modem looks for the item when it goes online; made, zeroed,
-	 * so that it finds it (modem_ipa_item=0: not).
+	 * The IPA's item: SMEM_IPA_FILTER_TABLE (497), 0x9000 bytes (dt: qcom,ipa-q6-smem-size of ipa_smmu_ap), which
+	 * Android's IPA driver allocates in this partition at its probe (techpack/dataipa, ipa_smmu_ap_cb_probe():
+	 * qcom_smem_alloc(SMEM_MODEM, SMEM_IPA_FILTER_TABLE, size)) and maps into the IPA's SMMU context as it is:
+	 * the modem puts its filter tables there for the IPA to read. The modem looks for it when its IPA driver
+	 * initializes; before the IPA ran here (22 October) an item of 0x2000 made the modem give up before any
+	 * service, since it then went on to the unclocked IPA. Now that the IPA runs, made by default, zeroed
+	 * (modem_ipa_item=0: not; our SMMU context maps all of DDR, so the item needs no mapping of its own).
 	 */
 	{
-		uint32_t ipa_item = 0, ipa_size = 0;     /* (497 made the modem give up before any service: off; modem_ipa_item=497 to try) */
+		uint32_t ipa_item = 497, ipa_size = 0;
 
 		PE_parse_boot_argn("modem_ipa_item", &ipa_item, sizeof(ipa_item));
 		if (ipa_item != 0) {
 			if (smem_item(ipa_item, &ipa_size) != 0) {
 				printf("mpss: %u: the IPA's item %u is there already (%u bytes)\n", step, ipa_item, ipa_size);
-			} else if (our_item_make(partition, ipa_item, 0x2000)) {
-				printf("mpss: %u: the IPA's item %u made, 0x2000 bytes, zeroed\n", step, ipa_item);
+			} else if (our_item_make(partition, ipa_item, 0x9000)) {
+				tell("mpss: %u: THE IPA'S ITEM %u MADE, 0x9000 bytes, zeroed (the modem's filter tables go there)\n", step, ipa_item);
 			} else {
 				printf("mpss: %u: the IPA's item %u could not be made\n", step, ipa_item);
 			}
@@ -1760,8 +1763,15 @@ step_our_item(void)
  * modem_ipa_fw=0 leaves it out.
  */
 #define PAS_IPA                 15
-#define IPA_FW_MEMORY           0x8b700000u
-#define IPA_FW_MEMORY_SIZE      0x1a000u        /* ipa_fw (0x10000) and ipa_gsi (0xa000), one after the other */
+/*
+ * Where the image goes. Android's pil (its dmesg: "yupik_ipa_fws: loading from 0x8b710000 to 0x8b717000")
+ * puts it at the ipa_gsi reservation (0x8b710000, 0xa000; gpu_micro_code follows at 0x8b71a000), not at
+ * ipa_fw@8b700000 as the reservations' names suggest; loaded at 0x8b700000 (runs up to 23 of 24 October)
+ * TrustZone started it and GSI came up, but the microcontroller never wrote "booted" and the modem,
+ * which starts it, never answered INIT_DRIVER. Should the microcontroller fetch its code from DDR at
+ * the address Android uses, this is why. modem_ipa_fw_at=ADDRESS chooses (0x8b700000 allows 0x1a000).
+ */
+static uint32_t ipa_fw_memory = 0x8b710000u, ipa_fw_size = 0xa000u;
 
 
 /*
@@ -2148,8 +2158,11 @@ ipa_firmware_load(void)
 	int32_t result;
 	bool ok = false;
 
-	announce("turn the IPA's clock on (RPMh), load the IPA's firmware (image 15) into its memory at 0x8b700000 and have TrustZone "
-	    "start it, as Android does before the modem");
+	PE_parse_boot_argn("modem_ipa_fw_at", &ipa_fw_memory, sizeof(ipa_fw_memory));
+	ipa_fw_size = ipa_fw_memory == 0x8b700000u ? 0x1a000u : 0xa000u;
+	announce("turn the IPA's clock on (RPMh), load the IPA's firmware (image 15) into its memory and have TrustZone start it, as "
+	    "Android does before the modem");
+	printf("mpss: %u: the IPA's image goes at %#x (%#x bytes allowed)\n", step, ipa_fw_memory, ipa_fw_size);
 	if (!ipa_clock(true)) {
 		printf("mpss: %u: the IPA's clock is not on: its firmware is not loaded (a start without the clock ends the kernel)\n", step);
 		return false;
@@ -2183,7 +2196,7 @@ ipa_firmware_load(void)
 		}
 		if (relocatable && lowest != ~0u) {
 			for (uint32_t i = 0; i < count; i++) {
-				segments[i].paddr = segments[i].paddr - lowest + IPA_FW_MEMORY;
+				segments[i].paddr = segments[i].paddr - lowest + ipa_fw_memory;
 			}
 		}
 	}
@@ -2193,7 +2206,7 @@ ipa_firmware_load(void)
 		if (segments[i].type != 1 || MDT_HASH(segments[i].flags) || segments[i].memory_size == 0) {
 			continue;
 		}
-		if (segments[i].paddr < IPA_FW_MEMORY || (uint64_t)segments[i].paddr + segments[i].memory_size > IPA_FW_MEMORY + IPA_FW_MEMORY_SIZE) {
+		if (segments[i].paddr < ipa_fw_memory || (uint64_t)segments[i].paddr + segments[i].memory_size > ipa_fw_memory + ipa_fw_size) {
 			printf("mpss: %u: the IPA's segment %u (%#x, %#x bytes) is not within its memory\n", step, i, segments[i].paddr,
 			    segments[i].memory_size);
 			goto out;
@@ -2211,8 +2224,8 @@ ipa_firmware_load(void)
 		}
 		loaded++;
 	}
-	size = ((highest + 0xfff) & ~0xfffu) - IPA_FW_MEMORY;
-	printf("mpss: %u: the IPA's image: %u segments to load, %#x bytes from %#x\n", step, loaded, size, IPA_FW_MEMORY);
+	size = ((highest + 0xfff) & ~0xfffu) - ipa_fw_memory;
+	printf("mpss: %u: the IPA's image: %u segments to load, %#x bytes from %#x\n", step, loaded, size, ipa_fw_memory);
 	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		goto out;
 	}
@@ -2226,17 +2239,17 @@ ipa_firmware_load(void)
 		printf("mpss: %u: TRUSTZONE DOES NOT TAKE THE IPA'S HEADER (%d, %#llx)\n", step, result, answer);
 		goto out;
 	}
-	result = scm("where the IPA's image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_IPA, IPA_FW_MEMORY, size, 0, &answer);
+	result = scm("where the IPA's image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_IPA, ipa_fw_memory, size, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT TAKE THE IPA'S PLACE (%d, %#llx)\n", step, result, answer);
 		goto out;
 	}
-	memory = (volatile uint8_t *)ml_io_map_unmappable(IPA_FW_MEMORY, size, VM_WIMG_WCOMB);
+	memory = (volatile uint8_t *)ml_io_map_unmappable(ipa_fw_memory, size, VM_WIMG_WCOMB);
 	if (memory == NULL) {
 		goto out;
 	}
 	for (uint32_t i = 0; i < count; i++) {
-		uint32_t at = segments[i].paddr - IPA_FW_MEMORY;
+		uint32_t at = segments[i].paddr - ipa_fw_memory;
 
 		if (segments[i].type != 1 || MDT_HASH(segments[i].flags) || segments[i].memory_size == 0) {
 			continue;
@@ -2253,6 +2266,53 @@ ipa_firmware_load(void)
 		goto out;
 	}
 	tell("mpss: %u: THE IPA'S FIRMWARE IS LOADED AND STARTED (image 15, %u segments)\n", step, loaded);
+	/*
+	 * Whether TrustZone has copied the segments where the image says they run (their virtual addresses:
+	 * GSI's instruction memory at 0x1e1f000 and the microcontroller's at 0x1e81000, both in the IPA's
+	 * register space) is checked by reading them back: the GSI's status bit alone does not prove its
+	 * firmware runs (24 October: the modem's IPA_CTL task never answers, as if GSI answered nothing).
+	 */
+	for (uint32_t i = 0; i < count; i++) {
+		if (segments[i].type == 1 && !MDT_HASH(segments[i].flags) && segment_file[i] != NULL && segments[i].file_size >= 16 &&
+		    segments[i].vaddr >= 0x01e00000u && segments[i].vaddr < 0x01f00000u) {
+			struct block iram = { "ipa iram", segments[i].vaddr & ~0xfffu, 0x8000 };
+			uint32_t n = segments[i].file_size < 256 ? segments[i].file_size : 256, same = 0, first[4];
+
+			need(&iram);
+			for (uint32_t at = 0; at < n; at += 4) {
+				uint32_t ours = rd(iram.base + (segments[i].vaddr & 0xfff) + at), file;
+
+				memcpy(&file, segment_file[i] + at, 4);
+				same += ours == file ? 4 : 0;
+				if (at < 16) {
+					first[at / 4] = ours;
+				}
+			}
+			tell("mpss: %u: the IPA's segment %u at %#x: %u of the first %u bytes read back as the file has them (%s); it begins %#x %#x %#x %#x\n",
+			    step, i, segments[i].vaddr, same, n, same == n ? "TRUSTZONE HAS PUT IT THERE" : "NOT WHAT TRUSTZONE WAS GIVEN",
+			    first[0], first[1], first[2], first[3]);
+		}
+	}
+	{
+		struct block gsi = { "gsi", 0x01e04000, 0x1000 };
+
+		need(&gsi);
+		tell("mpss: %u: GSI_CFG %#x (bit 0 GSI enable, 1 MCS enable, 2 double MCS clock, 3 uC is MCS, 4 power collapse, 5 bypass matrix off, "
+		    "[11:8] sleep clock divider), MCS_CFG %#x (bit 0: the sequencer runs)\n", step, rd(gsi.base + 0), rd(gsi.base + 0xb000));
+		if (option("modem_ipa_gsi_enable")) {
+			/*
+			 * What Android's gsi_enable_fw() writes when the firmware was put into the instruction memory by hand
+			 * rather than by TrustZone (GSI 2.5 and later): the sequencer on, then GSI on with the doubled
+			 * sequencer clock and the sleep clock divided by 2. TrustZone's start is supposed to do the same.
+			 */
+			wr(gsi.base + 0xb000, 1);
+			wr(gsi.base + 0, 1u | 1u << 2 | 2u << 8);
+			settle();
+			need(&gsi_ee0);
+			tell("mpss: %u: GSI enabled by hand: GSI_CFG %#x, MCS_CFG %#x, status %#x\n", step, rd(gsi.base + 0), rd(gsi.base + 0xb000),
+			    rd(gsi_ee0.base + 0));
+		}
+	}
 	sleep_ms(50);
 	if (!option("modem_ipa_quiet")) {
 		ipa_status("after its firmware's start");
