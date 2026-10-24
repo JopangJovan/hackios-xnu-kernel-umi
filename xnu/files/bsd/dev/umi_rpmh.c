@@ -1,6 +1,6 @@
 /* UMI PM8150A L1 ACTIVE vote through the SM8250 RPMh apps DRV.
  * Adapted from the validated older UMI project; bounded waits, no recovery
- * or sleep/wake programming. Used only by the gated UMI touch thread. */
+ * or sleep/wake programming. Used by the gated UMI touch and PCIe clients. */
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
@@ -12,6 +12,7 @@ extern void hk_tl(const char *, ...) __printflike(1, 2);
 #define printf hk_tl
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 int umi_rpmh_vreg_enable(const char *res, unsigned mv);
+int umi_rpmh_wifi_power(void);
 
 /* Live downstream DT has two positional reg entries, no reg-names. */
 #define RH_RSC_PA       0x18220000u
@@ -189,6 +190,12 @@ rh_lookup(const char *res, uint32_t *address)
 				printf("UMI RPMH: invalid VRM entry for %s\n", res);
 				return EINVAL;
 			}
+			/* UMI's firmware repeats some VRM entries across slave headers.
+			 * An alias is harmless only when it resolves to the same register. */
+			if (matches && *address != addr) {
+				printf("UMI RPMH: conflicting addresses for %s: %#x / %#x\n", res, *address, addr);
+				return EINVAL;
+			}
 			*address = addr;
 			++matches;
 			printf("UMI RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
@@ -196,7 +203,7 @@ rh_lookup(const char *res, uint32_t *address)
 			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
 		}
 	}
-	if (matches != 1) {
+	if (matches == 0) {
 		printf("UMI RPMH: %s lookup matches=%u; refusing\n", res, matches);
 		return ENODEV;
 	}
@@ -218,7 +225,7 @@ rh_free(unsigned t)
 }
 
 static int
-rh_send(uint32_t address, unsigned mv)
+rh_send(uint32_t address, unsigned mv, bool set_ldo_mode)
 {
 	int chosen = -1;
 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
@@ -233,7 +240,7 @@ rh_send(uint32_t address, unsigned mv)
 		for (unsigned c = 0; c < rh_ncpt; ++c) {
 			if ((enabled & (1u << c)) &&
 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
-				printf("UMI RPMH: conflicting inherited L1C request in TCS%u\n", t);
+				printf("UMI RPMH: conflicting inherited VRM request in TCS%u\n", t);
 				return EBUSY;
 			}
 		}
@@ -266,11 +273,15 @@ rh_send(uint32_t address, unsigned mv)
 	}
 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
 	rh_poisoned = true;
-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
-	const uint32_t offsets[3] = {0, 8, 4};
-	const uint32_t values[3] = {mv, 7, 1};
-	printf("UMI RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
-	for (unsigned c = 0; c < 3; ++c) {
+	/* Touch's PMIC5 LDO needs HPM. Wi-Fi's shared SMPS/LDO rails retain
+	 * their inherited mode; a PMIC5 LDO mode must not be applied to an SMPS. */
+	const uint32_t offsets[3] = {0, set_ldo_mode ? 8u : 4u, 4};
+	const uint32_t values[3] = {mv, set_ldo_mode ? 7u : 1u, 1};
+	unsigned commands = set_ldo_mode ? 3 : 2;
+	uint32_t command_mask = (1u << commands) - 1;
+	printf("UMI RPMH: TCS%u ACTIVE %u mV commands=%u enable=1 irq-enable=%#x\n",
+	    t, mv, commands, irq_en);
+	for (unsigned c = 0; c < commands; ++c) {
 		uint32_t cmd = b + c * RH_CMD_STRIDE;
 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
 		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
@@ -278,7 +289,7 @@ rh_send(uint32_t address, unsigned mv)
 			return EIO;
 		}
 	}
-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
+	if (!rh_sync(b + RH_WAIT, command_mask) || !rh_sync(b + RH_ENABLE, command_mask) ||
 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
 		return EIO;
 	}
@@ -289,7 +300,7 @@ rh_send(uint32_t address, unsigned mv)
 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
 		idle = rh_read(rh_tcs, b + RH_STATUS);
 		bool complete = true;
-		for (unsigned c = 0; c < 3; ++c) {
+		for (unsigned c = 0; c < commands; ++c) {
 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
 			complete &= status[c] != 0xffffffffu &&
 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
@@ -320,7 +331,7 @@ rh_send(uint32_t address, unsigned mv)
 		return EIO;
 	}
 	rh_poisoned = false;
-	printf("UMI RPMH: L1C ACTIVE vote complete (rail voltage requires hardware verification)\n");
+	printf("UMI RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
 	return 0;
 }
 
@@ -347,12 +358,45 @@ umi_rpmh_vreg_enable(const char *res, unsigned mv)
 		error = rh_lookup(res, &address);
 	}
 	if (!error) {
-		error = rh_send(address, mv);
+		error = rh_send(address, mv, true);
 	}
 out:
 	if (error) {
 		printf("UMI RPMH: enable failed errno=%d\n", error);
 	}
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
+}
+
+/* Exact UMI supplies from the merged stock DT, not a generic regulator API.
+ * ACTIVE votes are held until reset; no SLEEP/WAKE votes or shared-rail disable.
+ * Called only by the explicit PCIe diagnostic, with the endpoint held in reset.
+ */
+int
+umi_rpmh_wifi_power(void)
+{
+	static const struct { const char *resource; unsigned mv; } rails[] = {
+		{ "smpa4", 1800 }, /* WLAN IO */
+		{ "smpa6", 950 },  /* WLAN AON */
+		{ "smpf2", 950 },  /* WLAN digital */
+		{ "smpa5", 1900 }, /* WLAN RFA1 */
+		{ "smpc8", 1350 }, /* WLAN RFA2 */
+		{ "ldoa9", 1200 }, /* PCIe vreg-1p8: DT actually requests 1.2 V */
+		{ "ldoa5", 880 },  /* PCIe vreg-0p9 */
+	};
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	int error = EIO;
+	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
+	if (rh_poisoned) goto out;
+	error = rh_map();
+	/* Validate every resource before starting the first power transaction. */
+	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); ++i)
+		error = rh_lookup(rails[i].resource, &addresses[i]);
+	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); ++i) {
+		printf("UMI RPMH: Wi-Fi/PCIe %s minimum=%u mV\n", rails[i].resource, rails[i].mv);
+		error = rh_send(addresses[i], rails[i].mv, false);
+	}
+out:
 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 	return error;
 }

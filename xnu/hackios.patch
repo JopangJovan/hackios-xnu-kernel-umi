@@ -65,7 +65,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..009fa9121756 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,45 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,47 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -77,6 +77,8 @@ index 44274016a4cf..009fa9121756 100644
 +bsd/dev/umi_rpmh.c		standard
 +bsd/dev/umi_touch_boost.c		standard
 +bsd/dev/umi_wifi.c		standard
++bsd/dev/umi_mhi.c		standard
++bsd/dev/umi_pcie.c		standard
 +bsd/dev/hk_buttons.c	standard
 +bsd/dev/hk_battery.c	standard
 +bsd/dev/hk_ufs.c	standard
