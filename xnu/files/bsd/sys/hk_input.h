@@ -88,6 +88,7 @@ int hk_wifi_tell(const char *format, ...) __printflike(1, 2);     /* ... one tha
 uint32_t hk_wifi_option(const char *name);                         /* a boot-arg's number, or what wifi=1 stands for */
 const uint8_t *hk_wifi_file(const char *name, uint64_t *size);     /* a file of fw/ in the small image, in place */
 bool hk_wlfw_exchange(uint32_t step);                              /* step 15 of wifi_step=N: hk_wlfw.c */
+bool hk_wlfw_query(uint32_t step);                                 /* UMI: query WLFW capabilities without downloading board data */
 bool hk_wlfw_registers(uint64_t *address, uint32_t *size, bool *mission); /* ... and what it learnt for step 16 */
 void hk_wlfw_stop(uint32_t step);                                  /* ... and its end, before the DSP is stopped */
 void hk_wifi_quiesce(void);        /* on the way back to the loader: the Wi-Fi DSP, if it still runs, shut down */
@@ -99,7 +100,12 @@ void hk_lx_net_early(void);        /* ... and en0 made on the radio now, if the 
 bool hk_wifi_dsp_is_up(void);      /* the DSP that runs the radio's firmware has been started and has a link */
 const uint8_t *hk_wifi_driver_file(const char *name, uint64_t *size);     /* a file by the name Linux has for it */
 bool hk_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */
+bool hk_wifi_radio_map_at(uint64_t physical, uint64_t size, unsigned long long address); /* memory shown at a stock IOVA */
 bool hk_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
+int hk_wifi_umi_smmu_test(void); /* gated UMI diagnostic, PCIe bus mastering must remain off */
+/* The gated action runs under an owned, verified context. It must hold the
+ * endpoint in reset before returning, including on error. Buffers stay wired. */
+int hk_wifi_umi_smmu_run(int (*action)(void *), void *context);
 bool hk_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
 /* the network to join (fw/network of the small image): name and passphrase, buffer sizes in and lengths out */
 bool hk_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);

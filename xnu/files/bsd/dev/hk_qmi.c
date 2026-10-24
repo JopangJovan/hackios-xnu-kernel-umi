@@ -841,6 +841,20 @@ hk_qmi_connect(struct socket *sock, uint32_t node, uint32_t port)
 }
 
 int
+hk_qmi_poll(struct qmi_handle *qmi, uint32_t timeout_ms)
+{
+	struct qmi_state *s = state_of(qmi);
+
+	if (s == NULL) {
+		return -EINVAL;
+	}
+	if (s->transport->poll == NULL) {
+		return 0;
+	}
+	return s->transport->poll(s->port, timeout_ms);
+}
+
+int
 qmi_txn_init(struct qmi_handle *qmi, struct qmi_txn *txn, const struct qmi_elem_info *ei, void *structure)
 {
 	struct qmi_state *s = state_of(qmi);

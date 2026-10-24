@@ -25,15 +25,21 @@ struct umi_mhi_io {
 	void (*sync_for_device)(void *, const struct umi_mhi_dma *);
 	void (*delay_us)(void *, unsigned);
 	void (*report)(void *, const char *, uint32_t);
+	void (*qrtr_packet)(void *, const void *, size_t);
 };
 
 struct umi_mhi {
 	const struct umi_mhi_io *io;
 	uint32_t bhi, bhie, channel_db, event_db, sequence;
-	bool poisoned, sbl_sent, contexts_ready, amss_sent;
+	uint64_t event_consumer[3], event_wp[3], command_wp, ipcr_rx_wp, ipcr_tx_wp;
+	unsigned ipcr_tx_slot;
+	uint16_t ipcr_wait_transaction;
+	bool poisoned, sbl_sent, contexts_ready, amss_sent, ipcr_started;
+	bool ipcr_tx_pending, ipcr_tx_done, ipcr_waiting_response, ipcr_response_done;
 	/* Retain these even on timeout: the endpoint may still be using them. */
 	struct umi_mhi_dma sbl, image, vectors;
 	struct umi_mhi_dma channels, events, commands, command_ring, event_ring[3];
+	struct umi_mhi_dma ipcr_tx_ring, ipcr_tx_buffers, ipcr_rx_ring, ipcr_rx_buffers;
 };
 
 /* A zero-initialized host, an enumerated endpoint, and a mapped BAR are required.
@@ -51,5 +57,14 @@ int umi_mhi_download_sbl(struct umi_mhi *, const void *, size_t);
  */
 int umi_mhi_prepare_ready(struct umi_mhi *);
 int umi_mhi_download_amss(struct umi_mhi *, const void *, size_t);
+int umi_mhi_wait_mission(struct umi_mhi *);
+/* Start the stock UMI QRTR/IPCR channels (20/21) and post bounded receive
+ * buffers. Polling is for bring-up only; production needs MSI event handling.
+ */
+int umi_mhi_start_ipcr(struct umi_mhi *);
+int umi_mhi_poll_ipcr(struct umi_mhi *, unsigned timeout_ms, unsigned *received);
+int umi_mhi_send_qrtr_hello(struct umi_mhi *);
+int umi_mhi_send_qrtr_packet(struct umi_mhi *, const void *, size_t,
+	unsigned timeout_ms, uint16_t expected_transaction);
 
 #endif

@@ -19,7 +19,7 @@ struct region { uint32_t base, size; uint32_t *words; };
 struct model {
 	struct region regions[8];
 	unsigned writes, phy_writes, delay, conf_reads, bar_reads;
-	bool powered, gdsc, clocks, perst_released, link, cfg_enabled, bar_enabled;
+	bool powered, gdsc, clocks, perst_released, link, cfg_enabled, bar_enabled, protection;
 	bool fail_power, fail_gdsc, fail_clock, fail_phy, fail_link, fail_atu, wrong_id, wrong_mhi;
 };
 static uint32_t *reg(struct model *m, uint32_t addr)
@@ -41,7 +41,7 @@ static uint32_t rd(void *context, uint32_t addr)
 		assert(m->link && m->cfg_enabled);
 		m->conf_reads++;
 	}
-	if (addr >= BAR && addr < BAR + 0x1000) {
+	if (addr >= BAR && addr < BAR + 0x100000) {
 		assert(m->bar_enabled && (*reg(m, CONF + 4) & 7) == 2);
 		m->bar_reads++;
 	}
@@ -55,7 +55,7 @@ static void wr(void *context, uint32_t addr, uint32_t value)
 	    (addr >= PHY && addr < PHY + 0x1000) ||
 	    (addr >= DBI && addr < DBI + 0x2000)) assert(m->powered && m->gdsc && m->clocks);
 	if (addr >= CONF && addr < CONF + 0x1000) assert(m->link && m->cfg_enabled);
-	if (addr == CONF + 4 || addr == DBI + 4) assert(!(value & 4)); /* Never DMA. */
+	if ((addr == CONF + 4 || addr == DBI + 4) && (value & 4)) assert(m->protection);
 	if (addr == GPIO + 79 * 0x1000 + 4) m->perst_released = (value & 2) != 0;
 	if (addr >= PHY && addr < PHY + 0x1000) {
 		assert(!m->perst_released);
@@ -122,12 +122,13 @@ static void setup(struct model *m, struct umi_pcie *p, struct umi_pcie_io *io)
 	m->regions[4] = (struct region){DBI, 0x1000, NULL};
 	m->regions[5] = (struct region){ATU, 0x1000, NULL};
 	m->regions[6] = (struct region){CONF, 0x1000, NULL};
-	m->regions[7] = (struct region){BAR, 0x1000, NULL};
+	m->regions[7] = (struct region){BAR, 0x100000, NULL};
 	for (unsigned i = 0; i < 8; i++) {
 		m->regions[i].words = calloc(1, m->regions[i].size);
 		assert(m->regions[i].words);
 	}
 	*reg(m, GCC + 0x6b004) = 1;
+	*reg(m, PARF + 0x2c00) = 1; /* Hardware defaults to SID bypass. */
 	const uint32_t gates[] = {0x6b010,0x6b014,0x6b01c,0x6b024,0x6b028};
 	for (unsigned i = 0; i < 5; i++) *reg(m, GCC + gates[i]) = BIT(31);
 	*reg(m, PHY + 0x814) = BIT(6);
@@ -191,5 +192,51 @@ int main(void)
 	umi_pcie_quiesce(&p);
 	cleanup(&m);
 	puts("PASS: real UMI cold-PBL signature enumerates without MHIVER initialized");
+	setup(&m, &p, &io);
+	assert(umi_pcie_enable_dma(&p) == ENODEV && m.writes == 0);
+	assert(umi_pcie_enumerate(&p, &io) == 0);
+	*reg(&m, PARF + 0x2000 + 4 * 0x15) = 0x02000200;
+	assert(umi_pcie_enable_dma(&p) == EBUSY && !p.dma_enabled);
+	*reg(&m, PARF + 0x2000 + 4 * 0x15) = 0;
+	m.protection = true; /* Caller has installed and verified an owned context. */
+	assert(umi_pcie_enable_dma(&p) == 0 && p.dma_enabled);
+	assert(*reg(&m, PARF + 0x2000 + 4 * 0x15) == 0x01000100);
+	assert((*reg(&m, PARF + 0x2c00) & 1) == 0);
+	assert((*reg(&m, CONF + 4) & 7) == 6 && (*reg(&m, DBI + 4) & 7) == 6);
+	assert(umi_pcie_enable_dma(&p) == EALREADY);
+	umi_pcie_quiesce(&p);
+	assert(!p.dma_enabled && !m.perst_released);
+	assert((*reg(&m, CONF + 4) & 4) == 0 && (*reg(&m, DBI + 4) & 4) == 0);
+	cleanup(&m);
+	puts("PASS: protected-DMA routing, conflicting owner rejection and bus-master shutdown");
+	setup(&m, &p, &io);
+	assert(umi_pcie_enumerate(&p, &io) == 0);
+	*reg(&m, BAR + 0x310c) = 0x40000001;
+	*reg(&m, BAR + 0x8031c) = 0x45;
+	assert(umi_pcie_prepare_radio(&p) == 0);
+	assert(*reg(&m, BAR + 0x8031c) == 0x40);
+	assert(*reg(&m, BAR + 0x310c) == 0x40000001);
+	umi_pcie_quiesce(&p);
+	cleanup(&m);
+	puts("PASS: WLAON shutdown/fuse-supply bits cleared and register window restored");
+	setup(&m, &p, &io);
+	assert(umi_pcie_enumerate(&p, &io) == 0);
+	*reg(&m, CONF + 0x34) = 0x40;
+	*reg(&m, CONF + 0x40) = 0x5001;
+	*reg(&m, CONF + 0x50) = 0x10a7005; /* 32 vectors, 32-bit addr, per-vector mask. */
+	assert(umi_pcie_setup_mhi_msi(&p, 0xa0000040, 800) == 0);
+	assert(*reg(&m, CONF + 0x54) == 0xa0000040 && *reg(&m, CONF + 0x58) == 800);
+	assert(*reg(&m, CONF + 0x5c) == 0xfffffff8 && (*reg(&m, CONF + 0x50) >> 16) == 0x15b);
+	assert(umi_pcie_setup_mhi_msi(&p, 0xa0000040, 800) == EBUSY);
+	umi_pcie_quiesce(&p);
+	assert(!(*reg(&m, CONF + 0x50) & (1u << 16)));
+	cleanup(&m);
+	setup(&m, &p, &io);
+	assert(umi_pcie_enumerate(&p, &io) == 0);
+	*reg(&m, CONF + 0x34) = 0x40;
+	*reg(&m, CONF + 0x40) = 0x4001; /* Capability cycle must not loop forever. */
+	assert(umi_pcie_setup_mhi_msi(&p, 0xa0000040, 800) == EINVAL);
+	cleanup(&m);
+	puts("PASS: stock MHI MSI mapping/masks, repeated setup rejection and capability-cycle guard");
 	return 0;
 }

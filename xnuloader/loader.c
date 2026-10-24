@@ -2733,6 +2733,8 @@ umi_bootargs_ok(const struct payload_info *pi)
 	static const char *const allowed[] = {
 		"-v", "debug=", "keepsyms=", "serial=", "cpus=", "bootcpu=",
 		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
+		/* Narrowly allow the existing frame-latency diagnostics on UMI. */
+		"touch_lat=1", "cpuload=1000",
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=",
@@ -2786,7 +2788,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 			if (umi_amp_probe || end - c != 15 || c[14] < '1' || c[14] > '5') ok = 0;
 			umi_amp_probe = 1;
 		} else if (starts_with(c, "umi_wifi_step=")) {
-			if (umi_wifi_step || end - c != 15 || c[14] < '1' || c[14] > '2') ok = 0;
+			if (umi_wifi_step || end - c != 15 || c[14] < '1' || c[14] > '9') ok = 0;
 			umi_wifi_step = 1;
 		} else if (starts_with(c, "umi_wifi_return=")) {
 			if (umi_wifi_return || end - c != 17 || c[16] != '1') ok = 0;
@@ -2877,7 +2879,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 		return 0;
 	}
 	if (umi_wifi_step != umi_wifi_return) {
-		print("UMI: Wi-Fi diagnostics require umi_wifi_step=1..2 umi_wifi_return=1\n");
+		print("UMI: Wi-Fi diagnostics require umi_wifi_step=1..9 umi_wifi_return=1\n");
 		return 0;
 	}
 	return 1;

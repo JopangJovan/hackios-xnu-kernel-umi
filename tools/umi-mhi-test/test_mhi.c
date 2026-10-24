@@ -12,6 +12,7 @@
 struct model {
 	uint32_t regs[1024];
 	unsigned writes, polls, allocations, syncs, event_doorbells;
+	unsigned command_starts;
 	unsigned ready_after, fail_allocation;
 	uint64_t next;
 	struct umi_mhi_dma memory[MAX_DMA];
@@ -34,7 +35,10 @@ static uint32_t rd(void *p, uint32_t off)
 static void *dma_at(struct model *m, uint64_t iova)
 {
 	for (unsigned i = 0; i < m->allocations; i++)
-		if (m->memory[i].address == iova) return m->memory[i].bytes;
+		if (iova >= m->memory[i].address &&
+		    iova < m->memory[i].address + m->memory[i].size)
+			return (unsigned char *)m->memory[i].bytes +
+			    (size_t)(iova - m->memory[i].address);
 	assert(!"unknown DMA context address");
 	return NULL;
 }
@@ -90,6 +94,35 @@ static void wr(void *p, uint32_t off, uint32_t value)
 	if (off == 0x260 && !m->amss_timeout) {
 		m->regs[0x268 / 4] = 0x80000000 | (m->stale ? value - 1 : value);
 		m->regs[0x128 / 4] = 2;
+	}
+	if (off == 0x70) {
+		uint64_t command_wp = address(m->regs, 0x70 / 4);
+		uint64_t command_iova = command_wp - 16;
+		uint32_t *command = dma_at(m, command_iova);
+		unsigned type = (command[3] >> 16) & 0xff;
+		assert(type == 1 || type == 18);
+		if (type == 18) {
+			unsigned channel = command[3] >> 24;
+			uint32_t *channel_contexts = dma_at(m, address(m->regs, 0x58 / 4));
+			uint32_t *channel_context = channel_contexts + channel * 11;
+			assert(channel == (m->command_starts ? 21u : 20u));
+			assert(address(channel_context, 9) == address(channel_context, 3));
+			channel_context[0] = (channel_context[0] & ~0xffu) | 2u;
+			m->command_starts++;
+		}
+		uint32_t *event_contexts = dma_at(m, address(m->regs, 0x60 / 4));
+		uint32_t *event_context = event_contexts;
+		uint64_t event_base = address(event_context, 3);
+		uint64_t event_rp = address(event_context, 7);
+		uint32_t *event = dma_at(m, event_rp);
+		event[0] = (uint32_t)command_iova;
+		event[1] = (uint32_t)(command_iova >> 32);
+		event[2] = 1u << 24; /* command completion success */
+		event[3] = 0x21u << 16;
+		uint64_t event_next = event_rp + 16;
+		if (event_next == event_base + 32 * 16) event_next = event_base;
+		event_context[7] = (uint32_t)event_next;
+		event_context[8] = (uint32_t)(event_next >> 32);
 	}
 }
 
@@ -176,12 +209,35 @@ int main(void)
 	assert(umi_mhi_prepare_ready(&h) == 0 && h.contexts_ready);
 	assert(umi_mhi_prepare_ready(&h) == EALREADY);
 	assert(umi_mhi_download_amss(&h, image, size) == 0 && h.amss_sent);
+	assert(umi_mhi_wait_mission(&h) == 0);
 	uint64_t *v = h.vectors.bytes;
 	assert(rd(&m, 0x258) == 48);
 	assert(v[0] == h.image.address && v[1] == SEG);
 	assert(v[2] == h.image.address + SEG && v[3] == SEG);
 	assert(v[4] == h.image.address + 2 * SEG && v[5] == 17);
 	assert(!memcmp(h.image.bytes, image, size));
+	assert(umi_mhi_start_ipcr(&h) == 0 && h.ipcr_started);
+	assert(m.command_starts == 2);
+	assert(umi_mhi_start_ipcr(&h) == EALREADY);
+	uint32_t *channels = dma_at(&m, address(m.regs, 0x58 / 4));
+	uint32_t *tx = channels + 20 * 11, *rx = channels + 21 * 11;
+	assert(tx[0] == 0x202 && tx[1] == 1 && tx[2] == 1);
+	assert(rx[0] == 0x202 && rx[1] == 2 && rx[2] == 1);
+	assert(address(rx, 5) == 32 * 16);
+	assert(address(rx, 7) == h.ipcr_rx_ring.address);
+	assert(address(rx, 9) == h.ipcr_rx_ring.address + 31 * 16);
+	uint32_t *rx_tres = h.ipcr_rx_ring.bytes;
+	assert(rx_tres[2] == 8192 && rx_tres[3] == ((2u << 16) | (1u << 9)));
+	assert(rx_tres[0] == (uint32_t)h.ipcr_rx_buffers.address);
+	/* A QMI BDF chunk exceeds 4 KiB; every slot must have its full 8 KiB
+	 * backing, while oversized sends must fail before publishing a TRE. */
+	assert(h.ipcr_rx_buffers.size == 31u * 8192u);
+	assert(h.ipcr_tx_buffers.size == 32u * 8192u);
+	writes = m.writes;
+	assert(umi_mhi_send_qrtr_packet(&h, image, 8193, 1, UINT16_MAX) == EINVAL);
+	assert(m.writes == writes && !h.ipcr_tx_pending && !h.poisoned);
+	unsigned received = UINT32_MAX;
+	assert(umi_mhi_poll_ipcr(&h, 1, &received) == 0 && received == 0);
 	writes = m.writes;
 	assert(umi_mhi_download_amss(&h, image, size) == EALREADY && m.writes == writes);
 	cleanup(&m);
@@ -274,6 +330,15 @@ int main(void)
 	m.regs[0x28 / 4] = 0x180;
 	assert(umi_mhi_probe(&h, &io) == ENODEV && m.writes == 0);
 	puts("PASS: captured cold-PBL signature accepted only with exact layout and PBL EE");
+	setup(&m, &h, &io);
+	boot_sbl(&m, &h, &io, image, size);
+	assert(umi_mhi_prepare_ready(&h) == 0);
+	assert(umi_mhi_wait_mission(&h) == EBUSY);
+	assert(umi_mhi_download_amss(&h, image, size) == 0);
+	m.regs[0x128 / 4] = 1;
+	assert(umi_mhi_wait_mission(&h) == ETIMEDOUT && h.poisoned && m.polls == 20000);
+	cleanup(&m);
+	puts("PASS: mission mode requires completed BHIE and has a bounded transition wait");
 	free(image);
 	return 0;
 }

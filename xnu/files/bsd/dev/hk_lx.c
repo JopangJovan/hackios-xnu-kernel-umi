@@ -86,6 +86,31 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 }
 
 void *
+lx_os_radio_memory_at(unsigned long size, unsigned long long address)
+{
+	vm_offset_t cached = 0, uncached;
+	uint64_t physical;
+
+	size = round_page(size);
+	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {
+		say("lx: no %lu bytes of memory in one piece\n", size);
+		return NULL;
+	}
+	physical = kvtophys(cached);
+	bzero((void *)cached, size);
+	for (vm_offset_t line = cached; line < cached + size; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB);
+	if (uncached == 0 || !hk_wifi_radio_map_at(physical, size, address)) {
+		return NULL;
+	}
+	return (void *)uncached;
+}
+
+void *
 lx_os_map_registers(unsigned long long physical, unsigned long size)
 {
 	unsigned long long page = trunc_page(physical);

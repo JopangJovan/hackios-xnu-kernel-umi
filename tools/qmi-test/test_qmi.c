@@ -735,7 +735,12 @@ router_close(struct hk_qrtr_port *port)
 	port->closed++;
 }
 
-static const struct hk_qrtr_ops router_ops = { router_open, router_send, router_lookup, router_close };
+static const struct hk_qrtr_ops router_ops = {
+	.open = router_open,
+	.send = router_send,
+	.lookup = router_lookup,
+	.close = router_close,
+};
 
 /* A datagram from the server to the handle, as the router's thread would bring it. */
 static void

@@ -3,10 +3,9 @@
 Wi-Fi is not working in iOS yet. UMI uses QCA6390 (`17cb:1101`) on
 PCIe0. Redwood's WCN6750 WPSS/GLINK startup cannot start this chip.
 
-The current work adds a gated PCIe enumeration diagnostic and an MHI
-BHI/BHIE transport component. Normal UMI boots still skip the Redwood
-radio startup. No network interface or successful firmware boot is claimed
-by these components alone.
+The current work adds gated PCIe, MHI firmware, and QRTR/IPCR diagnostics.
+Normal UMI boots still skip the Redwood radio startup. These diagnostics do
+not yet provide an iOS network interface.
 
 ## Board information
 
@@ -44,8 +43,8 @@ mode setting is not applied to the SMPS supplies.
 
 ## Diagnostics
 
-Both diagnostics require `umi_wifi_return=1` and return to the resident
-loader. The loader accepts only steps 1 and 2. They must run in a temporary
+All diagnostics require `umi_wifi_return=1` and return to the resident
+loader. The loader accepts only steps 1 through 9. They must run in a temporary
 RAM boot, using the UMI loader and UMI DTB.
 
 - `umi_wifi_step=1`: read GCC and the NORTH TLMM GPIO registers only.
@@ -55,6 +54,28 @@ RAM boot, using the UMI loader and UMI DTB.
   The endpoint and root bridge keep bus mastering disabled. The diagnostic
   asserts PERST and lowers WLAN_EN before returning. Shared power/clock votes
   remain until a hardware reset; this is not a normal Wi-Fi enable/disable API.
+
+- `umi_wifi_step=3`: run PCIe enumeration, then install an empty SMMU
+  translation context for stream `0x1c01`, check readback, and restore its
+  saved configuration. Bus mastering remains disabled throughout. An
+  existing owner or pending context faults prevents this test.
+- `umi_wifi_step=4`: add the QCA6390 WLAON preparation, Android-matched MSI
+  setup, protected SMMU mapping, and the first 512 KiB BHI transfer.
+- `umi_wifi_step=5`: wait for MHI READY, install UMI's three event rings and
+  command/channel contexts, and request M0.
+- `umi_wifi_step=6`: transfer the full firmware through BHIE and wait for
+  mission execution environment 2 (AMSS).
+- `umi_wifi_step=7`: start stock QRTR/IPCR transmit and receive channels 20
+  and 21 in the vendor order, post receive buffers after channel start, and
+  discover WLFW instance 1. Register indications, advertise one host client,
+  supply the firmware's DDR and CAL regions, wait for `FW_MEM_READY`, and
+  query target capabilities. This uses a bounded MHI poller.
+- `umi_wifi_step=8`: continue step 7 with stock `regdb.bin` and `bd_j1gl.elf`,
+  map and copy `m3.bin`, send its address, and wait for firmware initialization.
+  It does not enter WLAN mission mode.
+- `umi_wifi_step=9`: continue step 8 by requesting cold-boot calibration,
+  with a bounded 60-second wait for calibration completion or firmware ready.
+  Calibration backing memory remains mapped until the endpoint is reset.
 
 Every hardware poll is bounded. PCIe apertures are accessed only after GDSC
 and clock readiness; configuration reads follow link and iATU readiness;
@@ -92,10 +113,55 @@ execution or networking.
 The temporary hardware diagnostic returned `errno=0` on UMI. XNU received
 completed RPMh transactions for all seven supplies, powered PCIe0's GDSC,
 initialized its PHY, trained Gen2 x1, read PCI ID `0x110117cb`, assigned
-BAR0 `0x60300004`, and validated the boot-ROM BHI register layout.
-The endpoint command was `0x00100402`: memory decode enabled, bus mastering
-clear. The endpoint was reset before returning to the loader. No partition
-was flashed. Host models and the ARM64 kernel/loader build also pass.
+BAR0 `0x60300004`, and validated the boot-ROM BHI register layout. The
+endpoint command was `0x00100402`: memory decode enabled, bus mastering clear.
+The endpoint was reset before returning to the loader. No partition was
+flashed. Host models and the ARM64 kernel/loader build also pass.
+
+On 2026-10-24, step 6 also completed on hardware: the source and uncached SBL
+buffer both hashed to `0xbf4837ba`, the BHI transfer completed, the controller
+entered M0, the BHIE transfer completed, and BHI execution environment reached
+`0x2` (AMSS). The protected SMMU context was restored with no reported radio
+translation fault. This confirms firmware transfer and AMSS startup; it does
+not mean Wi-Fi is operational.
+
+Step 7 subsequently completed on hardware (`logs/174906-run.log`). QCA6390
+requested DDR size `0x5e0000` and CAL size `0xd8000`; XNU mapped separate
+backing allocations at stock IOVAs `0xa1000000` and `0xa1600000`. The
+firmware accepted RespondMem, sent `FW_MEM_READY`, and answered CAP with
+chip family `0xb`, board `0xff`, firmware `0x1014046e` built 2023-05-08.
+The endpoint was reset and the SMMU restored before returning to the loader.
+
+Host-capabilities must advertise **one** client here. Android advertises two
+because `cnss-daemon` connects separately; with two clients in this probe,
+firmware acknowledges host-capabilities but does not request memory.
+Stock CNSS advertises WAKE MSI 813 and BDF/M3 support, and omits ath11k's
+non-Qualcomm `nm_modem` and `mem_cfg_mode` TLVs. The diagnostic matches the
+stock request shape but advertises `cal_done=0` for its freshly allocated
+CAL backing. The captured Android `cal_done=1` belongs to a later startup
+after calibration. Its flags also match the
+[Qualcomm CNSS implementation](https://android.googlesource.com/kernel/msm/+/cac892741c52c1875d40f642559e4e7026602da6/drivers/net/wireless/cnss2/qmi.c).
+
+The bundled AMSS, M3, and UMI board file hashes match Android's mounted
+firmware files. Android sends M3 at IOVA `0xa1880000`, size `0x411bc`.
+The local `~/linux` tree targets SM7150 and is not a UMI board reference.
+
+Step 8 completed on hardware (`logs/175455-run.log`): regdb was accepted
+in four chunks, the UMI board file in ten, M3 was accepted, and firmware
+sent `FW_INIT_DONE` after 39 ms. The diagnostic returned `errno=0`, with
+endpoint reset and successful SMMU restoration. QRTR receive confirmations
+require deferred `RESUME_TX` replies; without them the firmware stalls
+after its tenth outgoing data message, on the first board-file chunk.
+
+The MHI/PCIe host models and 56,627 QMI checks pass with address and
+undefined-behavior sanitizers. Host models do not verify RF operation or
+the iOS network interface.
+
+Step 9 completed on hardware (`logs/175915-run.log`) with `cal_done=0`:
+firmware accepted mode 7 and reported both `COLD_BOOT_CAL_DONE` and
+`FW_READY` about 3.9 seconds after WLFW setup began. The diagnostic
+returned `errno=0` and restored the SMMU after endpoint reset. Reusing
+this CAL allocation across firmware restart still needs integration.
 
 The cold PBL capture differs from Android mission mode: `MHIVER` reads
 `0xdeadbeef`, `MHICFG=0x00800080`, BHI major version is 1 and BHI EE is 0.
@@ -110,16 +176,19 @@ conflicting aliases. Repeated boot diagnostics also require diagnostic
 AHB/SLV clocks to be held on: hardware clock gating can report an idle
 clock as halted, so the diagnostic clears HWCG while checking readiness.
 
+The read-only SMMU survey reports `SCR0=0x00260406`,
+`IDR0=0x4c017e57`, `IDR1=0x6000004a`, 84 unused match slots, 74
+translation contexts and no existing match for endpoint stream `0x1c01`.
+This establishes available ownership slots; it does not validate DMA.
+
 ## Remaining integration
 
-The next phase needs an owned SMMU
-context for stream `0x1c01`, coherent buffers mapped into the captured IOVA
-window, endpoint MSI setup, and the MHI platform callbacks. The radio then
-needs MHI channel/event servicing and QRTR/QMI, plus QCA6390 PCI register
-windowing and bus operations for the existing ath11k core and iOS network
-bridge. The current `wifi/lx/src/lx_bus.c` is specialized for WCN6750 and
-must not access this endpoint using Redwood's fixed windows.
+The next phase needs production MSI/event servicing, persistent calibration
+memory across firmware restart, QCA6390 PCI register windowing and bus
+operations, and the iOS network bridge. The current `wifi/lx/src/lx_bus.c` is
+specialized for WCN6750 and must not access this endpoint using Redwood's
+fixed windows.
 
 Firmware is already packaged in `userland/root/fw/qca6390/`:
-`amss20.bin`, `m3.bin`, `bdwlan.elf`, and `regdb.bin`.
+`amss20.bin`, `m3.bin`, `bd_j1gl.elf`, and `regdb.bin`.
 The paused MHI stash remains available as a recovery copy.

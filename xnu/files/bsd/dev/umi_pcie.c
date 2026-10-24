@@ -126,8 +126,21 @@ static int outbound(struct umi_pcie *p, unsigned index, uint32_t type,
 void umi_pcie_quiesce(struct umi_pcie *p)
 {
 	if (!p || !p->io) return;
-	/* No bus-master enable is ever issued, including on error paths. */
+	if (p->msi_cap) {
+		uint32_t cap = rd(p, CONF + p->msi_cap);
+		if (cap != UINT32_MAX) wr(p, CONF + p->msi_cap, cap & ~BIT(16));
+		p->msi_cap = 0;
+	}
+	/* Stop protected firmware DMA before asserting reset. Enumeration alone
+	 * never enables bus mastering. Shared power/clock votes remain held. */
+	if (p->dma_enabled) {
+		uint32_t command = rd(p, CONF + 4);
+		if (command != UINT32_MAX) wr(p, CONF + 4, (command & 0xffff) & ~4u);
+		wr(p, DBI + 4, 2);
+		p->dma_enabled = false;
+	}
 	(void)gpio_output(p, 79, false, 1);
+	pause_us(p, 1000); /* PERST propagation before the SMMU can be restored. */
 	(void)gpio_output(p, 20, false, 3 | (7u << 6));
 	p->enumerated = false;
 }
@@ -202,6 +215,15 @@ int umi_pcie_enumerate(struct umi_pcie *p, const struct umi_pcie_io *io)
 	}
 	/* QCA6390's known 1 MiB BAR; never enable DMA before installing its SMMU. */
 	wr(p, CONF + 4, ((command & 0xffff) & ~7u) | BIT(10));
+	if (rd(p, CONF + 4) & 4) { error = EIO; goto fail; }
+	/* The SID table can contain uninitialized values after reset.
+	 * Initialize this owned, single-endpoint controller like the stock driver,
+	 * after checking QCA6390 identity and disabling endpoint bus mastering. */
+	for (unsigned i = 0; i < 256; i++) {
+		wr(p, PARF + 0x2000 + 4 * i, 0);
+		if (rd(p, PARF + 0x2000 + 4 * i) != 0) { error = EIO; goto fail; }
+	}
+	report(p, "BDF-to-SID table initialized, DMA disabled", 256);
 	wr(p, CONF + 0x10, BAR | (bar & 15));
 	if ((bar & 6) == 4) wr(p, CONF + 0x14, 0);
 	TRY(outbound(p, 1, 0, BAR, BAR + 0xfffff, BAR));
@@ -241,4 +263,101 @@ fail:
 	report(p, "enumeration failed errno", (uint32_t)error);
 	umi_pcie_quiesce(p);
 	return error;
+}
+
+int umi_pcie_enable_dma(struct umi_pcie *p)
+{
+	if (!p || !p->io || !p->enumerated || p->failed) return ENODEV;
+	if (p->dma_enabled) return EALREADY;
+	/* Kona hashes the two BDF bytes (bus 1, devfn 0) using CRC-8/0x07.
+	 * SID table contains the low byte; PCIe0 supplies the wired 0x1c00 base. */
+	uint8_t hash = 0;
+	const uint8_t bdf[] = {1, 0};
+	for (unsigned i = 0; i < sizeof(bdf); i++) {
+		hash ^= bdf[i];
+		for (unsigned b = 0; b < 8; b++) hash = (hash << 1) ^ ((hash & 0x80) ? 7 : 0);
+	}
+	uint32_t route = PARF + 0x2000 + 4 * hash;
+	uint32_t old = rd(p, route), wanted = 0x01000100;
+	report(p, "BDF-to-SID route address", route);
+	report(p, "BDF-to-SID previous route", old);
+	if (old != 0 && old != wanted) return EBUSY;
+	wr(p, route, wanted);
+	if (rd(p, route) != wanted) return EIO;
+	uint32_t command = rd(p, CONF + 4);
+	if (command == UINT32_MAX || (command & 7) != 2) return EIO;
+	/* SM8250 defaults to BDF-to-SID bypass. A table alone does not route
+	 * requests through the owned context; explicitly enable translation. */
+	report(p, "BDF-to-SID configuration before", rd(p, PARF + 0x2c00));
+	int error = update(p, PARF + 0x2c00, 1, 0);
+	if (error || (rd(p, PARF + 0x2c00) & 1)) return EIO;
+	report(p, "BDF-to-SID configuration after", rd(p, PARF + 0x2c00));
+	wr(p, DBI + 4, 6); /* Allow protected endpoint transactions upstream. */
+	wr(p, CONF + 4, (command & 0xffff) | 4);
+	p->dma_enabled = true; /* Quiesce must clear it even if readback fails. */
+	if ((rd(p, CONF + 4) & 7) != 6) return EIO;
+	report(p, "protected DMA stream", 0x1c01);
+	return 0;
+}
+
+int umi_pcie_prepare_radio(struct umi_pcie *p)
+{
+	if (!p || !p->io || !p->enumerated || p->failed) return ENODEV;
+	if (p->dma_enabled) return EBUSY;
+	/* UMI DT sets qcom,set-wlaon-pwr-ctrl. CNSS clears SHUTDOWN_EN and
+	 * VDD4BLOW_SW_EN in WLAON_QFPROM_PWR_CTRL before the first MHI request.
+	 * This disables those bits; it never enables fuse programming. */
+	uint32_t saved_window = rd(p, BAR + 0x310c);
+	if (saved_window == UINT32_MAX || saved_window == 0xdeadbeef) return EIO;
+	wr(p, BAR + 0x310c, 0x4000003f); /* Internal 0x01f80000 window. */
+	int error = EIO;
+	if ((rd(p, BAR + 0x310c) & 0x4000003f) == 0x4000003f) {
+		uint32_t power = rd(p, BAR + 0x8031c);
+		report(p, "WLAON power control before", power);
+		if (power != UINT32_MAX && power != 0xdeadbeef) {
+			wr(p, BAR + 0x8031c, power & ~5u);
+			uint32_t now = rd(p, BAR + 0x8031c);
+			report(p, "WLAON power control after", now);
+			if (now == (power & ~5u)) error = 0;
+		}
+	}
+	wr(p, BAR + 0x310c, saved_window);
+	return error;
+}
+
+int umi_pcie_setup_mhi_msi(struct umi_pcie *p, uint64_t address, uint32_t data)
+{
+	if (!p || !p->io || !p->enumerated || p->failed) return ENODEV;
+	if (p->dma_enabled || p->msi_cap) return EBUSY;
+	if ((address & 3) || data > 0xffff || (data & 31)) return EINVAL;
+	uint32_t cap = rd(p, CONF + 0x34) & 0xff;
+	uint64_t seen = 0;
+	for (unsigned i = 0; i < 48 && cap; i++) {
+		if (cap < 0x40 || cap > 0xfc || (cap & 3) || (seen & (1ull << (cap / 4)))) return EINVAL;
+		seen |= 1ull << (cap / 4);
+		uint32_t header = rd(p, CONF + cap);
+		if (header == UINT32_MAX) return EIO;
+		if ((header & 0xff) == 5) {
+			uint32_t control = header >> 16;
+			bool wide = (control & 0x80) != 0;
+			if (((control >> 1) & 7) < 5 || !(control & 0x100)) return ENOTSUP;
+			if (!wide && address > UINT32_MAX) return ERANGE;
+			uint32_t msg = cap + (wide ? 12 : 8), mask = msg + 4;
+			if (mask > 0xfc) return EINVAL;
+			wr(p, CONF + cap, header & ~BIT(16));
+			wr(p, CONF + mask, UINT32_MAX);
+			wr(p, CONF + cap + 4, (uint32_t)address);
+			if (wide) wr(p, CONF + cap + 8, (uint32_t)(address >> 32));
+			wr(p, CONF + msg, data);
+			wr(p, CONF + mask, 0xfffffff8); /* UMI MHI owns vectors 0, 1 and 2. */
+			wr(p, CONF + cap, (header & ~(0x71u << 16)) | (0x51u << 16));
+			p->msi_cap = cap;
+			if (!(rd(p, CONF + cap) & BIT(16))) return EIO;
+			report(p, "MHI MSI address low", (uint32_t)address);
+			report(p, "MHI MSI data", data);
+			return 0;
+		}
+		cap = (header >> 8) & 0xff;
+	}
+	return ENODEV;
 }

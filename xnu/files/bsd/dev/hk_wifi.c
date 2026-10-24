@@ -3542,8 +3542,9 @@ static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
 #define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */
 #define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
 #define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
-#define RADIO_STREAM            0x1c00
-#define RADIO_STREAM_MASK       0x0001
+static bool umi_smmu_client;
+#define RADIO_STREAM            (umi_smmu_client ? 0x1c01u : 0x1c00u)
+#define RADIO_STREAM_MASK       (umi_smmu_client ? 0u : 0x0001u)
 
 static void
 smmu_look(void)
@@ -3743,6 +3744,11 @@ radio_space_find(void)
 		uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n)), s2cr = rd(apps_smmu.base + SMMU_S2CR(n));
 
 		if (smr >> 31) {
+			if (umi_smmu_client &&
+			    (((smr & 0x7fff) ^ RADIO_STREAM) & ~((smr >> 16) & 0x7fff)) == 0) {
+				printf("UMI Wi-Fi: endpoint stream already belongs to SMR%u; refusing to replace it\n", n);
+				return false;
+			}
 			printf("wifi: %u: match register %u is in use: stream %#x mask %#x, s2cr %#x\n", step, n, smr & 0x7fff,
 			    smr >> 16 & 0x7fff, s2cr);
 			used[s2cr & 0xff] = true;
@@ -3876,6 +3882,79 @@ radio_space_off(void)
 	radio_space.on = false;
 }
 
+/* Called only with PCIe clocks on and endpoint bus mastering disabled.
+ * Install an empty translation context, verify it, optionally run a protected
+ * action, then restore every saved configuration register. The action must
+ * quiesce the endpoint before returning. With NULL action this only tests setup.
+ */
+int
+hk_wifi_umi_smmu_run(int (*action)(void *), void *context)
+{
+	if (!umi_wifi_is_board()) return ENODEV;
+	lck_mtx_lock(&hk_smmu_lock);
+	if (radio_space.on || radio_space.found || radio_space.next) {
+		lck_mtx_unlock(&hk_smmu_lock);
+		return EBUSY;
+	}
+	umi_smmu_client = true;
+	int error = EIO;
+	uint32_t old_pause = pause_ms;
+	pause_ms = 0;
+	if (!radio_space_find() || !radio_enter(RADIO_ADDRESSES, 0, 0, RADIO_PTE)) goto out;
+	if (rd(apps_smmu_context.base + SMMU_CB_FSR) & SMMU_FSR_ALL) {
+		printf("UMI Wi-Fi: free SMMU context has pending faults; leaving it intact\n");
+		goto out;
+	}
+	static const uint32_t offsets[] = { SMMU_CB_SCTLR, SMMU_CB_TCR2,
+	    SMMU_CB_TTBR0, SMMU_CB_TTBR0 + 4, SMMU_CB_TTBR1, SMMU_CB_TTBR1 + 4,
+	    SMMU_CB_TCR, SMMU_CB_MAIR0, SMMU_CB_MAIR1 };
+	uint32_t saved[sizeof(offsets) / sizeof(offsets[0])];
+	for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); i++)
+		saved[i] = rd(apps_smmu_context.base + offsets[i]);
+	uint32_t cbar = rd(apps_smmu_second.base + SMMU_CBAR(radio_space.context));
+	uint32_t cba2r = rd(apps_smmu_second.base + SMMU_CBA2R(radio_space.context));
+	bool accepted = radio_space_on();
+	if (accepted && action) {
+		/* The valid SMR reserves ownership while coherent allocations take
+		 * this same mutex. The action must stop endpoint DMA before return. */
+		radio_space.wanted = 2;
+		lck_mtx_unlock(&hk_smmu_lock);
+		error = action(context);
+		lck_mtx_lock(&hk_smmu_lock);
+		radio_space.wanted = 0;
+	}
+	radio_space_off();
+	/* Restore the inactive context, with SCTLR last. Also handles a failed
+	 * installation that stopped before radio_space.on became true. */
+	put(&apps_smmu_context, "sctlr restore off", SMMU_CB_SCTLR, 0);
+	for (unsigned i = 1; i < sizeof(saved) / sizeof(saved[0]); i++)
+		put(&apps_smmu_context, "context restore", offsets[i], saved[i]);
+	put(&apps_smmu_second, "cbar restore", SMMU_CBAR(radio_space.context), cbar);
+	put(&apps_smmu_second, "cba2r restore", SMMU_CBA2R(radio_space.context), cba2r);
+	put(&apps_smmu_context, "sctlr restore", SMMU_CB_SCTLR, saved[0]);
+	bool restored = rd(apps_smmu.base + SMMU_SMR(radio_space.match)) == radio_space.old_smr &&
+	    rd(apps_smmu.base + SMMU_S2CR(radio_space.match)) == radio_space.old_s2cr &&
+	    rd(apps_smmu_second.base + SMMU_CBAR(radio_space.context)) == cbar &&
+	    rd(apps_smmu_second.base + SMMU_CBA2R(radio_space.context)) == cba2r;
+	for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); i++)
+		restored &= rd(apps_smmu_context.base + offsets[i]) == saved[i];
+	printf("UMI Wi-Fi: %s SMMU context accepted=%d restored=%d stream=%#x\n",
+	    action ? "protected DMA" : "empty", accepted, restored, RADIO_STREAM);
+	if (accepted && restored && !action) error = 0;
+	if (!restored) error = EIO;
+out:
+	radio_space.found = false;
+	pause_ms = old_pause;
+	lck_mtx_unlock(&hk_smmu_lock);
+	return error;
+}
+
+int
+hk_wifi_umi_smmu_test(void)
+{
+	return hk_wifi_umi_smmu_run(NULL, NULL);
+}
+
 /*
  * For the driver (hk_lx.c): memory of ours that the radio is to see, at the address
  * returned. Without wifi_smmu=2 it has an address and the radio is shown nothing.
@@ -3912,6 +3991,17 @@ radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long l
 	lck_mtx_unlock(&hk_smmu_lock);
 	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, radio_space.context);
 	put(&apps_smmu_context, "tlbsync", SMMU_CB_TLBSYNC, 1);
+	if (umi_smmu_client) {
+		/* New mappings must be visible before PBL is given a DMA pointer. */
+		for (unsigned us = 0; us < 100000; us++) {
+			uint32_t status = rd(apps_smmu_context.base + SMMU_CB_TLBSTATUS);
+			if (status == UINT32_MAX) return false;
+			if (!(status & 1)) return true;
+			delay(1);
+		}
+		printf("UMI Wi-Fi: DMA mapping TLB sync timeout\n");
+		return false;
+	}
 	return true;
 }
 
@@ -3919,6 +4009,49 @@ bool
 hk_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address)
 {
 	return radio_map(physical, size, RADIO_PTE, address);
+}
+
+bool
+hk_wifi_radio_map_at(uint64_t physical, uint64_t size, unsigned long long address)
+{
+	size = (size + 4095) & ~4095ull;
+	if (!size || address < RADIO_ADDRESSES || address + size < address ||
+	    address + size > RADIO_ADDRESSES + RADIO_ADDRESSES_SIZE ||
+	    address < RADIO_ADDRESSES + radio_space.next) return false;
+	if (whole) radio_space.wanted = 2;
+	if (radio_space.wanted != 2) {
+		radio_space.next = address + size - RADIO_ADDRESSES;
+		printf("wifi: %u: THE RADIO IS NOT SHOWN %llu KB of ours at %#llx to %#llx; that takes a context of the SMMU\n",
+		    step, size >> 10, physical, address);
+		return true;
+	}
+	lck_mtx_lock(&hk_smmu_lock);
+	if ((!radio_space.found && !radio_space_find()) || !radio_enter(address, physical, size, RADIO_PTE)) {
+		lck_mtx_unlock(&hk_smmu_lock);
+		return false;
+	}
+	radio_space.next = address + size - RADIO_ADDRESSES;
+	printf("wifi: %u: the radio is to see %llu KB of ours (%#llx) at fixed IOVA %#llx\n",
+	    step, size >> 10, physical, address);
+	if (!radio_space.on) {
+		bool on = radio_space_on();
+		lck_mtx_unlock(&hk_smmu_lock);
+		return on;
+	}
+	lck_mtx_unlock(&hk_smmu_lock);
+	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, radio_space.context);
+	put(&apps_smmu_context, "tlbsync", SMMU_CB_TLBSYNC, 1);
+	if (umi_smmu_client) {
+		for (unsigned us = 0; us < 100000; us++) {
+			uint32_t status = rd(apps_smmu_context.base + SMMU_CB_TLBSTATUS);
+			if (status == UINT32_MAX) return false;
+			if (!(status & 1)) return true;
+			delay(1);
+		}
+		printf("UMI Wi-Fi: fixed-I/O-virtual-address TLB sync timeout\n");
+		return false;
+	}
+	return true;
 }
 
 /*
@@ -3980,7 +4113,7 @@ hk_wifi_dsp_is_up(void)
  * ath11k asks by its Linux firmware-tree names. HK maps board.bin and regdb.bin to the
  * files for its WCN6750. UMI maps QCA6390's amss.bin, m3.bin, board.bin, and regdb.bin to the
  * vendor files bundled under fw/qca6390. QCA's board-2.bin is absent; ath11k falls back to
- * board.bin, which CNSS supplies as bdwlan.elf. This resolves files only; UMI's PCIe/MHI path
+ * board.bin, which stock UMI CNSS supplies as bd_j1gl.elf. This resolves files only; UMI's PCIe/MHI path
  * still has to start the radio before ath11k can use them.
  */
 const uint8_t *
@@ -3990,7 +4123,7 @@ hk_wifi_driver_file(const char *name, uint64_t *size)
 	static const char *const umi_files[][2] = {
 		{ "amss.bin", "qca6390/amss20.bin" },
 		{ "m3.bin", "qca6390/m3.bin" },
-		{ "board.bin", "qca6390/bdwlan.elf" },
+		{ "board.bin", "qca6390/bd_j1gl.elf" },
 		{ "regdb.bin", "qca6390/regdb.bin" },
 	};
 	const char *last = strrchr(name, '/');

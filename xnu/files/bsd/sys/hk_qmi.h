@@ -201,6 +201,8 @@ int hk_qmi_txn_wait_ms(struct qmi_txn *txn, uint64_t milliseconds);
  * handle's socket, which is how ath11k does it; here that call is this one.
  */
 int hk_qmi_connect(struct socket *sock, uint32_t node, uint32_t port);
+/* Pump an optional polled QRTR transport; threaded transports may leave this as a no-op. */
+int hk_qmi_poll(struct qmi_handle *qmi, uint32_t timeout_ms);
 #ifndef HK_QMI_NO_KERNEL_CONNECT
 static inline int
 kernel_connect(struct socket *sock, void *address, __attribute__((unused)) int length, __attribute__((unused)) int flags)

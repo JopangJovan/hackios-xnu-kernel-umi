@@ -14,12 +14,18 @@ struct umi_pcie_io {
 };
 struct umi_pcie {
 	const struct umi_pcie_io *io;
-	bool failed, enumerated;
+	bool failed, enumerated, dma_enabled;
+	uint32_t msi_cap;
 };
 /* Explicit diagnostic only, on a zero-initialized host. Bus mastering stays
  * disabled. No SMMU, MSI or MHI context is installed by this component.
  */
 int umi_pcie_enumerate(struct umi_pcie *, const struct umi_pcie_io *);
+/* Requires an owned, verified SMMU context for stream 0x1c01. No caller
+ * may enable bus mastering before that protection is installed. */
+int umi_pcie_enable_dma(struct umi_pcie *);
+int umi_pcie_prepare_radio(struct umi_pcie *);
+int umi_pcie_setup_mhi_msi(struct umi_pcie *, uint64_t address, uint32_t data);
 /* Hold endpoint in reset before returning to loader. Rail/clock votes remain
  * until hardware reset; shared supplies are never disabled here. */
 void umi_pcie_quiesce(struct umi_pcie *);

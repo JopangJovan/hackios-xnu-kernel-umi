@@ -25,6 +25,7 @@ void	 lx_os_free(void *memory, unsigned long size);
  * reading it slow. NULL when there is none; never given back.
  */
 void	*lx_os_radio_memory(unsigned long size, unsigned long long *address);
+void	*lx_os_radio_memory_at(unsigned long size, unsigned long long address);
 void	*lx_os_map_registers(unsigned long long physical, unsigned long size);	/* never unmapped */
 
 /* ---- saying things ---- */
