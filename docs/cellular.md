@@ -239,3 +239,18 @@ readiness`. Драйвер IPA модема при ініціалізації ч
 - Прогони з `modem_step=11` тримають SpringBoard 600 с (телефон стоїть на логотипі Apple);
   тепер `tools/modem-cycle.sh` бере `XL_SB_DELAY` з оточення, і прогін 31 — повне завантаження
   iOS з модемом у фоні (`modem=1`).
+
+### Прогін 31 (09:12): повне завантаження iOS, перемикання слота, ПЕРШИЙ СИГНАЛ
+
+`XL_SB_DELAY=8` + `modem=1`: SpringBoard стартує одразу (телефон більше не стоїть на логотипі
+Apple під час тестів), модем піднімається у фоні. Після UIM Switch Slot (логічний 1 → фізичний 2)
+картка з'явилась у слоті 1 у стані «detected», і NAS уперше прочитав сигнал: **-80…-87 dBm,
+UMTS** — радіо працює, модем бачить мережу; реєстрації ще нема (помилка 37 на Initiate Network
+Register = `UIM_UNINITIALIZED`: SIM ще ініціалізується після перемикання). Тепер крок 11 раз на
+10 с питає стан картки та NAS Get System Info (0x4d).
+
+Статус-бар: у SpringBoard iOS 16.5 стільникові пункти заповнює `SBStatusBarStateAggregator`
+через `_updateSignalStrengthItem:withData:SIMInfo:barsGetter:barsSetter:` і `_setItem:enabled:`
+(селектори знайдені в кеші dyld). `inject_sb.c` тепер перехоплює цей метод: коли
+`kern.redwood.cellular_registered`, виставляє палички через barsSetter і вмикає пункт; раз на 3 с
+просить пункт оновитися, коли стан у ядрі змінюється; список методів агрегатора пишеться в лог.

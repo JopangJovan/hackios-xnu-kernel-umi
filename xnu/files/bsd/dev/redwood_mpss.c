@@ -5286,6 +5286,7 @@ static volatile uint32_t sim_slot_ready;        /* the physical slot whose card 
 static volatile bool sim_slot_switched;
 #define NAS_INITIATE_NETWORK_REGISTER 0x0022
 #define NAS_GET_SYSTEM_SELECTION_PREFERENCE 0x0034
+#define NAS_GET_SYSTEM_INFO     0x004d
 static struct redwood_qrtr_port *uim_port, *nas2_port;
 static uint32_t uim_node, uim_port_number, nas2_node, nas2_port_number;
 
@@ -5322,6 +5323,10 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 		return;
 	}
 	probe_dump("uim", m, length);
+	if ((m[3] | m[4] << 8) == UIM_SWITCH_SLOT) {
+		tell("mpss: uim: the modem answers the slot switch\n");
+		return;
+	}
 	if ((m[3] | m[4] << 8) != UIM_GET_CARD_STATUS || (v = qmi_tlv(m, length, 0x10, &size)) == NULL || size < 9) {
 		return;
 	}
@@ -5370,8 +5375,6 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 			tell("mpss: uim: LOGICAL SLOT 1 IS POINTED AT PHYSICAL SLOT %u, where the card is ready\n", sim_slot_ready);
 			qrtr_send(uim_port, uim_node, uim_port_number, sw, sizeof(sw));
 		}
-	} else if ((m[3] | m[4] << 8) == UIM_SWITCH_SLOT) {
-		tell("mpss: uim: the modem answers the slot switch\n");
 	}
 }
 
@@ -5409,6 +5412,25 @@ nas2_receive(__unused void *context, __unused uint32_t node, __unused uint32_t p
 		    emergency, roaming, domain);
 	} else if ((m[3] | m[4] << 8) == NAS_INITIATE_NETWORK_REGISTER) {
 		tell("mpss: nas: the modem answers INITIATE NETWORK REGISTER (automatic)\n");
+	} else if ((m[3] | m[4] << 8) == NAS_GET_SYSTEM_INFO) {
+		/* per radio: service status (0 none, 1 limited, 2 available, 3 limited regional, 4 power save), true status, data path;
+		 * and the SIM reject reason (0x27: 0 available, 1 not available, 2 CS invalid, 3 CS+PS invalid, 4 PS invalid) */
+		static const char *const radios[] = { "GSM", "WCDMA", "LTE" };
+		static const uint8_t types[] = { 0x12, 0x13, 0x14 };
+		uint32_t reject = ~0u;
+		char line[160] = "";
+		size_t at = 0;
+
+		for (unsigned r = 0; r < 3; r++) {
+			if ((v = qmi_tlv(m, length, types[r], &size)) != NULL && size >= 3) {
+				at += (size_t)snprintf(line + at, sizeof(line) - at, "%s service %u (true %u, data path %u); ", radios[r], v[0], v[1], v[2]);
+			}
+		}
+		if ((v = qmi_tlv(m, length, 0x27, &size)) != NULL && size >= 4) {
+			reject = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24);
+		}
+		tell("mpss: nas: SYSTEM INFO: %sSIM reject %u (0 available, 1 not available, 2 CS invalid, 3 CS and PS invalid, 4 PS invalid)\n",
+		    line, reject);
 	}
 }
 
@@ -5503,7 +5525,7 @@ step_nas(void)
 	uint32_t wait_seconds = 90, online = 1;
 	uint64_t began, asked_online = 0;
 	bool registered = false, is_online = false, probed = option("modem_sim_probe_off"), probed_again = false;
-	uint64_t probed_at = 0;
+	uint64_t probed_at = 0, watched_at = 0;
 
 	if (!glink.channel[CHANNEL_QRTR].open) {
 		return false;
@@ -5542,6 +5564,15 @@ step_nas(void)
 			/* the slots switched: the card's status, the selection and the registration asked once more */
 			probed_again = true;
 			sim_probe();
+		}
+		if (probed && now_us() - watched_at > 10000000ull && uim_port_number != 0 && nas2_port_number != 0) {
+			/* every ten seconds: the card's state as it initializes, and the system's service status */
+			uint8_t card[7] = { 0, 0x35, 0, UIM_GET_CARD_STATUS & 0xff, UIM_GET_CARD_STATUS >> 8, 0, 0 };
+			uint8_t info[7] = { 0, 0x36, 0, NAS_GET_SYSTEM_INFO & 0xff, NAS_GET_SYSTEM_INFO >> 8, 0, 0 };
+
+			watched_at = now_us();
+			qrtr_send(uim_port, uim_node, uim_port_number, card, sizeof(card));
+			qrtr_send(nas2_port, nas2_node, nas2_port_number, info, sizeof(info));
 		}
 		if (nas.connected) {
 			nas_polls += redwood_nas_client_poll(&nas) == 0;

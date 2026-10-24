@@ -260,6 +260,109 @@ battery_power_source(void)
 	return found;
 }
 
+/* ---- the cellular items of the status bar, from the kernel's modem ------------------------------ */
+
+/*
+ * SpringBoard's SBStatusBarStateAggregator fills the raw status bar data from CoreTelephony, which
+ * has no baseband here. Its item updaters take the data and a getter and setter for the field
+ * (iOS 16.5: -[SBStatusBarStateAggregator _updateSignalStrengthItem:withData:SIMInfo:barsGetter:
+ * barsSetter:], and the like for the service string): the signal one is replaced so that, when the
+ * kernel's modem is registered (sysctl kern.redwood.cellular_registered, _bars: redwood_mpss.c),
+ * the bars are set and the item switched on (-[... _setItem:enabled:]). The aggregator's whole
+ * method list is said once in the log, for the posting to be found; and the signal item is asked
+ * to update itself every few seconds while the kernel's state changes.
+ */
+static void (*original_update_signal_item)(id self, SEL sel, long item, void *data, id sim, void *getter, void *setter);
+static id cellular_aggregator;
+static int cellular_last_bars = -2, cellular_said;
+
+static void
+update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter, void *setter)
+{
+	int up = sysctl_int("kern.redwood.cellular_up"), registered = sysctl_int("kern.redwood.cellular_registered");
+	int bars = sysctl_int("kern.redwood.cellular_bars");
+
+	cellular_aggregator = self;
+	if (original_update_signal_item) {
+		original_update_signal_item(self, sel, item, data, sim, getter, setter);
+	}
+	if (cellular_said++ < 8) {
+		say("redwood: cellular: signal item %ld: data %p, SIM info %p, getter %p, setter %p; the kernel says up %d registered %d bars %d\n",
+		    item, data, (void *)sim, getter, setter, up, registered, bars);
+	}
+	if (up > 0 && registered > 0 && bars >= 0 && bars <= 5 && setter != NULL && data != NULL) {
+		((void (*)(void *, int))setter)(data, bars);
+		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
+		if (bars != cellular_last_bars) {
+			say("redwood: cellular: %d bars shown (item %ld)\n", bars, item);
+		}
+	}
+	cellular_last_bars = bars;
+}
+
+static void
+cellular_hook(void)
+{
+	const char *selector = "_updateSignalStrengthItem:withData:SIMInfo:barsGetter:barsSetter:";
+	Class cls = objc_getClass("SBStatusBarStateAggregator");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName(selector)) : NULL;
+
+	if (method == NULL) {
+		say("redwood: cellular: no -[SBStatusBarStateAggregator %s]\n", selector);
+		return;
+	}
+	say("redwood: cellular: -[SBStatusBarStateAggregator %s] at %#lx, types \"%s\": replaced\n", selector,
+	    (uintptr_t)method_getImplementation(method) - slide, method_getTypeEncoding(method));
+	original_update_signal_item = (void (*)(id, SEL, long, void *, id, void *, void *))method_getImplementation(method);
+	method_setImplementation(method, (IMP)update_signal_item);
+	{
+		/* the whole class, once: which updaters and posters there are */
+		unsigned count = 0;
+		Method *list = class_copyMethodList(cls, &count);
+		char line[1024] = "";
+		size_t at = 0;
+
+		for (unsigned i = 0; list && i < count; i++) {
+			const char *name = sel_getName(method_getName(list[i]));
+			size_t n = strlen(name);
+
+			if (at + n + 2 > sizeof(line)) {
+				say("redwood: cellular: aggregator methods: %s\n", line);
+				line[0] = 0;
+				at = 0;
+			}
+			memcpy(line + at, name, n);
+			at += n;
+			line[at++] = ' ';
+			line[at] = 0;
+		}
+		if (at) {
+			say("redwood: cellular: aggregator methods: %s\n", line);
+		}
+		free(list);
+	}
+	/* every 3 s: when the kernel's registration or bars change, the item is asked to update itself */
+	dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+
+	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), 3 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
+	dispatch_source_set_event_handler(timer, ^{
+		static int last_registered = -2, last_bars = -2;
+		int registered = sysctl_int("kern.redwood.cellular_registered"), bars = sysctl_int("kern.redwood.cellular_bars");
+
+		if ((registered != last_registered || bars != last_bars) && cellular_aggregator != nil) {
+			SEL update = sel_registerName("_updateSignalStrengthItem");
+
+			last_registered = registered;
+			last_bars = bars;
+			if (class_getInstanceMethod(object_getClass(cellular_aggregator), update)) {
+				((void (*)(id, SEL))objc_msgSend)(cellular_aggregator, update);
+				say("redwood: cellular: the signal item asked to update (registered %d, bars %d)\n", registered, bars);
+			}
+		}
+	});
+	dispatch_resume(timer);
+}
+
 /* UIDevice.batteryLevel: 0.0..1.0; -1.0 if monitoring not enabled */
 static float
 battery_level(id self, SEL sel)
@@ -1098,6 +1201,7 @@ redwood_springboard_init(void)
 		    sysctl_int("kern.redwood.cellular_registered"), sysctl_int("kern.redwood.cellular_bars"),
 		    sysctl_int("kern.redwood.cellular_dbm"), sysctl_int("kern.redwood.cellular_radio"));
 	}
+	cellular_hook();
 	say("redwood: battery UI: shows%% %s, set-shows%% %s, bolt %s, chargePercent %s, setChargePercent %s, lockscreen ring %s\n",
 	    original_battery_view_shows_percentage ? "ok" : "NO",
 	    original_battery_view_set_shows_percentage ? "ok" : "NO",
