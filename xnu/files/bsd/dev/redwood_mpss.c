@@ -1715,7 +1715,7 @@ step_our_item(void)
 	 * driver here). Off unless modem_ipa=1 (valid, off) or 3 (on): with the entry the run of 23 October hung.
 	 */
 	{
-		uint32_t ipa = 0;
+		uint32_t ipa = 3;                       /* (the modem's IPA driver waits for this entry to exist: see the IPA's handshake) */
 
 		PE_parse_boot_argn("modem_ipa", &ipa, sizeof(ipa));
 		if (ipa != 0) {
@@ -5269,12 +5269,241 @@ dms_online(void)
 	return false;
 }
 
+/*
+ * ---- the SIM and the network selection, looked at once the modem is online ----
+ *
+ * Online (cycle 29, 24 October) the modem reported no registration and no search: "registration 0,
+ * CS 2, PS 2", no signal. What the modem thinks of the SIM (UIM, service 0xb: Get Card Status 0x2f:
+ * the card's state and its applications' states) and of the network selection (NAS Get System
+ * Selection Preference 0x34: mode preference, automatic or manual) is asked here, and the modem is
+ * told to register automatically (NAS Initiate Network Register 0x22, action 1). Every answer is
+ * shown as it comes (modem_sim_probe=0: not).
+ */
+#define QMI_UIM                 0x0b
+#define UIM_GET_CARD_STATUS     0x002f
+#define UIM_SWITCH_SLOT         0x0046
+static volatile uint32_t sim_slot_ready;        /* the physical slot whose card is READY, found by uim_receive(); 0: none yet */
+static volatile bool sim_slot_switched;
+#define NAS_INITIATE_NETWORK_REGISTER 0x0022
+#define NAS_GET_SYSTEM_SELECTION_PREFERENCE 0x0034
+static struct redwood_qrtr_port *uim_port, *nas2_port;
+static uint32_t uim_node, uim_port_number, nas2_node, nas2_port_number;
+
+static void
+probe_dump(const char *who, const uint8_t *m, size_t length)
+{
+	uint32_t result = ~0u, error = ~0u;
+
+	for (size_t at = 7; at + 3 <= length;) {
+		uint16_t size = (uint16_t)(m[at + 1] | m[at + 2] << 8);
+
+		if (m[at] == 2 && size == 4 && at + 7 <= length) {
+			result = (uint32_t)(m[at + 3] | m[at + 4] << 8);
+			error = (uint32_t)(m[at + 5] | m[at + 6] << 8);
+		}
+		at += 3 + size;
+	}
+	printf("mpss: %s: < %s %#x, transaction %u, %u bytes: result %u, error %u;", who, m[0] == 2 ? "answer" : m[0] == 4 ? "indication" : "?",
+	    m[3] | m[4] << 8, m[1] | m[2] << 8, (unsigned)length, result, error);
+	for (size_t i = 0; i < length && i < 64; i++) {
+		printf(" %02x", m[i]);
+	}
+	printf("%s\n", length > 64 ? " ..." : "");
+}
+
+static void
+uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint16_t size = 0;
+	const uint8_t *v;
+
+	if (length < 7) {
+		return;
+	}
+	probe_dump("uim", m, length);
+	if ((m[3] | m[4] << 8) != UIM_GET_CARD_STATUS || (v = qmi_tlv(m, length, 0x10, &size)) == NULL || size < 9) {
+		return;
+	}
+	{
+		/* card status: four indices of 16 bits, the number of slots, then per slot: the card's state (0 absent, 1 present, 2 error),
+		 * UPIN state and retries, PUK retries, error code, the applications' count, and per application: type (1 SIM, 2 USIM, 3 RUIM,
+		 * 4 CSIM, 5 ISIM), state (0 unknown, 1 detected, 2 PIN1 wanted, 3 PUK1 wanted, 4 personalization, 5 PIN1 blocked, 6 illegal,
+		 * 7 READY), then 11 bytes of personalization and PIN states, and the AID */
+		static const char *const card_states[] = { "ABSENT", "PRESENT", "ERROR" };
+		static const char *const app_states[] = { "unknown", "detected", "PIN1 WANTED", "PUK1 wanted", "personalization", "PIN1 blocked",
+			"illegal", "READY" };
+		unsigned at = 8, slots = v[8], first_card = ~0u;
+
+		at = 9;
+		for (unsigned slot = 0; slot < slots && at + 6 <= size; slot++) {
+			unsigned card = v[at], apps = v[at + 5];
+
+			tell("mpss: uim: SLOT %u: THE CARD IS %s (%u), UPIN state %u, error %u, %u applications\n", slot + 1,
+			    card < 3 ? card_states[card] : "?", card, v[at + 1], v[at + 4], apps);
+			if (slot == 0) {
+				first_card = card;
+			}
+			at += 6;
+			for (unsigned a = 0; a < apps && at + 13 <= size; a++) {
+				unsigned type = v[at], state = v[at + 1], aid = v[at + 12];
+
+				tell("mpss: uim:   application %u: type %u, state %u (%s), PIN1 state %u, retries %u\n", a, type, state,
+				    state < 8 ? app_states[state] : "?", v[at + 6], v[at + 7]);
+				if (card == 1 && state == 7 && sim_slot_ready == 0) {
+					sim_slot_ready = slot + 1;
+				}
+				at += 13 + aid;
+			}
+		}
+		/*
+		 * The first (logical) slot is the primary subscription's, the one NAS registers with. On this phone
+		 * (cycle 30) the card there is "ERROR" while the SIM sits READY in slot 2: logical slot 1 is pointed at
+		 * physical slot 2 (UIM Switch Slot: TLV 1 the logical slot, TLV 2 the physical one, both from 1), as
+		 * Android's telephony does with its dual-SIM mapping (modem_sim_switch=0: not).
+		 */
+		if (first_card != 1 && sim_slot_ready > 1 && !sim_slot_switched && !option("modem_sim_switch_off") && uim_port != NULL) {
+			uint8_t sw[7 + 4 + 7] = { 0, 0x34, 0, UIM_SWITCH_SLOT & 0xff, UIM_SWITCH_SLOT >> 8, 11, 0,
+						  1, 1, 0, 1, 2, 4, 0, (uint8_t)sim_slot_ready, 0, 0, 0 };
+
+			sim_slot_switched = true;
+			tell("mpss: uim: LOGICAL SLOT 1 IS POINTED AT PHYSICAL SLOT %u, where the card is ready\n", sim_slot_ready);
+			qrtr_send(uim_port, uim_node, uim_port_number, sw, sizeof(sw));
+		}
+	} else if ((m[3] | m[4] << 8) == UIM_SWITCH_SLOT) {
+		tell("mpss: uim: the modem answers the slot switch\n");
+	}
+}
+
+static void
+nas2_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint16_t size = 0;
+	const uint8_t *v;
+
+	if (length < 7) {
+		return;
+	}
+	probe_dump("nas", m, length);
+	if ((m[3] | m[4] << 8) == NAS_GET_SYSTEM_SELECTION_PREFERENCE) {
+		uint32_t mode = ~0u, selection = ~0u, emergency = ~0u, roaming = ~0u, domain = ~0u;
+
+		if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 2) {
+			mode = (uint32_t)(v[0] | v[1] << 8);
+		}
+		if ((v = qmi_tlv(m, length, 0x16, &size)) != NULL && size >= 1) {
+			selection = v[0];
+		}
+		if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 1) {
+			emergency = v[0];
+		}
+		if ((v = qmi_tlv(m, length, 0x14, &size)) != NULL && size >= 1) {
+			roaming = v[0];
+		}
+		if ((v = qmi_tlv(m, length, 0x1c, &size)) != NULL && size >= 4) {
+			domain = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24);
+		}
+		tell("mpss: nas: SYSTEM SELECTION: mode preference %#x (bits: 1 CDMA, 2 EVDO, 4 GSM, 8 UMTS, 0x10 LTE, 0x40 TD-SCDMA), network "
+		    "selection %u (0 automatic, 1 manual), emergency mode %u, roaming %u, service domain %#x (0 CS, 1 PS, 2 both)\n", mode, selection,
+		    emergency, roaming, domain);
+	} else if ((m[3] | m[4] << 8) == NAS_INITIATE_NETWORK_REGISTER) {
+		tell("mpss: nas: the modem answers INITIATE NETWORK REGISTER (automatic)\n");
+	}
+}
+
+static void
+uim_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	if (service != QMI_UIM) {
+		return;
+	}
+	if (arrived) {
+		uim_node = node;
+		uim_port_number = port;
+	} else if (node == uim_node && port == uim_port_number) {
+		uim_node = uim_port_number = 0;
+	}
+}
+
+static void
+nas2_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	if (service != QMI_NAS) {
+		return;
+	}
+	if (arrived) {
+		nas2_node = node;
+		nas2_port_number = port;
+	} else if (node == nas2_node && port == nas2_port_number) {
+		nas2_node = nas2_port_number = 0;
+	}
+}
+
+static void
+sim_probe_open(void)
+{
+	if (uim_port == NULL) {
+		uim_port = qrtr_open(uim_receive, uim_server, NULL);
+		if (uim_port != NULL) {
+			qrtr_lookup(uim_port, QMI_UIM, 0, 0);
+		}
+	}
+	if (nas2_port == NULL) {
+		nas2_port = qrtr_open(nas2_receive, nas2_server, NULL);
+		if (nas2_port != NULL) {
+			qrtr_lookup(nas2_port, QMI_NAS, 0, 0);
+		}
+	}
+}
+
+/* The three questions, sent; the answers come to uim_receive() and nas2_receive(). */
+static void
+sim_probe(void)
+{
+	uint8_t card[7] = { 0, 0x31, 0, UIM_GET_CARD_STATUS & 0xff, UIM_GET_CARD_STATUS >> 8, 0, 0 };
+	uint8_t selection[7] = { 0, 0x32, 0, NAS_GET_SYSTEM_SELECTION_PREFERENCE & 0xff, NAS_GET_SYSTEM_SELECTION_PREFERENCE >> 8, 0, 0 };
+	uint8_t reg[11] = { 0, 0x33, 0, NAS_INITIATE_NETWORK_REGISTER & 0xff, NAS_INITIATE_NETWORK_REGISTER >> 8, 4, 0, 1, 1, 0, 1 };
+
+	if (uim_port != NULL && uim_port_number != 0) {
+		printf("mpss: uim: about to ask for the card's status (node %u port %u)\n", uim_node, uim_port_number);
+		qrtr_send(uim_port, uim_node, uim_port_number, card, sizeof(card));
+	} else {
+		printf("mpss: uim: NOT THERE: the card's status is not asked\n");
+	}
+	if (nas2_port != NULL && nas2_port_number != 0) {
+		printf("mpss: nas: about to ask for the system selection preference, and for automatic registration (node %u port %u)\n",
+		    nas2_node, nas2_port_number);
+		qrtr_send(nas2_port, nas2_node, nas2_port_number, selection, sizeof(selection));
+		qrtr_send(nas2_port, nas2_node, nas2_port_number, reg, sizeof(reg));
+	}
+}
+
+static void
+sim_probe_close(void)
+{
+	if (uim_port != NULL) {
+		qrtr_close(uim_port);
+		uim_port = NULL;
+	}
+	if (nas2_port != NULL) {
+		qrtr_close(nas2_port);
+		nas2_port = NULL;
+	}
+	uim_node = uim_port_number = nas2_node = nas2_port_number = 0;
+	sim_slot_ready = 0;
+	sim_slot_switched = false;
+}
+
 static bool
 step_nas(void)
 {
 	uint32_t wait_seconds = 90, online = 1;
 	uint64_t began, asked_online = 0;
-	bool registered = false, is_online = false;
+	bool registered = false, is_online = false, probed = option("modem_sim_probe_off"), probed_again = false;
+	uint64_t probed_at = 0;
 
 	if (!glink.channel[CHANNEL_QRTR].open) {
 		return false;
@@ -5294,11 +5523,25 @@ step_nas(void)
 		return false;
 	}
 	nas_opened = true;
+	if (!probed) {
+		sim_probe_open();
+	}
 	began = now_us();
 	while (now_us() - began < wait_seconds * 1000000ull) {
 		if (online && !is_online && dms_port_number != 0 && now_us() - asked_online > 5000000ull) {
 			asked_online = now_us();
 			is_online = dms_online();       /* (asked again every five seconds until the modem agrees) */
+		}
+		if (!probed && (is_online || now_us() - began > 40000000ull) && uim_port_number != 0 && nas2_port_number != 0) {
+			sleep_ms(2000);                 /* (the modem, just online, is given a moment) */
+			sim_probe();
+			probed = true;
+			probed_at = now_us();
+		}
+		if (probed && sim_slot_switched && !probed_again && now_us() - probed_at > 6000000ull) {
+			/* the slots switched: the card's status, the selection and the registration asked once more */
+			probed_again = true;
+			sim_probe();
 		}
 		if (nas.connected) {
 			nas_polls += redwood_nas_client_poll(&nas) == 0;
@@ -5310,6 +5553,7 @@ step_nas(void)
 		}
 	}
 	cellular_up = nas.connected;
+	sim_probe_close();
 	if (ipa_loaded && !option("modem_ipa_quiet")) {
 		ipa_status("at the end of step 11");
 		ipa_space_faults("at the end of step 11");
