@@ -8,7 +8,7 @@ slow it down. The thermal service is the governor that Android's thermal engine 
 | What | How |
 |---|---|
 | Sensors | all 27 TSENS sensors of the SoC, every 250 ms (cores, GPU, DSPs, memory, modem area, camera, video) |
-| Limits | from the phone's own device tree; slowing starts at 95 C (cores, GPU, modem area) or 100 C (the rest), lower than Xiaomi's 108..112 C because nothing else governs here |
+| Limits | Redwood starts slowing at 95 C (cores, GPU, modem area) or 100 C (the rest). UMI's eight performance-core sensors use its stock device-tree cpufreq trip of 75 C; the other UMI sensor limits retain the shared defaults. |
 | Slowing | one row of the frequency table a tick, three when 5 C past the limit; heat outside the cores slows every group |
 | Speeding up | one row a second, only after a second of being 5 C under the limit (no see-saw) |
 | Battery | from 45 C the pressure is at least moderate, from 50 C the cores are held at half speed, from 58 C at the lowest |
@@ -29,8 +29,10 @@ cool-down without see-saw, a single hot group, package heat, near-critical, a on
 silent sensors, a hot battery, a configuration with one group of cores. The kernel builds with it and boots in QEMU
 (where it stays off: QEMU has no TSENS). **On the phone** (POCO X5 Pro, 22 October 2026, `cpufreq=1 cpus=8`, the
 cores at 1.8 / 2.4 / 2.4 GHz, one core kept busy for a minute and a half): all 27 sensors answered, 33..38 C, pressure
-nominal, nothing slowed -- as it should be at that heat. The governor has not yet been seen slowing the cores on the
-phone itself: that needs a load that heats it past 95 C.
+nominal, nothing slowed -- as it should be at that heat. The governor had not been seen slowing the POCO X5 Pro itself:
+that needs a load that heats it past 95 C. On UMI, the 24 October 2026 `cpufreq=1` run started at 62.5 C on the
+prime sensor. Under sustained use the performance sensors reached 84.1 C while the governor stepped their caps down;
+after about a minute the hottest reading was 71.0 C and it was restoring rows slowly. All 27 sensors answered.
 
 ## Sensors (accelerometer, gyroscope, compass, light, proximity, barometer)
 

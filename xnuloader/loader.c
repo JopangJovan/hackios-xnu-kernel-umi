@@ -2734,13 +2734,13 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"-v", "debug=", "keepsyms=", "serial=", "cpus=", "bootcpu=",
 		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
-		"gpu=", "metal=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
+		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};
 	int adsp_umi = 0, adsp_step = 0, adsp_return = 0, umi_amp_probe = 0, adsp_on = 0, sound = 0;
-	int gpu = 0, metal = 0, fb_filter = 0, fb_threads = 0, fbscale = 0, adreno = 0, adreno_fine = 0, adreno_return = 0;
+	int gpu = 0, metal = 0, cpufreq = 0, fb_filter = 0, fb_threads = 0, fbscale = 0, adreno = 0, adreno_fine = 0, adreno_return = 0;
 	int umi_wifi_step = 0, umi_wifi_return = 0;
 	if (PLAT != &platform_umi) return 1;
 	if (pi->forced_base != 0) {
@@ -2797,6 +2797,9 @@ umi_bootargs_ok(const struct payload_info *pi)
 		} else if (starts_with(c, "metal=")) {
 			if (metal || end - c != 7 || c[6] != '1') ok = 0;
 			metal = 1;
+		} else if (starts_with(c, "cpufreq=")) {
+			if (cpufreq || end - c != 9 || c[8] != '1') ok = 0;
+			cpufreq = 1;
 		} else if (starts_with(c, "fb_scan=")) {
 			if (end - c != 9 || c[8] != '1') ok = 0;
 		} else if (starts_with(c, "fb_filter=")) {

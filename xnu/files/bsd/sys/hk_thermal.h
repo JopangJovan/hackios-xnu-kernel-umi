@@ -61,7 +61,8 @@ struct thermal_zone {
 	int16_t critical;                       /* the emergency stop */
 };
 
-static const struct thermal_zone hk_thermal_zones[] = {
+/* hk_thermal_init adjusts the performance-core trip to UMI's 75 C cpufreq trip. */
+static struct thermal_zone hk_thermal_zones[] = {
 	{ "aoss-0", 0, 0, THERMAL_NO_CPU, 1000, 1150 },
 	{ "cpu-0-0", 0, 1, 0, 950, 1150 },
 	{ "cpu-0-1", 0, 2, 0, 950, 1150 },

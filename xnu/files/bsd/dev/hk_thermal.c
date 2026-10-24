@@ -42,6 +42,7 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <sys/hk_input.h>
 #include <sys/hk_thermal.h>
 #include <sys/sysctl.h>
@@ -137,6 +138,18 @@ read_sensor(unsigned block, unsigned sensor)
 	return THERMAL_INVALID;
 }
 
+static bool
+umi_board(void)
+{
+	DTEntry chosen;
+	const void *board;
+	unsigned size;
+
+	return SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+	    SecureDTGetProperty(chosen, "hackios-board", &board, &size) == kSuccess &&
+	    size == 4 && memcmp(board, "umi", 4) == 0;
+}
+
 /* the table of kern.hackios.thermal, from this tick's readings and decisions */
 static void
 write_text(int battery)
@@ -227,9 +240,19 @@ hk_thermal_init(void)
 {
 	uint32_t mode = 1;
 	int top[THERMAL_DOMAINS], raised = 0;
+	bool umi = umi_board();
 	thread_t thread;
 	char a[16];
 
+	if (umi) {
+		/* UMI's stock DTS sets cpu-1-0..7 cpufreq trips at 75,000 mC (sensors 7..14). */
+		for (int z = 0; z < THERMAL_ZONES; z++) {
+			if (hk_thermal_zones[z].block == 0 && hk_thermal_zones[z].sensor >= 7 &&
+			    hk_thermal_zones[z].sensor <= 14) {
+				hk_thermal_zones[z].passive = 750;
+			}
+		}
+	}
 	PE_parse_boot_argn("thermal", &mode, sizeof(mode));
 	for (int d = 0; d < THERMAL_DOMAINS; d++) {
 		top[d] = hk_cpufreq_top(d);

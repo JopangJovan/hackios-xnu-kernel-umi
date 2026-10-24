@@ -10,8 +10,9 @@ the Redwood profile retains its own serial values.
 The first milestone is UEFI -> XNU -> iOS from RAM with a framebuffer.
 UMI power and volume buttons now have a read-only PM8150 driver, gated by
 `umi_keys=1`; the loader accepts CPU/session arguments and the UMI touch and
-button drivers. CPU frequency changes, Wi-Fi, cameras and internal
-storage access remain unavailable.
+button drivers. XNU CPU frequency control and thermal caps are available with
+`cpufreq=1` (tested at 1804, 2419 and 2841 MHz before thermal throttling).
+Wi-Fi, cameras and internal storage access remain unavailable.
 Single-, four-, and eight-core boots are verified. The profile uses all eight
 cores with `bootcpu=0 cpus=8 umi_touch=1 umi_keys=1`; USB resumes after the session.
 A custom XNU build adds the UMI FTS521 touchscreen driver; validation results are recorded below. Wi-Fi, camera and storage drivers are still pending.
