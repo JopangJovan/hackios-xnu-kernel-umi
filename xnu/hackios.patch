@@ -62,7 +62,7 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..a9751cbe6364 100644
+index 44274016a4cf..009fa9121756 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -109,6 +109,45 @@ bsd/dev/munge.c 			optional config_requires_u32_munging

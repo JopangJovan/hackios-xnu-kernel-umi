@@ -49,15 +49,17 @@ invalid Metal arguments, and the existing UMI image and amplifier bounds.
 Both APFS containers pass `apfsck`. The kernel's APFS reader matches all 214
 boot-volume entries to their source files and reads all 62,474 system-volume
 entries, including the Metal bundle, audio plug-in and UMI firmware.
-Hardware validation of the newly integrated Metal driver is still required.
+The user has confirmed the Adreno-backed iOS UI boots and works; app Metal use
+remains experimental.
 
 ## First device boot and tearing
 
 The user confirmed that the integrated build boots and works on UMI. Scrolling
-and app transitions still show horizontal tearing, also present before the Metal
-update. The default profile has no panel scan synchronization enabled.
+and app transitions initially showed horizontal tearing, also present before the
+Metal update. A later boot with panel scan synchronization removed the visible
+tearing; the user confirmed it was gone on 24 October 2026.
 
-The opt-in `fb_scan=1` path now selects UMI/Kona's GCC display AHB register
+The `fb_scan=1` path selects UMI/Kona's GCC display AHB register
 `0x0010b00c`, DISPCC AHB `0x0af02080`, MDSS GDSC `0x0af03000`, and DSI0
 interface `0x0ae6b800`, from the UMI device tree and Kona clock driver. It checks
 clocks and power before reading the interface, bounds unstable counter reads,
@@ -76,14 +78,14 @@ about 59.93 Hz and 7083 ns per counter line. Composition now uses a separate
 framebuffer, early in the measured DMA-idle window, with a bounded wait and
 copy-time margin. A missed window keeps the previous complete picture.
 
-The first staged run reduced tearing but the user still saw some. The next
-run additionally restricts copies to the beginning of the idle window and
-keeps SwapEnd pending until the source surfaces have been consumed. Initial
-copies took about 1.6–1.7 ms without reported window misses. Visual confirmation
-of this final revision is pending. Logs: `logs/212845-run.log.live`.
+The staged path restricts copies to the beginning of the idle window and keeps
+SwapEnd pending until the source surfaces have been consumed. Initial copies
+took about 1.6–1.7 ms without reported window misses. The confirmed UMI defaults
+now include `fb_scan=1 fb_threads=6 fb_filter=0`.
 
 The backend compiles and passes the host register-model and boot-packaging
-checks. It remains opt-in with `fb_scan=1` while scrolling is being validated.
+checks. The default `xl` UMI profile also preserves the validated eight-core,
+touch, button, haptic, audio, Metal and GPU boot arguments.
 
 The unfinished Wi-Fi transport is preserved in the named git stash
 `WIP UMI Wi-Fi MHI transport paused for Metal integration`; it is not included

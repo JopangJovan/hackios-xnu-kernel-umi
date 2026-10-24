@@ -585,16 +585,68 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 
 static struct {
 	bool found, on, passed;         /* passed: the boot chain lets the stream through untranslated */
-	uint32_t page, pages, match, context, old_smr, old_s2cr, old_sctlr;
+	bool reclaimed, saved;
+	uint32_t page, pages, match, context, old_smr, old_s2cr;
+	uint32_t old_cbar, old_cba2r, old_sctlr, old_tcr2, old_tcr;
+	uint32_t old_ttbr0_low, old_ttbr0_high, old_ttbr1_low, old_ttbr1_high, old_mair0, old_mair1;
 	vm_offset_t tables;             /* three of 4K: the root, one of the second level, one of the third */
 } space;
 static vm_offset_t buffer;              /* BUFFER_BYTES of ours, the periods (and MIC_BYTES behind them: the microphones') */
 static uint64_t buffer_address;         /* as the DSP is to know it */
 
+static void
+space_context_save(void)
+{
+	space.old_cbar = get(&apps_smmu_second, "cbar", SMMU_CBAR(space.context));
+	space.old_cba2r = get(&apps_smmu_second, "cba2r", SMMU_CBA2R(space.context));
+	space.old_sctlr = get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR);
+	space.old_tcr2 = get(&apps_smmu_context, "tcr2", SMMU_CB_TCR2);
+	space.old_tcr = get(&apps_smmu_context, "tcr", SMMU_CB_TCR);
+	space.old_ttbr0_low = get(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0);
+	space.old_ttbr0_high = get(&apps_smmu_context, "ttbr0, high", SMMU_CB_TTBR0 + 4);
+	space.old_ttbr1_low = get(&apps_smmu_context, "ttbr1, low", SMMU_CB_TTBR1);
+	space.old_ttbr1_high = get(&apps_smmu_context, "ttbr1, high", SMMU_CB_TTBR1 + 4);
+	space.old_mair0 = get(&apps_smmu_context, "mair0", SMMU_CB_MAIR0);
+	space.old_mair1 = get(&apps_smmu_context, "mair1", SMMU_CB_MAIR1);
+	space.saved = true;
+}
+
+static void
+space_context_restore(void)
+{
+	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, 0);
+	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, space.context);
+	put(&apps_smmu_context, "tlbsync", SMMU_CB_TLBSYNC, 1);
+	for (unsigned ms = 0; rd(apps_smmu_context.base + SMMU_CB_TLBSTATUS) & 1; ms++) {
+		if (ms == 100) {
+			say("sound: the SMMU does not finish forgetting our audio translations before restore\n");
+			break;
+		}
+		sleep_ms(1);
+	}
+	put(&apps_smmu_context, "tcr2", SMMU_CB_TCR2, space.old_tcr2);
+	put(&apps_smmu_context, "tcr", SMMU_CB_TCR, space.old_tcr);
+	put(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0, space.old_ttbr0_low);
+	put(&apps_smmu_context, "ttbr0, high", SMMU_CB_TTBR0 + 4, space.old_ttbr0_high);
+	put(&apps_smmu_context, "ttbr1, low", SMMU_CB_TTBR1, space.old_ttbr1_low);
+	put(&apps_smmu_context, "ttbr1, high", SMMU_CB_TTBR1 + 4, space.old_ttbr1_high);
+	put(&apps_smmu_context, "mair0", SMMU_CB_MAIR0, space.old_mair0);
+	put(&apps_smmu_context, "mair1", SMMU_CB_MAIR1, space.old_mair1);
+	put(&apps_smmu_second, "cba2r", SMMU_CBA2R(space.context), space.old_cba2r);
+	put(&apps_smmu_second, "cbar", SMMU_CBAR(space.context), space.old_cbar);
+	put(&apps_smmu, "s2cr", SMMU_S2CR(space.match), space.old_s2cr);
+	put(&apps_smmu, "smr", SMMU_SMR(space.match), space.old_smr);
+	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, space.old_sctlr);
+	get(&apps_smmu, "smr", SMMU_SMR(space.match));
+	get(&apps_smmu, "s2cr", SMMU_S2CR(space.match));
+	get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR);
+}
+
 static bool
 space_find(void)
 {
 	bool used[256] = { false };
+	uint32_t context_users[256] = { 0 }, covered = 0, covered_match = ~0u, covered_smr = 0, covered_s2cr = 0;
 	uint32_t scr0 = get(&apps_smmu, "scr0", SMMU_SCR0), idr0 = get(&apps_smmu, "idr0", SMMU_IDR0);
 	uint32_t idr1 = get(&apps_smmu, "idr1", SMMU_IDR1), matches = idr0 & 0xff, contexts = idr1 & 0xff;
 
@@ -609,6 +661,7 @@ space_find(void)
 		    space.pages, space.page);
 		return false;
 	}
+	apps_smmu_second.phys = apps_smmu.phys + space.page;
 	space.match = ~0u;
 	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
 		uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n)), s2cr = rd(apps_smmu.base + SMMU_S2CR(n));
@@ -616,15 +669,16 @@ space_find(void)
 
 		if (smr >> 31) {
 			used[s2cr & 0xff] = true;
+			if ((s2cr >> 16 & 3) == 0) {
+				context_users[s2cr & 0xff]++;
+			}
 			if (((stream ^ AUDIO_STREAM) & ~mask) == 0) {
 				say("sound: match register %u covers the audio stream already: stream %#x mask %#x, s2cr %#x\n", n,
 				    stream, mask, s2cr);
-				if ((s2cr >> 16 & 3) == 1) {
-					space.passed = true;
-					return true;
-				}
-				say("sound: ... and does not let it through untranslated: it is somebody's, and is left alone\n");
-				return false;
+				covered++;
+				covered_match = n;
+				covered_smr = smr;
+				covered_s2cr = s2cr;
 			}
 		} else if (space.match == ~0u) {
 			space.match = n;
@@ -632,17 +686,48 @@ space_find(void)
 			space.old_s2cr = s2cr;
 		}
 	}
+	if (covered) {
+		uint32_t kind = covered_s2cr >> 16 & 3, context = covered_s2cr & 0xff;
+
+		if (covered != 1) {
+			say("sound: %u match registers cover the audio stream; it is ambiguous and left alone\n", covered);
+			return false;
+		}
+		if (kind == 1) {
+			space.passed = true;
+			return true;
+		}
+		if (kind != 0 || (covered_smr & 0x7fff) != AUDIO_STREAM || (covered_smr >> 16 & 0x7fff) != 0 || context >= contexts) {
+			say("sound: the existing match is not an exact translated audio stream; it is left alone\n");
+			return false;
+		}
+		if (context_users[context] != 1) {
+			say("sound: audio context %u also serves %u other translated SMMU streams; it is left alone\n", context,
+			    context_users[context] - 1);
+			return false;
+		}
+		space.match = covered_match;
+		space.context = context;
+		space.old_smr = covered_smr;
+		space.old_s2cr = covered_s2cr;
+		apps_smmu_context.phys = apps_smmu.phys + (space.pages + space.context) * space.page;
+		say("sound: reclaiming the exact audio-only translated stream in match register %u and context %u; its complete state will be restored "
+		    "when audio stops\n", space.match, space.context);
+		space_context_save();
+		space.reclaimed = true;
+		space.found = true;
+		return true;
+	}
 	for (space.context = 0; space.context < contexts && used[space.context]; space.context++) {
 	}
 	if (space.match == ~0u || space.context >= contexts) {
 		say("sound: the SMMU has no match register or no context left\n");
 		return false;
 	}
-	apps_smmu_second.phys = apps_smmu.phys + space.page;
 	apps_smmu_context.phys = apps_smmu.phys + (space.pages + space.context) * space.page;
 	say("sound: the boot chain has set nothing up for stream %#x; free: match register %u (smr %#x, s2cr %#x) and context %u, at "
 	    "%#x\n", AUDIO_STREAM, space.match, space.old_smr, space.old_s2cr, space.context, apps_smmu_context.phys);
-	space.old_sctlr = get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR);
+	space_context_save();
 	if (space.old_sctlr & 1) {
 		say("sound: CONTEXT %u IS SWITCHED ON although no stream is sent through it: it is somebody's, and is left alone\n",
 		    space.context);
@@ -701,6 +786,7 @@ space_on(void)
 	if (pause_ms) {
 		sleep_ms(pause_ms);
 	}
+	space.on = true;                /* even a failed setup must restore the saved stream/context */
 	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, 0);
 	put(&apps_smmu_second, "cba2r", SMMU_CBA2R(space.context), SMMU_CBA2R_64_BIT);
 	put(&apps_smmu_second, "cbar", SMMU_CBAR(space.context), SMMU_CBAR_STAGE_1);
@@ -723,7 +809,6 @@ space_on(void)
 		sleep_ms(1);
 	}
 	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, SMMU_SCTLR_ON);
-	space.on = true;
 	put(&apps_smmu, "s2cr", s2cr, space.context);
 	put(&apps_smmu, "smr", smr, sees);
 	if (get(&apps_smmu, "smr", smr) != sees || (get(&apps_smmu, "s2cr", s2cr) & 0x300ff) != space.context ||
@@ -745,10 +830,10 @@ space_off(void)
 	}
 	space_faults();
 	say("sound: the audio stream and context %u of the SMMU are put back as they were found\n", space.context);
-	put(&apps_smmu, "smr", SMMU_SMR(space.match), space.old_smr);
-	put(&apps_smmu, "s2cr", SMMU_S2CR(space.match), space.old_s2cr);
-	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, space.old_sctlr);
-	get(&apps_smmu, "smr", SMMU_SMR(space.match));
+	uint32_t s2cr = rd(apps_smmu.base + SMMU_S2CR(space.match));
+	s2cr = (s2cr & ~0x300ffu) | (2u << 16) | space.context;  /* fault while the old context is restored */
+	put(&apps_smmu, "s2cr (block during restore)", SMMU_S2CR(space.match), s2cr);
+	space_context_restore();
 	space.on = false;
 }
 
@@ -773,6 +858,7 @@ shared_get(unsigned user)
 			return false;
 		}
 		if (!space.passed && !space.on && !space_on()) {
+			space_off();
 			return false;
 		}
 		buffer_address = space.passed ? (kvtophys(buffer) | AUDIO_STREAM_BITS) : (AUDIO_ADDRESSES | AUDIO_STREAM_BITS);
