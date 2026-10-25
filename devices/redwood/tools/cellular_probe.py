@@ -116,7 +116,7 @@ def android_inventory(serial):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dtb", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parents[1] / "prebuilt/uefi/redwood.dtb")
+    parser.add_argument("--dtb", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parents[1] / "prebuilt/redwood.dtb")
     parser.add_argument("--adb", action="store_true", help="also query a connected Android phone without changing it")
     parser.add_argument("--serial", help="ADB serial when more than one phone is connected")
     args = parser.parse_args()

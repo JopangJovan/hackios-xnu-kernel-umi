@@ -4,7 +4,7 @@
 # has, files/ for the ones it does not. apply.sh puts them into a fresh clone.
 set -e
 cd "$(dirname "$(readlink -f "$0")")"
-MU=../Mu-Silicium
+MU=../../../Mu-Silicium
 git -C $MU rev-parse HEAD > BASE
 git -C $MU diff -- BootShim Silicon > mu-silicium.patch
 rm -rf files

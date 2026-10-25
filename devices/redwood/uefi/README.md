@@ -3,7 +3,7 @@
 Порт [Project Silicium / Mu-Silicium](https://github.com/Project-Silicium/Mu-Silicium) на POCO X5 Pro 5G (redwood).
 В апстриме этого устройства нет; порт сделан по образцу `lisa` (тот же SoC-пакет `KodiakPkg`).
 
-Для запуска пересобирать UEFI не нужно — готовый образ лежит в `prebuilt/uefi`, `mkxnuimg.py` берёт его сам.
+Для запуска пересобирать UEFI не нужно — готовый образ лежит в `devices/redwood/prebuilt`, `mkxnuimg.py` берёт его сам.
 
 Что здесь:
 
@@ -23,7 +23,7 @@
 python python-pip python-virtualenv`).
 
 ```sh
-uefi/apply.sh                                   # клонирует Mu-Silicium (с подмодулями, ~3 ГБ) и накладывает порт
+devices/redwood/uefi/apply.sh                                   # клонирует Mu-Silicium (с подмодулями, ~3 ГБ) и накладывает порт
 python3 -m venv venv && venv/bin/pip install -r Mu-Silicium/pip-requirements.txt
 cd Mu-Silicium
 source ../venv/bin/activate
@@ -40,8 +40,8 @@ ln -s /usr/bin/nasm /usr/bin/ndisasm $D/Linux-x86-64/
 ```
 
 После сборки `mkxnuimg.py` (его вызывает `./xl enter`) берёт UEFI уже из `Mu-Silicium/`, а
-`tools/update-prebuilt.sh` обновляет `prebuilt/uefi`.
+`tools/update-prebuilt.sh` обновляет `devices/redwood/prebuilt`.
 
-`uefi/export.sh` — обратное действие: сохранить правки из `Mu-Silicium/` сюда.
+`devices/redwood/uefi/export.sh` — обратное действие: сохранить правки из `Mu-Silicium/` сюда.
 
 Сборка «с нуля» по этой инструкции заново не проверялась (дерево собиралось по ходу работы над портом).

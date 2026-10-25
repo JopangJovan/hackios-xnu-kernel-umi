@@ -2317,8 +2317,8 @@ Mesa в репозитории нет: `tools/mk-mesa.sh` один раз ска
 
 ### UEFI для телефона
 
-См. `uefi/README.md` (порт Project Silicium на redwood). Для запуска пересобирать не нужно: `mkxnuimg.py` берёт
-готовое из `prebuilt/uefi`.
+См. `devices/redwood/uefi/README.md` (порт Project Silicium на redwood). Для запуска пересобирать не нужно: `mkxnuimg.py` берёт
+готовое из `devices/redwood/prebuilt`.
 
 ## Как это устроено
 
@@ -3255,5 +3255,5 @@ iOS, которого она ждёт, — это уже другое: созд�
   уведомления об авторских правах (они в заголовках файлов ath11k и в `COPYRIGHT` из архива FreeBSD);
 - `xnu-deps/build/lzbitmap/libzbitmap.*` — libzbitmap (Corellium, GPL-2.0+ OR MIT);
   `xnu-deps/hostinc/mach-o/{loader,nlist,fat}.h` — заголовки из XNU (APSL 2.0).
-- `uefi/files/Binaries/redwood` и `prebuilt/uefi/SILICIUM_UEFI.fd` содержат драйверы UEFI из прошивки Xiaomi
-  (так же, как их распространяет Project Silicium для других устройств); `prebuilt/uefi/mkbootimg.py` — AOSP, Apache-2.0.
+- `devices/redwood/uefi/files/Binaries/redwood` и `devices/redwood/prebuilt/SILICIUM_UEFI.fd` содержат драйверы UEFI из прошивки Xiaomi
+  (так же, как их распространяет Project Silicium для других устройств); `devices/redwood/prebuilt/mkbootimg.py` — AOSP, Apache-2.0.

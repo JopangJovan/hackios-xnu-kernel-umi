@@ -76,15 +76,12 @@ qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # сеанс на 20 ми�
 
 ## На телефоне
 
-Нужен телефон, для которого есть порт (сейчас — POCO X5 Pro 5G), с разблокированным загрузчиком,
-`adb` и `fastboot`, образы из предыдущего раздела и прошивки телефона из его Android:
+Нужен телефон, для которого есть порт (сейчас — `devices/redwood/`, POCO X5 Pro 5G), с
+разблокированным загрузчиком, `adb` и `fastboot`, образы из предыдущего раздела и прошивки
+телефона из его Android:
 
 ```sh
-adb pull /vendor/firmware/a660_{gmu.bin,sqe.fw,zap.mdt,zap.b00,zap.b01,zap.b02} fw-gpu/   # GPU
-adb pull /vendor/firmware_mnt/image/wpss.{mdt,b02,b03,b04,b05,b06,b07} fw-wifi/           # Wi-Fi
-adb pull /vendor/firmware_mnt/image/adsp.{mdt,b02,…,b36} fw-audio/                        # звук, батарея
-adb pull /vendor/firmware/aw8697_haptic.bin fw-haptic/                                    # вибрация
-adb pull /vendor/firmware_mnt/image/modem.{mdt,b00,…} fw-modem/                            # модем
+devices/redwood/pull-firmware.sh    # GPU, Wi-Fi, звук/батарея, вибрация, модем, камеры → fw-*/
 ```
 
 Что попало в образ, `userland/build.sh` печатает строкой `build.sh: fw/: N files from ../fw-*: …`.
@@ -146,6 +143,16 @@ xnu-deps/setup.sh        # зависимости, инструменты и SDK
 | `qemu/` | запуск в QEMU |
 | `docs/` | `notes.md` — подробные заметки, `cellular.md` — сотовая связь, `air.md`/`metal.md` — GPU |
 | `prebuilt/` | собранные ядро, загрузчик, библиотеки |
+| `devices/redwood/` | всё про один телефон: его UEFI (порт Mu-Silicium), дерево устройств, готовые образы UEFI, скрипт снятия прошивок, инструменты |
+
+## Устройства
+
+Ядро, загрузчик и userland — общие. Всё, что относится к одному телефону, живёт в `devices/<имя>/`:
+его UEFI, дерево устройств, список прошивок и инструменты. Сейчас там один каталог,
+`devices/redwood/` (POCO X5 Pro 5G), и его README — карта того, что нужно для порта на другой
+аппарат на Qualcomm. Сами драйверы телефона — файлы `xnu/files/bsd/dev/redwood_*.c`; в начале каждого
+написано, откуда взяты числа. Прошивки телефона снимаются с вашего аппарата
+(`devices/redwood/pull-firmware.sh`) и в репозиторий не входят.
 
 ## Сотовая связь
 
