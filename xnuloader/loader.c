@@ -2739,7 +2739,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"touch_lat=1", "cpuload=1000",
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
-		"umi_wifi_step=", "umi_wifi_return=", "wifi_mac=", "wifi=1",
+		"umi_wifi_step=", "umi_wifi_return=", "wifi_mac=", "wifi=1", "umi_bt_probe=",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};
@@ -2786,6 +2786,8 @@ umi_bootargs_ok(const struct payload_info *pi)
 		} else if (starts_with(c, "adsp_return=")) {
 			if (adsp_return || end - c != 13 || c[12] != '1') ok = 0;
 			adsp_return = 1;
+		} else if (starts_with(c, "umi_bt_probe=")) {
+			if (end - c != 14 || c[13] < '1' || c[13] > '3') ok = 0;
 		} else if (starts_with(c, "umi_amp_probe=")) {
 			if (umi_amp_probe || end - c != 15 || c[14] < '1' || c[14] > '5') ok = 0;
 			umi_amp_probe = 1;

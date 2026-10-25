@@ -65,7 +65,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 44274016a4cf..009fa9121756 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,47 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,48 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -77,6 +77,7 @@ index 44274016a4cf..009fa9121756 100644
 +bsd/dev/umi_rpmh.c		standard
 +bsd/dev/umi_touch_boost.c		standard
 +bsd/dev/umi_wifi.c		standard
++bsd/dev/umi_bluetooth.c		standard
 +bsd/dev/umi_mhi.c		standard
 +bsd/dev/umi_pcie.c		standard
 +bsd/dev/hk_buttons.c	standard
@@ -366,12 +367,13 @@ diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
 index 4df41ba1f61b..613494793615 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,13 @@
+@@ -147,6 +147,14 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
 +#include <sys/hk_input.h>
 +#include <sys/hk_audio.h>
++#include <sys/hk_bluetooth.h>
 +#include <sys/hk_virtio_blk.h>
 +#include <sys/hk_sparse.h>
 +#if APFS
@@ -389,12 +391,13 @@ index 4df41ba1f61b..613494793615 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +983,14 @@ bsd_init(void)
+@@ -976,6 +983,15 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
 +		hk_input_init();           /* /dev/hk-touch */
 +		hk_audio_init();           /* /dev/hk-audio */
++		umi_bluetooth_init();      /* explicit UMI transport diagnostic */
 +		hk_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
 +		hk_sparse_init();          /* /dev/rsp0, part of an image too big to hold */
 +#if APFS
@@ -3291,7 +3294,7 @@ diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
 index 18ef2f0..26697f0 100644
 --- a/osfmk/arm/io_map.c
 +++ b/osfmk/arm/io_map.c
-@@ -62,7 +62,8 @@
+@@ -62,4 +62,5 @@
 
  extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
 
