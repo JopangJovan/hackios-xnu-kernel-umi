@@ -43,6 +43,7 @@ struct hk_audio_volume {
 /* UMI: execute the protection DSP with the amplifier outputs disabled. */
 bool umi_speaker_dsp_test(void);
 bool umi_speaker_prepare(void);
+bool umi_speaker_calibrated(void);
 bool umi_speaker_start(void);
 bool umi_speaker_volume(uint32_t below, uint32_t step_ms);
 bool umi_speaker_healthy(void);

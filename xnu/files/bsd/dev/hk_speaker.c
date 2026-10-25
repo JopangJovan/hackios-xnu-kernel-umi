@@ -1576,6 +1576,9 @@ umi_cs35l41_update(uint8_t a, uint32_t reg, uint32_t mask, uint32_t value)
 }
 
 #include "umi_cs35l41_otp.h"
+#include "umi_cs35l41_audio.h"
+
+static bool umi_unit_calibrated[2];
 
 static bool
 umi_cs35l41_trims(uint8_t a)
@@ -1728,12 +1731,20 @@ umi_cs35l41_dsp_boot(uint8_t a)
 	}
 	if (umi_runtime_preparing) {
 		uint32_t xm = umi_cspl_xm[a == 0x42];
-		/* Same conservative fallback calibration as Xiaomi's driver before
-		 * Android supplies the unit's saved calibration. Initial tone is capped. */
-		if (!xm || !umi_cs35l41_update(a, xm + 7 * 4, 0xffffff, 8392) ||
-		    !umi_cs35l41_update(a, xm + 8 * 4, 0xffffff, 30) ||
+		/* Persisted Android resistance is a little-endian uint32 per amp.
+		 * Keep CAL_AMBIENT from this amp's stock protection tuning, as Android does. */
+		uint64_t cal_size = 0;
+		const char *cal_name = a == 0x42 ? "cs35l41_cal_right.bin" : "cs35l41_cal.bin";
+		const uint8_t *cal = hk_image_file("fw/cs35l41", cal_name, &cal_size, NULL);
+		uint32_t resistance = cal && cal_size == 4 ? umi_le32(cal) : 0;
+		umi_unit_calibrated[a == 0x42] = resistance >= 2000 && resistance <= 30000;
+		if (!umi_unit_calibrated[a == 0x42]) resistance = 8392;
+		say("umi-audio: amp %#x: %s calibration R=%u; stock %s channel\n", a,
+		    umi_unit_calibrated[a == 0x42] ? "per-unit" : "fallback", resistance,
+		    a == 0x42 ? "top/left" : "bottom/right");
+		if (!xm || !umi_cs35l41_update(a, xm + 7 * 4, 0xffffff, resistance) ||
 		    !umi_cs35l41_update(a, xm + 9 * 4, 0xffffff, 1) ||
-		    !umi_cs35l41_update(a, xm + 10 * 4, 0xffffff, 8393) ||
+		    !umi_cs35l41_update(a, xm + 10 * 4, 0xffffff, resistance + 1) ||
 		    !umi_cs35l41_write(a, 0x4c50, 0x28) || !umi_cs35l41_write(a, 0x4c54, 0x21) ||
 		    !umi_cs35l41_write(a, 0x4c58, 0x3a) || !umi_cs35l41_write(a, 0x4c5c, 0x3b)) return false;
 	}
@@ -1856,7 +1867,7 @@ umi_speaker_start(void)
 		uint8_t a = i ? 0x42 : 0x40;
 		/* Fixed initial test ceiling: -40 dB digital, 4 ms soft ramp.
 		 * The test tone itself is another 20 dB below full scale. */
-		if (!umi_cs35l41_update(a, 0x6000, 0x3fff, ((2048u - 320u) << 3) | 4u) ||
+		if (!umi_cs35l41_update(a, 0x6000, 0x3fff, umi_cs35l41_volume_register(320)) ||
 		    !umi_cs35l41_update(a, 0x2024, 0x10, 0)) goto fail;
 	}
 	umi_output_on = true;
@@ -1873,7 +1884,7 @@ fail:
 bool
 umi_speaker_volume(uint32_t below, uint32_t step_ms)
 {
-	uint32_t target_attenuation = below > 2048 ? 2048 : below;
+	uint32_t target_attenuation = below > UMI_CS35L41_MAX_ATTENUATION ? UMI_CS35L41_MAX_ATTENUATION : below;
 	if (target_attenuation == 0) target_attenuation = 1;
 
 	if (!umi_output_ready || !umi_output_on || umi_reset_asserted) return false;
@@ -1886,10 +1897,9 @@ umi_speaker_volume(uint32_t below, uint32_t step_ms)
 		} else {
 			break;
 		}
-		uint32_t code = 2048 - next;
 		for (unsigned i = 0; i < 2; i++) {
 			uint8_t a = i ? 0x42 : 0x40;
-			if (!umi_cs35l41_update(a, 0x6000, 0x3fff, (code << 3) | 4u)) {
+			if (!umi_cs35l41_update(a, 0x6000, 0x3fff, umi_cs35l41_volume_register(next))) {
 				umi_speaker_quiesce();
 				return false;
 			}
@@ -1946,6 +1956,7 @@ umi_speaker_begin(bool keep)
 
 bool umi_speaker_dsp_test(void) { return umi_speaker_begin(false); }
 bool umi_speaker_prepare(void) { return umi_speaker_begin(true); }
+bool umi_speaker_calibrated(void) { return umi_output_ready && umi_unit_calibrated[0] && umi_unit_calibrated[1]; }
 
 static void
 umi_amp_probe_thread(__unused void *parameter, __unused wait_result_t result)

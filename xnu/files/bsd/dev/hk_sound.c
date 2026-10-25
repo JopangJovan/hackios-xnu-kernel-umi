@@ -1352,8 +1352,9 @@ guard_level(uint32_t level_below)
 static uint32_t
 sound_attenuation(uint32_t extra)
 {
-	uint32_t base = below > 2048 ? 2048 : below;
-	return extra > 2048 - base ? 2048 : base + extra;
+	uint32_t maximum = umi_profile ? 816 : 2048;
+	uint32_t base = below > maximum ? maximum : below;
+	return extra > maximum - base ? maximum : base + extra;
 }
 
 static bool
@@ -1591,6 +1592,11 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		    "the amplifiers, set up from Android's Music profile, powered down until iOS plays");
 		if (umi_profile) {
 			if (!umi_speaker_prepare()) goto out;
+			uint32_t requested_below;
+			if (umi_speaker_calibrated() && !PE_parse_boot_argn("sound_below", &requested_below, sizeof(requested_below))) {
+				below = 18 * 8;
+				say("sound: both per-unit calibrations loaded: playback ceiling -18 dB (12 dB above bring-up)\n");
+			}
 		} else {
 			if (!hk_speaker_prepare(acf, acf_size)) goto out;
 			hk_adsp_fw_free(acf, acf_size);

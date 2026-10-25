@@ -80,3 +80,27 @@ return their logs when the timed run ends.
 Still required: per-unit saved calibration and microphone capture, which needs
 its own WCD938x/codec-DMA/SoundWire path.
 Microphone capture requires its own WCD938x/codec-DMA/SoundWire path.
+
+## Calibrated playback and stereo check
+
+The UMI path reads `fw/cs35l41/cs35l41_cal.bin` (amp 0x40, bottom/right)
+ and `cs35l41_cal_right.bin` (amp 0x42, top/left). Each is the original
+four-byte little-endian resistance from this device's Android persist/audio.
+Copy them locally into `fw-audio/cs35l41/` before rebuilding the helper image;
+calibration files stay outside git. The driver validates each resistance,
+sets CAL_R/status/checksum and retains CAL_AMBIENT from the stock coefficient
+file, matching Android. Missing or invalid files retain fallback calibration
+and the original -30 dB playback ceiling.
+
+With both calibrations available, default playback uses a -18 dB ceiling,
+12 dB above the bring-up profile. `sound_below` still overrides this value.
+The stock analog gain, per-amp protection tuning, DRE and software guard remain
+active. PCM attenuation is clamped at -102 dB to avoid signed-register wrap.
+
+`RC_JOBS=rc.jobs.umi-speakers` identifies channels using a left-only 440 Hz
+one-second tone (top), a right-only 660 Hz tone (bottom), then both for two
+seconds. These are listening checks; matching perceived loudness and confirming
+noise reduction still require a device retest.
+
+Host volume conversion check:
+`cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined tools/audio-test/cs35l41-volume.c -o /tmp/umi-volume && /tmp/umi-volume`
