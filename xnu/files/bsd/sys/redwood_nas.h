@@ -12,6 +12,8 @@ struct redwood_nas_state {
 	uint8_t radio_interface; /* QMI NAS: 4 GSM, 5 UMTS, 8 LTE, 12 NR */
 	int16_t dbm;            /* LTE/NR RSRP; GSM/UMTS RSSI */
 	uint8_t bars;           /* 0 until registration and a valid signal reading */
+	uint16_t mcc, mnc;      /* the current PLMN (serving system TLV 0x10); 0: none told */
+	char operator_name[32]; /* its description, as the network gives it; "" when none */
 };
 
 /* Apply one complete QMI NAS frame. 1: state changed; 0: ignored; -1: malformed. */

@@ -300,9 +300,47 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 	cellular_last_bars = bars;
 }
 
+static void (*original_update_service_item)(id self, SEL sel, long item, void *data, id sim, id other, void *g1, void *s1, void *g2, void *s2,
+    void *g3, void *s3, void *g4, void *s4);
+
+/* The service item ("No SIM", the network's name): looked at first; its string setter is for the next step. */
+static void
+update_service_item(id self, SEL sel, long item, void *data, id sim, id other, void *g1, void *s1, void *g2, void *s2, void *g3, void *s3,
+    void *g4, void *s4)
+{
+	static int said;
+
+	if (original_update_service_item) {
+		original_update_service_item(self, sel, item, data, sim, other, g1, s1, g2, s2, g3, s3, g4, s4);
+	}
+	if (said++ < 4) {
+		char name[64] = "";
+		size_t size = sizeof(name) - 1;
+
+		sysctlbyname("kern.redwood.cellular_operator", name, &size, NULL, 0);
+		say("redwood: cellular: service item %ld: data %p, SIM info %p, other %p; string getter %p setter %p, content type getter %p "
+		    "setter %p; the kernel's network \"%s\"\n", item, data, (void *)sim, (void *)other, g1, s1, g3, s3, name);
+	}
+}
+
 static void
 cellular_hook(void)
 {
+	{
+		const char *service_selector = "_updateServiceItem:withData:SIMInfo:otherSIMInfo:serviceStringGetter:serviceStringSetter:"
+		    "serviceCrossfadeStringGetter:serviceCrossfadeStringSetter:serviceContentTypeGetter:serviceContentTypeSetter:"
+		    "serviceBadgeStringGetter:serviceBadgeStringSetter:";
+		Class cls = objc_getClass("SBStatusBarStateAggregator");
+		Method method = cls ? class_getInstanceMethod(cls, sel_registerName(service_selector)) : NULL;
+
+		if (method) {
+			say("redwood: cellular: -[SBStatusBarStateAggregator %s] at %#lx, types \"%s\": looked at\n", service_selector,
+			    (uintptr_t)method_getImplementation(method) - slide, method_getTypeEncoding(method));
+			original_update_service_item = (void (*)(id, SEL, long, void *, id, id, void *, void *, void *, void *, void *, void *, void *,
+			    void *))method_getImplementation(method);
+			method_setImplementation(method, (IMP)update_service_item);
+		}
+	}
 	const char *selector = "_updateSignalStrengthItem:withData:SIMInfo:barsGetter:barsSetter:";
 	Class cls = objc_getClass("SBStatusBarStateAggregator");
 	Method method = cls ? class_getInstanceMethod(cls, sel_registerName(selector)) : NULL;

@@ -5105,6 +5105,7 @@ static volatile uint32_t dms_answers;
 static volatile uint32_t dms_result, dms_error;
 static uint16_t dms_transaction;
 static int cellular_up, cellular_registered, cellular_bars, cellular_dbm, cellular_radio;
+static char cellular_operator[40];               /* "MCC MNC name" of the serving network; "" when none */
 static uint32_t nas_polls, nas_changes;
 
 SYSCTL_DECL(_kern_redwood);
@@ -5113,6 +5114,8 @@ SYSCTL_INT(_kern_redwood, OID_AUTO, cellular_up, CTLFLAG_RD | CTLFLAG_LOCKED, &c
 SYSCTL_INT(_kern_redwood, OID_AUTO, cellular_registered, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_registered, 0,
     "registered with a network");
 SYSCTL_INT(_kern_redwood, OID_AUTO, cellular_bars, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_bars, 0, "signal, 0 to 4 bars");
+SYSCTL_STRING(_kern_redwood, OID_AUTO, cellular_operator, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_operator, 0,
+    "the serving network: its name as the modem gives it; empty when none");
 SYSCTL_INT(_kern_redwood, OID_AUTO, cellular_dbm, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_dbm, 0, "signal, dBm; 0: none read");
 SYSCTL_INT(_kern_redwood, OID_AUTO, cellular_radio, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_radio, 0,
     "the radio (QMI NAS): 4 GSM, 5 UMTS, 8 LTE, 12 NR");
@@ -5129,10 +5132,12 @@ nas_changed(__unused void *context, const struct redwood_nas_state *state)
 {
 	nas_changes++;
 	cellular_registered = state->registered;
+	snprintf(cellular_operator, sizeof(cellular_operator), "%s", state->registered ? state->operator_name : "");
 	cellular_bars = state->bars;
 	cellular_dbm = state->has_signal ? state->dbm : 0;
 	cellular_radio = state->has_signal ? state->radio_interface : 0;
-	tell("mpss: nas: %s; signal %s%d dBm (%s): %u bars\n", state->registered ? "REGISTERED WITH A NETWORK" : "not registered",
+	tell("mpss: nas: %s%s%s (%u-%u); signal %s%d dBm (%s): %u bars\n", state->registered ? "REGISTERED WITH A NETWORK" : "not registered",
+	    state->operator_name[0] ? ", network " : "", state->operator_name, state->mcc, state->mnc,
 	    state->has_signal ? "" : "none read, ", state->has_signal ? state->dbm : 0, radio_name(state->radio_interface), state->bars);
 }
 

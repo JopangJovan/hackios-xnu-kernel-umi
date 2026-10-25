@@ -71,6 +71,14 @@ redwood_nas_apply(struct redwood_nas_state *state, const void *frame, size_t len
 				next.bars = 0;
 			}
 			serving = true;
+		} else if (message == 0x24 && type == 0x10 && size >= 5 && size >= (size_t)5 + value[4]) {
+			/* the current PLMN: MCC, MNC (16 bits each), the description's length and bytes */
+			unsigned n = value[4] < sizeof(next.operator_name) - 1 ? value[4] : sizeof(next.operator_name) - 1;
+
+			next.mcc = le16(value);
+			next.mnc = le16(value + 2);
+			memcpy(next.operator_name, value + 5, n);
+			next.operator_name[n] = 0;
 		} else if ((message == 0x4f || message == 0x51) && type == 0x17 && size >= 4) {
 			level = (int16_t)le16(value); radio = 12; signal = true;
 		} else if ((message == 0x4f || message == 0x51) && type == 0x14 && size >= 6 && radio != 12) {
@@ -89,7 +97,8 @@ redwood_nas_apply(struct redwood_nas_state *state, const void *frame, size_t len
 		next.bars = next.registered ? bars_for(level) : 0;
 	}
 	if (!serving && !signal) return 0;
-	if (next.registered == state->registered && next.has_signal == state->has_signal &&
+	if (next.registered == state->registered && next.has_signal == state->has_signal && next.mcc == state->mcc && next.mnc == state->mnc &&
+	    strcmp(next.operator_name, state->operator_name) == 0 &&
 	    next.radio_interface == state->radio_interface && next.dbm == state->dbm && next.bars == state->bars) return 0;
 	*state = next;
 	return 1;
