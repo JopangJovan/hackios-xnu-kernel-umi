@@ -22,12 +22,28 @@ def prf(key, label, data, length):
     return out[:length]
 
 
-def key_message(version, info, replay, nonce, rsc, data, kck):
-    body = struct.pack('>BHH8s32s16s8s8s16sH', 2, info, 16 if info & 0x80 else 0, replay, nonce, bytes(16), rsc, bytes(8),
+def rc4(key, data):
+    state = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + state[i] + key[i % len(key)]) & 255
+        state[i], state[j] = state[j], state[i]
+    i = j = 0
+    stream = bytearray()
+    for _ in range(256 + len(data)):
+        i = (i + 1) & 255
+        j = (j + state[i]) & 255
+        state[i], state[j] = state[j], state[i]
+        stream.append(state[(state[i] + state[j]) & 255])
+    return bytes(a ^ b for a, b in zip(data, stream[256:]))
+
+
+def key_message(version, info, replay, nonce, rsc, data, kck, key_length=16, iv=bytes(16), md5=False):
+    body = struct.pack('>BHH8s32s16s8s8s16sH', 2, info, key_length if info & 0x80 else 0, replay, nonce, iv, rsc, bytes(8),
                        bytes(16), len(data)) + data
     frame = bytearray(struct.pack('>BBH', version, 3, len(body)) + body)
     if kck is not None:
-        frame[81:97] = hmac.new(kck, bytes(frame), hashlib.sha1).digest()[:16]
+        frame[81:97] = hmac.new(kck, bytes(frame), hashlib.md5 if md5 else hashlib.sha1).digest()[:16]
     return bytes(frame)
 
 
@@ -36,19 +52,25 @@ def c_bytes(name, data):
 
 
 def case(n):
+    tkip = n == 0
     passphrase = bytes(rnd.choice(b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 !#') for _ in
                        range(rnd.randint(8, 63)))
     name = bytes(rnd.randrange(32, 127) for _ in range(rnd.randint(1, 32)))
     ap, station = bytes([2] + [rnd.randrange(256) for _ in range(5)]), bytes([2] + [rnd.randrange(256) for _ in range(5)])
     anonce, snonce = rnd.randbytes(32), rnd.randbytes(32)
-    rsn = bytes.fromhex('30140100000fac040100000fac040100000fac020000')      # CCMP, CCMP, PSK, no capabilities
-    group, group_index, group2 = rnd.randbytes(16), rnd.randint(1, 3), rnd.randbytes(16)
+    suite = '02' if tkip else '04'
+    rsn = bytes.fromhex('30140100000fac' + suite + '0100000fac' + suite + '0100000fac020000')
+    group, group_index, group2 = rnd.randbytes(32 if tkip else 16), rnd.randint(1, 3), rnd.randbytes(32 if tkip else 16)
+    descriptor = 1 if tkip else 2
+    descriptor_info = lambda x: (x & ~7) | descriptor
+    pairwise_length = 32 if tkip else 16
+    digest = hashlib.md5 if tkip else hashlib.sha1
     version = rnd.choice([1, 2])
     counter = rnd.randrange(1 << 40)
     replay = lambda k: struct.pack('>Q', counter + k)
 
     pmk = hashlib.pbkdf2_hmac('sha1', passphrase, name, 4096, 32)
-    ptk = prf(pmk, b'Pairwise key expansion', min(ap, station) + max(ap, station) + min(anonce, snonce) + max(anonce, snonce), 48)
+    ptk = prf(pmk, b'Pairwise key expansion', min(ap, station) + max(ap, station) + min(anonce, snonce) + max(anonce, snonce), 32 + pairwise_length)
     kck, kek, tk = ptk[:16], ptk[16:32], ptk[32:]
 
     def wrapped(key, index, before=b''):
@@ -56,19 +78,27 @@ def case(n):
         plain = before + bytes([0xdd, 6 + len(key), 0x00, 0x0f, 0xac, 1, index, 0]) + key
         if len(plain) % 8:
             plain += b'\xdd' + bytes(7 - len(plain) % 8)
-        return aes_key_wrap(kek, plain)
+        if tkip:
+            iv = rnd.randbytes(16)
+            return iv, rc4(iv + kek, plain)
+        return bytes(16), aes_key_wrap(kek, plain)
 
     rsc = rnd.randbytes(6) + bytes(2)
-    m1 = key_message(version, 0x008a, replay(0), anonce, bytes(8), b'', None)
-    m2 = key_message(version, 0x010a, replay(0), snonce, bytes(8), rsn, kck)
-    m3 = key_message(version, 0x13ca, replay(1), anonce, rsc, wrapped(group, group_index, rsn), kck)
-    m4 = key_message(version, 0x030a, replay(1), bytes(32), bytes(8), b'', kck)
-    g1 = key_message(version, 0x1382, replay(5), bytes(32), rsc, wrapped(group2, group_index % 3 + 1), kck)
-    g2 = key_message(version, 0x0302, replay(5), bytes(32), bytes(8), b'', kck)
+    iv3, keydata3 = wrapped(group, group_index, rsn)
+    ivg, keydatag = wrapped(group2, group_index % 3 + 1)
+    m1 = key_message(version, descriptor_info(0x008a), replay(0), anonce, bytes(8), b'', None, pairwise_length, md5=tkip)
+    m2 = key_message(version, descriptor_info(0x010a), replay(0), snonce, bytes(8), rsn, kck, pairwise_length, md5=tkip)
+    m3 = key_message(version, descriptor_info(0x13ca), replay(1), anonce, rsc, keydata3, kck, pairwise_length, iv3, tkip)
+    m4 = key_message(version, descriptor_info(0x030a), replay(1), bytes(32), bytes(8), b'', kck, pairwise_length, md5=tkip)
+    g1 = key_message(version, descriptor_info(0x1382), replay(5), bytes(32), rsc, keydatag, kck, pairwise_length, ivg, tkip)
+    g2 = key_message(version, descriptor_info(0x0302), replay(5), bytes(32), bytes(8), b'', kck, pairwise_length, md5=tkip)
     # the same message 3 from an access point that was given another passphrase
     other = hashlib.pbkdf2_hmac('sha1', passphrase + b'x', name, 4096, 32)
-    other_ptk = prf(other, b'Pairwise key expansion', min(ap, station) + max(ap, station) + min(anonce, snonce) + max(anonce, snonce), 48)
-    m3_wrong = key_message(version, 0x13ca, replay(1), anonce, rsc, aes_key_wrap(other_ptk[16:32], bytes(24)), other_ptk[:16])
+    other_ptk = prf(other, b'Pairwise key expansion', min(ap, station) + max(ap, station) + min(anonce, snonce) + max(anonce, snonce), 32 + pairwise_length)
+    wrong_iv = rnd.randbytes(16)
+    wrong_data = rc4(wrong_iv + other_ptk[16:32], bytes(80)) if tkip else aes_key_wrap(other_ptk[16:32], bytes(24))
+    m3_wrong = key_message(version, descriptor_info(0x13ca), replay(1), anonce, rsc, wrong_data, other_ptk[:16],
+                            pairwise_length, wrong_iv, tkip)
 
     text = ''.join(c_bytes('c%d_%s' % (n, k), v) for k, v in (
         ('passphrase', passphrase), ('name', name), ('ap', ap), ('station', station), ('snonce', snonce), ('rsn', rsn),
@@ -77,6 +107,7 @@ def case(n):
     entry = '{ %s, %d }' % (', '.join('c%d_%s, sizeof(c%d_%s)' % (n, k, n, k) for k in (
         'passphrase', 'name', 'ap', 'station', 'snonce', 'rsn', 'pmk', 'tk', 'group', 'group2', 'm1', 'm2', 'm3', 'm4', 'g1',
         'g2', 'm3_wrong')), group_index)
+    entry = entry[:-2] + ', %d, %d }' % (pairwise_length, descriptor)
     return text, entry
 
 

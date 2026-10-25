@@ -138,6 +138,124 @@ hmac_sha1(const uint8_t *key, unsigned key_length, const uint8_t *const pieces[]
 	memset(inner, 0, sizeof(inner));
 }
 
+/* ---- MD5 and RC4 for RSN's legacy TKIP key descriptor (version 1) ------------------------------ */
+
+struct md5 {
+	uint32_t h[4];
+	uint64_t length;
+	uint8_t block[64];
+};
+
+static uint32_t
+md5_rol(uint32_t x, unsigned n)
+{
+	return (x << n) | (x >> (32 - n));
+}
+
+static void
+md5_block(uint32_t h[4], const uint8_t *p)
+{
+	static const uint32_t k[64] = {
+		0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+		0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+		0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+		0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+		0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+		0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+		0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+		0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+	};
+	static const uint8_t shifts[64] = {
+		7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22, 5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+		4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23, 6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21
+	};
+	uint32_t m[16], a = h[0], b = h[1], c = h[2], d = h[3];
+
+	for (unsigned i = 0; i < 16; i++) {
+		m[i] = (uint32_t)p[4 * i] | (uint32_t)p[4 * i + 1] << 8 | (uint32_t)p[4 * i + 2] << 16 | (uint32_t)p[4 * i + 3] << 24;
+	}
+	for (unsigned i = 0; i < 64; i++) {
+		uint32_t f;
+		unsigned g;
+
+		if (i < 16) {
+			f = (b & c) | (~b & d); g = i;
+		} else if (i < 32) {
+			f = (d & b) | (~d & c); g = (5 * i + 1) & 15;
+		} else if (i < 48) {
+			f = b ^ c ^ d; g = (3 * i + 5) & 15;
+		} else {
+			f = c ^ (b | ~d); g = (7 * i) & 15;
+		}
+		uint32_t next = b + md5_rol(a + f + k[i] + m[g], shifts[i]);
+		a = d; d = c; c = b; b = next;
+	}
+	h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+}
+
+static void
+md5_begin(struct md5 *s)
+{
+	s->h[0] = 0x67452301; s->h[1] = 0xefcdab89; s->h[2] = 0x98badcfe; s->h[3] = 0x10325476;
+	s->length = 0;
+}
+
+static void
+md5_more(struct md5 *s, const uint8_t *p, unsigned n)
+{
+	for (unsigned i = 0; i < n; i++) {
+		s->block[s->length++ % 64] = p[i];
+		if (s->length % 64 == 0) md5_block(s->h, s->block);
+	}
+}
+
+static void
+md5_end(struct md5 *s, uint8_t out[16])
+{
+	uint64_t bits = s->length * 8;
+	uint8_t tail[8];
+	md5_more(s, (const uint8_t *)"\x80", 1);
+	while (s->length % 64 != 56) md5_more(s, (const uint8_t *)"", 1);
+	for (unsigned i = 0; i < 8; i++) tail[i] = (uint8_t)(bits >> (8 * i));
+	md5_more(s, tail, 8);
+	for (unsigned i = 0; i < 16; i++) out[i] = (uint8_t)(s->h[i / 4] >> (8 * (i % 4)));
+}
+
+static void
+hmac_md5(const uint8_t *key, unsigned key_length, const uint8_t *const pieces[], const unsigned lengths[], unsigned count,
+	uint8_t out[16])
+{
+	uint8_t pad[64] = { 0 }, inner[16];
+	struct md5 s;
+	if (key_length > sizeof(pad)) {
+		md5_begin(&s); md5_more(&s, key, key_length); md5_end(&s, inner); key = inner; key_length = sizeof(inner);
+	}
+	for (unsigned i = 0; i < sizeof(pad); i++) pad[i] = (i < key_length ? key[i] : 0) ^ 0x36;
+	md5_begin(&s); md5_more(&s, pad, sizeof(pad));
+	for (unsigned i = 0; i < count; i++) md5_more(&s, pieces[i], lengths[i]);
+	md5_end(&s, inner);
+	for (unsigned i = 0; i < sizeof(pad); i++) pad[i] ^= 0x36 ^ 0x5c;
+	md5_begin(&s); md5_more(&s, pad, sizeof(pad)); md5_more(&s, inner, sizeof(inner)); md5_end(&s, out);
+	memset(pad, 0, sizeof(pad)); memset(inner, 0, sizeof(inner));
+}
+
+static void
+rc4_crypt(const uint8_t *key, unsigned key_length, uint8_t *data, unsigned length)
+{
+	uint8_t s[256], j = 0, i = 0, t;
+	for (unsigned n = 0; n < 256; n++) s[n] = (uint8_t)n;
+	for (unsigned n = 0; n < 256; n++) {
+		j = (uint8_t)(j + s[n] + key[n % key_length]); t = s[n]; s[n] = s[j]; s[j] = t;
+	}
+	j = 0;
+	for (unsigned n = 0; n < 256 + length; n++) {
+		i++; j = (uint8_t)(j + s[i]); t = s[i]; s[i] = s[j]; s[j] = t;
+		uint8_t stream = s[(uint8_t)(s[i] + s[j])];
+		if (n >= 256) data[n - 256] ^= stream;
+	}
+	memset(s, 0, sizeof(s));
+}
+
 /* ---- the key of a name and a passphrase -------------------------------------------------------- */
 
 /* PBKDF2 with HMAC-SHA1, 4096 rounds, 32 bytes: two blocks of 20, of the second the first 12. */
@@ -338,13 +456,14 @@ aes_unwrap(const uint8_t kek[16], const uint8_t *wrapped, unsigned length, uint8
 #define AT_INFO		5
 #define AT_REPLAY	9
 #define AT_NONCE	17
+#define AT_IV		49
 #define AT_RSC		65
 #define AT_MIC		81
 #define AT_DATA_LENGTH	97
 #define AT_DATA		99
 #define MESSAGE_MOST	640
 
-#define INFO_VERSION	0x0007			/* 2: HMAC-SHA1 for the MIC, the AES key wrap for the key data */
+#define INFO_VERSION	0x0007			/* descriptor version: 1 legacy RC4/MD5, 2 AES/SHA1 */
 #define INFO_PAIRWISE	0x0008
 #define INFO_INSTALL	0x0040
 #define INFO_ACK	0x0080
@@ -358,27 +477,33 @@ mic_of(const struct lx_wpa *wpa, const uint8_t *message, unsigned length, uint8_
 	const uint8_t zeros[16] = { 0 };
 	const uint8_t *pieces[3] = { message, zeros, message + AT_MIC + 16 };
 	const unsigned lengths[3] = { AT_MIC, 16, length - AT_MIC - 16 };
-	uint8_t digest[20];
-
-	hmac_sha1(wpa->kck, 16, pieces, lengths, 3, digest);
-	memcpy(mic, digest, 16);
+	if (wpa->descriptor_version == 1) {
+		hmac_md5(wpa->kck, 16, pieces, lengths, 3, mic);
+	} else {
+		uint8_t digest[20];
+		hmac_sha1(wpa->kck, 16, pieces, lengths, 3, digest);
+		memcpy(mic, digest, 16);
+		memset(digest, 0, sizeof(digest));
+	}
 }
 
 /* The keys of the handshake and the pairwise key, from the PMK, both addresses and both nonces. */
 static void
 derive(struct lx_wpa *wpa)
 {
-	uint8_t data[76], keys[48];
+	uint8_t data[76], keys[64];
+	unsigned key_length = wpa->pairwise_length == 32 ? 32 : 16;
 	int own_first = memcmp(wpa->own, wpa->peer, 6) < 0, own_nonce_first = memcmp(wpa->own_nonce, wpa->peer_nonce, 32) < 0;
 
 	memcpy(data, own_first ? wpa->own : wpa->peer, 6);
 	memcpy(data + 6, own_first ? wpa->peer : wpa->own, 6);
 	memcpy(data + 12, own_nonce_first ? wpa->own_nonce : wpa->peer_nonce, 32);
 	memcpy(data + 44, own_nonce_first ? wpa->peer_nonce : wpa->own_nonce, 32);
-	prf(wpa->pmk, 32, "Pairwise key expansion", data, sizeof(data), keys, sizeof(keys));
+	prf(wpa->pmk, 32, "Pairwise key expansion", data, sizeof(data), keys, 32 + key_length);
 	memcpy(wpa->kck, keys, 16);
 	memcpy(wpa->kek, keys + 16, 16);
-	memcpy(wpa->pairwise, keys + 32, 16);
+	memcpy(wpa->pairwise, keys + 32, key_length);
+	wpa->pairwise_length = key_length;
 	memset(keys, 0, sizeof(keys));
 	wpa->have_keys = 1;
 }
@@ -396,6 +521,7 @@ answer(const struct lx_wpa *wpa, const uint8_t *message, unsigned info, const ui
 	reply[2] = (uint8_t)((length - 4) >> 8);
 	reply[3] = (uint8_t)(length - 4);
 	reply[AT_KIND] = 2;
+	info = (info & ~7u) | (wpa->descriptor_version == 1 ? 1u : 2u);
 	reply[AT_INFO] = (uint8_t)(info >> 8);
 	reply[AT_INFO + 1] = (uint8_t)info;
 	memcpy(reply + AT_REPLAY, message + AT_REPLAY, 8);
@@ -459,8 +585,8 @@ lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length
 		*why = "it is not an RSN key message (WPA of the first kind?)";
 		return (LX_WPA_BAD);
 	}
-	if ((info & INFO_VERSION) != 2) {
-		*why = "its key descriptor is not version 2 (the network wants another kind of key management)";
+	if ((info & INFO_VERSION) != (wpa->descriptor_version == 1 ? 1u : 2u)) {
+		*why = "its EAPOL-Key descriptor version does not match the negotiated cipher";
 		return (LX_WPA_BAD);
 	}
 	if (AT_DATA + data_length > length) {
@@ -500,11 +626,32 @@ lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length
 		*why = "its nonce is not message 1's";
 		return (LX_WPA_BAD);
 	}
-	if (!(info & INFO_ENCRYPTED) || aes_unwrap(wpa->kek, message + AT_DATA, data_length, data) != 0) {
+	if (!(info & INFO_ENCRYPTED) || data_length > sizeof(data)) {
 		*why = "its key data does not unwrap";
 		return (LX_WPA_BAD);
 	}
-	if (group_key(wpa, data, data_length - 8, message + AT_RSC) != 0) {
+	unsigned plain_length;
+	if (wpa->descriptor_version == 1) {
+		uint8_t rc4_key[32];
+		memcpy(rc4_key, message + AT_IV, 16);
+		memcpy(rc4_key + 16, wpa->kek, 16);
+		memcpy(data, message + AT_DATA, data_length);
+		rc4_crypt(rc4_key, sizeof(rc4_key), data, data_length);
+		memset(rc4_key, 0, sizeof(rc4_key));
+		plain_length = data_length;
+	} else {
+		if (aes_unwrap(wpa->kek, message + AT_DATA, data_length, data) != 0) {
+			*why = "its AES-wrapped key data does not unwrap";
+			return (LX_WPA_BAD);
+		}
+		if (data_length < 8) {
+			memset(data, 0, sizeof(data));
+			*why = "its AES-wrapped key data is too short";
+			return (LX_WPA_BAD);
+		}
+		plain_length = data_length - 8;
+	}
+	if (group_key(wpa, data, plain_length, message + AT_RSC) != 0) {
 		memset(data, 0, sizeof(data));
 		*why = "there is no group key in it";
 		return (LX_WPA_BAD);

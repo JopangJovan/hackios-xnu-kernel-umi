@@ -75,7 +75,9 @@ fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
 # does the loader answer while its kernel runs (0.5 and later)? an older one answers only when the run is over
 live_loader() { fb getvar version | grep -Eq 'version: 0\.([5-9]|[1-9][0-9])'; }
 in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
-is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
+is_loader() {
+	in_fastboot && { fb getvar product | grep -q 'product: xnuloader' || fb getvar version | grep -Eq 'version: 0\.[5-9]|version: 0\.[1-9][0-9]'; }
+}
 state() {
 	if is_loader; then echo loader
 	elif in_fastboot; then echo fastboot

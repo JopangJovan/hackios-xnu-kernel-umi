@@ -55,6 +55,7 @@ struct handshake {
 	const unsigned char *g2; size_t g2_length;
 	const unsigned char *m3_wrong; size_t m3_wrong_length;
 	unsigned group_index;
+	unsigned pairwise_length, descriptor_version;
 };
 
 #include "cases.inc"
@@ -162,13 +163,15 @@ whole(void)
 		memcpy(wpa.own_nonce, h->snonce, 32);
 		wpa.rsn = h->rsn;
 		wpa.rsn_length = (unsigned)h->rsn_length;
+		wpa.pairwise_length = h->pairwise_length;
+		wpa.descriptor_version = h->descriptor_version;
 
 		/* a signed message before any message 1 */
 		check(lx_wpa_message(&wpa, h->m3, (unsigned)h->m3_length, reply, &length, &why) == LX_WPA_BAD, "message 3 first is refused",
 		    (int)n);
 		check(lx_wpa_message(&wpa, h->m1, (unsigned)h->m1_length, reply, &length, &why) == LX_WPA_ANSWER &&
 		    length == h->m2_length && memcmp(reply, h->m2, length) == 0, "message 2 is the reference's", (int)n);
-		check(memcmp(wpa.pairwise, h->tk, 16) == 0, "the pairwise key is the reference's", (int)n);
+		check(memcmp(wpa.pairwise, h->tk, h->pairwise_length) == 0, "the pairwise key is the reference's", (int)n);
 
 		/* message 3 from an access point with another passphrase, and one with a bit turned */
 		check(lx_wpa_message(&wpa, h->m3_wrong, (unsigned)h->m3_wrong_length, reply, &length, &why) == LX_WPA_BAD &&
@@ -180,7 +183,7 @@ whole(void)
 
 		check(lx_wpa_message(&wpa, h->m3, (unsigned)h->m3_length, reply, &length, &why) == LX_WPA_KEYS &&
 		    length == h->m4_length && memcmp(reply, h->m4, length) == 0, "message 4 is the reference's", (int)n);
-		check(wpa.group_length == 16 && memcmp(wpa.group, h->group, 16) == 0 && wpa.group_index == h->group_index,
+		check(wpa.group_length == h->group_length && memcmp(wpa.group, h->group, h->group_length) == 0 && wpa.group_index == h->group_index,
 		    "the group key and its number are the reference's", (int)n);
 		check(memcmp(wpa.group_counter, h->m3 + AT_RSC, 8) == 0, "the group key's packet number is message 3's", (int)n);
 
@@ -192,7 +195,7 @@ whole(void)
 		check(lx_wpa_message(&wpa, h->g1, (unsigned)h->g1_length, reply, &length, &why) == LX_WPA_GROUP &&
 		    length == h->g2_length && memcmp(reply, h->g2, length) == 0, "the answer to a new group key is the reference's",
 		    (int)n);
-		check(memcmp(wpa.group, h->group2, 16) == 0 && wpa.group_index == h->group_index % 3 + 1,
+		check(memcmp(wpa.group, h->group2, h->group_length) == 0 && wpa.group_index == h->group_index % 3 + 1,
 		    "the new group key and its number are the reference's", (int)n);
 
 		/* a network that wants another kind of key management says so in the descriptor's version */

@@ -22,10 +22,12 @@ struct lx_wpa {
 	/* from here on: lx_wpa.c's */
 	unsigned char peer_nonce[32];
 	unsigned char kck[16], kek[16];		/* the keys the handshake's own messages are signed and ciphered with */
+	unsigned pairwise_length;			/* 16 for CCMP, 32 for TKIP */
+	unsigned descriptor_version;		/* 2: HMAC-SHA1/AES wrap; 1: HMAC-MD5/RC4 */
 	unsigned char replay[8];		/* the counter of the last message accepted */
 	int have_keys, replay_known;
 	/* what comes out of it */
-	unsigned char pairwise[16];		/* the key for frames between the two ("TK", CCMP) */
+	unsigned char pairwise[32];		/* temporal key, and TKIP's two MIC keys when present */
 	unsigned char group[32];		/* the key the access point sends to everybody with ("GTK") ... */
 	unsigned group_length, group_index;	/* ... its length, and its number (1 to 3) */
 	unsigned char group_counter[8];		/* ... and the packet number its frames have got to ("RSC") */

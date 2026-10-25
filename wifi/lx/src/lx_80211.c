@@ -91,6 +91,7 @@ struct lx_radio {
 	uint8_t want[32], want_length;		/* the name of the network that is wanted ... */
 	unsigned width;				/* MHz of the channel joined: 20, or with wifi_wide=1 what the access point offers */
 	struct lx_target target;		/* ... and the best of it */
+	uint32_t pairwise_cipher, group_cipher;	/* selected WPA2 suites: CCMP or legacy TKIP */
 
 	/* the network joined */
 	struct ieee80211_sta *sta;		/* its access point, as the driver knows it */
@@ -1258,7 +1259,7 @@ station_abilities(struct lx_radio *radio, const uint8_t *elements, unsigned leng
  * capabilities if it has them, and WMM. Returns their length.
  */
 static unsigned
-request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
+request_elements(struct lx_radio *radio, uint8_t *out)
 {
 	const struct lx_target *target = &radio->target;
 	struct linuxkpi_ieee80211_channel *channel = radio->channel->def.chan;
@@ -1291,8 +1292,15 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
 	}
 	radio->rsn[0] = 48;
 	radio->rsn[1] = 20;
-	memcpy(radio->rsn + 2, "\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x02\x00\x00", 20);
-	radio->rsn[7] = (uint8_t)group_cipher;
+	memcpy(radio->rsn + 2, "\x01\x00\x00\x0f\xac", 5);
+	radio->rsn[7] = (uint8_t)(radio->group_cipher & 0xff);
+	radio->rsn[8] = 1;
+	radio->rsn[9] = 0;
+	memcpy(radio->rsn + 10, "\x00\x0f\xac", 3);
+	radio->rsn[13] = (uint8_t)(radio->pairwise_cipher & 0xff);
+	radio->rsn[14] = 1;
+	radio->rsn[15] = 0;
+	memcpy(radio->rsn + 16, "\x00\x0f\xac\x02\x00\x00", 6);
 	memcpy(at, radio->rsn, 22);
 	at += 22;
 	if (element(target->elements, target->elements_length, 45) != NULL && band->ht_cap.ht_supported) {
@@ -1332,10 +1340,10 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
  * *group_cipher is then what it ciphers frames to everybody with; else what stands in the way.
  */
 static const char *
-protection(const struct lx_target *target, unsigned *group_cipher)
+protection(const struct lx_target *target, unsigned *group_cipher, unsigned *pairwise_cipher)
 {
 	const uint8_t *rsn = element(target->elements, target->elements_length, 48), *at, *end;
-	bool ccmp = false, passphrase = false;
+	bool ccmp = false, tkip = false, passphrase = false;
 	unsigned count;
 
 	if (rsn == NULL) {
@@ -1347,26 +1355,36 @@ protection(const struct lx_target *target, unsigned *group_cipher)
 	if (end - at < 8 || at[2] != 0x00 || at[3] != 0x0f || at[4] != 0xac) {
 		return ("its RSN element is not one this reads");
 	}
+	if (at[5] != 2 && at[5] != 4) {
+		return ("it uses a group cipher other than TKIP or CCMP");
+	}
 	*group_cipher = at[5];
 	count = at[6] | at[7] << 8;
 	at += 8;
+	if (count > (unsigned)(end - at) / 4) {
+		return ("its RSN pairwise cipher list is truncated");
+	}
 	for (; count != 0 && end - at >= 4; count--, at += 4) {
-		ccmp |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == 4;
+		if (at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac) {
+			ccmp |= at[3] == 4;
+			tkip |= at[3] == 2;
+		}
 	}
 	if (end - at < 2) {
 		return ("its RSN element names no kind of key management");
 	}
 	count = at[0] | at[1] << 8;
 	at += 2;
+	if (count > (unsigned)(end - at) / 4) {
+		return ("its RSN key-management list is truncated");
+	}
 	for (; count != 0 && end - at >= 4; count--, at += 4) {
 		passphrase |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == 2;
 	}
-	if (*group_cipher != 4) {
-		return ("it ciphers frames to everybody with something other than CCMP (TKIP, for old stations), which is not done here");
+	if (!ccmp && !tkip) {
+		return ("it does not offer TKIP or CCMP");
 	}
-	if (!ccmp) {
-		return ("it does not offer CCMP");
-	}
+	*pairwise_cipher = ccmp ? 4 : 2;
 	if (!passphrase) {
 		return ("it does not take a passphrase's key of the WPA2 kind (WPA3 only, or an enterprise network)");
 	}
@@ -1380,20 +1398,37 @@ protection(const struct lx_target *target, unsigned *group_cipher)
 static struct ieee80211_key_conf *
 key_set(struct lx_radio *radio, const uint8_t *key, unsigned index, bool pairwise, int *error)
 {
-	struct ieee80211_key_conf *conf = kzalloc(sizeof(*conf) + 16, GFP_KERNEL);
+	uint8_t tkip[32];
+	uint32_t cipher = pairwise ? radio->pairwise_cipher : radio->group_cipher;
+	unsigned key_length = cipher == 2 ? 32 : 16;
+	struct ieee80211_key_conf *conf;
+	if (!pairwise && radio->wpa.group_length != key_length) {
+		*error = -EINVAL;
+		return (NULL);
+	}
+	conf = kzalloc(sizeof(*conf) + 32, GFP_KERNEL);
 
 	if (conf == NULL) {
 		*error = -ENOMEM;
 		return (NULL);
 	}
-	conf->cipher = WLAN_CIPHER_SUITE_CCMP;
+	conf->cipher = cipher == 2 ? WLAN_CIPHER_SUITE_TKIP : WLAN_CIPHER_SUITE_CCMP;
 	conf->keyidx = (uint8_t)index;
-	conf->keylen = 16;
+	conf->keylen = (uint8_t)key_length;
 	conf->iv_len = 8;
-	conf->icv_len = 8;
+	conf->icv_len = cipher == 2 ? 4 : 8;
 	conf->flags = pairwise ? IEEE80211_KEY_FLAG_PAIRWISE : 0;
 	conf->link_id = -1;
-	memcpy(conf->key, key, 16);
+	if (cipher == 2 && !pairwise) {
+		/* A GTK is laid out from the authenticator's view; swap its Michael MIC directions for a station. */
+		memcpy(tkip, key, 16);
+		memcpy(tkip + 16, key + 24, 8);
+		memcpy(tkip + 24, key + 16, 8);
+		memcpy(conf->key, tkip, sizeof(tkip));
+		explicit_bzero(tkip, sizeof(tkip));
+	} else {
+		memcpy(conf->key, key, key_length);
+	}
 	mutex_lock(&radio->wiphy->mtx);
 	*error = radio->ops->set_key(&radio->hw, SET_KEY, radio->vif, pairwise ? radio->sta : NULL, conf);
 	mutex_unlock(&radio->wiphy->mtx);
@@ -1407,7 +1442,7 @@ key_drop(struct lx_radio *radio, struct ieee80211_key_conf **conf, bool pairwise
 		mutex_lock(&radio->wiphy->mtx);
 		radio->ops->set_key(&radio->hw, DISABLE_KEY, radio->vif, pairwise ? radio->sta : NULL, *conf);
 		mutex_unlock(&radio->wiphy->mtx);
-		explicit_bzero((*conf)->key, 16);
+		explicit_bzero((*conf)->key, (*conf)->keylen);
 		kfree(*conf);
 		*conf = NULL;
 	}
@@ -1580,7 +1615,7 @@ station_join(struct lx_radio *radio, const struct hk_sta_join *what)
 	const uint8_t *e;
 	const char *obstacle;
 	unsigned long long began;
-	unsigned group_cipher = 0, length;
+	unsigned group_cipher = 0, pairwise_cipher = 0, length;
 	int ret, error = 0, answer = ANSWER_NONE;
 
 	if (name_length == 0 || name_length > sizeof(radio->want)) {
@@ -1636,16 +1671,18 @@ station_join(struct lx_radio *radio, const struct hk_sta_join *what)
 		/* (a beacon can be heard on the channel next to its own: where it says it is counts) */
 		channel = linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band));
 	}
-	obstacle = protection(target, &group_cipher);
+	obstacle = protection(target, &group_cipher, &pairwise_cipher);
 	lx_tell("lx: the network that is wanted: an access point on channel %u (%u MHz) at %d dBm, capabilities %#x, beacons every "
 	    "%u units; HT %s, VHT %s, WMM %s; %s%s\n", channel != NULL ? channel_of(channel->center_freq) : 0, channel != NULL ?
 	    channel->center_freq : 0, target->signal, target->capability, target->interval, element(target->elements,
 	    target->elements_length, 45) ? "yes" : "no", element(target->elements, target->elements_length, 191) ? "yes" : "no",
-	    vendor_element(target->elements, target->elements_length, wmm) ? "yes" : "no", obstacle == NULL ? "WPA2 with a "
-	    "passphrase and CCMP: it can be joined" : "IT CANNOT BE JOINED: ", obstacle == NULL ? "" : obstacle);
+	    vendor_element(target->elements, target->elements_length, wmm) ? "yes" : "no", obstacle == NULL ? "WPA2-PSK with "
+	    "CCMP/TKIP: it can be joined" : "IT CANNOT BE JOINED: ", obstacle == NULL ? "" : obstacle);
 	if (obstacle != NULL || channel == NULL || (channel->flags & IEEE80211_CHAN_DISABLED)) {
 		return (ENOTSUP);
 	}
+	radio->pairwise_cipher = pairwise_cipher;
+	radio->group_cipher = group_cipher;
 
 	/* the key of the name and the passphrase, and what the handshake needs besides */
 	began = lx_os_nanoseconds();
@@ -1660,6 +1697,8 @@ station_join(struct lx_radio *radio, const struct hk_sta_join *what)
 	get_random_bytes(radio->wpa.own_nonce, sizeof(radio->wpa.own_nonce));
 	radio->wpa.rsn = radio->rsn;
 	radio->wpa.rsn_length = 22;
+	radio->wpa.pairwise_length = pairwise_cipher == 2 ? 32 : 16;
+	radio->wpa.descriptor_version = pairwise_cipher == 2 ? 1 : 2;
 	radio->handshake = LX_WPA_NOTHING;
 	printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: %llu ms\n",
 	    name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull);
@@ -1747,7 +1786,7 @@ station_join(struct lx_radio *radio, const struct hk_sta_join *what)
 		frame[1] = (uint8_t)((target->capability & 0x0500) >> 8);
 		frame[2] = 10;				/* we listen at least every tenth beacon */
 		frame[3] = 0;
-		length = request_elements(radio, frame + 4, group_cipher);
+		length = request_elements(radio, frame + 4);
 		skb_trim(skb, 28 + length);
 		frame_send(radio, skb);
 		answer = answer_wait(radio, 500);
@@ -1807,6 +1846,11 @@ station_join(struct lx_radio *radio, const struct hk_sta_join *what)
 		goto out;
 	}
 	lx_pause_ms(30);			/* (for message 4 to have left unciphered, before there is a key to cipher with) */
+	if (radio->wpa.group_length != (group_cipher == 2 ? 32u : 16u)) {
+		lx_tell("lx: the access point's group key has the wrong length for its advertised cipher\n");
+		error = EPROTO;
+		goto out;
+	}
 	radio->pairwise_key = key_set(radio, radio->wpa.pairwise, 0, true, &ret);
 	if (ret == 0) {
 		radio->group_key = key_set(radio, radio->wpa.group, radio->wpa.group_index, false, &ret);
