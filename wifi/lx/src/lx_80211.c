@@ -1421,8 +1421,8 @@ key_set(struct lx_radio *radio, const uint8_t *key, unsigned index, bool pairwis
 	conf->icv_len = cipher == 2 ? 4 : 8;
 	conf->flags = pairwise ? IEEE80211_KEY_FLAG_PAIRWISE : 0;
 	conf->link_id = -1;
-	if (cipher == 2 && !pairwise) {
-		/* A GTK is laid out from the authenticator's view; swap its Michael MIC directions for a station. */
+	if (cipher == 2) {
+		/* PTK and GTK Michael MICs arrive in authenticator order; this station needs its TX key first. */
 		memcpy(tkip, key, 16);
 		memcpy(tkip + 16, key + 24, 8);
 		memcpy(tkip + 24, key + 16, 8);
