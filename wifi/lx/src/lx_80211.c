@@ -1434,6 +1434,7 @@ key_set(struct lx_radio *radio, const uint8_t *key, unsigned index, bool pairwis
 	mutex_lock(&radio->wiphy->mtx);
 	*error = radio->ops->set_key(&radio->hw, SET_KEY, radio->vif, pairwise ? radio->sta : NULL, conf);
 	mutex_unlock(&radio->wiphy->mtx);
+	lx_tell("lx: TKIP/CCMP %s key install returned %d\n", pairwise ? "pairwise" : "group", *error);
 	return (conf);
 }
 
@@ -2051,10 +2052,13 @@ boundary_join(const struct hk_sta_join *what)
 	if (radio == NULL || !radio->registered) {
 		return (ENXIO);
 	}
+	lx_tell("lx: iOS join reached the station driver: security %u, SSID length %u, key length %u\n", what->security,
+	    what->ssid_length, what->passphrase_length);
 	radio->joining = true;
 	error = station_join(radio, what);
 	radio->last_error = error;
 	radio->joining = false;
+	lx_tell("lx: station driver join returned %d\n", error);
 	return (error);
 }
 

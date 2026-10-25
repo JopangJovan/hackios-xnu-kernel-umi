@@ -531,6 +531,8 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 	snprintf(said, said_size, " (a join: a name of %u bytes, %s access point, authentication %#x/%#x, a key of %u bytes of kind %u)",
 	    asked->ssid_length, asked->bssid[0] | asked->bssid[1] | asked->bssid[2] | asked->bssid[3] | asked->bssid[4] |
 	    asked->bssid[5] ? "a given" : "any", asked->auth_lower, asked->auth_upper, asked->key_length, asked->key_cipher);
+	printf("apple80211: join request: SSID length %u, authentication %#x/%#x, key cipher %u, key length %u\n",
+	    asked->ssid_length, asked->auth_lower, asked->auth_upper, asked->key_cipher, asked->key_length);
 	if (asked->ssid_length == 0 || asked->ssid_length > sizeof(what->ssid)) {
 		error = EINVAL;
 		goto out;
