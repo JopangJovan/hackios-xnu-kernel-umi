@@ -9,7 +9,7 @@ K=${KERNEL:-xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.deve
 MU=Mu-Silicium
 mkdir -p prebuilt/userland devices/poco-x5-pro/prebuilt
 cp $K prebuilt/mach.development.bcm2837
-cp xnuloader/loader.efi prebuilt/loader.efi
+[ -f xnuloader/loader.efi ] && cp xnuloader/loader.efi prebuilt/loader.efi || echo "update-prebuilt.sh: no xnuloader/loader.efi here (lld-link); prebuilt/loader.efi kept"
 cp userland/hello prebuilt/userland/
 for f in init child stage0 hello_dyn svc_test surf_test rwtouch mg_test cpu_test sound_test libhakios.dylib libhakios.sb.dylib \
 	libhakios.media.dylib libhakios.app.dylib libhakios.tweaks.dylib HakiosAudio net_test; do
