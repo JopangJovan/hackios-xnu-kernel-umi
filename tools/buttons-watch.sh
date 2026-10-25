@@ -13,7 +13,7 @@
 # the loader for travels the same way as the run's own log, and must not be in its place when
 # the run fetches that.
 cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
-PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-redwood-phone
+PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 out=${1:-logs/buttons-$(date +%H%M%S)}
 mkdir -p "$out"
 pattern='^buttons: |\[Button\] [A-Za-z]+ page|^\$ /redwood/bin/rwtouch .*button |Set Blanked'

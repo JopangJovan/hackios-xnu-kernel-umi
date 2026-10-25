@@ -27,7 +27,7 @@
 #                                   a directory). This goes into the boot volume, which every recipe
 #                                   carries and which the flash recipe puts in RAM, so its size is paid
 #                                   for at every boot -- a few megabytes, not more
-#                      RC_JOBS=<file> what the job com.redwood.demo runs: rc.jobs (default), or
+#                      RC_JOBS=<file> what the job com.hakios.demo runs: rc.jobs (default), or
 #                                   rc.jobs.unlock, which also swipes the lock screen away (for the phone,
 #                                   where nothing else can touch the screen yet).
 #                                   A job list cannot assume a shell. iOS 16.5's own root has none at all
@@ -42,7 +42,7 @@
 #                                   air_run grew --buffer.
 #                      GL=1         with an OpenGL ES implementation for the window server: Mesa
 #                                   (tools/mk-mesa.sh fetches and builds it) behind src/eagl.c, as
-#                                   lib/libOSMesa.8.dylib (15 MB) and lib/libredwood-gl.dylib. Where the
+#                                   lib/libOSMesa.8.dylib (15 MB) and lib/libhakios.gl.dylib. Where the
 #                                   kernel has started the phone's GPU, CoreAnimation then draws with its
 #                                   OpenGL ES renderer, by that GPU (boot-arg gpu=1); anywhere else -- QEMU,
 #                                   no boot-arg, no firmware in ../fw-gpu -- the library is not even loaded
@@ -50,7 +50,7 @@
 #                                   GL=test: only the library and bin/gl_test (a triangle, src/gl_test.c;
 #                                   RC_JOBS=rc.jobs.gltest runs it); the window server stays as it is.
 #                      ADSP=1       with the audio DSP's firmware from ../fw-audio in fw/ (20 MB; for the
-#                                   kernel's adsp_step=N, bsd/dev/redwood_adsp.c, which runs before the root is
+#                                   kernel's adsp_step=N, bsd/dev/hakios.adsp.c, which runs before the root is
 #                                   mounted). Not beside GL=1: the two do not fit the 64 MB the loader takes with
 #                                   the kernel. adsp=1 needs none of it: the system image has the firmware in /fw.
 #                      MODEM=1      stage checked local MPSS firmware from ../fw-modem in system.apfs /fw.
@@ -108,7 +108,7 @@ IOS_JOBS=${JOBS-"
 	com.apple.SpringBoard
 "}
 # iOS's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
-# bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
+# bsd/dev/hakios.apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
 # networks the radio hears. NOT FINISHED: a network cannot be joined from Settings yet.
 # It is in by default now, because it costs nothing where there is no radio at all: in QEMU it comes up, talks
 # to itself about country codes and sits there -- 114 processes started against 119 without it, no crash, never
@@ -119,27 +119,27 @@ IOS_JOBS=${JOBS-"
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
-# (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is
-# libredwood-media.dylib).
+# (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
+# libhakios.media.dylib).
 # What Sileo runs from /bin (see the package manager's prefix below): the system image's /bin, or the
 # boot volume's bin, bound over the iOS volume's /bin when that is the root (src/init.c, flash_root).
 SILEO_BIN="chmod cp mkdir mv rm"
-# (libredwood-tweaks is the tweak loader of the package manager's prefix, src/inject_tweaks.c: in
+# (libhakios.tweaks is the tweak loader of the package manager's prefix, src/inject_tweaks.c: in
 # SpringBoard the library above opens it, here it is named for the programs that have no library of
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
-INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system
-/redwood/lib/libredwood-sb.dylib SpringBoard
-/redwood/lib/libredwood-media.dylib mediaserverd
-/redwood/lib/libredwood-app.dylib Sileo
-/redwood/lib/libredwood-tweaks.dylib Preferences"}
+INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
+/redwood/lib/libhakios.sb.dylib SpringBoard
+/redwood/lib/libhakios.media.dylib mediaserverd
+/redwood/lib/libhakios.app.dylib Sileo
+/redwood/lib/libhakios.tweaks.dylib Preferences"}
 # STOREFRONT=1: and a library of ours inside appstored as well (src/inject_store.c). It is not in the
 # list above because it changes what the daemon believes: AMS's account is made to answer with the
 # storefront Apple's bag server returned for this device, which is how the App Store is asked whether
 # a storefront is the only thing it is missing. It also writes down whether a bag request is ever
 # built at all. For an experiment, not for an image anybody else boots.
 [ -n "$STOREFRONT" ] && INJECT="$INJECT
-/redwood/lib/libredwood-store.dylib appstored AppStore
-/redwood/lib/libredwood-fairplay.dylib fairplayd.H2"
+/redwood/lib/libhakios.store.dylib appstored AppStore
+/redwood/lib/libhakios.fairplay.dylib fairplayd.H2"
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -170,8 +170,8 @@ cp obj/child root/bin/child
 # ends: the program and its job together, away from the iOS job list below, which several working
 # copies are editing at once.
 [ -f obj/var_store ] && cp obj/var_store root/bin/
-cp com.redwood.varstore.plist root/LaunchDaemons/
-echo "Darwin on redwood: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
+cp com.hakios.varstore.plist root/LaunchDaemons/
+echo "Darwin on hakios: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
 # EXTRA_SHARE: whole directories of data for a one-off diagnostic, each under its own name. Here and
@@ -230,42 +230,42 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
 		# our library for inside stock iOS programs (the jobs in INJECT are started with it)
-		$DYN -dynamiclib -install_name /redwood/lib/libredwood.dylib -framework CoreFoundation -framework IOKit -lobjc \
-			-o obj/libredwood.dylib src/inject.c
-		$DYN -dynamiclib -install_name /redwood/lib/libredwood-sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
-			-o obj/libredwood-sb.dylib src/inject_sb.c
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
+			-o obj/libhakios.dylib src/inject.c
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
+			-o obj/libhakios.sb.dylib src/inject_sb.c
 		# ... the tweak loader of the package manager's prefix (src/inject_tweaks.c): it goes into a
 		# program either as the one library the kernel inserts or opened by a library of ours
-		$DYN -dynamiclib -install_name /redwood/lib/libredwood-tweaks.dylib -framework CoreFoundation -lobjc \
-			-o obj/libredwood-tweaks.dylib src/inject_tweaks.c
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.tweaks.dylib -framework CoreFoundation -lobjc \
+			-o obj/libhakios.tweaks.dylib src/inject_tweaks.c
 		# ... and inside an application, to say what killed it (src/inject_app.c)
-		$DYN -dynamiclib -install_name /redwood/lib/libredwood-app.dylib -lobjc \
-			-o obj/libredwood-app.dylib src/inject_app.c
-		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -framework CoreMedia \
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
+			-o obj/libhakios.app.dylib src/inject_app.c
+		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
-			-o obj/libredwood-media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
+			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
 		# ... and inside appstored (STOREFRONT=1), which answers with a storefront and watches for a bag
 		# request being built (src/inject_store.c)
 		# (-lc++abi for __cxa_throw: every C++ exception thrown in the process is watched, which is how
 		#  the jetpack parser's rejections are seen -- a throw somebody catches logs nothing of itself)
-		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-store.dylib -framework CoreFoundation -lobjc \
-			-lc++abi -o obj/libredwood-store.dylib src/inject_store.c
+		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.store.dylib -framework CoreFoundation -lobjc \
+			-lc++abi -o obj/libhakios.store.dylib src/inject_store.c
 		# ... and inside fairplayd.H2, which starts and leaves at once: what it looks for, and where it
 		# gives up (src/inject_fairplay.c; watches only, replaces nothing)
-		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-fairplay.dylib -framework CoreFoundation \
+		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.fairplay.dylib -framework CoreFoundation \
 			-framework IOKit -framework Security -lMobileGestalt \
-			-o obj/libredwood-fairplay.dylib src/inject_fairplay.c
+			-o obj/libhakios.fairplay.dylib src/inject_fairplay.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
-		$DYN -bundle -framework CoreFoundation -o obj/RedwoodAudio src/audio_plugin.c
+		$DYN -bundle -framework CoreFoundation -o obj/HakiosAudio src/audio_plugin.c
 		if [ -n "$GL" ]; then
 			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
 			# (Mesa says beside the library what it was built from: one from other patches is built again)
 			M=../xnu-deps/build/mesa/out
-			[ "$(cat $M/built-from 2>/dev/null)" = "$(cat ../tools/mesa/*.patch ../tools/mesa/redwood-drm/* | sha256sum)" ] ||
+			[ "$(cat $M/built-from 2>/dev/null)" = "$(cat ../tools/mesa/*.patch ../tools/mesa/hakios-drm/* | sha256sum)" ] ||
 				../tools/mk-mesa.sh
 			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
-			$DYN -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation \
-				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libredwood-gl.dylib \
+			$DYN -dynamiclib -install_name /redwood/lib/libhakios.gl.dylib -Iobj -framework CoreFoundation \
+				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libhakios.gl.dylib \
 				src/eagl.c src/gl_osmesa.c
 			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
 			# ... and what this GPU makes of an unsigned integer turned into a float (src/u2f_test.c)
@@ -304,23 +304,23 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# devfs is mounted on /dev, and init puts a ramfs on /private/var
 	mkdir -p root/dev root/private/var
 	mkdir -p root/lib
-	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
-	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
-	[ -f obj/libredwood-store.dylib ] && cp obj/libredwood-store.dylib root/lib/
-	[ -f obj/libredwood-fairplay.dylib ] && cp obj/libredwood-fairplay.dylib root/lib/
-	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
-	[ -f obj/libredwood-tweaks.dylib ] && cp obj/libredwood-tweaks.dylib root/lib/
-	if [ -f obj/RedwoodAudio ]; then
-		mkdir -p root/lib/RedwoodAudio.driver
-		cp obj/RedwoodAudio root/lib/RedwoodAudio.driver/
-		cp src/audio_plugin.plist root/lib/RedwoodAudio.driver/Info.plist
+	cp obj/libhakios.dylib obj/libhakios.sb.dylib root/lib/
+	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
+	[ -f obj/libhakios.store.dylib ] && cp obj/libhakios.store.dylib root/lib/
+	[ -f obj/libhakios.fairplay.dylib ] && cp obj/libhakios.fairplay.dylib root/lib/
+	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
+	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+	if [ -f obj/HakiosAudio ]; then
+		mkdir -p root/lib/HakiosAudio.driver
+		cp obj/HakiosAudio root/lib/HakiosAudio.driver/
+		cp src/audio_plugin.plist root/lib/HakiosAudio.driver/Info.plist
 	fi
 	if [ -n "$GL" ]; then
 		cp obj/libOSMesa.8.dylib root/lib/
 		cp obj/gl_test root/bin/
 		if [ -f obj/u2f_test ]; then cp obj/u2f_test root/bin/; fi   # an "if": see the inject.conf loop below
 		[ -f obj/air_run ] && cp obj/air_run root/bin/
-		[ "$GL" = test ] || cp obj/libredwood-gl.dylib root/lib/
+		[ "$GL" = test ] || cp obj/libhakios.gl.dylib root/lib/
 	fi
 	# a program is not started with a library that is not there: it would not start at all
 	echo "$INJECT" | while read -r library names; do
@@ -385,19 +385,19 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# the system image, so mkjobs.py judges "is this daemon's program there" by the listing of the volume
 	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
 	# fairplayd among them).
-	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
+	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
-# (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/redwood_adreno.c, finds it in fw/
+# (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/hakios.adreno.c, finds it in fw/
 if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
 fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
-# (bsd/dev/redwood_wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
+# (bsd/dev/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
 if [ -f ../fw-wifi/wpss.mdt ]; then
 	mkdir -p root/fw
@@ -412,30 +412,30 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
-# (bsd/dev/redwood_haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
+# (bsd/dev/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
 if [ -f ../fw-haptic/aw8697_haptic.bin ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-haptic/aw8697_haptic.bin root/fw/
 fi
-# ... and the cameras' register tables (bsd/dev/redwood_camera.c, cam=2 and up), made by tools/camsensor.py out of
+# ... and the cameras' register tables (bsd/dev/hakios.camera.c, cam=2 and up), made by tools/camsensor.py out of
 # the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
-# redwood_<maker>_<sensor>_<camera>.bin, in ../fw-camera (the vendor's: neither they nor the tables are in the
+# hakios_<maker>_<sensor>_<camera>.bin, in ../fw-camera (the vendor's: neither they nor the tables are in the
 # repository): camera-<sensor>.tab
-for module in ../fw-camera/com.qti.sensormodule.redwood_*.bin; do
+for module in ../fw-camera/com.qti.sensormodule.hakios_*.bin; do
 	[ -f "$module" ] || continue
-	sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.redwood_[a-z]*_\([a-z0-9]*\)_.*/\1/')
+	sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.hakios_[a-z]*_\([a-z0-9]*\)_.*/\1/')
 	mkdir -p root/fw
 	../tools/camsensor.py "$module" "root/fw/camera-$sensor.tab" >/dev/null
 done
-# ... and their colour tuning (libredwood-media's processor, src/camera_isp.c), made by tools/camtuning.py out of the
-# cameras' tuning files beside them, com.qti.tuned.redwood_<maker>_<sensor>_<camera>.bin: camera-<sensor>.isp
-for tuned in ../fw-camera/com.qti.tuned.redwood_*.bin; do
+# ... and their colour tuning (libhakios.media's processor, src/camera_isp.c), made by tools/camtuning.py out of the
+# cameras' tuning files beside them, com.qti.tuned.hakios_<maker>_<sensor>_<camera>.bin: camera-<sensor>.isp
+for tuned in ../fw-camera/com.qti.tuned.hakios_*.bin; do
 	[ -f "$tuned" ] || continue
-	sensor=$(basename "$tuned" .bin | sed 's/^com\.qti\.tuned\.redwood_[a-z]*_\([a-z0-9]*\)_.*/\1/')
+	sensor=$(basename "$tuned" .bin | sed 's/^com\.qti\.tuned\.hakios_[a-z]*_\([a-z0-9]*\)_.*/\1/')
 	mkdir -p root/fw
 	../tools/camtuning.py "$tuned" "root/fw/camera-$sensor.isp" >/dev/null
 done
-# ... and with ADSP=1 the image of the audio DSP, from the same place into ../fw-audio (bsd/dev/redwood_adsp.c):
+# ... and with ADSP=1 the image of the audio DSP, from the same place into ../fw-audio (bsd/dev/hakios.adsp.c):
 # adsp.mdt and adsp.b02 to adsp.b36, 20 MB. Only when asked for: beside GL=1 the payload would be more than the 64 MB
 # the loader takes.
 if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
@@ -472,9 +472,9 @@ mkdir -p root/empty root/xpc root/hal
 for f in extensions.plist extensions.plist.sig; do
 	[ -f $IOS/rootfs/System/Library/xpc/$f ] && cp $IOS/rootfs/System/Library/xpc/$f root/xpc/
 done
-[ -d root/lib/RedwoodAudio.driver ] && ln -s /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
+[ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
-# as it is, which the kernel's drivers use where it lies in memory (bsd/dev/redwood_image.c)
+# as it is, which the kernel's drivers use where it lies in memory (bsd/dev/hakios.image.c)
 python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
 [ -z "$CHECK" ] || ../tools/apfs/check-image.sh root.apfs redwood=root
 
@@ -584,7 +584,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.ios
 	cp obj/stage0 sysroot/sbin/launchd
 	# the audio DSP's firmware, the phone's own from ../fw-audio (never in the repository), where the kernel reads
-	# it once the root is mounted (bsd/dev/redwood_adsp.c, adsp=1): 20 MB that do not fit beside GL=1 in the small image
+	# it once the root is mounted (bsd/dev/hakios.adsp.c, adsp=1): 20 MB that do not fit beside GL=1 in the small image
 	if [ -f ../fw-audio/adsp.mdt ]; then
 		mkdir -p sysroot/fw
 		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] sysroot/fw/
@@ -594,17 +594,17 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# This stages the files; a separate XNU MPSS driver is still required to start the modem.
 	if [ -n "$MODEM" ]; then
 		[ -f ../fw-modem/modem.mdt ] || { echo "build.sh: MODEM=1 needs ../fw-modem/modem.mdt" >&2; exit 1; }
-		../devices/redwood/tools/modem_firmware.py --dtb ../devices/redwood/prebuilt/redwood.dtb --firmware-dir ../fw-modem \
+		../devices/poco-x5-pro/tools/modem_firmware.py --dtb ../devices/poco-x5-pro/prebuilt/device-tree.dtb --firmware-dir ../fw-modem \
 			--node /soc/qcom,mss@4080000 >/dev/null
 		mkdir -p sysroot/fw
 		cp ../fw-modem/modem.mdt ../fw-modem/modem.b[0-9][0-9] sysroot/fw/
 		# ... and the firmware partition's image/ (its mcfg configurations and the registry's *.jsn, pulled from
-		# the phone's /vendor/firmware_mnt/image into ../fw-modem/image), which the modem reads over TFTP (redwood_mpss.c)
+		# the phone's /vendor/firmware_mnt/image into ../fw-modem/image), which the modem reads over TFTP (hakios.mpss.c)
 		if [ -d ../fw-modem/image ]; then
 			rm -rf sysroot/fw/image && cp -R ../fw-modem/image sysroot/fw/image
 		fi
 	fi
-	# ... and the speaker amplifiers' configuration, the phone's /vendor/etc/aw882xx_acf.bin (bsd/dev/redwood_speaker.c,
+	# ... and the speaker amplifiers' configuration, the phone's /vendor/etc/aw882xx_acf.bin (bsd/dev/hakios.speaker.c,
 	# for sound=3): Android's own register values, which are not in the repository either
 	if [ -f ../fw-audio/aw882xx_acf.bin ]; then
 		mkdir -p sysroot/fw
@@ -632,7 +632,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	fi
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
-	ln -s /redwood/lib/RedwoodAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
+	ln -s /redwood/lib/HakiosAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver
 	# the OS cryptex: on a device a separate volume grafted at /System/Cryptexes/OS. It holds the dyld
 	# shared cache (dyld looks there first) and a few libraries and resources outside the cache.
 	mkdir -p sysroot/System/Cryptexes

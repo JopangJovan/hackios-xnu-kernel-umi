@@ -5,7 +5,7 @@
 # (btrfs or xfs), so a workspace costs about 0.5 GB, most of it the kernel's build output.
 #
 # usage: tools/new-workspace.sh NAME INSTANCE [DIR]
-#   NAME      the branch, and the directory ../darwin-redwood-NAME unless DIR is given
+#   NAME      the branch, and the directory ../hakios-NAME unless DIR is given
 #   INSTANCE  the QEMU instance number of the copy (1, 2, ...; see qemu/run-ios.sh)
 #
 # The kernel tree is copied as it is now, uncommitted work included, and that state is recorded
@@ -17,7 +17,7 @@ set -e
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 NAME=${1:?usage: new-workspace.sh NAME INSTANCE [DIR]}
 INSTANCE=${2:?usage: new-workspace.sh NAME INSTANCE [DIR]}
-WS=${3:-$(dirname "$ROOT")/darwin-redwood-$NAME}
+WS=${3:-$(dirname "$ROOT")/hakios-$NAME}
 [ -e "$WS" ] && { echo "new-workspace.sh: $WS already exists"; exit 1; }
 
 git -C "$ROOT" worktree add -q -b "$NAME" "$WS"

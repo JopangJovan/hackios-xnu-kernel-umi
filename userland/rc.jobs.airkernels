@@ -1,4 +1,4 @@
-# Commands run by the launchd job com.redwood.demo (RC_JOBS=rc.jobs.airkernels).
+# Commands run by the launchd job com.hakios.demo (RC_JOBS=rc.jobs.airkernels).
 #
 # Every compute kernel of the corpus, dispatched on the Adreno. This is the question softpipe
 # cannot answer and has been deferred twice: of the 47, six dispatch on software and 38 stop in

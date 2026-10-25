@@ -20,12 +20,12 @@ iOS 16.5: launchd, backboardd, SpringBoard, застосунки. Те саме 
 
 Лише мій код і мої дані:
 
-- ядро: патч до відкритого XNU від Apple (`xnu/redwood.patch`, APSL 2.0) і мої файли драйверів
+- ядро: патч до відкритого XNU від Apple (`xnu/hakios.patch`, APSL 2.0) і мої файли драйверів
   (`xnu/files/`), які `xnu/apply.sh` накладає на свіжий клон;
 - завантажувач (`xnuloader/`), мої програми й бібліотеки (`userland/src/`), інструменти
   (`tools/`), скрипти збірки та запуску;
 - `prebuilt/`: ядро, завантажувач і бібліотеки, зібрані з цього репозиторію;
-- `devices/redwood/`: те, що потрібно одному телефону (порт UEFI, дерево пристроїв, скрипт прошивок).
+- `devices/poco-x5-pro/`: те, що потрібно одному телефону (порт UEFI, дерево пристроїв, скрипт прошивок).
 
 Чого немає і не буде:
 
@@ -58,7 +58,7 @@ iOS 16.5: launchd, backboardd, SpringBoard, застосунки. Те саме 
 Linux x86-64, близько 12 ГБ на диску, 7-Zip 23 або новіший, `lz4`, `qemu-system-aarch64`, `edk2-aarch64`.
 
 ```sh
-git clone https://github.com/oosexgang/hackios-xnu-kernel.git hakios
+git clone https://github.com/oosexgang/hakios-os.git hakios
 cd hakios
 make fetch        # IPSW iOS 16.5 із серверів Apple, потрібне розпаковується (7,4 ГБ)
 make images       # образи APFS: userland/root.apfs і userland/system.apfs
@@ -70,7 +70,7 @@ make qemu         # сеанс на 20 хвилин
 
 ## На телефоні
 
-Телефон, для якого є порт (`devices/redwood/`, POCO X5 Pro 5G), з розблокованим завантажувачем,
+Телефон, для якого є порт (`devices/poco-x5-pro/`, POCO X5 Pro 5G), з розблокованим завантажувачем,
 `adb` і `fastboot` на комп'ютері, образи з попереднього розділу і прошивки самого телефона:
 
 ```sh
@@ -108,11 +108,11 @@ make images       # користувацький простір і образи
 | Каталог | Вміст |
 |---|---|
 | `xnu/` | патч і файли ядра; `apply.sh`, `export.sh`; README про ядро |
-| `xnu/files/bsd/dev/redwood_*.c` | мої драйвери: екран, тач, UFS, GPU, Wi-Fi, звук, модем, SIM/NAS, вібро, камери |
+| `xnu/files/bsd/dev/hakios_*.c` | мої драйвери: екран, тач, UFS, GPU, Wi-Fi, звук, модем, SIM/NAS, вібро, камери |
 | `xnuloader/` | завантажувач (застосунок UEFI) |
 | `userland/` | мої програми й бібліотеки (`src/`), збірка образів, завдання launchd |
 | `sysimage/` | скрипти, що беруть і розпаковують файли ОС з IPSW (самих файлів немає) |
-| `devices/redwood/` | один телефон: його порт UEFI, дерево пристроїв, готові образи UEFI, скрипт прошивок |
+| `devices/poco-x5-pro/` | один телефон: його порт UEFI, дерево пристроїв, готові образи UEFI, скрипт прошивок |
 | `tools/` | APFS, прошивки, тести QMI, скрипти прогонів |
 | `qemu/` | запуск у QEMU |
 | `docs/` | `cellular.md` — зв'язок (англійською); `ru/` — докладний щоденник розробки російською |

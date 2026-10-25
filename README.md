@@ -20,12 +20,12 @@ device tree and its own Android, so a port to another Qualcomm phone is a new di
 
 Only my code and my data:
 
-- the kernel: a patch to Apple's open-source XNU (`xnu/redwood.patch`, APSL 2.0) and my driver
+- the kernel: a patch to Apple's open-source XNU (`xnu/hakios.patch`, APSL 2.0) and my driver
   files (`xnu/files/`), laid over a fresh clone by `xnu/apply.sh`;
 - the boot loader (`xnuloader/`), my programs and libraries (`userland/src/`), tools (`tools/`),
   build and run scripts;
 - `prebuilt/`: the kernel, loader and libraries built from this repository;
-- `devices/redwood/`: what one phone needs (its UEFI port, device tree, firmware script).
+- `devices/poco-x5-pro/`: what one phone needs (its UEFI port, device tree, firmware script).
 
 Not in the repository, never:
 
@@ -58,7 +58,7 @@ Not in the repository, never:
 Linux x86-64, about 12 GB of disk, 7-Zip 23 or newer, `lz4`, `qemu-system-aarch64`, `edk2-aarch64`.
 
 ```sh
-git clone https://github.com/oosexgang/hackios-xnu-kernel.git hakios
+git clone https://github.com/oosexgang/hakios-os.git hakios
 cd hakios
 sysimage/fetch.sh             # the iOS 16.5 IPSW from Apple's servers, the needed parts unpacked (7.4 GB)
 REST=1 userland/build.sh      # the APFS images: userland/root.apfs and userland/system.apfs
@@ -71,11 +71,11 @@ The lock screen appears after two or three minutes. The mouse with the button he
 
 ## On the phone
 
-A phone with a port (`devices/redwood/`, POCO X5 Pro 5G), its boot loader unlocked, `adb` and
+A phone with a port (`devices/poco-x5-pro/`, POCO X5 Pro 5G), its boot loader unlocked, `adb` and
 `fastboot` on the PC, the images from the previous section, and the phone's own firmware:
 
 ```sh
-devices/redwood/pull-firmware.sh    # GPU, Wi-Fi, audio/battery, haptics, modem, cameras -> fw-*/
+devices/poco-x5-pro/pull-firmware.sh    # GPU, Wi-Fi, audio/battery, haptics, modem, cameras -> fw-*/
 ./xl enter                          # Android -> fastboot -> our loader in RAM
 ./xl ramdisk userland/system.apfs   # the system image into the phone's RAM (~80 s), once per loader session
 XL_SB_DELAY=8 XL_SECS=600 \
@@ -125,11 +125,11 @@ module, or the open lzfse library gets built). User space and the images: `REST=
 | Directory | Contents |
 |---|---|
 | `xnu/` | the kernel patch and files; `apply.sh`, `export.sh`; a README about the kernel |
-| `xnu/files/bsd/dev/redwood_*.c` | my drivers: display, touch, UFS, GPU, Wi-Fi, audio, modem (`redwood_mpss.c`), SIM/NAS, haptics, cameras |
+| `xnu/files/bsd/dev/hakios_*.c` | my drivers: display, touch, UFS, GPU, Wi-Fi, audio, modem (`hakios.mpss.c`), SIM/NAS, haptics, cameras |
 | `xnuloader/` | the boot loader (a UEFI application) |
 | `userland/` | my programs and libraries (`src/`), the image build, launchd jobs |
 | `sysimage/` | scripts that fetch and unpack the OS files from the IPSW (none of the files themselves) |
-| `devices/redwood/` | one phone: its UEFI port, device tree, prebuilt UEFI images, firmware script, tools |
+| `devices/poco-x5-pro/` | one phone: its UEFI port, device tree, prebuilt UEFI images, firmware script, tools |
 | `tools/` | APFS, firmware, QMI tests, run scripts |
 | `qemu/` | running in QEMU |
 | `docs/` | `notes.md`: the detailed notes (Russian); `cellular.md`: cellular; `air.md`, `metal.md`: the GPU |
@@ -139,8 +139,8 @@ module, or the open lzfse library gets built). User space and the images: `REST=
 
 The kernel, loader and user space are shared. Everything about one phone lives in
 `devices/<name>/`: its UEFI, device tree, firmware list and tools. Today there is one,
-`devices/redwood/`, and its README is the map of what a port to another Qualcomm phone must bring.
-The phone's drivers are the files `xnu/files/bsd/dev/redwood_*.c`; the head of each says where its
+`devices/poco-x5-pro/`, and its README is the map of what a port to another Qualcomm phone must bring.
+The phone's drivers are the files `xnu/files/bsd/dev/hakios_*.c`; the head of each says where its
 numbers came from.
 
 ## Cellular

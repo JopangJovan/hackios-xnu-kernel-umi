@@ -510,8 +510,8 @@ figure to adjust.
 **Decision: a Mesa frontend in Mesa's tree, shaped like `src/compiler/spirv`.** Its entry point
 is one function, `air_to_nir()` (`nir_air.h`), the analogue of `spirv_to_nir()`. In this
 repository the sources are `tools/mesa/air/`; `tools/mk-mesa.sh` and `tools/air/mk-host.sh` copy
-them to `src/compiler/air/` of the pinned Mesa release, exactly as `tools/mesa/redwood-drm/` is
-copied to `src/redwood-drm/`, and `tools/mesa/air.patch` adds the two lines of meson that build
+them to `src/compiler/air/` of the pinned Mesa release, exactly as `tools/mesa/hakios-drm/` is
+copied to `src/hakios-drm/`, and `tools/mesa/air.patch` adds the two lines of meson that build
 it. The tree is the shape an upstream merge request would have.
 
 Why not a standalone library that Mesa links:
@@ -1292,7 +1292,7 @@ the Mesa already on the phone rather than being built from nothing:
 
 - The port's Mesa **already creates a Gallium screen for the Adreno**:
   `osmesa_create_gpu_screen()` in `tools/mesa/freedreno-darwin.patch` opens the kernel's `msm`
-  driver through `tools/mesa/redwood-drm` and calls `fd_drm_screen_create_renderonly()`. It also
+  driver through `tools/mesa/hakios-drm` and calls `fd_drm_screen_create_renderonly()`. It also
   already has `osmesa_surface_resource()`, which wraps an IOSurface as a `pipe_resource`. So the
   Gallium layer is reachable inside the library CoreAnimation already draws iOS through.
 - **freedreno takes NIR natively** (`PIPE_SHADER_CAP_SUPPORTED_IRS` includes
@@ -1304,7 +1304,7 @@ the Mesa already on the phone rather than being built from nothing:
 
 **That is now built and in the image, and no export was needed.** `air_run` is built *inside* the
 Mesa cross build (`AIR=1 tools/mk-mesa.sh`), so it links Gallium's own static libraries and opens
-the Adreno itself — `drmOpenWithType("msm", …)` through `tools/mesa/redwood-drm`, then
+the Adreno itself — `drmOpenWithType("msm", …)` through `tools/mesa/hakios-drm`, then
 `fd_drm_screen_create_renderonly()`, exactly as `osmesa_create_gpu_screen()` does. It needs
 nothing exported from `libOSMesa` and does not load it: a 9.8 MB arm64 Mach-O against libSystem,
 libz and IOKit alone. `userland/build.sh` puts it in `/redwood/bin`, and `rc.jobs.air` runs it.

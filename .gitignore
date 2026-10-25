@@ -4,6 +4,8 @@
 /*
 !/.gitignore
 !/README.md
+!/CONTRIBUTING.md
+!/.github/
 !/README.uk.md
 !/README.zh.md
 !/Makefile
@@ -46,7 +48,7 @@ __pycache__/
 !/userland/build.sh
 !/userland/*.py
 !/userland/rc.*
-!/userland/com.redwood.*.plist
+!/userland/com.hakios.*.plist
 !/userland/src/
 !/userland/libmini/
 !/userland/var/

@@ -1,5 +1,5 @@
 /*
- * libredwood-media.dylib: code of ours inside mediaserverd (see inject.c for how it gets there).
+ * libhakios.media.dylib: code of ours inside mediaserverd (see inject.c for how it gets there).
  *
  * mediaserverd is the audio server, and also the camera's: the capture stack of CMCapture lives
  * in the same process. Soon after it starts, that stack "prewarms" the Core Image filters of the
@@ -13,7 +13,7 @@
  * and the stock wallpaper of iOS 16, whose layers are four such pictures, is its gradient alone.
  * There is no hardware decoder here; VideoToolbox takes its software one (VCPHEVC.videocodec).
  *
- * The flashlight (only where the kernel has one: torch=3, /dev/redwood-torch): Control Center's
+ * The flashlight (only where the kernel has one: torch=3, /dev/hakios-torch): Control Center's
  * button and AVFlashlight reach FigFlashlight in here, which asks the capture stack's device vendor
  * (+[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]) for the camera device and its back
  * camera's stream, and sets the stream's "TorchLevel" (0 to 1). Without a camera there is no
@@ -22,7 +22,7 @@
  * by where it calls from -- is given one of ours, with a device and a stream whose torch level goes
  * to the kernel (see flashlight_*() below). Everybody else still gets none, as before.
  *
- * The camera (only where the kernel has one: cam=5, /dev/redwood-camera): the vendor is made for
+ * The camera (only where the kernel has one: cam=5, /dev/hakios-camera): the vendor is made for
  * everybody, with the create function of our capture device (camera_device.c) in place of the
  * one H10ISP.mediacapture would give for the iPhone's ISP; the capture graph is built around it and
  * its frames reach Camera.app's preview (see camera_device.c). Its stream takes the torch level too,
@@ -80,9 +80,9 @@ prewarm_portrait_filter(__unused id self, __unused SEL selector, __unused int ve
 
 /* ---- the flashlight ------------------------------------------------------------------------------- */
 
-static int torch = -1;                  /* /dev/redwood-torch */
-static bool camera;                     /* /dev/redwood-camera is there */
-extern int redwood_camera_device_create(const void *allocator, const void *options, void **out);
+static int torch = -1;                  /* /dev/hakios-torch */
+static bool camera;                     /* /dev/hakios-camera is there */
+extern int hakios_camera_device_create(const void *allocator, const void *options, void **out);
 static Class vendor_class, device_class, stream_class;
 static IMP original_shared_vendor;
 static unsigned torch_said;
@@ -107,9 +107,9 @@ shared_vendor(id self, SEL selector)
 	if (vendor != NULL) {
 		return vendor;
 	}
-	if (!camera && access("/dev/redwood-camera", F_OK) == 0) {
+	if (!camera && access("/dev/hakios-camera", F_OK) == 0) {
 		camera = true;          /* (should the kernel have made it after mediaserverd started) */
-		say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera)\n");
+		say("hakios: mediaserverd: the kernel has a camera (/dev/hakios-camera)\n");
 	}
 	if (camera) {
 		pthread_mutex_lock(&lock);
@@ -117,8 +117,8 @@ shared_vendor(id self, SEL selector)
 			id made = ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("BWFigCaptureDeviceVendor"), sel_registerName("alloc"));
 
 			camera_vendor = ((id (*)(id, SEL, void *))objc_msgSend)(made, sel_registerName("initWithDeviceCreateFunction:"),
-			    (void *)redwood_camera_device_create);
-			say("redwood: mediaserverd: the camera's device vendor %s\n", camera_vendor ? "made (camera_device.c)" :
+			    (void *)hakios_camera_device_create);
+			say("hakios: mediaserverd: the camera's device vendor %s\n", camera_vendor ? "made (camera_device.c)" :
 			    "CANNOT BE MADE");
 		}
 		pthread_mutex_unlock(&lock);
@@ -128,7 +128,7 @@ shared_vendor(id self, SEL selector)
 		if (caller >= flashlight_code[i].from && caller < flashlight_code[i].to) {
 			if (ours == NULL) {
 				ours = class_createInstance(vendor_class, 0);
-				say("redwood: mediaserverd: no camera, so no device vendor: FigFlashlight gets the flashlight's own\n");
+				say("hakios: mediaserverd: no camera, so no device vendor: FigFlashlight gets the flashlight's own\n");
 			}
 			return ours;
 		}
@@ -143,8 +143,8 @@ flashlight_set(uint32_t level)
 
 	if (written != (ssize_t)sizeof(level) || torch_said < 40) {
 		torch_said++;
-		say("redwood: mediaserverd: the flashlight at %u of 1000%s\n", level, written == (ssize_t)sizeof(level) ? "" :
-		    " (NOT TAKEN by /dev/redwood-torch)");
+		say("hakios: mediaserverd: the flashlight at %u of 1000%s\n", level, written == (ssize_t)sizeof(level) ? "" :
+		    " (NOT TAKEN by /dev/hakios-torch)");
 	}
 }
 
@@ -281,7 +281,7 @@ audio_source_start(id self, SEL selector, id *error)
 	*error = NULL;                  /* (autoreleased by the capture stack: not ours to give back) */
 	if (!said) {
 		said = true;
-		say("redwood: mediaserverd: there is no capture audio on this phone: the session's audio source gives nothing, "
+		say("hakios: mediaserverd: there is no capture audio on this phone: the session's audio source gives nothing, "
 		    "and the camera runs without it\n");
 	}
 	return true;
@@ -308,7 +308,7 @@ quality_prioritization(id self, SEL selector)
 
 	if (asked > 1 && !said) {
 		said = true;
-		say("redwood: mediaserverd: a photograph's quality prioritization %d taken as 1 (speed): one frame, no SIS bracket\n",
+		say("hakios: mediaserverd: a photograph's quality prioritization %d taken as 1 (speed): one frame, no SIS bracket\n",
 		    asked);
 	}
 	return asked > 1 ? 1 : asked;
@@ -330,7 +330,7 @@ gnr_render(id self, SEL selector, void *sample_buffer, id input)
 	(void)selector, (void)input;
 	if (!said) {
 		said = true;
-		say("redwood: mediaserverd: a photograph goes past the noise reduction, which has nothing to do it with here\n");
+		say("hakios: mediaserverd: a photograph goes past the noise reduction, which has nothing to do it with here\n");
 	}
 	if (output != nil) {
 		((void (*)(id, SEL, void *))objc_msgSend)(output, sel_registerName("emitSampleBuffer:"), sample_buffer);
@@ -363,7 +363,7 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
 			if (timebase.denom == 0) {
 				mach_timebase_info(&timebase);
 			}
-			say("redwood: mediaserverd: a photograph of %zux%zu encoded in %.0f ms\n", CVPixelBufferGetWidth(image),
+			say("hakios: mediaserverd: a photograph of %zux%zu encoded in %.0f ms\n", CVPixelBufferGetWidth(image),
 			    CVPixelBufferGetHeight(image), (double)(mach_absolute_time() - began) * timebase.numer / timebase.denom / 1e6);
 		}
 		began = 0;
@@ -394,7 +394,7 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 	if (sample_buffer == NULL) {
 		if (!said) {
 			said = true;
-			say("redwood: mediaserverd: a node's output was given no sample buffer (the silent audio source's): not passed on\n");
+			say("hakios: mediaserverd: a node's output was given no sample buffer (the silent audio source's): not passed on\n");
 		}
 		return;
 	}
@@ -425,7 +425,7 @@ register_hevc_encoder(void)
 	int status;
 
 	if (create == NULL || register_encoder == NULL || id_key == NULL || name_key == NULL || hardware_key == NULL) {
-		say("redwood: mediaserverd: no software HEVC encoder to register (%s)\n", codec == NULL ? "no VCPHEVC.videocodec" :
+		say("hakios: mediaserverd: no software HEVC encoder to register (%s)\n", codec == NULL ? "no VCPHEVC.videocodec" :
 		    create == NULL ? "no HEVCVideoEncoder_CreateInstance" : "VideoToolbox without VTRegisterVideoEncoderWithInfo");
 		return;
 	}
@@ -437,7 +437,7 @@ register_hevc_encoder(void)
 
 	status = register_encoder('hvc1', info, create);
 	CFRelease(info);
-	say("redwood: mediaserverd: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (%d)\n", status);
+	say("hakios: mediaserverd: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (%d)\n", status);
 }
 
 struct method_spec {
@@ -472,9 +472,9 @@ flashlight_classes(void)
 		{ "setProperty:value:", "i@:@@", (IMP)flashlight_stream_set },
 	};
 
-	vendor_class = make_class("RedwoodFlashlightVendor", vendor, sizeof(vendor) / sizeof(vendor[0]));
-	device_class = make_class("RedwoodFlashlightDevice", NULL, 0);
-	stream_class = make_class("RedwoodFlashlightStream", stream, sizeof(stream) / sizeof(stream[0]));
+	vendor_class = make_class("HakiosFlashlightVendor", vendor, sizeof(vendor) / sizeof(vendor[0]));
+	device_class = make_class("HakiosFlashlightDevice", NULL, 0);
+	stream_class = make_class("HakiosFlashlightStream", stream, sizeof(stream) / sizeof(stream[0]));
 }
 
 /*
@@ -522,7 +522,7 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 		    class_getClassMethod(cls, sel_registerName(r->selector));
 		original = method ? method_getImplementation(method) : NULL;
 		if (original == NULL || (uintptr_t)original != r->expected + slide) {
-			say("redwood: %c[%s %s]: found %#lx, expected %#lx; left alone\n", r->instance ? '-' : '+', r->class_name,
+			say("hakios: %c[%s %s]: found %#lx, expected %#lx; left alone\n", r->instance ? '-' : '+', r->class_name,
 			    r->selector,
 			    original ? (uintptr_t)original - slide : 0, r->expected);
 			continue;
@@ -531,13 +531,13 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 			*r->original = original;
 		}
 		method_setImplementation(method, r->replacement);
-		say("redwood: mediaserverd: %c[%s %s] replaced\n", r->instance ? '-' : '+', r->class_name, r->selector);
+		say("hakios: mediaserverd: %c[%s %s] replaced\n", r->instance ? '-' : '+', r->class_name, r->selector);
 	}
 }
 
 __attribute__((constructor))
 static void
-redwood_media_init(void)
+hakios_media_init(void)
 {
 	const char *name = getprogname();
 	size_t length = 0;
@@ -546,14 +546,14 @@ redwood_media_init(void)
 		return;
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
-	torch = open("/dev/redwood-torch", O_WRONLY);
-	camera = access("/dev/redwood-camera", F_OK) == 0;
+	torch = open("/dev/hakios-torch", O_WRONLY);
+	camera = access("/dev/hakios-camera", F_OK) == 0;
 	if (torch >= 0) {
 		flashlight_classes();
-		say("redwood: mediaserverd: the kernel has a flashlight (/dev/redwood-torch)\n");
+		say("hakios: mediaserverd: the kernel has a flashlight (/dev/hakios-torch)\n");
 	}
 	if (camera) {
-		say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera)\n");
+		say("hakios: mediaserverd: the kernel has a camera (/dev/hakios-camera)\n");
 		register_hevc_encoder();
 	}
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */

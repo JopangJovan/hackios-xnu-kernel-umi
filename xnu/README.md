@@ -2,7 +2,7 @@
 
 Our changes to XNU `xnu-8796.121.2` (the kernel of iOS 16.5, Darwin 22.5.0):
 
-- `redwood.patch`: changes to Apple's files;
+- `hakios.patch`: changes to Apple's files;
 - `files/`: new files at their paths in the XNU tree;
 - `apply.sh`: fetches the sources from Apple's GitHub and lays all of this over them;
   `export.sh`: the reverse, run before committing.
@@ -46,15 +46,15 @@ Things to know:
 | `iokit/Kernel/GenericARMPE.cpp`, `MiniIOSurface.*`, `MiniIOMobileFramebuffer.cpp`, `MiniAppleKeyStore.cpp` | the platform expert and replacements for closed drivers: surfaces, the display, the key store |
 | `bsd/miscfs/apfs/`, `bsd/miscfs/ramfs/` | read-only APFS and a writable RAM file system |
 | `bsd/kern/kern_minimac.c`, `libkern/amfi/` | AMFI and Sandbox stubs |
-| `bsd/dev/redwood_input.c`, `redwood_goodix.c` | input: `/dev/redwood-touch`, the Goodix GT9916 touch controller |
-| `bsd/dev/redwood_cpufreq.c` | CPU clocks (Qualcomm EPSS) |
-| `bsd/dev/redwood_net.c`, `redwood_virtio_net.c` | the `en0` network interface |
-| `bsd/dev/redwood_adreno.c`, `iokit/Kernel/RedwoodGPU.cpp` | the Adreno 642L GPU |
-| `bsd/dev/redwood_wifi.c`, `redwood_wlfw.c` | Wi-Fi (WCN6750): shared memory, the radio's DSP, the driver |
-| `bsd/dev/redwood_qmi.c`, `redwood_nas.c` | QMI and the NAS client |
-| `bsd/dev/redwood_mpss.c` | the modem: firmware, file systems, IPA, SIM, registration |
-| `bsd/dev/redwood_audio.c`, `redwood_adsp.c`, `redwood_speaker.c`, `redwood_mic.c` | sound through the audio DSP; the battery comes through it too |
-| `bsd/dev/redwood_haptic.c`, `redwood_camera.c`, `redwood_ufs.c` | the vibration motor, the cameras, the UFS storage |
+| `bsd/dev/hakios.input.c`, `hakios.goodix.c` | input: `/dev/hakios-touch`, the Goodix GT9916 touch controller |
+| `bsd/dev/hakios.cpufreq.c` | CPU clocks (Qualcomm EPSS) |
+| `bsd/dev/hakios.net.c`, `hakios.virtio_net.c` | the `en0` network interface |
+| `bsd/dev/hakios.adreno.c`, `iokit/Kernel/hakios.gpu.cpp` | the Adreno 642L GPU |
+| `bsd/dev/hakios.wifi.c`, `hakios.wlfw.c` | Wi-Fi (WCN6750): shared memory, the radio's DSP, the driver |
+| `bsd/dev/hakios.qmi.c`, `hakios.nas.c` | QMI and the NAS client |
+| `bsd/dev/hakios.mpss.c` | the modem: firmware, file systems, IPA, SIM, registration |
+| `bsd/dev/hakios.audio.c`, `hakios.adsp.c`, `hakios.speaker.c`, `hakios.mic.c` | sound through the audio DSP; the battery comes through it too |
+| `bsd/dev/hakios.haptic.c`, `hakios.camera.c`, `hakios.ufs.c` | the vibration motor, the cameras, the UFS storage |
 | `bsd/pthread/pthread_kext_static.c` | the pthread kext linked into the kernel |
 
 The patch also fixes what keeps open XNU from building and running outside Apple: the makefiles

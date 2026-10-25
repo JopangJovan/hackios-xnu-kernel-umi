@@ -18,7 +18,7 @@ Where the modem stands (October 2026). The detailed, step-by-step diary in Russi
   logical slot 1 is pointed at it, the provisioning session is bound to its USIM, and NAS reads
   the signal (-70 to -87 dBm on UMTS).
 - SpringBoard's status bar: the signal item is hooked (`userland/src/inject_sb.c`) and shows the
-  kernel's bars (`sysctl kern.redwood.cellular_bars`) once the modem is registered.
+  kernel's bars (`sysctl kern.hakios.cellular_bars`) once the modem is registered.
 
 ## Not yet
 
@@ -34,7 +34,7 @@ XL_SB_DELAY=8 tools/modem-cycle.sh "modem=1 modem_again=1 modem_buffer=0xa800000
 
 `modem_step=N` runs the bring-up step by step and returns to the loader with the log;
 `modem=1` brings the modem up beside the system. Everything is in
-`xnu/files/bsd/dev/redwood_mpss.c` (the modem), `redwood_nas.c` (NAS), `redwood_qmi.c` (QMI).
+`xnu/files/bsd/dev/hakios.mpss.c` (the modem), `hakios.nas.c` (NAS), `hakios.qmi.c` (QMI).
 
 ## Kernel arguments
 

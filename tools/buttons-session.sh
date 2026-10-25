@@ -16,7 +16,7 @@
 # Environment: XL_CMDLINE_MORE="..." more boot-args (gpu=1, -v, ...); RAMDISK=1 upload the system
 # image even if the phone is already in the loader; RECORD=0 no screen recording.
 cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
-PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-redwood-phone
+PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 secs=${1:-120}
 out=logs/buttons-$(date +%H%M%S)
 mkdir -p "$out"

@@ -54,7 +54,7 @@ L=xnuloader/loader.efi
 mkdir -p logs
 # There is one phone, whichever working copy (tools/new-workspace.sh) talks to it: the locks are
 # outside all of them.
-PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-redwood-phone
+PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 
 # one fastboot at a time (a run in one terminal, "xl screenshot" in another): each takes the lock for itself
 fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }

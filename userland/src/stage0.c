@@ -25,7 +25,7 @@ main(int argc, char **argv, char **envp)
 	}
 
 	if (mount("apfs", "/redwood", MNT_RDONLY, (void *)"/dev/md1") != 0) {
-		printf("stage0: cannot mount /dev/md1 on /redwood: %s\n", strerror(errno));
+		printf("stage0: cannot mount /dev/md1 on /hakios: %s\n", strerror(errno));
 	} else {
 		execve(init_argv[0], init_argv, envp);
 		printf("stage0: cannot run %s: %s\n", init_argv[0], strerror(errno));
