@@ -16,7 +16,7 @@ import argparse, gzip, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
-PREBUILT = os.path.join(HERE, 'devices', 'redwood', 'prebuilt')
+PREBUILT = os.path.join(HERE, 'devices', 'poco-x5-pro', 'prebuilt')
 FD_BASE, FD_SIZE = 0x9FD00000, 0x200000
 PAYLOAD_BASE, PAYLOAD_MAX = 0xF0000000, 0x04000000
 
