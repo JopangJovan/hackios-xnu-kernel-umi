@@ -76,6 +76,7 @@ fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
 live_loader() { fb getvar version | grep -Eq 'version: 0\.([5-9]|[1-9][0-9])'; }
 in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
 is_loader() {
+	fastboot devices 2>/dev/null | awk '$1 == "xnuloader" && $2 == "fastboot" { found = 1 } END { exit !found }' && return 0
 	in_fastboot && { fb getvar product | grep -q 'product: xnuloader' || fb getvar version | grep -Eq 'version: 0\.[5-9]|version: 0\.[1-9][0-9]'; }
 }
 state() {
