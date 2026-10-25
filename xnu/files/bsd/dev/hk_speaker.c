@@ -1784,19 +1784,45 @@ umi_speaker_quiesce(void)
 	}
 }
 
+/* A preempted bit-banged read can NACK even though the amp is healthy.
+ * Retry transport failures only; a reported protection fault is never retried. */
+static bool
+umi_cs35l41_health_read(uint8_t a, uint32_t reg, uint32_t *value)
+{
+	for (unsigned attempt = 0; attempt < 3; attempt++) {
+		if (umi_cs35l41_read(a, reg, value)) {
+			if (attempt) say("umi-audio: amp %#x recovered I2C read at %#x after %u retries\n", a, reg, attempt);
+			return true;
+		}
+		wait_ms(2);
+	}
+	say("umi-audio: amp %#x I2C read failed three times at %#x; output stopped\n", a, reg);
+	return false;
+}
+
 bool
 umi_speaker_healthy(void)
 {
-	if (!umi_output_ready) return false;
+	if (!umi_output_ready || umi_reset_asserted) return false;
 	for (unsigned i = 0; i < 2; i++) {
 		uint8_t a = i ? 0x42 : 0x40;
-		uint32_t status, error;
-		if (!umi_cs35l41_read(a, 0x10010, &status) || (status & 0x800281c0) ||
-		    !umi_cs35l41_read(a, umi_cspl_xm[i] + 12, &error) || error) {
-			say("umi-audio: amp %#x fault; both chips held in reset\n", a);
-			umi_speaker_quiesce();
-			return false;
+		uint32_t status = 0, error = 0;
+		if (!umi_cs35l41_health_read(a, 0x10010, &status)) goto fault;
+		if (status & 0x800281c0) {
+			say("umi-audio: amp %#x hardware protection: IRQ1_STATUS1=%#x, faults=%#x\n",
+			    a, status, status & 0x800281c0);
+			goto fault;
 		}
+		if (!umi_cs35l41_health_read(a, umi_cspl_xm[i] + 12, &error)) goto fault;
+		if (error) {
+			say("umi-audio: amp %#x protection DSP error=%#x, IRQ1_STATUS1=%#x\n", a, error, status);
+			goto fault;
+		}
+		continue;
+	fault:
+		say("umi-audio: both chips held in reset following amp %#x health failure\n", a);
+		umi_speaker_quiesce();
+		return false;
 	}
 	return true;
 }
