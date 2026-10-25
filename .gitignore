@@ -5,7 +5,7 @@
 !/.gitignore
 !/README.md
 !/CONTRIBUTING.md
-!/.github/
+!/ci/
 !/README.uk.md
 !/README.zh.md
 !/Makefile

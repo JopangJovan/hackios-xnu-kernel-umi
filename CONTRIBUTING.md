@@ -15,3 +15,10 @@
   devices `/dev/hakios-<thing>`.
 - Licenses: the kernel patch and files are APSL 2.0 (derived from XNU); everything else is MIT.
   Third-party code goes into `NOTICE`.
+
+## CI
+
+`ci/github-check.yml` is a GitHub Actions workflow (Python compiles, scripts parse, no Apple
+files or pictures in the tree, the kernel patch applies to Apple's tag). Enable it by copying it
+to `.github/workflows/check.yml`; a push that adds it needs a token with the `workflow` scope,
+or do it in the web editor.
