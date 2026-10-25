@@ -95,6 +95,7 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 /* What the Wi-Fi's DSP and this one both use (redwood_wifi.c). */
 extern lck_mtx_t redwood_aop_mailbox_lock;
 extern lck_mtx_t redwood_smem_alloc_lock;
+extern lck_mtx_t redwood_rsc_lock;            /* RPMh's sequencer, shared with the other DSP's driver */
 
 static LCK_GRP_DECLARE(mpss_lock_group, "redwood-mpss");
 
@@ -892,10 +893,12 @@ rails(uint32_t level)
 		values[r] = (uint32_t)position;
 	}
 	need(&rsc);
+	lck_mtx_lock(&redwood_rsc_lock);
 	/* (the boot loader leaves the trigger set after its last request, done: idle is what the status says) */
 	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
 		printf("mpss: %u: TCS %u of the sequencer is busy (status %#x, control %#x): the rails are not asked\n", step, RPMH_TCS,
 		    rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS), rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL));
+		lck_mtx_unlock(&redwood_rsc_lock);
 		return false;
 	}
 	printf("mpss: %u: about to ask RPMh, through TCS %u, for cx.lvl (%#x) = %u and mss.lvl (%#x) = %u (level %u%s)\n", step,
@@ -928,6 +931,7 @@ rails(uint32_t level)
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	lck_mtx_unlock(&redwood_rsc_lock);
 	return done != 0;
 }
 
@@ -949,8 +953,10 @@ rpmh_command(const char *name, uint32_t value)
 		return false;
 	}
 	need(&rsc);
+	lck_mtx_lock(&redwood_rsc_lock);
 	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
 		printf("mpss: %u: TCS %u of the sequencer is busy: \"%s\" is not asked\n", step, RPMH_TCS, name);
+		lck_mtx_unlock(&redwood_rsc_lock);
 		return false;
 	}
 	printf("mpss: %u: about to ask RPMh, through TCS %u, for %s (%#x) = %#x\n", step, RPMH_TCS, name, address, value);
@@ -979,6 +985,7 @@ rpmh_command(const char *name, uint32_t value)
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	lck_mtx_unlock(&redwood_rsc_lock);
 	return done != 0;
 }
 
