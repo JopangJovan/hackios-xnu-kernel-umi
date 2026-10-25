@@ -80,3 +80,8 @@ __pycache__/
 !/xnu-deps/build/lzbitmap/libzbitmap.h
 /tools/android/f2fs-resize
 /tools/macos-bin/platform-tools/
+
+# made at build time from the device tree of the builder's own IPSW (xnuloader/mkidentity.sh)
+/xnuloader/identity.h
+!/xnuloader/im4p.py
+!/xnuloader/mkidentity.sh

@@ -125,7 +125,11 @@ xnu-deps/setup.sh        # зависимости, инструменты и SDK
 ./xnu-build.sh -j8 -k    # → xnu-src/…/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 ```
 
-Загрузчик: `xnuloader/build.sh` (clang + lld-link, EFI-приложение без EDK2). Userland и образы:
+Загрузчик: `xnuloader/build.sh` (clang + lld-link, EFI-приложение без EDK2). Заголовок
+`xnuloader/identity.h` — свойства, по которым iOS узнаёт, «какой она iPhone», — в репозитории не
+хранится: `xnuloader/mkidentity.sh` делает его при сборке из дерева устройств вашего IPSW (один файл
+в 34 КБ с серверов Apple, LZFSE декодирует `lzfse`, `compression_tool` macOS или модуль Python
+`lzfse`; без них собирается открытая библиотека lzfse). Userland и образы:
 `REST=1 userland/build.sh` (`MODEM=1 SYSTEM=1` кладут прошивку модема в образ системы). Подробности —
 `xnu/README.md` и `docs/notes.md`.
 

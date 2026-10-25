@@ -2,6 +2,9 @@
 # Build the XNU loader as a freestanding AArch64 UEFI application.
 set -e
 cd "$(dirname "$0")"
+# the iPhone's identity for XNU, from the device tree of the builder's own IPSW (not in the repository)
+[ -f identity.h ] || ./mkidentity.sh
+
 clang --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector -fshort-wchar \
   -mgeneral-regs-only -O1 -Wall -Wextra -Wno-unused-parameter -c loader.c -o loader.obj
 # /base: UEFI loads an image at its preferred address when that is free. The PE default (0x140000000)

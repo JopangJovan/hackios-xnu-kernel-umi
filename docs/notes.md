@@ -1709,8 +1709,8 @@ xnu-deps/setup.sh        # зависимости, инструменты и SDK
 xnuloader/build.sh        # clang + lld-link → xnuloader/loader.efi (EFI-приложение без EDK2)
 ```
 
-`xnuloader/identity.h` сгенерирован `mkidentity.py` из дерева устройств iPhone X (так система узнаёт, «какой она
-iPhone»); перегенерировать: `python3 ios165/fetch-from-ipsw.py Firmware/all_flash/DeviceTree.d22ap.im4p dt.im4p`,
+`xnuloader/identity.h` генерируется при сборке `xnuloader/mkidentity.sh` (через `mkidentity.py`) из дерева устройств
+iPhone X в вашем IPSW (так система узнаёт, «какой она iPhone»); в репозитории его нет. Вручную: `python3 ios165/fetch-from-ipsw.py Firmware/all_flash/DeviceTree.d22ap.im4p dt.im4p`,
 `ipsw img4 im4p extract dt.im4p -o dt.bin`, `xnuloader/mkidentity.py dt.bin > xnuloader/identity.h`. Кроме свойств
 корня и `/product` оттуда же берётся узел `/product/haptics` (`closed-loop`, `supports-3rd-party-haptics`): по нему
 MobileGestalt отвечает `DeviceSupportsClosedLoopHaptics`, и iOS играет вибрацию и отклики волнами на устройстве
