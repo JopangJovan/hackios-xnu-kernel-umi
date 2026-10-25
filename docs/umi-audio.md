@@ -104,3 +104,9 @@ noise reduction still require a device retest.
 
 Host volume conversion check:
 `cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined tools/audio-test/cs35l41-volume.c -o /tmp/umi-volume && /tmp/umi-volume`
+
+UMI defaults to `sound_gain=0`: real media already reaches full-scale PCM.
+The inherited +12 dB compensation made the peak limiter engage throughout
+music. A three-second stereo sine check limits only 13 startup-transient
+frames at unity (zero after filter startup), versus 143997 of 144000 frames
+with +12 dB. `sound_gain` can still explicitly override the default.

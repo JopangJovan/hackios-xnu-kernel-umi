@@ -1663,6 +1663,9 @@ hk_sound_dsp_up(void)
 	uint32_t umi = 0;
 	umi_profile = PE_parse_boot_argn("adsp_umi", &umi, sizeof(umi)) && umi == 1;
 	if (umi_profile) {
+		/* UMI media can already reach full-scale PCM. Redwood's fixed +12 dB
+		 * bring-up compensation drives the limiter throughout music playback. */
+		gain = 0;
 		if (level > 4) {
 			say("sound: UMI supports sound levels 1 through 4\n");
 			return;
