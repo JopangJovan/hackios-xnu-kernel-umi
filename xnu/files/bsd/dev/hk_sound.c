@@ -1594,8 +1594,8 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 			if (!umi_speaker_prepare()) goto out;
 			uint32_t requested_below;
 			if (umi_speaker_calibrated() && !PE_parse_boot_argn("sound_below", &requested_below, sizeof(requested_below))) {
-				below = 18 * 8;
-				say("sound: both per-unit calibrations loaded: playback ceiling -18 dB (12 dB above bring-up)\n");
+				below = 12 * 8;
+				say("sound: both per-unit calibrations loaded: playback ceiling -12 dB (18 dB above bring-up)\n");
 			}
 		} else {
 			if (!hk_speaker_prepare(acf, acf_size)) goto out;

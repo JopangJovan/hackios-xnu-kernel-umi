@@ -18,5 +18,6 @@ int main(void)
     check(UINT32_MAX);
     assert(umi_cs35l41_volume_register(240) == 0x3884); /* -30 dB */
     assert(umi_cs35l41_volume_register(144) == 0x3b84); /* -18 dB */
+    assert(umi_cs35l41_volume_register(96) == 0x3d04); /* -12 dB */
     return 0;
 }

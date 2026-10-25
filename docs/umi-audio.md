@@ -92,8 +92,8 @@ sets CAL_R/status/checksum and retains CAL_AMBIENT from the stock coefficient
 file, matching Android. Missing or invalid files retain fallback calibration
 and the original -30 dB playback ceiling.
 
-With both calibrations available, default playback uses a -18 dB ceiling,
-12 dB above the bring-up profile. `sound_below` still overrides this value.
+With both calibrations available, default playback uses a -12 dB ceiling,
+18 dB above the bring-up profile. `sound_below` still overrides this value.
 The stock analog gain, per-amp protection tuning, DRE and software guard remain
 active. PCM attenuation is clamped at -102 dB to avoid signed-register wrap.
 
@@ -110,3 +110,8 @@ The inherited +12 dB compensation made the peak limiter engage throughout
 music. A three-second stereo sine check limits only 13 startup-transient
 frames at unity (zero after filter startup), versus 143997 of 144000 frames
 with +12 dB. `sound_gain` can still explicitly override the default.
+
+Amplifier health checks retry failed I2C reads up to three times, with a 2 ms
+pause, before stopping output. Reported hardware protection flags and nonzero
+CSPL DSP errors still stop both amps immediately. Shutdown logs now distinguish
+transport failures from IRQ1_STATUS1 protection flags and CSPL error codes.
