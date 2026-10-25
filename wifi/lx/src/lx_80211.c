@@ -1434,7 +1434,7 @@ key_set(struct lx_radio *radio, const uint8_t *key, unsigned index, bool pairwis
 	mutex_lock(&radio->wiphy->mtx);
 	*error = radio->ops->set_key(&radio->hw, SET_KEY, radio->vif, pairwise ? radio->sta : NULL, conf);
 	mutex_unlock(&radio->wiphy->mtx);
-	lx_tell("lx: TKIP/CCMP %s key install returned %d\n", pairwise ? "pairwise" : "group", *error);
+	lx_tell("lx: %s %s key install returned %d\n", cipher == 2 ? "TKIP" : "CCMP", pairwise ? "pairwise" : "group", *error);
 	return (conf);
 }
 
@@ -1687,6 +1687,8 @@ station_join(struct lx_radio *radio, const struct hk_sta_join *what)
 	}
 	radio->pairwise_cipher = pairwise_cipher;
 	radio->group_cipher = group_cipher;
+	lx_tell("lx: selected pairwise %s and group %s\n", pairwise_cipher == 2 ? "TKIP" : "CCMP",
+	    group_cipher == 2 ? "TKIP" : "CCMP");
 
 	/* The passphrase and handshake state exist only for protected networks. */
 	bzero(&radio->wpa, sizeof(radio->wpa));
