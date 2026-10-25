@@ -4,6 +4,11 @@
 /*
 !/.gitignore
 !/README.md
+!/Makefile
+!/LICENSE
+!/LICENSE.APSL
+!/NOTICE
+!/devices/
 !/docs/
 !/xl
 !/mkxnuimg.py
@@ -16,7 +21,6 @@
 !/sysimage/
 !/xnu/
 !/xnu-deps/
-!/uefi/
 !/prebuilt/
 !/wifi/
 
