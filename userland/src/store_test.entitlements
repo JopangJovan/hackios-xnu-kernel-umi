@@ -8,10 +8,10 @@
 	<key>com.apple.private.accounts.allaccounts</key>
 	<true/>
 	<key>application-identifier</key>
-	<string>hackios.store-test</string>
+	<string>hakios.store-test</string>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>hackios.store-test</string>
+		<string>hakios.store-test</string>
 		<string>com.apple.itunes</string>
 	</array>
 </dict>

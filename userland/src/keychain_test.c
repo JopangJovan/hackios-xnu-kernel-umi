@@ -28,7 +28,7 @@ query(void)
 	CFMutableDictionaryRef q = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 
 	CFDictionarySetValue(q, kSecClass, kSecClassGenericPassword);
-	CFDictionarySetValue(q, kSecAttrService, CFSTR("hackios-keychain-test"));
+	CFDictionarySetValue(q, kSecAttrService, CFSTR("hakios-keychain-test"));
 	CFDictionarySetValue(q, kSecAttrAccount, CFSTR("test"));
 	return q;
 }

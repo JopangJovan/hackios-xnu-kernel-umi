@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
 	<key>application-identifier</key>
-	<string>hackios.keychain-test</string>
+	<string>hakios.keychain-test</string>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>hackios.keychain-test</string>
+		<string>hakios.keychain-test</string>
 	</array>
 </dict>
 </plist>

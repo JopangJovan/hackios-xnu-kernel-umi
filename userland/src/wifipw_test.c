@@ -2,7 +2,7 @@
  * wifipw_test: what wifid does with a network's password when Settings joins it, done here the same
  * way: MobileWiFi's WiFiSecuritySetPassword() into the keychain, WiFiSecurityCopyPassword() back
  * (what Auto-Join asks before it joins a known network on its own), WiFiSecurityRemovePassword()
- * (what "Forget This Network" does). The network is a made-up one ("hackios-wifipw-test") with a
+ * (what "Forget This Network" does). The network is a made-up one ("hakios-wifipw-test") with a
  * made-up password, neither printed in full. Signed with wifipw_test.entitlements: wifid's name
  * and its right to the system keychain, as the keychain answers a program by those.
  * MobileWiFi's own os_log lines ("__WiFiSecuritySetPassword:[...] Error result -25291") say the
@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#define SSID	CFSTR("hackios-wifipw-test")
+#define SSID	CFSTR("hakios-wifipw-test")
 #define SECRET	CFSTR("not-a-real-password")
 
 static CFStringRef (*copy_password)(CFStringRef ssid);
