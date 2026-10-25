@@ -84,7 +84,7 @@ XL_CMDLINE="bootcpu=7 cpus=8 cpufreq=1 ufs=2 touchscreen=1 gpu=1 adsp=1 sound=4 
 
 `tools/modem-cycle.sh "ARGS" SECS` does all of that in one command and returns the phone to Android.
 
-The main kernel arguments (the full list is in `docs/notes.md`):
+The main kernel arguments (the full list is in `docs/ru/notes.md`):
 
 | Argument | What it does |
 |---|---|
@@ -116,7 +116,7 @@ repository: `xnuloader/mkidentity.sh` makes it at build time from the device tre
 (one 34 KB file; LZFSE is decoded by `lzfse`, macOS's `compression_tool` or the Python `lzfse`
 module, or the open lzfse library gets built). User space and the images: `REST=1 userland/build.sh`
 (`MODEM=1 SYSTEM=1` put the modem's firmware into the system image). Details: `xnu/README.md`,
-`docs/notes.md`.
+`docs/ru/notes.md`.
 
 ## Layout
 
