@@ -1,5 +1,7 @@
 # HakiOS
 
+English · [中文](README.zh.md) · [Українська](README.uk.md)
+
 HakiOS runs the open-source XNU kernel (xnu-8796.121.2) with my own boot loader and my own drivers
 on an Android phone with a Qualcomm SoC, and boots the stock iOS 16.5 user space on top of it:
 launchd, backboardd, SpringBoard, the apps. The same thing runs in QEMU (`virt`, aarch64) on a

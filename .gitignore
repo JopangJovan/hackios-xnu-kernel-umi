@@ -4,6 +4,8 @@
 /*
 !/.gitignore
 !/README.md
+!/README.uk.md
+!/README.zh.md
 !/Makefile
 !/LICENSE
 !/LICENSE.APSL
