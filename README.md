@@ -1,173 +1,161 @@
 # HakiOS
 
-**HakiOS** — мой проект по запуску Darwin на Android-телефонах: открытое ядро XNU (xnu-8796.121.2 — то
-же ядро, что в iOS 16.5), собственный загрузчик и собственные драйверы для железа Qualcomm, под
-которыми работает пользовательское окружение iOS: launchd → backboardd → SpringBoard → приложения.
-То же самое запускается в QEMU (`virt`, aarch64) на обычном Linux-компьютере.
+HakiOS runs the open-source XNU kernel (xnu-8796.121.2) with my own boot loader and my own drivers
+on an Android phone with a Qualcomm SoC, and boots the stock iOS 16.5 user space on top of it:
+launchd, backboardd, SpringBoard, the apps. The same thing runs in QEMU (`virt`, aarch64) on a
+Linux PC.
 
-Первый и пока единственный телефон, на котором всё это отлажено, — **POCO X5 Pro 5G (redwood,
-Snapdragon 778G)**, но проект с самого начала делается переносимым: ядро ничего не знает о телефоне
-заранее, все адреса, прерывания, рельсы питания и прошивки берутся из дерева устройств и из Android
-конкретного аппарата, и каждый драйвер написан так, чтобы перенос на другой телефон на Qualcomm был
-вопросом данных, а не переписывания. Если у вас другой аппарат и желание — порт делается по тем же
-шагам, что описаны в `docs/notes.md` и `docs/cellular.md`.
+Nothing is flashed. The loader goes into RAM through `fastboot boot`, the system lives in RAM for
+the length of a session, and a reboot brings the phone back to its own Android. This is a research
+bench, not a ROM.
 
-Ничего в телефон не прошивается: загрузчик уходит в ОЗУ через `fastboot boot`, система живёт в ОЗУ до
-конца сеанса, после перезагрузки телефон снова в своём Android. Это исследовательский стенд для
-изучения того, как устроены XNU и железо телефона, а не прошивка и не замена Android.
+The first phone is the **POCO X5 Pro 5G** (`redwood`, Snapdragon 778G). The kernel knows nothing
+about it in advance: every address, interrupt, power rail and firmware comes from the phone's own
+device tree and its own Android, so a port to another Qualcomm phone is a new directory under
+`devices/`, not a rewrite.
 
-## Что в репозитории, а чего нет
+## What is in the repository
 
-Я слежу за тем, чтобы в репозитории были **только мой код и мои данные** — ничего, что принадлежит
-Apple или производителю телефона:
+Only my code and my data:
 
-- ядро — патч к открытым исходникам XNU Apple (`xnu/redwood.patch`, лицензия APSL) и наши файлы
-  драйверов (`xnu/files/`), которые `xnu/apply.sh` накладывает на свежий клон xnu;
-- загрузчик (`xnuloader/`), наши программы и библиотеки (`userland/src/`), инструменты (`tools/`),
-  сценарии сборки и запуска;
-- `prebuilt/` — собранные из этого же репозитория ядро, загрузчик и наши библиотеки.
+- the kernel: a patch to Apple's open-source XNU (`xnu/redwood.patch`, APSL 2.0) and my driver
+  files (`xnu/files/`), laid over a fresh clone by `xnu/apply.sh`;
+- the boot loader (`xnuloader/`), my programs and libraries (`userland/src/`), tools (`tools/`),
+  build and run scripts;
+- `prebuilt/`: the kernel, loader and libraries built from this repository;
+- `devices/redwood/`: what one phone needs (its UEFI port, device tree, firmware script).
 
-Чего **нет и не будет**:
+Not in the repository, never:
 
-- файлов iOS: ни одного бинарника, образа, кеша, шрифта, картинки или иного ресурса Apple, и ни одного
-  снимка экрана iOS. Образ системы собирается на вашей машине из IPSW iOS 16.5, который вы скачиваете
-  сами (`ios165/fetch.sh` берёт его с публичных серверов Apple, ничего не расшифровывая и не обходя);
-- прошивок телефона (GPU, Wi-Fi, звукового процессора, модема, вибромотора, камер): они вендорские и
-  снимаются с того самого аппарата из его Android (`adb pull`) в каталоги `fw-*/`, которые в git
-  не попадают;
-- ключей, сертификатов, обхода защиты, активации и чего-либо, что позволяло бы выдавать устройство за
-  iPhone перед службами Apple или пользоваться платными службами. Вход в учётную запись Apple здесь
-  невозможен и не является целью.
+- any file of iOS: no binary, image, cache, font, picture or screenshot. You build the system
+  image on your machine from the iOS 16.5 IPSW, which `sysimage/fetch.sh` downloads from Apple's
+  public servers for you, without decrypting or circumventing anything;
+- the phone's firmware (GPU, Wi-Fi, audio DSP, modem, haptics, cameras): it is the vendor's and
+  is pulled from your own phone into `fw-*/`, which git ignores;
+- keys, certificates, activation, or anything that would make the phone pass as an iPhone to
+  Apple's services. Signing in to an Apple account is impossible here and not a goal.
 
-Пользоваться iOS на не-Apple устройстве вы можете только в рамках вашего собственного права на
-копию iOS и её лицензионного соглашения; этот репозиторий — инструменты и ядро, а не iOS.
+## Status
 
-## Что работает
-
-| Работает | Не работает / в работе |
+| Works | Not yet |
 |---|---|
-| Экран блокировки, домашний экран, Пункт управления, системные жесты, запуск стандартных приложений | Сотовая связь: модем запускается, видит сеть, SIM привязывается — регистрация в сети и палочки в статус-баре в работе (`docs/cellular.md`) |
-| Сенсорный экран (Goodix GT9916), мультитач, кнопки питания и громкости | Bluetooth |
-| Все 8 ядер процессора (`cpus=8`), большое ядро на 2,4 ГГц | Зарядка под нашим ядром |
-| Графика на Adreno телефона (`gpu=1`, OpenGL ES через Mesa) или программный рендер | Metal (есть компилятор шейдеров, самого Metal нет) |
-| Звук из динамиков и запись с микрофона (`adsp=1 sound=4 mic=4`) | Вход в учётную запись Apple: нет Secure Enclave |
-| Батарея и зарядка в интерфейсе (через звуковой процессор, `adsp=1`) | |
-| Вибромотор (`haptic=5`) | |
-| Wi-Fi телефона: радио, драйвер, подключение к сети (`wifi=1`) | |
-| Камеры в Camera.app (`cam=5`) | |
-| Данные `/private/var` между перезагрузками (`var_store=1 ufs_write=1`) | |
-| Sileo и пакеты Procursus, SSH на телефон | |
+| Lock screen, home screen, Control Center, gestures, the stock apps | Cellular: the modem boots, sees the network, the SIM is bound; registration and the status bar bars are in progress (`docs/cellular.md`) |
+| Touch screen, multitouch, power and volume buttons | Bluetooth |
+| All 8 CPU cores, the big core at 2.4 GHz | Charging under this kernel |
+| GPU rendering on Adreno (`gpu=1`, OpenGL ES through Mesa) | Metal (there is a shader compiler, no Metal) |
+| Speakers and microphone (`adsp=1 sound=4 mic=4`) | Apple account: no Secure Enclave |
+| Battery level in the UI (through the audio DSP, `adsp=1`) | |
+| Vibration (`haptic=5`) | |
+| Wi-Fi: radio, driver, network connection (`wifi=1`) | |
+| Cameras in Camera.app (`cam=5`) | |
+| `/private/var` kept across reboots (`var_store=1 ufs_write=1`) | |
+| Sileo, Procursus packages, SSH into the phone | |
 
-## Быстрый старт: QEMU
+## Quick start in QEMU
 
-Нужны Linux x86-64, ~12 ГБ места, 7-Zip 23+, `lz4`, `qemu-system-aarch64`, `edk2-aarch64`.
+Linux x86-64, about 12 GB of disk, 7-Zip 23 or newer, `lz4`, `qemu-system-aarch64`, `edk2-aarch64`.
 
 ```sh
-git clone https://github.com/vcvkk/darwin-redwood.git
-cd darwin-redwood
-ios165/fetch.sh               # IPSW iOS 16.5 с серверов Apple, распаковка нужного (7,4 ГБ)
-REST=1 userland/build.sh      # образы APFS: userland/root.apfs и userland/system.apfs
+git clone https://github.com/oosexgang/hackios-xnu-kernel.git hakios
+cd hakios
+sysimage/fetch.sh             # the iOS 16.5 IPSW from Apple's servers, the needed parts unpacked (7.4 GB)
+REST=1 userland/build.sh      # the APFS images: userland/root.apfs and userland/system.apfs
 mkdir -p logs
-qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # сеанс на 20 минут
+qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # a 20-minute session
 ```
 
-Через 2–3 минуты появится экран блокировки. Мышь с зажатой кнопкой — палец; `H` — «Домой», `L` —
-питание, `↑`/`↓` — громкость.
+The lock screen appears after two or three minutes. The mouse with the button held is a finger;
+`H` is Home, `L` is the power button, `↑`/`↓` are volume.
 
-## На телефоне
+## On the phone
 
-Нужен телефон, для которого есть порт (сейчас — `devices/redwood/`, POCO X5 Pro 5G), с
-разблокированным загрузчиком, `adb` и `fastboot`, образы из предыдущего раздела и прошивки
-телефона из его Android:
-
-```sh
-devices/redwood/pull-firmware.sh    # GPU, Wi-Fi, звук/батарея, вибрация, модем, камеры → fw-*/
-```
-
-Что попало в образ, `userland/build.sh` печатает строкой `build.sh: fw/: N files from ../fw-*: …`.
+A phone with a port (`devices/redwood/`, POCO X5 Pro 5G), its boot loader unlocked, `adb` and
+`fastboot` on the PC, the images from the previous section, and the phone's own firmware:
 
 ```sh
-./xl enter                          # Android → fastboot → наш загрузчик в ОЗУ
-./xl ramdisk userland/system.apfs   # образ системы в ОЗУ телефона (~80 с), один раз на сеанс
+devices/redwood/pull-firmware.sh    # GPU, Wi-Fi, audio/battery, haptics, modem, cameras -> fw-*/
+./xl enter                          # Android -> fastboot -> our loader in RAM
+./xl ramdisk userland/system.apfs   # the system image into the phone's RAM (~80 s), once per loader session
 XL_SB_DELAY=8 XL_SECS=600 \
 XL_CMDLINE="bootcpu=7 cpus=8 cpufreq=1 ufs=2 touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 modem=1" \
-./xl run                            # сеанс на 10 минут, журнал в logs/
-./xl reboot                         # обратно в Android
+./xl run                            # a 10-minute session, the log goes to logs/
+./xl reboot                         # back to Android
 ```
 
-`tools/modem-cycle.sh "ARGS" SECS` делает всё это одной командой и возвращает телефон в Android.
+`tools/modem-cycle.sh "ARGS" SECS` does all of that in one command and returns the phone to Android.
 
-Главные параметры ядра (полный список — в `docs/notes.md`):
+The main kernel arguments (the full list is in `docs/notes.md`):
 
-| Параметр | Что даёт |
+| Argument | What it does |
 |---|---|
-| `cpus=8 bootcpu=7 cpufreq=1` | все ядра процессора и их частоты |
-| `touchscreen=1` | сенсорный экран |
-| `gpu=1` | отрисовка на Adreno (образ, собранный с `GL=1`, прошивки в `fw-gpu/`) |
-| `adsp=1 sound=4 mic=4` | звуковой процессор: динамики, микрофон; с ним же батарея и зарядка |
-| `haptic=5` | вибромотор |
-| `wifi=1` | Wi-Fi (сеть из `fw-wifi/network`) |
-| `cam=5` | камеры |
-| `modem=1` | модем рядом с системой: его прошивка, файловые системы, IPA, SIM, NAS |
-| `modem_step=N` | модем по шагам, для отладки (`docs/cellular.md`) |
-| `var_store=1 ufs_write=1` | сохранять `/private/var` между перезагрузками |
+| `cpus=8 bootcpu=7 cpufreq=1` | all CPU cores and their clocks |
+| `touchscreen=1` | the touch screen |
+| `gpu=1` | rendering on Adreno (an image built with `GL=1`, firmware in `fw-gpu/`) |
+| `adsp=1 sound=4 mic=4` | the audio DSP: speakers, microphone; battery and charging come with it |
+| `haptic=5` | the vibration motor |
+| `wifi=1` | Wi-Fi (the network from `fw-wifi/network`) |
+| `cam=5` | the cameras |
+| `modem=1` | the modem beside the system: its firmware, file systems, IPA, SIM, NAS |
+| `modem_step=N` | the modem step by step, for debugging (`docs/cellular.md`) |
+| `var_store=1 ufs_write=1` | keep `/private/var` across reboots |
 
-## Сборка из исходников
+## Building from source
 
-Ядро (Linux: theos с cctools и `iPhoneOS16.5.sdk`; macOS: Xcode или cctools, SDK подтягивается сам):
+The kernel (Linux: theos with its cctools and `iPhoneOS16.5.sdk`; macOS: Xcode or cctools, the SDK
+is fetched for you):
 
 ```sh
-xnu/apply.sh             # исходники XNU с GitHub Apple + наши правки → xnu-src/
-xnu-deps/setup.sh        # зависимости, инструменты и SDK
-./xnu-build.sh -j8 -k    # → xnu-src/…/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+xnu/apply.sh             # XNU sources from Apple's GitHub + my changes -> xnu-src/
+xnu-deps/setup.sh        # dependencies, tools and the SDK
+./xnu-build.sh -j8 -k    # -> xnu-src/.../BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 ```
 
-Загрузчик: `xnuloader/build.sh` (clang + lld-link, EFI-приложение без EDK2). Заголовок
-`xnuloader/identity.h` — свойства, по которым iOS узнаёт, «какой она iPhone», — в репозитории не
-хранится: `xnuloader/mkidentity.sh` делает его при сборке из дерева устройств вашего IPSW (один файл
-в 34 КБ с серверов Apple, LZFSE декодирует `lzfse`, `compression_tool` macOS или модуль Python
-`lzfse`; без них собирается открытая библиотека lzfse). Userland и образы:
-`REST=1 userland/build.sh` (`MODEM=1 SYSTEM=1` кладут прошивку модема в образ системы). Подробности —
-`xnu/README.md` и `docs/notes.md`.
+The loader: `xnuloader/build.sh` (clang + lld-link, an EFI application without EDK2). The header
+`xnuloader/identity.h`, the properties by which iOS tells which iPhone it is, is not kept in the
+repository: `xnuloader/mkidentity.sh` makes it at build time from the device tree in your own IPSW
+(one 34 KB file; LZFSE is decoded by `lzfse`, macOS's `compression_tool` or the Python `lzfse`
+module, or the open lzfse library gets built). User space and the images: `REST=1 userland/build.sh`
+(`MODEM=1 SYSTEM=1` put the modem's firmware into the system image). Details: `xnu/README.md`,
+`docs/notes.md`.
 
-## Где что лежит
+## Layout
 
-| Каталог | Содержимое |
+| Directory | Contents |
 |---|---|
-| `xnu/` | патч и файлы ядра; `apply.sh`, `export.sh`; `README.md` о ядре |
-| `xnu/files/bsd/dev/redwood_*.c` | наши драйверы: экран, тач, UFS, GPU, Wi-Fi, звук, модем (`redwood_mpss.c`), SIM/NAS, вибро, камеры |
-| `xnuloader/` | загрузчик (UEFI-приложение) |
-| `userland/` | наши программы и библиотеки (`src/`), сборка образов, задания launchd |
-| `ios165/` | сценарии получения iOS 16.5 из IPSW (самих файлов нет) |
-| `tools/` | APFS, прошивки, тесты QMI, сценарии прогонов |
-| `qemu/` | запуск в QEMU |
-| `docs/` | `notes.md` — подробные заметки, `cellular.md` — сотовая связь, `air.md`/`metal.md` — GPU |
-| `prebuilt/` | собранные ядро, загрузчик, библиотеки |
-| `devices/redwood/` | всё про один телефон: его UEFI (порт Mu-Silicium), дерево устройств, готовые образы UEFI, скрипт снятия прошивок, инструменты |
+| `xnu/` | the kernel patch and files; `apply.sh`, `export.sh`; a README about the kernel |
+| `xnu/files/bsd/dev/redwood_*.c` | my drivers: display, touch, UFS, GPU, Wi-Fi, audio, modem (`redwood_mpss.c`), SIM/NAS, haptics, cameras |
+| `xnuloader/` | the boot loader (a UEFI application) |
+| `userland/` | my programs and libraries (`src/`), the image build, launchd jobs |
+| `sysimage/` | scripts that fetch and unpack the OS files from the IPSW (none of the files themselves) |
+| `devices/redwood/` | one phone: its UEFI port, device tree, prebuilt UEFI images, firmware script, tools |
+| `tools/` | APFS, firmware, QMI tests, run scripts |
+| `qemu/` | running in QEMU |
+| `docs/` | `notes.md`: the detailed notes (Russian); `cellular.md`: cellular; `air.md`, `metal.md`: the GPU |
+| `prebuilt/` | the built kernel, loader and libraries |
 
-## Устройства
+## Devices
 
-Ядро, загрузчик и userland — общие. Всё, что относится к одному телефону, живёт в `devices/<имя>/`:
-его UEFI, дерево устройств, список прошивок и инструменты. Сейчас там один каталог,
-`devices/redwood/` (POCO X5 Pro 5G), и его README — карта того, что нужно для порта на другой
-аппарат на Qualcomm. Сами драйверы телефона — файлы `xnu/files/bsd/dev/redwood_*.c`; в начале каждого
-написано, откуда взяты числа. Прошивки телефона снимаются с вашего аппарата
-(`devices/redwood/pull-firmware.sh`) и в репозиторий не входят.
+The kernel, loader and user space are shared. Everything about one phone lives in
+`devices/<name>/`: its UEFI, device tree, firmware list and tools. Today there is one,
+`devices/redwood/`, and its README is the map of what a port to another Qualcomm phone must bring.
+The phone's drivers are the files `xnu/files/bsd/dev/redwood_*.c`; the head of each says where its
+numbers came from.
 
-## Сотовая связь
+## Cellular
 
-Модем (Hexagon MPSS) поднимается из XNU: прошивка через TrustZone, общая память, SMP2P, GLINK, QRTR,
-QMI; файловые системы модема отдаются с UFS (только чтение, записи живут в памяти ядра), TFTP и
-реестр служб — наши. Пакетный ускоритель IPA запускается с прошивкой, тактом и SMMU, рукопожатие
-с модемом проходит. SIM-карта привязывается к подписке, NAS читает сигнал. Текущее состояние и история —
-в `docs/cellular.md`.
+The modem (the Hexagon MPSS) is brought up from XNU: firmware through TrustZone, shared memory,
+SMP2P, GLINK, QRTR, QMI; its file systems are served from the UFS (read-only, writes stay in kernel
+memory), TFTP and the service registry are mine. The IPA packet engine runs with its firmware,
+clock and SMMU context, and the handshake with the modem goes through. The SIM is bound to the
+subscription and NAS reads the signal. The current state and the whole story are in
+`docs/cellular.md`.
 
-## Лицензии и юридическая сторона
+## Licenses and the legal side
 
-Мой код — под той же лицензией, что и файлы, которые он изменяет: патч к XNU — Apple Public Source
-License 2.0 (исходники XNU открыты Apple именно под ней, и условия я соблюдаю: изменения публикуются
-в виде исходников, уведомления сохранены), остальное — см. заголовки файлов. iOS, её образы,
-товарные знаки Apple и прошивки телефона принадлежат их владельцам, в репозиторий не входят и мною
-не распространяются; каждый получает их сам со своего телефона и из своего IPSW. Названия «iOS»,
-«iPhone», «Apple» упоминаются только для описания того, с чем работает код. Если какой-то файл
-здесь, по вашему мнению, нарушает чьи-то права — напишите в issue, я уберу его.
+My code is under the license of the files it changes: the XNU patch under the Apple Public Source
+License 2.0 (Apple publishes XNU under it; the terms are met: changes are published as source,
+notices are kept), the rest as the file headers say. iOS, its images, Apple's trademarks and the
+phone's firmware belong to their owners, are not in this repository and are not distributed by me;
+everyone takes them from their own phone and their own IPSW. "iOS", "iPhone" and "Apple" are
+named only to describe what the code works with. If you believe a file here infringes anyone's
+rights, open an issue and I will remove it.

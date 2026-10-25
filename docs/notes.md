@@ -56,7 +56,7 @@ sudo pacman -S --needed git python 7zip lz4 gcc qemu-system-aarch64 qemu-ui-gtk 
 ```sh
 git clone git@github.com:vcvkk/darwin-redwood.git
 cd darwin-redwood
-ios165/fetch.sh               # скачивает 7,4 ГБ с CDN Apple и распаковывает нужное (минут 5–15)
+sysimage/fetch.sh               # скачивает 7,4 ГБ с CDN Apple и распаковывает нужное (минут 5–15)
 REST=1 userland/build.sh      # собирает образы APFS: userland/root.apfs и userland/system.apfs (2,5 ГБ)
 mkdir -p logs
 qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # сеанс на 20 минут
@@ -65,7 +65,7 @@ qemu/run-ios.sh 1200 -display gtk > logs/qemu.log     # сеанс на 20 ми�
 Через 2–3 минуты в окне появится экран блокировки.
 
 **Сколько это занимает.** Измерено 20 октября на этой машине (Linux x86-64, 12 потоков, NVMe), проходом
-по этим самым командам из чистого клона: `ios165/fetch.sh` — 1 мин 45 с, из них скачивание криптексов
+по этим самым командам из чистого клона: `sysimage/fetch.sh` — 1 мин 45 с, из них скачивание криптексов
 2,7 ГБ (образ корня, 4,7 ГБ, в этом прогоне уже лежал рядом; с нуля к этому времени добавится его
 скачивание — на том же канале около трёх минут); `REST=1 userland/build.sh` — 1 мин 52 с; QEMU до
 экрана блокировки — ещё 2–3 минуты. То есть около восьми минут от пустого каталога до iOS, если канал
@@ -197,7 +197,7 @@ codec DMA TX_CDC_DMA_TX_3 и звуковой процессор в поток, 
   CoreGraphics в них не рисовал — плитки оставались нулями. Теперь загрузчик пишет в дерево sRGB, как и есть у
   нашего кадрового буфера, и WebKit рисует в BGRA (`xnuloader/loader.c`, `dt_identity()`; проверка —
   `RC_JOBS=rc.jobs.safari`). Цветные эмодзи и китайский шрифт PingFang (130 и 74 МБ) целиком в образ системы не
-  помещаются, и их знаки выходили квадратиками с вопросом; теперь `ios165/fetch.sh` кладёт их в образ уменьшенными
+  помещаются, и их знаки выходили квадратиками с вопросом; теперь `sysimage/fetch.sh` кладёт их в образ уменьшенными
   (`tools/font_trim.py`): эмодзи — без самых крупных картинок (остаются 40, 64 и 96 точек; 59 МБ), PingFang — с
   обычным и полужирным начертаниями упрощённого, традиционного и гонконгского письма (26 МБ). Проверка —
   `RC_JOBS=rc.jobs.fonts` (`font_test`: к какому шрифту система идёт за эмодзи, китайским, японским и корейским и
@@ -234,7 +234,7 @@ codec DMA TX_CDC_DMA_TX_3 и звуковой процессор в поток, 
 ## На телефоне
 
 Нужен именно **POCO X5 Pro 5G (redwood)** с разблокированным загрузчиком, `adb` и `fastboot` на компьютере
-(`sudo pacman -S android-tools`), и образы из предыдущего раздела (`ios165/fetch.sh`, `REST=1 userland/build.sh`).
+(`sudo pacman -S android-tools`), и образы из предыдущего раздела (`sysimage/fetch.sh`, `REST=1 userland/build.sh`).
 
 **Прошивка самого телефона.** В репозитории её нет и быть не может: она вендорская и берётся с того самого
 аппарата, на котором всё будет работать, из его Android (подробности — в разделах по каждому устройству):
@@ -1296,7 +1296,7 @@ APFS, и все их читает тот же драйвер APFS ядра, чт
 у `mkapfs` из apfsprogs. `-z` — zlib, как Apple сжимает корень: маленький файл целиком в атрибуте
 `com.apple.decmpfs` (тип 3), остальные кусками по 64 КБ в ресурсной вилке (тип 4) — там, где это экономит блоки;
 `--plain fw` оставляет прошивки как есть, и драйверы ядра берут их прямо из памяти диска (`bsd/dev/redwood_image.c`;
-то, что лежит не одним куском, копируется). Манифест (`ios165/system.manifest`) даёт владельцев и права. Хеш имён
+то, что лежит не одним куском, копируется). Манифест (`sysimage/system.manifest`) даёт владельцев и права. Хеш имён
 каталога — CRC-32C по NFD, как у Apple. Жёстких ссылок нет: имя — отдельный файл.
 
 **Проверка.** Каждый контейнер, который делает сборка (`CHECK=1`), проверяют два читателя, которые не он:
@@ -1419,7 +1419,7 @@ iOS, на блок за концом раздела, нули в супербл�
 ### Том данных между загрузками
 
 `/private/var` — файловая система в памяти (`bsd/miscfs/ramfs`): `init` монтирует её пустой при каждой загрузке и
-создаёт в ней каталоги шаблона, который iOS носит в своём образе (`ios165/mkvarskel.py` → `ios165/var.skel`,
+создаёт в ней каталоги шаблона, который iOS носит в своём образе (`sysimage/mkvarskel.py` → `sysimage/var.skel`,
 `init.c`, `mount_writable`). Поэтому ничто, что iOS туда записала, не переживало ту самую загрузку, в которую
 было записано: ни раскладка домашнего экрана (`/var/mobile/Library/SpringBoard/IconState.plist`), ни данные
 приложений (`/var/mobile/Containers/Data/Application/…`), ни снимки окон, ни запечённые обои — каждая загрузка
@@ -1710,7 +1710,7 @@ xnuloader/build.sh        # clang + lld-link → xnuloader/loader.efi (EFI-пр�
 ```
 
 `xnuloader/identity.h` генерируется при сборке `xnuloader/mkidentity.sh` (через `mkidentity.py`) из дерева устройств
-iPhone X в вашем IPSW (так система узнаёт, «какой она iPhone»); в репозитории его нет. Вручную: `python3 ios165/fetch-from-ipsw.py Firmware/all_flash/DeviceTree.d22ap.im4p dt.im4p`,
+iPhone X в вашем IPSW (так система узнаёт, «какой она iPhone»); в репозитории его нет. Вручную: `python3 sysimage/fetch-from-ipsw.py Firmware/all_flash/DeviceTree.d22ap.im4p dt.im4p`,
 `ipsw img4 im4p extract dt.im4p -o dt.bin`, `xnuloader/mkidentity.py dt.bin > xnuloader/identity.h`. Кроме свойств
 корня и `/product` оттуда же берётся узел `/product/haptics` (`closed-loop`, `supports-3rd-party-haptics`): по нему
 MobileGestalt отвечает `DeviceSupportsClosedLoopHaptics`, и iOS играет вибрацию и отклики волнами на устройстве
@@ -1733,7 +1733,7 @@ REST=1 userland/build.sh
 
 - `userland/root.apfs` — маленький (наш init, библиотеки-вставки, задания launchd, прошивки); едет вместе с
   ядром (`/dev/md1`, на `/redwood`), пересобирается за секунды;
-- `userland/system.apfs` — корень: отобранная часть iOS 16.5 (`ios165/select-system.py`), криптексы OS (с кэшем
+- `userland/system.apfs` — корень: отобранная часть iOS 16.5 (`sysimage/select-system.py`), криптексы OS (с кэшем
   dyld) и App на `/System/Cryptexes`. Пересобирается только при изменении входных данных или с `SYSTEM=1`;
 - `userland/flashboot.apfs` (`FLASHBOOT=1`) — то, что нужно в памяти, когда корень — том iOS на флеше: загрузочный
   том и оба криптекса, три контейнера подряд (см. «iOS с корнем на флеше»).
@@ -2360,7 +2360,7 @@ fastboot boot ──► UEFI (Mu-Silicium, redwood) ──► xnuloader (EFI-п�
 | `xnu-deps/` | всё для сборки XNU на Linux: `setup.sh`, обёртки инструментов, заглушки |
 | `xnu-build.sh`, `xnu-env.sh` | сборка ядра |
 | `userland/` | наш init, вставки (`src/inject.c` — backboardd, `src/inject_sb.c` — SpringBoard, `src/inject_media.c` — mediaserverd), звуковое устройство (`src/audio_plugin.c`), тесты, сборка образов |
-| `ios165/` | добыча файлов iOS из IPSW и выбор того, что идёт в образ |
+| `sysimage/` | добыча файлов iOS из IPSW и выбор того, что идёт в образ |
 | `qemu/` | запуск в QEMU, касания, снимки экрана, разбор стеков |
 | `uefi/`, `mkxnuimg.py` | порт UEFI на redwood и упаковка загрузочного образа для `fastboot boot` |
 | `tools/` | `recording.py` (запись экрана → mp4), `sound.py` (запись звука → wav), `update-prebuilt.sh`, `new-workspace.sh` (вторая рабочая копия со своим ядром и QEMU), `mk-mesa.sh` (Mesa для `GL=1`), `mk-ath11k.sh` (драйвер Wi-Fi для ядра), `mk-jb.sh` (бутстрап Procursus и Sileo, см. «Sileo и пакеты»), `apfs/` (APFS на компьютере: чтение — «Чтение APFS», запись — «Запись в APFS», сборка образов `mkapfs.py` и их проверка `check-image.sh` — «Только APFS, как на iPhone»), `darwin-write.py` (запись в раздел `darwin` и только в него — «Криптексы на флеше»), `qmi-test/` и `wpa-test/` (проверки на компьютере) |
@@ -2513,8 +2513,8 @@ mac80211 из Linux стоит наша станция (`wifi/lx/src/lx_80211.c`
 
 ## Чтение APFS
 
-Сначала корневая файловая система у нас была не APFS: `ios165/select-system.py` выбирал нужные файлы iOS из уже
-распакованного `ios165/rootfs/`, а `mkpackfs.py` складывал их в наш образ `packfs` (только чтение, целиком в ОЗУ).
+Сначала корневая файловая система у нас была не APFS: `sysimage/select-system.py` выбирал нужные файлы iOS из уже
+распакованного `sysimage/rootfs/`, а `mkpackfs.py` складывал их в наш образ `packfs` (только чтение, целиком в ОЗУ).
 Чтобы ядро читало настоящий образ iOS как есть, нужен был свой APFS; теперь он — единственная файловая система
 образов (см. «Только APFS, как на iPhone»). Пишется он снизу вверх, и каждый слой сначала проверяется на
 компьютере — в ядро идёт только то, что уже сошлось с настоящим образом.
@@ -2527,9 +2527,9 @@ mac80211 из Linux стоит наша станция (`wifi/lx/src/lx_80211.c`
 
 | | |
 |---|---|
-| `dmg.py` | `ios165/rootfs.dmg` — не файловая система, а образ диска UDIF: сначала сжатые куски, потом список блочных таблиц в XML, а в последних 512 байтах — хвост `koly`, который говорит, где этот список. Читает любое место распакованного образа и вынимает из него раздел. Виды кусков: как есть, нули, zlib, bzip2, LZMA, ADC, LZFSE (в нашем образе — LZFSE и «как есть») |
+| `dmg.py` | `sysimage/rootfs.dmg` — не файловая система, а образ диска UDIF: сначала сжатые куски, потом список блочных таблиц в XML, а в последних 512 байтах — хвост `koly`, который говорит, где этот список. Читает любое место распакованного образа и вынимает из него раздел. Виды кусков: как есть, нули, zlib, bzip2, LZMA, ADC, LZFSE (в нашем образе — LZFSE и «как есть») |
 | `apfs.py` | контейнер → контрольная точка → карта объектов → том → B-деревья → inode, каталоги, экстенты, расширенные атрибуты, дырки, сжатие `decmpfs`. Fletcher-64 проверяется у каждого прочитанного блока метаданных. Команды: `info`, `ls`, `tree`, `cat`, `stat`, `census` |
-| `verify.py` | сверка с чужим читателем: тот же образ при распаковке читал 7-Zip, и от него остались `ios165/rootfs.slt` (список всего тома) и `ios165/rootfs/` (распакованные файлы) |
+| `verify.py` | сверка с чужим читателем: тот же образ при распаковке читал 7-Zip, и от него остались `sysimage/rootfs.slt` (список всего тома) и `sysimage/rootfs/` (распакованные файлы) |
 | `run-tests.sh` | всё, что проверяется на компьютере, одной командой |
 | `write-tests.sh` | то же для записи: 81 проверка apfs_write.c против apfsck, apfs.py, 7-Zip и списка изменившихся блоков — «Запись в APFS» |
 | `txn-probe.py` | настоящая транзакция APFS на образе `mkapfs.py`: одна запись изменена и зафиксирована новой контрольной точкой — «Запись в APFS» |
@@ -2538,7 +2538,7 @@ mac80211 из Linux стоит наша станция (`wifi/lx/src/lx_80211.c`
 Распаковать раздел и проверить (образ нужен целиком, около 5,3 ГБ, в git он не кладётся):
 
 ```sh
-tools/apfs/dmg.py extract ios165/rootfs.dmg /куда/rootfs.apfs --apfs
+tools/apfs/dmg.py extract sysimage/rootfs.dmg /куда/rootfs.apfs --apfs
 tools/apfs/run-tests.sh /куда/rootfs.apfs
 ```
 
@@ -2596,7 +2596,7 @@ inode с `INODE_IS_SPARSE`), поэтому чтение дырок провер
 | `bsd/dev/redwood_apfs_check.c` | монтирует `/dev/rvblk0` и обходит том через VFS (`vnode_lookup`, `vnode_getattr`, `VNOP_READDIR`, `VNOP_READLINK`, `vn_rdwr`), печатая на запись ту же строку, что `apfs-tool census` и `verify.py clines`. Параметры ядра: `apfs_check=1` — только итоги, `=2` — каждая строка, `apfs_subtree=/путь` — часть тома. 318 098 строк — это 47 МБ через последовательный порт, поэтому по умолчанию каждая строка хешируется отдельно, а хеши складываются: сложению всё равно, в каком порядке обход видел записи. `verify.py sum` считает то же самое на хосте |
 
 ```sh
-tools/apfs/dmg.py extract ios165/rootfs.dmg /куда/rootfs.apfs --apfs
+tools/apfs/dmg.py extract sysimage/rootfs.dmg /куда/rootfs.apfs --apfs
 CMDLINE="virtio_blk=1 apfs_check=1" qemu/run-ios.sh 1200 \
   -drive file=/куда/rootfs.apfs,format=raw,if=none,id=apfsd,readonly=on \
   -device virtio-blk-device,drive=apfsd
@@ -3018,7 +3018,7 @@ APFS никогда не перезаписывает уже опубликов�
 
 Ещё одно правило — порта, а не APFS: том с ролью системного или preboot отвергается. Это стоит сказать вслух,
 потому что остальные проверки его не ловят. Корневой том iOS 16.5 в том виде, в каком его берёт порт
-(`ios165/rootfs.dmg`, он же записанный в `darwin`), **не запечатан**, без снимков и без метаданных целостности
+(`sysimage/rootfs.dmg`, он же записанный в `darwin`), **не запечатан**, без снимков и без метаданных целостности
 (`incompatible 0x8` — только нечувствительность к нормализации, роль `0x0001`): он прошёл бы любую проверку APFS,
 какая здесь есть. На телефоне его хранит не она, а то, куда записи вообще разрешено идти: `BLOCK_WRITE_FIRST`
 загрузчика и ядро, у которого блочные устройства отказывают в любой записи.
@@ -3235,7 +3235,7 @@ iOS, которого она ждёт, — это уже другое: созд�
 
 ## Про файлы Apple и лицензии
 
-- Файлов iOS в репозитории нет: `ios165/fetch.sh` скачивает их из IPSW с CDN Apple на вашу машину.
+- Файлов iOS в репозитории нет: `sysimage/fetch.sh` скачивает их из IPSW с CDN Apple на вашу машину.
 - `xnu/` — производная работа от XNU, распространяется на условиях APSL 2.0, как и сам XNU; `prebuilt/mach.*` —
   ядро, собранное из этих исходников.
 - `xnu/files/bsd/miscfs/apfs/libzbitmap/` — декодер LZBITMAP libzbitmap (Corellium LLC, GPL-2.0+ OR MIT; здесь —

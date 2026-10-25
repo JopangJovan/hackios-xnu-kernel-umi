@@ -13,7 +13,7 @@
 !/qemu/
 !/tools/
 !/userland/
-!/ios165/
+!/sysimage/
 !/xnu/
 !/xnu-deps/
 !/uefi/
@@ -45,9 +45,9 @@ __pycache__/
 !/userland/libmini/
 !/userland/var/
 
-/ios165/*
-!/ios165/fetch.sh
-!/ios165/*.py
+/sysimage/*
+!/sysimage/fetch.sh
+!/sysimage/*.py
 
 # of xnu-deps only what is ours; setup.sh fetches and builds the rest
 /xnu-deps/*
