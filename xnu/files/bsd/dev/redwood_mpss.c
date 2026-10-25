@@ -5282,8 +5282,9 @@ dms_online(void)
 #define QMI_UIM                 0x0b
 #define UIM_GET_CARD_STATUS     0x002f
 #define UIM_SWITCH_SLOT         0x0046
+#define UIM_CHANGE_PROVISIONING_SESSION 0x0038
 static volatile uint32_t sim_slot_ready;        /* the physical slot whose card is READY, found by uim_receive(); 0: none yet */
-static volatile bool sim_slot_switched;
+static volatile bool sim_slot_switched, sim_provisioned, sim_register_again;
 #define NAS_INITIATE_NETWORK_REGISTER 0x0022
 #define NAS_GET_SYSTEM_SELECTION_PREFERENCE 0x0034
 #define NAS_GET_SYSTEM_INFO     0x004d
@@ -5327,6 +5328,11 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 		tell("mpss: uim: the modem answers the slot switch\n");
 		return;
 	}
+	if ((m[3] | m[4] << 8) == UIM_CHANGE_PROVISIONING_SESSION) {
+		tell("mpss: uim: the modem answers the provisioning change: registration will be asked for again\n");
+		sim_register_again = true;
+		return;
+	}
 	if ((m[3] | m[4] << 8) != UIM_GET_CARD_STATUS || (v = qmi_tlv(m, length, 0x10, &size)) == NULL || size < 9) {
 		return;
 	}
@@ -5338,7 +5344,8 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 		static const char *const card_states[] = { "ABSENT", "PRESENT", "ERROR" };
 		static const char *const app_states[] = { "unknown", "detected", "PIN1 WANTED", "PUK1 wanted", "personalization", "PIN1 blocked",
 			"illegal", "READY" };
-		unsigned at = 8, slots = v[8], first_card = ~0u;
+		unsigned at = 8, slots = v[8], first_card = ~0u, primary_gw = (unsigned)(v[0] | v[1] << 8);
+		uint8_t ready_aid[1 + 32] = { 0 };     /* the AID (a length, then the bytes) of a READY USIM in logical slot 1 */
 
 		tell("mpss: uim: the primary GW application is slot %u application %u (0xff: none)\n", v[1], v[0]);
 		at = 9;
@@ -5362,6 +5369,10 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 				if (card == 1 && state == 7 && sim_slot_ready == 0) {
 					sim_slot_ready = slot + 1;
 				}
+				if (slot == 0 && card == 1 && state == 7 && (type == 2 || type == 1) && aid <= 32 && at + 7 + aid <= size) {
+					ready_aid[0] = (uint8_t)aid;
+					memcpy(ready_aid + 1, v + at + 7, aid);
+				}
 				at += 7 + aid + 7;
 			}
 		}
@@ -5371,6 +5382,30 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 		 * physical slot 2 (UIM Switch Slot: TLV 1 the logical slot, TLV 2 the physical one, both from 1), as
 		 * Android's telephony does with its dual-SIM mapping (modem_sim_switch=0: not).
 		 */
+		/*
+		 * The primary GW provisioning session: which application the subscription NAS registers with uses.
+		 * After the slots are switched it is "none" (0xffff: cycle 32), and the modem sits in power save
+		 * with no service: the READY USIM of logical slot 1 is made the primary GW application (UIM
+		 * Change Provisioning Session: session type 0, activate 1, the slot and the AID).
+		 */
+		if (primary_gw == 0xffff && ready_aid[0] != 0 && !sim_provisioned && uim_port != NULL) {
+			uint8_t pr[7 + 5 + 3 + 2 + 32];
+			unsigned n = 0;
+
+			pr[n++] = 0; pr[n++] = 0x37; pr[n++] = 0;
+			pr[n++] = UIM_CHANGE_PROVISIONING_SESSION & 0xff; pr[n++] = UIM_CHANGE_PROVISIONING_SESSION >> 8;
+			pr[n++] = 0; pr[n++] = 0;       /* the length, below */
+			pr[n++] = 0x01; pr[n++] = 2; pr[n++] = 0; pr[n++] = 0; pr[n++] = 1;   /* primary GW, activate */
+			pr[n++] = 0x10; pr[n++] = (uint8_t)(2 + ready_aid[0]); pr[n++] = 0;
+			pr[n++] = 1;                    /* logical slot 1 */
+			pr[n++] = ready_aid[0];
+			memcpy(pr + n, ready_aid + 1, ready_aid[0]);
+			n += ready_aid[0];
+			pr[5] = (uint8_t)(n - 7); pr[6] = (uint8_t)((n - 7) >> 8);
+			sim_provisioned = true;
+			tell("mpss: uim: THE USIM OF SLOT 1 IS MADE THE PRIMARY GW APPLICATION (AID of %u bytes)\n", ready_aid[0]);
+			qrtr_send(uim_port, uim_node, uim_port_number, pr, n);
+		}
 		if (first_card != 1 && sim_slot_ready > 1 && !sim_slot_switched && !option("modem_sim_switch_off") && uim_port != NULL) {
 			uint8_t sw[7 + 4 + 7] = { 0, 0x34, 0, UIM_SWITCH_SLOT & 0xff, UIM_SWITCH_SLOT >> 8, 11, 0,
 						  1, 1, 0, 1, 2, 4, 0, (uint8_t)sim_slot_ready, 0, 0, 0 };
@@ -5520,7 +5555,7 @@ sim_probe_close(void)
 	}
 	uim_node = uim_port_number = nas2_node = nas2_port_number = 0;
 	sim_slot_ready = 0;
-	sim_slot_switched = false;
+	sim_slot_switched = sim_provisioned = sim_register_again = false;
 }
 
 static bool
@@ -5568,6 +5603,14 @@ step_nas(void)
 			/* the slots switched: the card's status, the selection and the registration asked once more */
 			probed_again = true;
 			sim_probe();
+		}
+		if (sim_register_again && nas2_port_number != 0) {
+			uint8_t reg[11] = { 0, 0x38, 0, NAS_INITIATE_NETWORK_REGISTER & 0xff, NAS_INITIATE_NETWORK_REGISTER >> 8, 4, 0, 1, 1, 0, 1 };
+
+			sim_register_again = false;
+			sleep_ms(3000);
+			qrtr_send(nas2_port, nas2_node, nas2_port_number, reg, sizeof(reg));
+			printf("mpss: nas: automatic registration asked for again after the provisioning\n");
 		}
 		if (probed && now_us() - watched_at > 10000000ull && uim_port_number != 0 && nas2_port_number != 0) {
 			/* every ten seconds: the card's state as it initializes, and the system's service status */

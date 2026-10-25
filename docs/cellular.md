@@ -254,3 +254,18 @@ Register = `UIM_UNINITIALIZED`: SIM ще ініціалізується післ
 (селектори знайдені в кеші dyld). `inject_sb.c` тепер перехоплює цей метод: коли
 `kern.redwood.cellular_registered`, виставляє палички через barsSetter і вмикає пункт; раз на 3 с
 просить пункт оновитися, коли стан у ядрі змінюється; список методів агрегатора пишеться в лог.
+
+### Прогін 32 (25 жовтня): хук статус-бару живий; підписка ні до чого не прив'язана
+
+- Хук у SpringBoard працює: `_updateSignalStrengthItem:withData:SIMInfo:barsGetter:barsSetter:`
+  викликається для пунктів 4 (основна SIM) і 5 (друга), setter-и передаються, і за нашим
+  проханням пункт оновлюється; повний список методів агрегатора є в лозі
+  (`_postItem:withState:inList:`, `_updateBatteryItems`, …).
+- UIM після перемикання слота: USIM у логічному слоті 1 READY, PIN1 вимкнений, але **первинний
+  GW-додаток — 0xffff (немає)**, і NAS System Info показує service 4 (power save) по всіх радіо.
+  Тобто підписці не призначено USIM. Прогін 33: UIM Change Provisioning Session (0x38): primary GW,
+  activate, слот 1 + AID USIM, потім повторне Initiate Network Register.
+- Прогони з самим модемом не вмикали решту заліза: GPU (`gpu=1`), DSP/батарея (`adsp=1`),
+  вібро (`haptic=5`), Wi-Fi (`wifi=1`) — звідси «no GPU to draw with», `SOC=-1%`, без вібрації.
+  Прогін 33 — з усім разом. Тач працює, коли екран увімкнений (iOS гасить його через ~25 с
+  бездіяльності; кнопка живлення будить).
