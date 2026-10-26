@@ -749,6 +749,13 @@ hakios_ipa_poll(void (*receive)(uint8_t mux, const uint8_t *packet, size_t lengt
 	return rc.packets;
 }
 
+void
+hakios_ipa_modem_endpoints(uint32_t *to_modem, uint32_t *from_modem)
+{
+	*to_modem = modem_tx.endpoint;          /* 2: what Linux exports as modem/tx_endpoint_id */
+	*from_modem = modem_rx.endpoint;        /* 16: modem/rx_endpoint_id */
+}
+
 bool
 hakios_ipa_data_ready(void)
 {

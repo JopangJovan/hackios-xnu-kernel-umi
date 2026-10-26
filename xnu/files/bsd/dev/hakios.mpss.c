@@ -5320,26 +5320,62 @@ static bool keep;                       /* (defined below: the DSP and the link 
 #define WDS_START_NETWORK_INTERFACE 0x0020
 #define WDS_GET_CURRENT_SETTINGS 0x002d
 #define WDS_BIND_MUX_DATA_PORT  0x00a2
+#define WDS_SET_IP_FAMILY       0x004d
 #define QMI_WDA                 0x1a
 #define WDA_SET_DATA_FORMAT     0x0020
+#define QMI_DPM                 0x2f            /* Data Port Mapper */
+#define DPM_OPEN_PORT           0x0020
 #define DATA_ENDPOINT_EMBEDDED  4               /* the IPA, "interface" 1: where the packets of this session go (as ModemManager binds it) */
 #define DATA_ENDPOINT_INTERFACE 1
 #define DATA_MUX                1               /* the QMAP mux id (hakios.cell.c carries mux 1) */
-static struct hakios_qrtr_port *wds_port, *wda_port;
-static uint32_t wds_node, wds_port_number, wda_node, wda_port_number;
+static struct hakios_qrtr_port *wds_port, *wda_port, *dpm_port;
+static uint32_t wds_node, wds_port_number, wda_node, wda_port_number, dpm_node, dpm_port_number;
 static volatile bool wds_started, wds_up, wds_bound, wda_set;
+static volatile bool dpm_done, dpm_open, wda_sent, wda_done;  /* the port mapped, the data format asked and answered */
+static uint64_t data_setup_began;       /* when WDS was first seen: the mapping and the format get 20 s before the bind goes ahead */
 static volatile bool wds_bind_sent, wds_start_pending;
 static uint64_t wds_last_try;           /* when the bind or the session was last sent, for the retry */
 static uint32_t wds_handle;
 static void wds_send_start(void);
 
 /*
- * Before the session: the modem is told how the packets of the embedded port (the IPA) are
- * framed -- raw IP in QMAP, without checksum offload, aggregated up to 16 packets or 14 KB
- * downlink -- (WDA Set Data Format 0x20, as ModemManager does for the IPA), and our WDS client is
- * bound to QMAP mux 1 of that port (WDS Bind Mux Data Port 0xa2), so that this session's packets
- * are the ones with mux 1 that hakios.ipa.c sends and receives.
+ * Before the session, the modem is told where its data goes and how it is framed, in the order
+ * ModemManager follows for a modem behind the IPA (its port for the "ipa" network driver):
+ *
+ *   1. DPM Open Port (Data Port Mapper, service 0x2f, 0x20): the hardware data port -- the embedded
+ *      endpoint, interface 1, and the IPA endpoints it runs on. The modem's receiving end is our
+ *      transmit endpoint (2) and its transmitting end our receive endpoint (16), which is how Linux
+ *      exports them (ipa_sysfs.c: modem/tx_endpoint_id, rx_endpoint_id) and MM hands them over.
+ *      Without this the modem knows no embedded port: WDA answers InvalidOperation, the mux bind
+ *      Internal, the session InvalidOperation -- what cycles 38 to 41 got.
+ *   2. WDA Set Data Format (0x1a, 0x20) on that port: raw IP in QMAP (v1: no checksum headers, as
+ *      hakios.ipa.c programs the endpoints), at most 16 packets or 14 KB per downlink aggregate.
+ *   3. WDS Bind Mux Data Port, Set IP Family, Start Network Interface: wds_advance() below.
+ *
+ * Each step goes on when the one before has been answered, or after 20 s without an answer.
+ * modem_dpm_off=1 / modem_wda_off=1: those steps left out.
  */
+static void
+wda_send_format(void)
+{
+	/* raw IP, QMAP both ways, downlink at most 16 packets or 14 KB per aggregate, on the embedded port */
+	uint8_t request[7 + 7 + 7 + 7 + 7 + 7 + 11] = { 0, 0x43, 0, WDA_SET_DATA_FORMAT & 0xff, WDA_SET_DATA_FORMAT >> 8, 0, 0,
+		0x11, 4, 0, 2, 0, 0, 0,
+		0x12, 4, 0, 5, 0, 0, 0,
+		0x13, 4, 0, 5, 0, 0, 0,
+		0x15, 4, 0, 16, 0, 0, 0,
+		0x16, 4, 0, 0x00, 0x38, 0, 0,
+		0x17, 8, 0, DATA_ENDPOINT_EMBEDDED, 0, 0, 0, DATA_ENDPOINT_INTERFACE, 0, 0, 0 };
+
+	if (wda_sent || wda_port == NULL || wda_port_number == 0) {
+		return;
+	}
+	wda_sent = true;
+	request[5] = sizeof(request) - 7;
+	tell("mpss: wda: about to set the data format of the embedded port: raw IP in QMAP, no checksum offload\n");
+	qrtr_send(wda_port, wda_node, wda_port_number, request, sizeof(request));
+}
+
 static void
 wda_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
 {
@@ -5360,8 +5396,10 @@ wda_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 	if ((v = qmi_tlv(m, length, 0x12, &size)) != NULL && size >= 4) { ul = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
 	if ((v = qmi_tlv(m, length, 0x13, &size)) != NULL && size >= 4) { dl = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
 	wda_set = result == 0;
-	tell("mpss: wda: the data format %s: result %u error %u; link layer %u (2: raw IP), aggregation up %u down %u (5: QMAP)\n",
-	    result == 0 ? "is set" : "IS REFUSED", result, error, link, ul, dl);
+	wda_done = true;
+	tell("mpss: wda: THE DATA FORMAT %s: result %u error %u; link layer %u (2: raw IP), aggregation up %u down %u (5: QMAP)\n",
+	    result == 0 ? "IS SET" : "IS REFUSED", result, error, link, ul, dl);
+	wds_advance();
 }
 
 static void
@@ -5372,22 +5410,66 @@ wda_server(__unused void *context, bool arrived, uint32_t service, __unused uint
 		return;
 	}
 	if (arrived) {
-		/* raw IP, QMAP both ways, downlink at most 16 packets or 14 KB per aggregate, on the embedded port */
-		uint8_t request[7 + 7 + 7 + 7 + 7 + 7 + 11] = { 0, 0x43, 0, WDA_SET_DATA_FORMAT & 0xff, WDA_SET_DATA_FORMAT >> 8, 0, 0,
-			0x11, 4, 0, 2, 0, 0, 0,
-			0x12, 4, 0, 5, 0, 0, 0,
-			0x13, 4, 0, 5, 0, 0, 0,
-			0x15, 4, 0, 16, 0, 0, 0,
-			0x16, 4, 0, 0x00, 0x38, 0, 0,
-			0x17, 8, 0, DATA_ENDPOINT_EMBEDDED, 0, 0, 0, DATA_ENDPOINT_INTERFACE, 0, 0, 0 };
-
 		wda_node = node;
 		wda_port_number = port;
-		request[5] = sizeof(request) - 7;
-		tell("mpss: wda: about to set the data format of the embedded port: raw IP in QMAP, no checksum offload\n");
-		qrtr_send(wda_port, node, port, request, sizeof(request));
+		if (dpm_done || option("modem_dpm_off")) {
+			wda_send_format();
+		}
 	} else if (node == wda_node && port == wda_port_number) {
 		wda_node = wda_port_number = 0;
+	}
+}
+
+static void
+dpm_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint16_t size = 0;
+	const uint8_t *v;
+	uint32_t result = ~0u, error = ~0u;
+
+	if (length < 7 || m[0] != 2 || (uint16_t)(m[3] | m[4] << 8) != DPM_OPEN_PORT) {
+		return;
+	}
+	probe_dump("dpm", m, length);
+	if ((v = qmi_tlv(m, length, 2, &size)) != NULL && size >= 4) {
+		result = (uint32_t)(v[0] | v[1] << 8);
+		error = (uint32_t)(v[2] | v[3] << 8);
+	}
+	dpm_open = result == 0;
+	dpm_done = true;
+	tell("mpss: dpm: THE EMBEDDED DATA PORT %s: result %u error %u\n", dpm_open ? "IS OPEN" : "IS NOT OPENED", result, error);
+	wda_send_format();
+}
+
+static void
+dpm_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	if (service != QMI_DPM) {
+		return;
+	}
+	if (arrived) {
+		uint32_t to_modem = 2, from_modem = 16;
+		/* TLV 0x11, the hardware data ports: a one-byte count, then per port the endpoint type, the interface
+		 * number, the modem's receiving endpoint (ours that sends) and its transmitting one (ours that receives) */
+		uint8_t request[7 + 3 + 1 + 16] = { 0, 0x45, 0, DPM_OPEN_PORT & 0xff, DPM_OPEN_PORT >> 8, 20, 0, 0x11, 17, 0, 1 };
+		unsigned at = 11;
+
+		hakios_ipa_modem_endpoints(&to_modem, &from_modem);
+		dpm_node = node;
+		dpm_port_number = port;
+#define PUT32(x) do { request[at++] = (uint8_t)(x); request[at++] = (uint8_t)((x) >> 8); request[at++] = (uint8_t)((x) >> 16); request[at++] = (uint8_t)((x) >> 24); } while (0)
+		PUT32(DATA_ENDPOINT_EMBEDDED);
+		PUT32(DATA_ENDPOINT_INTERFACE);
+		PUT32(to_modem);
+		PUT32(from_modem);
+#undef PUT32
+		tell("mpss: dpm: about to open the embedded data port (interface %u, the modem receives on IPA endpoint %u and sends on %u)\n",
+		    DATA_ENDPOINT_INTERFACE, to_modem, from_modem);
+		qrtr_send(dpm_port, node, port, request, sizeof(request));
+	} else if (node == dpm_node && port == dpm_port_number) {
+		dpm_node = dpm_port_number = 0;
 	}
 }
 
@@ -5442,8 +5524,22 @@ wds_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 		wds_bound = result == 0;
 		tell("mpss: wds: the client %s to mux %u of the embedded port (result %u, error %u); the session waits for registration%s\n",
 		    wds_bound ? "is bound" : "IS NOT BOUND", DATA_MUX, result, error, wds_bound ? "" : " (started all the same)");
+		{
+			/* the client's IP family: IPv4 (WDS Set IP Family 0x4d), as MM does before starting */
+			uint8_t family[11] = { 0, 0x46, 0, WDS_SET_IP_FAMILY & 0xff, WDS_SET_IP_FAMILY >> 8, 4, 0, 0x01, 1, 0, 4 };
+
+			qrtr_send(wds_port, wds_node, wds_port_number, family, sizeof(family));
+		}
 		wds_last_try = now_us();        /* give the session a moment after the bind */
 		wds_advance();
+	} else if (m[0] == 2 && message == WDS_SET_IP_FAMILY) {
+		uint32_t result = ~0u, error = ~0u;
+
+		if ((v = qmi_tlv(m, length, 2, &size)) != NULL && size >= 4) {
+			result = (uint32_t)(v[0] | v[1] << 8);
+			error = (uint32_t)(v[2] | v[3] << 8);
+		}
+		tell("mpss: wds: the IP family (IPv4) %s (result %u, error %u)\n", result == 0 ? "is set" : "is not set", result, error);
 	} else if (m[0] == 2 && message == WDS_GET_CURRENT_SETTINGS) {
 		uint32_t ip = 0, gw = 0, mask = 0, dns1 = 0, dns2 = 0, mtu = 0;
 		char a[20], g[20], d1[20], d2[20], mk[20];
@@ -5498,9 +5594,13 @@ wds_open(void)
 			qrtr_lookup(wds_port, QMI_WDS, 0, 0);
 		}
 	}
-	/* WDA Set Data Format is for USB/PCIe rmnet; the embedded IPA's format is set by the IPA
-	 * driver (INIT_DRIVER), so WDA returns InvalidOperation here. Opt in with modem_wda=1. */
-	if (wda_port == NULL && option("modem_wda") && !option("modem_data_off")) {
+	if (dpm_port == NULL && !option("modem_dpm_off") && !option("modem_data_off")) {
+		dpm_port = qrtr_open(dpm_receive, dpm_server, NULL);
+		if (dpm_port != NULL) {
+			qrtr_lookup(dpm_port, QMI_DPM, 0, 0);
+		}
+	}
+	if (wda_port == NULL && !option("modem_wda_off") && !option("modem_data_off")) {
 		wda_port = qrtr_open(wda_receive, wda_server, NULL);
 		if (wda_port != NULL) {
 			qrtr_lookup(wda_port, QMI_WDA, 0, 0);
@@ -5525,6 +5625,19 @@ wds_advance(void)
 
 	if (wds_port == NULL || wds_port_number == 0 || wds_up) {
 		return;
+	}
+	if (data_setup_began == 0) {
+		data_setup_began = now_us();
+	}
+	/* the port mapping and the data format first (or 20 s for them); a WDA that never came is not waited for */
+	if (!wds_bind_sent && now_us() - data_setup_began < 20000000ull) {
+		if (!option("modem_dpm_off") && !dpm_done) {
+			return;
+		}
+		if (!option("modem_wda_off") && wda_port_number != 0 && !wda_done) {
+			wda_send_format();      /* (if DPM answered before WDA was there) */
+			return;
+		}
 	}
 	/* bind once (unless modem_data_nobind), before or after registration */
 	if (!wds_bind_sent && !option("modem_data_nobind")) {
@@ -5578,7 +5691,13 @@ wds_close(void)
 		qrtr_close(wda_port);
 		wda_port = NULL;
 	}
-	wds_node = wds_port_number = wda_node = wda_port_number = 0;
+	if (dpm_port != NULL) {
+		qrtr_close(dpm_port);
+		dpm_port = NULL;
+	}
+	wds_node = wds_port_number = wda_node = wda_port_number = dpm_node = dpm_port_number = 0;
+	dpm_done = dpm_open = wda_sent = wda_done = false;
+	data_setup_began = 0;
 	wds_started = wds_up = wds_bound = wda_set = false;
 	wds_bind_sent = wds_start_pending = wds_registered = false;
 	wds_last_try = 0;

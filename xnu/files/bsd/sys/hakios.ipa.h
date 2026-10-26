@@ -37,6 +37,8 @@ bool hakios_ipa_transmit(uint8_t mux, const void *packet, size_t length);
 unsigned hakios_ipa_poll(void (*receive)(uint8_t mux, const uint8_t *packet, size_t length));
 /* What has gone through, for the log. */
 void hakios_ipa_status(char *to, size_t size);
+/* The IPA endpoints of this processor's data path to and from the modem (for QMI DPM Open Port). */
+void hakios_ipa_modem_endpoints(uint32_t *to_modem, uint32_t *from_modem);
 
 /* ---- hakios.cell.c: the interface ---- */
 
