@@ -27,3 +27,5 @@ jobs:
       - name: APFS tools self-test
         run: |
           [ -x tools/apfs/run-tests.sh ] && tools/apfs/run-tests.sh || echo "no self-test on this runner"
+      - name: SoC args generator reproduces the POCO X5 Pro values
+        run: sh tools/soc-args-test.sh
