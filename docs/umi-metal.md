@@ -91,3 +91,17 @@ The unfinished Wi-Fi transport is preserved in the named git stash
 `WIP UMI Wi-Fi MHI transport paused for Metal integration`; it is not included
 in this integration. Previous local images and the previous XNU build are kept
 under `out/metal-integration/` and `work/xnu-umi-before-metal/` on this host.
+
+## Presentation pipeline (26 October 2026)
+
+Once every source layer is copied into the private command-mode staging buffer,
+release SwapEnd before waiting for the panel's TE copy window. The presenter is
+the only writer of that staging buffer, so CoreAnimation can draw its next frame
+without changing the pending picture. Screen recording retains the old ownership
+span because it still samples source pixels after presentation.
+
+The kernel builds and the real scan-reader register-model checks pass. The user
+reports smoother scrolling, with remaining frame skips and occasional home-screen
+freezes. The initial test samples showed 6% of intervals above 18 ms versus 18%
+in the preceding monitor-only thermal run; these were manual gestures, not a
+controlled benchmark, and do not establish that all stalls are fixed.

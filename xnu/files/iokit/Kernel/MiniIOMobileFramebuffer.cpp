@@ -949,7 +949,8 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	uint64_t ticket = ++fNextTicket;
 	IOLockWakeup(fSwapLock, fSwap, true);
 	/* A source surface must not be handed back to CoreAnimation while the CPU
-	 * is still scaling it into the command-mode staging buffer.
+	 * is still scaling it into the command-mode staging buffer. Once staged,
+	 * the panel wait no longer needs the source and can overlap the next render.
 	 */
 	while (fComposeBase != NULL && fCompletedTicket < ticket) {
 		if (IOLockSleepDeadline(fSwapLock, &fCompletedTicket, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
@@ -1011,7 +1012,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
-	bool report;
+	bool report, stagedReleased = false;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
@@ -1076,7 +1077,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	shown = began;
-	/* Command-mode sources stay owned until staging and presentation finish. */
+	/* Staged sources stay owned until the CPU has consumed every layer. */
 	if (fComposeBase == NULL) completeSwap();
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
@@ -1145,6 +1146,15 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	if (fComposeBase != NULL) {
+		/* Only this presenter writes fComposeBase. All source pixels have now
+		 * been consumed, so CoreAnimation may render its next frame while we
+		 * wait for TE and copy this private buffer to the panel. Recordings
+		 * still sample source pixels below, so keep their old ownership span.
+		 */
+		if (fRecBase == NULL) {
+			completeSwap();
+			stagedReleased = true;
+		}
 		const struct hk_display_scan * scan = hk_display_scan();
 		fStatScanWaits++;
 		if (scan != NULL && hk_display_wait_copy(fCopyNs, scan->frame_ns * 3 / 2)) {
@@ -1236,7 +1246,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatSince = 0;
 	}
 	IOLockUnlock(fLock);
-	if (fComposeBase != NULL) completeSwap();
+	if (fComposeBase != NULL && !stagedReleased) completeSwap();
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
