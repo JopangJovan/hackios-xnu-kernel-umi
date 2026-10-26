@@ -126,8 +126,15 @@ def main():
     pas_id('qcom,mss', 'soc_pas_mpss')
     pas_id('qcom,ipa_fws', 'soc_pas_ipa')
 
+    _, ipa_fws = find_named(nodes, 'qcom,ipa_fws')
+    ipa_fw_name = None
+    if ipa_fws and 'qcom,firmware-name' in ipa_fws:
+        ipa_fw_name = ipa_fws['qcom,firmware-name'].split(b'\0')[0].decode()
+
     for name, value in args:
         print(f'{name}={value:#x}')
+    if ipa_fw_name:
+        print(f'soc_ipa_fw={ipa_fw_name}')
     if not args:
         sys.exit('soc-args.py: found none of the expected nodes; is this the phone\'s own device tree?')
 

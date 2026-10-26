@@ -2207,10 +2207,19 @@ ipa_firmware_load(void)
 	if (!option("modem_ipa_smmu_off")) {
 		ipa_space_on();
 	}
-	header = root_file("image/yupik_ipa_fws.mdt", &header_size);
-	if (header == NULL) {
-		printf("mpss: %u: no fw/image/yupik_ipa_fws.mdt: the IPA's firmware is not loaded\n", step);
-		return false;
+	{
+		/* the IPA's firmware file is SoC-specific (dt: qcom,firmware-name of qcom,ipa_fws; "yupik_ipa_fws"
+		 * on the first phone, something else on another SoC); soc_ipa_fw= overrides the name */
+		char fw[80], path[96];
+
+		strlcpy(fw, "yupik_ipa_fws", sizeof(fw));
+		PE_parse_boot_argn("soc_ipa_fw", fw, sizeof(fw));
+		snprintf(path, sizeof(path), "image/%s.mdt", fw);
+		header = root_file(path, &header_size);
+		if (header == NULL) {
+			printf("mpss: %u: no fw/%s: the IPA's firmware is not loaded\n", step, path);
+			return false;
+		}
 	}
 	count = header_size >= 52 ? header[44] | header[45] << 8 : 0;
 	if (memcmp(header, "\177ELF\1", 5) != 0 || count == 0 || count > 8 || 52 + 32 * count > header_size) {
