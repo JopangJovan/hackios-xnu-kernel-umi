@@ -32,8 +32,11 @@ Run the diagnostic with bootcpu=7 cpus=1, without starting iOS.
 The loader whitelist accepts stages 1 through 4. Stage 4 now sequences the
 stock Bluetooth rails, sideband GPIO, reset delay, QUP6 pins and 115200-baud
 GENI clock, then requests HCI Reset and Read Local Version. It holds reset
-low again and restores UART and clock configuration before returning. This
-external controller probe is built but still needs a live UMI run.
+low again and restores UART and clock configuration before returning. The live UMI probe completed HCI Reset and Read Local Version. The controller
+reported HCI/LMP version 0x09 (Bluetooth 5.2), manufacturer 0x001d (Qualcomm),
+and LMP subversion 0x0d2b. See logs/100309-run.log. The ROM response matches
+the stock Android-reported controller family; firmware download has not yet
+been attempted.
 
 Host validation:
 

@@ -138,7 +138,7 @@ static void bt_hci_probe(vm_offset_t gcc,vm_offset_t gpio,vm_offset_t uart)
     bt_write(uart,0x80c,1); bt_write(uart,0x810,0); bt_write(uart,0x814,6);
     bt_write(uart,0x618,0xffffffff); bt_write(uart,0x648,0xffffffff);
     bt_write(uart,0x630,(1u<<27)|0x80); /* START_READ, RFR_OPEN */
-    const uint8_t cmd[]={0x03,0x0c,0x00};
+    const uint8_t cmd[]={0x01,0x03,0x0c,0x00};
     bt_write(uart,0x270,sizeof(cmd)); bt_write(uart,0x600,1u<<27);
     for(unsigned b=0;b<sizeof(cmd);b++) bt_write(uart,0x700,cmd[b]);
     uint8_t data[32]; unsigned n=0;
@@ -148,12 +148,12 @@ static void bt_hci_probe(vm_offset_t gcc,vm_offset_t gpio,vm_offset_t uart)
             for(unsigned b=0;b<bytes;b++) if(n<sizeof(data)) data[n++]=(w>>(b*8))&0xff; }
         if(n>=7) break; delay(1);
     }
-    hk_tl("UMI BT: HCI reset response bytes=%u:",n);
+    hk_tl("UMI BT: HCI reset response bytes=%u MIRQ=%#x SIRQ=%#x RX=%#x GPIO16=%#x GPIO19=%#x:",n,bt_read(uart,0x610),bt_read(uart,0x640),bt_read(uart,0x804),bt_read(gpio,16*0x1000+4),bt_read(gpio,19*0x1000+4));
     for(unsigned b=0;b<n;b++) hk_tl(" %02x",data[b]);
     hk_tl("\n");
     if(n>=7 && data[0]==4 && data[1]==0x0e && data[3]==1 && data[4]==3 && data[5]==0x0c && data[6]==0) {
         hk_tl("UMI BT: controller answered HCI Reset; requesting local version\n");
-        const uint8_t ver[]={0x01,0x10,0x00};
+        const uint8_t ver[]={0x01,0x01,0x10,0x00};
         bt_write(uart,0x618,0xffffffff); bt_write(uart,0x270,sizeof(ver)); bt_write(uart,0x600,1u<<27);
         for(unsigned b=0;b<sizeof(ver);b++) bt_write(uart,0x700,ver[b]);
         n=0; for(unsigned us=0;us<300000 && n<15;us++) {
