@@ -32,6 +32,7 @@
  *     answered, with that program's layers.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <time.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -307,6 +308,23 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 	 * registration) at least one bar is forced so the icon is visibly present rather than empty.
 	 * modem_bars_off=1 (as a sysctl) is not honoured; set kern.hakios.cellular_up=0 to hide it.
 	 */
+	/*
+	 * The kernel's NAS state alternates between two reports -- "registered, signal not read" and
+	 * "not registered, -86 dBm" -- so at the moments it says registered the dBm reads 0. The last
+	 * real reading (within a minute) stands in for it.
+	 */
+	{
+		static int last_dbm;
+		static time_t last_dbm_at;
+		time_t now = time(NULL);
+
+		if (dbm < 0) {
+			last_dbm = dbm;
+			last_dbm_at = now;
+		} else if (last_dbm < 0 && now - last_dbm_at < 60) {
+			dbm = last_dbm;
+		}
+	}
 	shown = bars;
 	if (shown <= 0 && dbm < 0) {
 		shown = dbm >= -95 ? 4 : dbm >= -105 ? 3 : dbm >= -115 ? 2 : 1;   /* derive from dBm when bars is 0 */
