@@ -118,6 +118,14 @@ def main():
     stream('qcom,ipa-smmu-ap-cb', 'soc_ipa_stream')
     stream('qcom,ipa-smmu-uc-cb', 'soc_ipa_stream_uc')
 
+    def pas_id(leaf, arg):
+        _, props = find_named(nodes, leaf)
+        if props and 'qcom,pas-id' in props:
+            args.append((arg, u32(props['qcom,pas-id'])))
+
+    pas_id('qcom,mss', 'soc_pas_mpss')
+    pas_id('qcom,ipa_fws', 'soc_pas_ipa')
+
     for name, value in args:
         print(f'{name}={value:#x}')
     if not args:

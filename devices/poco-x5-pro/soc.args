@@ -10,3 +10,5 @@ soc_smem=0x80900000
 soc_imem=0x14600000
 soc_ipa_stream=0x480
 soc_ipa_stream_uc=0x482
+soc_pas_mpss=0x4
+soc_pas_ipa=0xf

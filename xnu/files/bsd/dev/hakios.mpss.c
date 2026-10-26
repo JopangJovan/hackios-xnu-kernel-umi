@@ -1047,7 +1047,8 @@ step_survey(void)
 #define MPSS_MEMORY_DEFAULT     0x8b800000u   /* dt: reserved-memory mpss@..., memory-region of qcom,mss */
 static uint32_t mpss_memory = MPSS_MEMORY_DEFAULT;
 #define MPSS_MEMORY_SIZE        0x0f600000u
-#define PAS_MPSS                4               /* dt: qcom,pas-id */
+#define PAS_MPSS_DEFAULT        4               /* dt: qcom,pas-id of qcom,mss */
+static uint32_t pas_mpss = PAS_MPSS_DEFAULT;
 
 
 /*
@@ -1433,7 +1434,7 @@ dsp_shutdown(const char *why)
 		link_stop();
 	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
-	result = scm("to shut the modem down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_MPSS, 0, 0, 0, &answer);
+	result = scm("to shut the modem down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, pas_mpss, 0, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT SHUT THE MODEM DOWN: the call returns %d, its answer is %#llx\n", step, result,
 		    answer);
@@ -1497,7 +1498,7 @@ step_header(void)
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
 	settle();
-	result = scm("to take the modem's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_MPSS, kvtophys(page), 0, 0, &answer);
+	result = scm("to take the modem's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, pas_mpss, kvtophys(page), 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT TAKE THE HEADER: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
@@ -1505,7 +1506,7 @@ step_header(void)
 	printf("mpss: %u: TRUSTZONE ACCEPTS THE MODEM'S SIGNATURE FROM THIS KERNEL\n", step);
 
 	announce("tell TrustZone where the image will be: the whole of the modem's memory, as Linux does");
-	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_MPSS, mpss_memory, MPSS_MEMORY_SIZE, 0, &answer);
+	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, pas_mpss, mpss_memory, MPSS_MEMORY_SIZE, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT TAKE THE PLACE: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
@@ -1790,7 +1791,8 @@ step_our_item(void)
  * a null pointer, twice of two). Nothing else of the IPA is done here yet: no clock, no tables.
  * modem_ipa_fw=0 leaves it out.
  */
-#define PAS_IPA                 15
+#define PAS_IPA_DEFAULT         15              /* dt: qcom,pas-id of qcom,ipa_fws */
+static uint32_t pas_ipa = PAS_IPA_DEFAULT;
 /*
  * Where the image goes. Android's pil (its dmesg: "yupik_ipa_fws: loading from 0x8b710000 to 0x8b717000")
  * puts it at the ipa_gsi reservation (0x8b710000, 0xa000; gpu_micro_code follows at 0x8b71a000), not at
@@ -2269,12 +2271,12 @@ ipa_firmware_load(void)
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
 	settle();
-	result = scm("to take the IPA's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_IPA, kvtophys(page), 0, 0, &answer);
+	result = scm("to take the IPA's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, pas_ipa, kvtophys(page), 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT TAKE THE IPA'S HEADER (%d, %#llx)\n", step, result, answer);
 		goto out;
 	}
-	result = scm("where the IPA's image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_IPA, ipa_fw_memory, size, 0, &answer);
+	result = scm("where the IPA's image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, pas_ipa, ipa_fw_memory, size, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT TAKE THE IPA'S PLACE (%d, %#llx)\n", step, result, answer);
 		goto out;
@@ -2295,7 +2297,7 @@ ipa_firmware_load(void)
 	}
 	settle();
 	ml_io_unmap((vm_offset_t)memory, size);
-	result = scm("to authenticate the IPA's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_IPA, 0, 0, 0, &answer);
+	result = scm("to authenticate the IPA's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, pas_ipa, 0, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT START THE IPA'S FIRMWARE (%d, %#llx)\n", step, result, answer);
 		goto out;
@@ -2385,7 +2387,7 @@ ipa_firmware_stop(void)
 {
 	uint64_t answer = ~0ull;
 
-	(void)scm("to shut the IPA's firmware down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_IPA, 0, 0, 0, &answer);
+	(void)scm("to shut the IPA's firmware down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, pas_ipa, 0, 0, 0, &answer);
 	if (!leaving) {
 		ipa_space_off();
 		ipa_clock(false);
@@ -2448,7 +2450,7 @@ step_start(void)
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
-	result = scm("to authenticate the modem's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_MPSS, 0, 0, 0,
+	result = scm("to authenticate the modem's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, pas_mpss, 0, 0, 0,
 	    &answer);
 	doorbell.since = started = now_us();
 	image_written = false;
@@ -6321,6 +6323,8 @@ soc_override(void)
 	PE_parse_boot_argn("soc_imem", &ipa_imem, sizeof(ipa_imem));
 	PE_parse_boot_argn("soc_ipa_stream", &ipa_stream, sizeof(ipa_stream));
 	PE_parse_boot_argn("soc_ipa_stream_uc", &ipa_stream_uc, sizeof(ipa_stream_uc));
+	PE_parse_boot_argn("soc_pas_mpss", &pas_mpss, sizeof(pas_mpss));
+	PE_parse_boot_argn("soc_pas_ipa", &pas_ipa, sizeof(pas_ipa));
 	if (said != 0 || smem_phys != SMEM_PHYS_DEFAULT || mpss_memory != MPSS_MEMORY_DEFAULT) {
 		printf("mpss: SoC addresses from boot-args: %u register blocks; shared memory %#x, command DB %#x, the modem's "
 		    "memory %#x, the SoC's internal memory %#x\n", said, smem_phys, cmd_db_phys, mpss_memory, ipa_imem);
