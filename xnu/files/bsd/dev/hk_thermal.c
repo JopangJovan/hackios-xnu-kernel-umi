@@ -262,7 +262,7 @@ hk_thermal_init(void)
 	if (mode == 0 || (mode == 1 && !raised)) {
 		return;
 	}
-	thermal_caps_on = raised;
+	thermal_caps_on = raised && mode != 2;
 	tsens[0] = ml_io_map(TSENS0_TM, TSENS_TM_SIZE);
 	tsens[1] = ml_io_map(TSENS1_TM, TSENS_TM_SIZE);
 	thermal_gov_init(&gov, top);

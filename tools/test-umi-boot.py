@@ -108,6 +108,9 @@ int main(void) {
     p.cmdline = "adsp=1 adsp_umi=1 sound=4"; assert(umi_bootargs_ok(&p));
     p.cmdline = "gpu=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "cpufreq=1"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "cpufreq=1 thermal=2"; assert(umi_bootargs_ok(&p));
+    p.cmdline = "thermal=0"; assert(!umi_bootargs_ok(&p));
+    p.cmdline = "thermal=20"; assert(!umi_bootargs_ok(&p));
     p.cmdline = "gpu=1 metal=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "gpu=1 metal=1 fb_scan=1"; assert(umi_bootargs_ok(&p));
     p.cmdline = "wifi=1 wifi_mac=02:11:22:33:44:55"; assert(umi_bootargs_ok(&p));

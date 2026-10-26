@@ -22,7 +22,7 @@ sysctl kern.hackios.thermal_pressure   # 0 nominal, 1 moderate, 2 heavy, 3 trapp
 thermald show                          # the same table, from the userland
 ```
 
-Boot arguments: on by default with `cpufreq=1`; `thermal=0` off; `thermal=2` watch and report without `cpufreq=1`.
+Boot arguments: on by default with `cpufreq=1`; `thermal=0` off; `thermal=2` watches and reports without applying CPU frequency caps, including when `cpufreq=1` is present. Temperature sampling, iOS pressure reporting, and the emergency overheat shutdown remain active. This is a temporary comparison mode; normal UMI boot defaults keep thermal throttling enabled.
 
 The governor's decisions are tested on the computer in 11 scenarios (`tools/thermal-test/run.sh`, in CI): heat-up,
 cool-down without see-saw, a single hot group, package heat, near-critical, a one-tick spike, a sustained emergency,
