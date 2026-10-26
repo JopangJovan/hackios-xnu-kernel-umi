@@ -1,0 +1,6 @@
+soc_ipa_base=0x1e40000
+soc_gsi_base=0x1e04000
+soc_ipcc=0x408000
+soc_aoss=0xc300000
+soc_rsc=0x18220000
+soc_apps_smmu=0x15000000

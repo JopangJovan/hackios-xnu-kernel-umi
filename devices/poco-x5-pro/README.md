@@ -31,3 +31,21 @@ TFTP) and the cameras (`fw-camera/`). All of it is the vendor's and stays out of
 
 From the top of the repository, see the main README: `./xl enter`, `./xl ramdisk`, `./xl run`,
 or everything in one command: `tools/modem-cycle.sh "ARGS" SECS`, or `make phone`.
+
+## Porting to another Qualcomm phone: the SoC addresses
+
+The kernel's modem and IPA drivers carry this phone's register and memory addresses as defaults and
+take any that differ from boot-args `soc_*` (`hakios.mpss.c`, `soc_override()`, and `hakios.ipa.c`).
+To bring up another phone, pull its own device tree and turn it into those arguments:
+
+```sh
+devices/<name>/pull-soc.sh      # adb pull /sys/firmware/fdt, then tools/soc-args.py -> devices/<name>/soc.args
+```
+
+`tools/soc-args.py DEVICE-TREE.dtb` reads the `qcom,ipa`, `qcom,ipcc`, the AOSS mailbox, the RPMh
+controller and `apps-smmu` nodes and prints `soc_ipa_base`, `soc_gsi_base`, `soc_ipcc`, `soc_aoss`,
+`soc_rsc`, `soc_apps_smmu`. The run scripts append `devices/<name>/soc.args` to the kernel command
+line automatically (`SOC_ARGS=` to point elsewhere). The memory addresses (`soc_smem`, `soc_cmd_db`,
+`soc_mpss_mem`, `soc_imem`) come from the phone's reserved-memory nodes; add them by hand for now.
+For this phone every generated value equals the built-in default, so `soc.args` changes nothing here
+and is kept only as the worked example.
