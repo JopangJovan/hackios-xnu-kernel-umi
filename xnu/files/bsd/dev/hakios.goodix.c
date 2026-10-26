@@ -33,6 +33,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
 
@@ -77,16 +78,17 @@ sleep_ms(uint32_t ms)
 #define PULL_NONE               0
 #define PULL_UP                 3
 
-#define PIN_MISO                52
-#define PIN_MOSI                53
-#define PIN_CLK                 54
-#define PIN_CS                  55
-#define PIN_INT                 81      /* low = the chip has a report */
-#define PIN_RESET               105     /* low = in reset */
-#define PIN_AVDD                107     /* high = analog supply on */
+static unsigned pin_miso = 52;
+static unsigned pin_mosi = 53;
+static unsigned pin_clk = 54;
+static unsigned pin_cs = 55;
+static unsigned pin_int = 81;      /* low = the chip has a report */
+static unsigned pin_reset = 105;   /* low = in reset */
+static unsigned pin_avdd = 107;    /* high = analog supply on */
 #define PIN_FOCALTECH_ID        68      /* FocalTech if this reads 0 ... */
 #define PIN_GOODIX_ID           96      /* ... and this reads 1 (sm8350-kernel-OKX convention) */
-#define PIN_FUNCTION_SPI        1       /* "qup15" */
+static unsigned pin_function_spi = 1;       /* "qup15" on redwood, "qup4" on marble */
+static bool is_marble = false;
 
 static void
 gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
@@ -117,7 +119,7 @@ gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
 
 #define CMD_DB_PHYS             0x80860000UL
 #define CMD_DB_SIZE             0x20000UL
-#define RSC_PHYS                0x18220000UL    /* the application processor's "DRV 2" */
+static vm_offset_t rsc_phys = 0x18220000UL;    /* the application processor's "DRV 2" */
 #define RSC_SIZE                0x10000UL
 #define TCS(reg)                (rsc + 0xd00 + (reg))           /* command slot set 0, an "active" one */
 #define TCS_IRQ_ENABLE          0x00
@@ -238,7 +240,7 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-/* The chip's I/O supply: 1.8 V from LDO2 of the PM8350C ("ldoc2"). Nothing else is connected to it. */
+/* The chip's I/O supply: 1.8 V from LDO2 of the PM8350C ("ldoc2"). */
 static bool
 io_supply_on(void)
 {
@@ -246,17 +248,21 @@ io_supply_on(void)
 	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
 	uint32_t data[3] = { 1800, 1, VRM_MODE_LDO_HPM };
 
-	/* addresses of regulators ("VRM") have 4 in bits 19:16; anything else is not what we are looking for */
-	if (base == 0 || (base >> 16 & 0xf) != 4) {
-		printf("goodix: RPMh: no regulator \"ldoc2\" (address %#x)\n", base);
-		return false;
+	if (base != 0 && (base >> 16 & 0xf) == 4) {
+		printf("goodix: RPMh: ldoc2 is at %#x; slot status %#x, control %#x\n", base,
+		    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)));
+		rpmh_write(address, data, 3);
 	}
-	printf("goodix: RPMh: ldoc2 is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", base,
-	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)), rd(TCS(TCS_IRQ_ENABLE)), rd(TCS(TCS_IRQ_STATUS)));
-	if (!rpmh_write(address, data, 3)) {
-		return false;
+	if (is_marble) {
+		uint32_t base9 = rpmh_address("ldoc9");
+		if (base9 != 0 && (base9 >> 16 & 0xf) == 4) {
+			uint32_t addr9[3] = { base9 + VRM_VOLTAGE, base9 + VRM_ENABLE, base9 + VRM_MODE };
+			uint32_t data9[3] = { 3300, 1, VRM_MODE_LDO_HPM };
+			printf("goodix: RPMh: ldoc9 (AVDD) is at %#x\n", base9);
+			rpmh_write(addr9, data9, 3);
+		}
 	}
-	printf("goodix: I/O supply on (1.8 V)\n");
+	printf("goodix: I/O supply on\n");
 	return true;
 }
 
@@ -307,6 +313,9 @@ rcg_rate(uint32_t cfg, uint32_t m, uint32_t not_n_minus_m)
 static bool
 clocks_on(void)
 {
+	if (is_marble) {
+		return false;
+	}
 	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP1_CORE_2X | VOTE_QUP1_CORE | VOTE_QUP1_M_AHB | VOTE_QUP1_S_AHB);
 	if (rd(GCC_QUP1_SE5_DFSR) & 1) {
 		/* preset rates: the lowest that is at least 4 MHz */
@@ -351,7 +360,7 @@ clocks_on(void)
 
 /* ---- SPI through the serial engine (GENI) ---------------------------------------------------------- */
 
-#define SE_PHYS                 0x00a94000UL
+static vm_offset_t se_phys = 0x00a94000UL;
 #define SE_SIZE                 0x4000UL
 #define GENI_FORCE_DEFAULT      (se + 0x020)
 #define GENI_OUTPUT_CTRL        (se + 0x024)
@@ -557,13 +566,13 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 
 /* ---- SPI by hand, on the same pins ----------------------------------------------------------------- */
 
-static unsigned bitbang_in = PIN_MISO, bitbang_out = PIN_MOSI;
+static unsigned bitbang_in = 52, bitbang_out = 53;
 
 static void
 bitbang_init(void)
 {
-	gpio_output(PIN_CS, true, PULL_NONE, 6);
-	gpio_output(PIN_CLK, false, PULL_NONE, 6);
+	gpio_output(pin_cs, true, PULL_NONE, 6);
+	gpio_output(pin_clk, false, PULL_NONE, 6);
 	gpio_output(bitbang_out, false, PULL_NONE, 6);
 	gpio_configure(bitbang_in, 0, PULL_NONE, 2, false);
 }
@@ -571,21 +580,21 @@ bitbang_init(void)
 static bool
 bitbang_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 {
-	gpio_set(PIN_CS, false);
+	gpio_set(pin_cs, false);
 	for (uint32_t i = 0; i < length; i++) {
 		uint8_t out = tx ? tx[i] : 0, in = 0;
 
 		for (int bit = 7; bit >= 0; bit--) {
 			gpio_set(bitbang_out, out >> bit & 1);
-			gpio_set(PIN_CLK, true);
+			gpio_set(pin_clk, true);
 			in = (uint8_t)(in << 1 | gpio_get(bitbang_in));
-			gpio_set(PIN_CLK, false);
+			gpio_set(pin_clk, false);
 		}
 		if (rx) {
 			rx[i] = in;
 		}
 	}
-	gpio_set(PIN_CS, true);
+	gpio_set(pin_cs, true);
 	return true;
 }
 
@@ -673,9 +682,9 @@ le32(const uint8_t *p)
 static void
 touch_reset(void)
 {
-	gpio_set(PIN_RESET, false);
+	gpio_set(pin_reset, false);
 	sleep_ms(2);
-	gpio_set(PIN_RESET, true);
+	gpio_set(pin_reset, true);
 	sleep_ms(100);
 }
 
@@ -1079,9 +1088,9 @@ focaltech_enter_boot_rom(void)
 	uint8_t boot_high = 0, boot_low = 0;
 
 	for (int cnt = 0; cnt < 3; cnt++) {
-		gpio_set(PIN_RESET, false);
+		gpio_set(pin_reset, false);
 		sleep_ms(1);
-		gpio_set(PIN_RESET, true);
+		gpio_set(pin_reset, true);
 		sleep_ms(FTS_CMD_START_DELAY + cnt * 8);
 		if (focaltech_read_boot_id(&boot_high, &boot_low) &&
 		    boot_high == 0x56 && boot_low == 0x62) {
@@ -1303,6 +1312,9 @@ static enum touch_chip touch_chip;
 static enum touch_chip
 touch_chip_detect(void)
 {
+	if (is_marble) {
+		return TOUCH_GOODIX;
+	}
 	gpio_configure(PIN_FOCALTECH_ID, 0, PULL_NONE, 2, false);
 	gpio_configure(PIN_GOODIX_ID, 0, PULL_NONE, 2, false);
 	if (gpio_get(PIN_GOODIX_ID) && !gpio_get(PIN_FOCALTECH_ID)) {
@@ -1336,11 +1348,16 @@ chip_poll(void)
 static void
 show_state(const char *when)
 {
+	if (is_marble) {
+		printf("goodix: %s: marble pins cs/clk/mosi/miso %u/%u/%u/%u, reset %u/%u, int %u/%u\n", when,
+		    pin_cs, pin_clk, pin_mosi, pin_miso, pin_reset, gpio_get(pin_reset), pin_int, gpio_get(pin_int));
+		return;
+	}
 	printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x dfs %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
 	    " reset %#x/%u, int %#x/%u, avdd %#x/%u, straps %u %u\n", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR),
-	    rd(GCC_QUP1_S_AHB_CBCR), rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)),
-	    rd(GPIO_CFG(PIN_CLK)), rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)), rd(GPIO_CFG(PIN_RESET)),
-	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)),
+	    rd(GCC_QUP1_S_AHB_CBCR), rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(pin_cs)),
+	    rd(GPIO_CFG(pin_clk)), rd(GPIO_CFG(pin_mosi)), rd(GPIO_CFG(pin_miso)), rd(GPIO_CFG(pin_reset)),
+	    rd(GPIO_IO(pin_reset)), rd(GPIO_CFG(pin_int)), rd(GPIO_IO(pin_int)), rd(GPIO_CFG(pin_avdd)), rd(GPIO_IO(pin_avdd)),
 	    gpio_get(68), gpio_get(96));
 }
 
@@ -1348,21 +1365,23 @@ show_state(const char *when)
 static void
 power_on(void)
 {
-	gpio_output(PIN_RESET, false, PULL_UP, 8);
-	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);
+	gpio_output(pin_reset, false, PULL_UP, 8);
+	gpio_configure(pin_int, 0, PULL_UP, 8, false);
 	io_supply_on();
 	sleep_ms(3);
-	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	if (pin_avdd) {
+		gpio_output(pin_avdd, true, PULL_NONE, 2);
+	}
 	sleep_ms(15);
 }
 
 static void
 use_engine_pins(void)
 {
-	gpio_configure(PIN_MISO, PIN_FUNCTION_SPI, PULL_NONE, 6, false);
-	gpio_configure(PIN_MOSI, PIN_FUNCTION_SPI, PULL_NONE, 6, false);
-	gpio_configure(PIN_CLK, PIN_FUNCTION_SPI, PULL_NONE, 6, false);
-	gpio_configure(PIN_CS, PIN_FUNCTION_SPI, PULL_NONE, 6, false);
+	gpio_configure(pin_miso, pin_function_spi, PULL_NONE, 6, false);
+	gpio_configure(pin_mosi, pin_function_spi, PULL_NONE, 6, false);
+	gpio_configure(pin_clk, pin_function_spi, PULL_NONE, 6, false);
+	gpio_configure(pin_cs, pin_function_spi, PULL_NONE, 6, false);
 }
 
 static const char *
@@ -1378,8 +1397,10 @@ bring_up(void)
 
 	show_state("as found");
 	touch_chip = touch_chip_detect();
-	printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
-	    gpio_get(PIN_FOCALTECH_ID), chip_name());
+	if (!is_marble) {
+		printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
+		    gpio_get(PIN_FOCALTECH_ID), chip_name());
+	}
 	power_on();
 
 	if (clocks_on()) {
@@ -1410,8 +1431,8 @@ bring_up(void)
 	/* by hand; which of the two data pins is the input is not written down anywhere, so try both */
 	spi_transfer = bitbang_transfer;
 	for (int attempt = 0; attempt < 2; attempt++) {
-		bitbang_in = attempt == 0 ? PIN_MISO : PIN_MOSI;
-		bitbang_out = attempt == 0 ? PIN_MOSI : PIN_MISO;
+		bitbang_in = attempt == 0 ? pin_miso : pin_mosi;
+		bitbang_out = attempt == 0 ? pin_mosi : pin_miso;
 		bitbang_init();
 		if (chip_probe(true)) {
 			printf("goodix: %s answers on pins driven by hand (data in on gpio%u)\n", chip_name(), bitbang_in);
@@ -1445,10 +1466,40 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	idle_looks = 80000 / poll_us;   /* a report read every 80 ms even with the line high, in case it is missed */
 
+	uint32_t soc_rsc = 0;
+	DTEntry arm_io;
+	void const *dev_type = NULL;
+	unsigned int prop_size = 0;
+
+	if (SecureDTLookupEntry(NULL, "/arm-io", &arm_io) == kSuccess &&
+	    SecureDTGetProperty(arm_io, "device_type", &dev_type, &prop_size) == kSuccess) {
+		if (strncmp((const char *)dev_type, "marble", 6) == 0) {
+			is_marble = true;
+		}
+	}
+	if (PE_parse_boot_argn("soc_rsc", &soc_rsc, sizeof(soc_rsc)) && soc_rsc == 0x17a20000) {
+		is_marble = true;
+	}
+	if (is_marble) {
+		pin_mosi = 16;
+		pin_miso = 17;
+		pin_clk = 18;
+		pin_cs = 19;
+		pin_reset = 20;
+		pin_int = 21;
+		pin_avdd = 0;
+		pin_function_spi = 1;
+		rsc_phys = 0x17a20000UL;
+		se_phys = 0x00990000UL;
+		touch_chip = TOUCH_GOODIX;
+		printf("goodix: detected POCO F5 (marble): pins cs %u, clk %u, mosi %u, miso %u, reset %u, int %u\n",
+		    pin_cs, pin_clk, pin_mosi, pin_miso, pin_reset, pin_int);
+	}
+
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
-	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
-	se = ml_io_map(SE_PHYS, SE_SIZE);
-	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	gcc = is_marble ? 0 : ml_io_map(GCC_PHYS, GCC_SIZE);
+	se = ml_io_map(se_phys, SE_SIZE);
+	rsc = ml_io_map(rsc_phys, RSC_SIZE);
 	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
 
 	if (!bring_up()) {
@@ -1473,7 +1524,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		uint64_t looked = micros_now(), read_at;
 
 		/* the interrupt line is low while a report waits; look anyway every 80 ms in case it is missed */
-		if (!gpio_get(PIN_INT)) {
+		if (!gpio_get(pin_int)) {
 			idle = 0;
 			chip_poll();
 			read_at = micros_now();
@@ -1493,7 +1544,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 			printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
 			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second\n",
 			    chip_name(), seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
-			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
+			    gpio_get(pin_int) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
 		}
 		sleep_us(poll_us);
 	}

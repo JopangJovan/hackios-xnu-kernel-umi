@@ -9,3 +9,4 @@ soc_ipa_stream=0x5c0
 soc_ipa_stream_uc=0x5c2
 soc_pas_ipa=0xf
 soc_ipa_fw=ipa_fws
+touchscreen=1

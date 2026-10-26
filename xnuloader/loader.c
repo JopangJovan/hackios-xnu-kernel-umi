@@ -518,6 +518,7 @@ struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
+	uint64_t gic_redist_size;        /* default 0x100000 */
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
@@ -555,7 +556,7 @@ static const struct platform platform_redwood = {
 static const struct platform platform_marble = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "marble", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x17100000, .gic_redist = 0x17180000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x17100000, .gic_redist = 0x17180000, .gic_redist_size = 0x200000, .uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
 	/* Cores 0-3 are Cortex-A510s, 4-6 Cortex-A710s, 7 Cortex-X2 */
 	.small_cores = 0x0f,
@@ -3250,7 +3251,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
-	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
+	uint64_t gicr_size = plat->gic_redist_size ? plat->gic_redist_size : 0x100000;
+	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, gicr_size };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
 	dt_end(&w);
 	if (plat->uart != 0) {
