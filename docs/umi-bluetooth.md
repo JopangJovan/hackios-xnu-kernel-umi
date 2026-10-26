@@ -73,13 +73,31 @@ Host checks:
     /tmp/umi-qca-test
     python3 tools/bluetooth/inspect-qca-firmware.py fw-bluetooth/*
 
-## iOS integration remaining
+## Native iOS integration (experimental)
 
-The hardware diagnostic can discover Bluetooth devices. Normal iOS pairing
-is not connected yet. Stock bluetoothd includes an H4 transport and a POSIX
-kernel-control driver; its BT_HCI_TRANSPORT setting can select those directly.
-The next layer is a persistent raw H4 endpoint and native-daemon integration.
-BlueTool's Broadcom firmware loader must not replace the QCA startup sequence.
+`umi_bt=1` retains the initialized UART and starts the root/mobile-only stream
+kernel control `com.hackios.bluetooth`. A single worker owns the UART and IBS
+handshake; socket callbacks enqueue fragmented H4 writes. RX is framed before
+being delivered to the native daemon. Transport faults clear the registry
+readiness property instead of returning synthetic HCI success.
+
+Build userland with `BLUETOOTH=1` to select
+`BT_HCI_TRANSPORT=H4:POSIX:com.hackios.bluetooth,115200`, include bluetoothd and
+the project's BlueTool XPC bootstrap helper, and inject the compatibility library.
+The helper acknowledges only boot/init after verifying the controller is ready;
+other script requests fail. The registry publishes the measured public address
+and Supported Commands mask. The current NVM address is a vendor default;
+factory-address provisioning remains to be implemented.
+
+The native daemon completes HCI initialization (verified in the 11:09:37
+26 October 2026 boot, `Stack initialization complete`). QCA6390 does not advertise the
+optional Write Default Erroneous Data Reporting command (command mask byte 18,
+bit 3), which Apple's initialization treats as mandatory. The userland shim
+skips only that optional init step when the capability is absent, the daemon
+UUID matches iOS 16.5 build 20F66, and the function/table fingerprints match.
+It does not change HCI replies or advertise unsupported commands. Unknown
+images are left unchanged. Native Settings discovery and pairing still require
+validation; hardware LE/classic discovery alone is not proof of either.
 
 References: local Xiaomi SM8250 msm_geni_serial.c, qcom-geni-se.c, gcc-kona.c,
 pinctrl-kona.c and UMI DT; upstream Qualcomm-specific NVM/unified-event behavior
