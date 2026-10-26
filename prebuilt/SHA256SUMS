@@ -1,4 +1,4 @@
-Built 2026-10-25 19:23 from this tree.
+Built 2026-10-25 19:41 from this tree.
 
 04263e76d6cc8b13e8f9e89229afa8f4d3039d8f3714ca7fd1d6e8603091d28b  prebuilt/mach.development.bcm2837
 3de0d8b2095989a9a8f9f9679b8bec01d80bad38eee535d934d29b7b76fee984  prebuilt/loader.efi
@@ -11,7 +11,7 @@ b089fec6fe19149c3a61f8645ea3c28b19a051d4d053794ae459ff6a7c947805  prebuilt/userl
 ef496beee457476dcda607d27cb26398b1fc463b6f6c7fe21012eb4c0c26edb9  prebuilt/userland/libhakios.app.dylib
 530c2e681093ece2afe7f5180a4723bd46d92f7af39edc0a8c77136136a4dad6  prebuilt/userland/libhakios.dylib
 d8680034e5f0cdecd396cd7488e9d0f30037223ebc57f5309f99a6cd45a4ad26  prebuilt/userland/libhakios.media.dylib
-33306f04783b9f6ac818f0beaaa68a4483a1b185f0a174f369fd6ea5002b5ef4  prebuilt/userland/libhakios.sb.dylib
+e439776447a081cb1c57232b2df976e0dbe09c92e412e6b7973a8d89adbc10ee  prebuilt/userland/libhakios.sb.dylib
 da392e632eb6978164c4c191b73773cf4ceac2c288d1b9697d35fd1f938f73f3  prebuilt/userland/libhakios.tweaks.dylib
 8ba7ffba4ff62aff74ab144fc25c61873408320511a83c9b8faf941f32e965d0  prebuilt/userland/mg_test
 8dccf07fb4d9f406fcf558355cc9f3a1614a39c29e5bb79740aa5c5e972023fe  prebuilt/userland/net_test

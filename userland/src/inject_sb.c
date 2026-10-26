@@ -317,7 +317,7 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 	if (shown > 5) {
 		shown = 5;
 	}
-	if (up > 0 && shown > 0 && setter != NULL && data != NULL) {
+	if ((up > 0 || registered > 0) && shown > 0 && setter != NULL && data != NULL) {
 		BLOCK_CALL(setter, void (*)(void *, void *, int), data, shown);
 		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
 		if (shown != cellular_last_bars) {
