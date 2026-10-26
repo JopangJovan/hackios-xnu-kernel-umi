@@ -1,0 +1,79 @@
+# Xiaomi Mi 10 (UMI, Snapdragon 865)
+
+This device port follows unified upstream `88513176b1e96ecf0b764cd62c6f4e6ac71345e3`.
+The previous UMI kernel and userland history is retained by the integration merge.
+
+## Source isolation
+
+All UMI implementations live here. Shared upstream sources in `xnu/files/`,
+`userland/src/`, `wifi/lx/`, the shared loader, and `xnu/hakios.patch` remain
+unchanged. `upstream-templates.sha256` records their contents;
+`python3 devices/xiaomi-mi-10/prepare.py verify` checks that invariant.
+
+`overlays/xnu/files/` contains the UMI-specific driver variants and helpers.
+`xnu-device.patch` adds their build entries and startup calls to the generated
+Apple source tree; it is applied after upstream's patch. It also retains the
+32 MiB peripheral mapping window required by the working UMI port.
+
+`overlays/wifi/` selects QCA6390 PCIe/MHI and retains UMI authentication fixes.
+`overlays/userland/` holds UMI firmware packaging, Bluetooth startup, and its
+controller compatibility library. The build scripts stage these into private
+copies under `out/xiaomi-mi-10/`; they do not replace upstream templates.
+
+The loader and UEFI source port are likewise device-local (`loader/`, `uefi/`).
+The supplied device tree is `prebuilt/device-tree.dtb`. Firmware, generated Apple
+identity headers, build output, captures, and credentials remain outside git.
+
+## Building
+
+Set `THEOS` to a toolchain directory containing `sdks/iPhoneOS16.5.sdk`; prepare
+XNU's dependencies with upstream `xnu-deps/setup.sh` when needed. Keep your own
+extracted iOS files in `sysimage/`, and the phone's firmware in the ignored
+`fw-gpu/`, `fw-audio/`, `fw-haptic/`, `fw-wifi/`, and `fw-bluetooth/` directories.
+UMI Bluetooth needs `htbtfw20.tlv` and `htnv20.bin`; its firmware is embedded only
+in the generated kernel tree. No vendor firmware is committed here.
+
+```sh
+devices/xiaomi-mi-10/build-wifi.sh
+devices/xiaomi-mi-10/build-kernel.sh -j8 -k
+devices/xiaomi-mi-10/build-loader.sh
+devices/xiaomi-mi-10/build-userland.sh
+```
+
+The kernel is `out/xiaomi-mi-10/xnu/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837`.
+The images and loader are `out/xiaomi-mi-10/{root.apfs,system.apfs,loader.efi}`.
+Build or supply a UMI UEFI image implementing the existing XNUP hook:
+`UEFI_FD=/path/to/SILICIUM_UEFI.fd`, with the device-local UEFI source in `uefi/`.
+The UMI FD is 3 MiB at `0x9fc00000`; packaging rejects another model's DTB.
+
+## RAM boot
+
+```sh
+devices/xiaomi-mi-10/run.sh reload
+devices/xiaomi-mi-10/run.sh ramdisk
+XL_SECS=1800 devices/xiaomi-mi-10/run.sh run
+```
+
+`run.sh` uses a generated, device-selected copy of upstream `xl`. It shares the
+phone lock with the earlier UMI workspace and refuses to fall back to a POCO
+kernel or loader. Nothing is flashed. The default arguments are in `boot.args`;
+they keep touch, keys, haptics, audio, GPU, scan synchronization, Wi-Fi, Bluetooth,
+and all eight cores. Stock maximum GPU frequency remains 587 MHz.
+
+For live USB logs, use `bootcpu=7 cpus=7` instead of the eight-core pair in
+`boot.args`. `XL_FOLLOW=5 XL_FOLLOW_KEEP=1` retains timing snapshots. `thermal=2`
+is an optional comparison mode: CPU caps are not applied, while sensors,
+pressure reporting and the emergency shutdown stay active. It is not a default.
+
+The upstream compositor currently uses OpenGL ES through Mesa. This update
+follows upstream's unfinished Metal status; it does not claim a Metal compositor.
+The UMI display variant retains the validated staging/cache fixes and releases
+source ownership after staging so rendering can overlap panel presentation.
+
+## Validation
+
+The kernel, Wi-Fi object, Mesa, userland images and UMI loader build. The actual
+scan-reader register-model test passes (`python3 devices/xiaomi-mi-10/tools/test-display.py`).
+The template checksum test passes. The Android RAM-boot package builds with the
+supplied UMI device tree and UMI UEFI layout. Device validation is in progress;
+boot success is not inferred from compilation.

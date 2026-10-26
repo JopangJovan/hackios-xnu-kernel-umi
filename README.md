@@ -16,6 +16,8 @@ about it in advance: every address, interrupt, power rail and firmware comes fro
 device tree and its own Android, so a port to another Qualcomm phone is a new directory under
 `devices/`, not a rewrite.
 
+The Xiaomi Mi 10 (UMI) integration is maintained in [devices/xiaomi-mi-10/](devices/xiaomi-mi-10/README.md), with isolated device overlays and build scripts.
+
 ## What is in the repository
 
 Only my code and my data:
