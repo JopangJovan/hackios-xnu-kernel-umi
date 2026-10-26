@@ -533,7 +533,7 @@ ipa_command(const char *what, uint8_t opcode, const void *payload, size_t size)
 	uint32_t slot = command.next % command.slots;
 	struct command_done waiting = { .tre = command.tre_ring.phys + slot * ELEMENT_SIZE };
 
-	if (size > command.buffer_size || command.next - command.done >= command.slots) {
+	if (size > command.buffer_size || command.next - command.done >= command.slots - 1) {
 		return false;
 	}
 	memcpy((void *)slot_virt(&command, slot), payload, size);
@@ -651,11 +651,13 @@ receive_event(struct channel *ch, const struct event *e, void *context)
 		}
 		return;
 	}
-	if (slot != ch->next % ch->slots) {
+	/* receives complete in order; ch->done is the next expected slot, ch->next the next to post (slots-1 ahead) */
+	if (slot != ch->done % ch->slots) {
 		if (ch->errors++ < 4) {
-			printf("ipa: %s: slot %u finished while slot %u was expected\n", ch->name, slot, ch->next % ch->slots);
+			printf("ipa: %s: slot %u finished while slot %u was expected\n", ch->name, slot, ch->done % ch->slots);
 		}
 	}
+	ch->done++;
 	buffer = (const uint8_t *)slot_virt(ch, slot);
 	if (length > ch->buffer_size) {
 		length = ch->buffer_size;
@@ -716,7 +718,7 @@ hakios_ipa_transmit(uint8_t mux, const void *packet, size_t length)
 	}
 	lck_mtx_lock(&ipa_lock);
 	channel_events(ch, transmit_event, NULL);
-	if (ch->next - ch->done >= ch->slots) {
+	if (ch->next - ch->done >= ch->slots - 1) {     /* one slot always left free: write==read means empty */
 		ch->dropped++;
 		lck_mtx_unlock(&ipa_lock);
 		return false;
@@ -852,7 +854,9 @@ hakios_ipa_data_setup(void)
 		}
 		ch->started = true;
 		if (!ch->to_ipa) {
-			for (uint32_t slot = 0; slot < ch->slots; slot++) {
+			/* one short of the ring: the doorbell is the write pointer, and writing it level with
+			 * the read pointer (base) would mean "empty", not "full" */
+			for (uint32_t slot = 0; slot + 1 < ch->slots; slot++) {
 				receive_post(ch, slot);
 			}
 			channel_doorbell(ch);
