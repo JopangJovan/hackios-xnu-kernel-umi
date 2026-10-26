@@ -75,5 +75,8 @@ source ownership after staging so rendering can overlap panel presentation.
 The kernel, Wi-Fi object, Mesa, userland images and UMI loader build. The actual
 scan-reader register-model test passes (`python3 devices/xiaomi-mi-10/tools/test-display.py`).
 The template checksum test passes. The Android RAM-boot package builds with the
-supplied UMI device tree and UMI UEFI layout. Device validation is in progress;
-boot success is not inferred from compilation.
+supplied UMI device tree and UMI UEFI layout. The updated kernel and matching
+iOS images booted on UMI; touch initialized, the GPU rendered apps at its
+587 MHz setting, and the audio DSP and Wi-Fi interface initialized. The user
+confirmed that the build works, while scrolling skips/freezes remain. This
+source migration does not claim to resolve that remaining performance issue.
