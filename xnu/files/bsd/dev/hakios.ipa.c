@@ -53,13 +53,21 @@ static LCK_MTX_DECLARE(ipa_lock, &ipa_lock_group);
 
 /* ---- the registers ---------------------------------------------------------------------------- */
 
-#define IPA_REGS_PHYS           0x01e40000ull
+/*
+ * Where the IPA and the GSI are. These are the values of the first phone (POCO X5 Pro, SM7325),
+ * which another Qualcomm phone overrides from its own device tree: the "reg" of the node whose
+ * compatible is "qcom,ipa" (reg-names "ipa-base" and "gsi-base"), passed as boot-args soc_ipa_base
+ * and soc_gsi_base (tools/soc-args.py reads them off the phone's fdt). The IPA driver has one
+ * execution environment's worth of GSI registers mapped, from the inter-EE masks to the scratch.
+ */
+#define IPA_REGS_PHYS_DEFAULT   0x01e40000ull
+#define GSI_PHYS_DEFAULT        0x01e04000ull
 #define IPA_REGS_SIZE           0x1000
-#define GSI_PHYS                0x01e04000ull
 #define GSI_FROM                0xc000          /* what is used of the GSI's registers: from the inter-EE masks (0xc020) to the scratch (0x12400) */
 #define GSI_SIZE                0x7000
 
-static vm_offset_t ipa_regs, gsi_regs;         /* gsi_regs maps GSI_PHYS + GSI_FROM */
+static uint64_t ipa_regs_phys = IPA_REGS_PHYS_DEFAULT, gsi_phys = GSI_PHYS_DEFAULT;
+static vm_offset_t ipa_regs, gsi_regs;         /* gsi_regs maps gsi_phys + GSI_FROM */
 
 static inline uint32_t
 ipa_rd(uint32_t offset)
@@ -797,8 +805,10 @@ hakios_ipa_data_setup(void)
 		return false;
 	}
 	if (ipa_regs == 0) {
-		ipa_regs = ml_io_map(IPA_REGS_PHYS, IPA_REGS_SIZE);
-		gsi_regs = ml_io_map(GSI_PHYS + GSI_FROM, GSI_SIZE);
+		PE_parse_boot_argn("soc_ipa_base", &ipa_regs_phys, sizeof(ipa_regs_phys));
+		PE_parse_boot_argn("soc_gsi_base", &gsi_phys, sizeof(gsi_phys));
+		ipa_regs = ml_io_map(ipa_regs_phys, IPA_REGS_SIZE);
+		gsi_regs = ml_io_map(gsi_phys + GSI_FROM, GSI_SIZE);
 	}
 	if (ipa_regs == 0 || gsi_regs == 0) {
 		printf("ipa: the registers cannot be mapped: no data path\n");

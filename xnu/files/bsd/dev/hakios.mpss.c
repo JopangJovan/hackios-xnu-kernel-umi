@@ -284,7 +284,8 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 
 /* ---- the shared memory (hakios.wifi.c, step 1) --------------------------------------------------- */
 
-#define SMEM_PHYS               0x80900000UL
+#define SMEM_PHYS_DEFAULT       0x80900000u   /* dt: reg of /soc/qcom,smem */
+static uint32_t smem_phys = SMEM_PHYS_DEFAULT;
 #define SMEM_SIZE               0x00200000u
 #define SMEM_US                 0
 #define SMEM_MPSS               1               /* dt: qcom,remote-pid of qcom,smp2p-modem and qcom,glink/modem */
@@ -330,7 +331,7 @@ static bool
 smem_peek(uint64_t offset, void *to, uint32_t size)
 {
 	if (smem == NULL) {
-		smem = (const volatile uint8_t *)ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, VM_WIMG_WCOMB);
+		smem = (const volatile uint8_t *)ml_io_map_unmappable(smem_phys, SMEM_SIZE, VM_WIMG_WCOMB);
 	}
 	if (offset + size > SMEM_SIZE) {
 		return false;
@@ -466,7 +467,7 @@ show_partition(void)
 	}
 	count = smem_items(partition, cacheline, found, 256);
 	printf("mpss: %u: the partition for us and the modem (0 and 1): at %#lx, %#x bytes, of which %#x free; %u items\n", step,
-	    SMEM_PHYS + partition, size, header.free_cached - header.free_uncached, count);
+	    smem_phys + partition, size, header.free_cached - header.free_uncached, count);
 	for (unsigned i = 0; i < count && i < 256;) {
 		int at = 0;
 
@@ -780,7 +781,8 @@ out:
  * the list of its levels that the boot loader's command database keeps (cmd-db.c), the first
  * position at or above the level wanted.
  */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS_DEFAULT     0x80860000u   /* dt: reg of /reserved-memory/cmd_db */
+static uint32_t cmd_db_phys = CMD_DB_PHYS_DEFAULT;
 #define CMD_DB_SIZE             0x20000UL
 
 struct cmd_db_slave {
@@ -824,7 +826,7 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 	char id[8] = { 0 };
 
 	if (cmd_db == NULL) {
-		cmd_db = (const struct cmd_db_header *)ml_io_map_unmappable(CMD_DB_PHYS, CMD_DB_SIZE, VM_WIMG_WCOMB);
+		cmd_db = (const struct cmd_db_header *)ml_io_map_unmappable(cmd_db_phys, CMD_DB_SIZE, VM_WIMG_WCOMB);
 	}
 	if (!(cmd_db->magic[0] == 0xdb && cmd_db->magic[1] == 0x30 && cmd_db->magic[2] == 0x03 && cmd_db->magic[3] == 0x0c)) {
 		printf("mpss: %u: the boot loader's command database is not there\n", step);
@@ -1042,7 +1044,8 @@ step_survey(void)
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define MPSS_MEMORY             0x8b800000u     /* dt: reserved-memory mpss@8b800000, memory-region of qcom,mss@4080000 */
+#define MPSS_MEMORY_DEFAULT     0x8b800000u   /* dt: reserved-memory mpss@..., memory-region of qcom,mss */
+static uint32_t mpss_memory = MPSS_MEMORY_DEFAULT;
 #define MPSS_MEMORY_SIZE        0x0f600000u
 #define PAS_MPSS                4               /* dt: qcom,pas-id */
 
@@ -1200,13 +1203,13 @@ step_firmware(void)
 		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
 			continue;
 		}
-		if (segment.paddr < MPSS_MEMORY || segment.file_size > segment.memory_size ||
-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)MPSS_MEMORY + MPSS_MEMORY_SIZE) {
+		if (segment.paddr < mpss_memory || segment.file_size > segment.memory_size ||
+		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)mpss_memory + MPSS_MEMORY_SIZE) {
 			printf("mpss: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
 			    segment.memory_size);
 			goto fail;
 		}
-		image.segment[image.segments].at = segment.paddr - MPSS_MEMORY;
+		image.segment[image.segments].at = segment.paddr - mpss_memory;
 		image.segment[image.segments].file_size = segment.file_size;
 		image.segment[image.segments].memory_size = segment.memory_size;
 		image.segment[image.segments].file = NULL;
@@ -1229,17 +1232,17 @@ step_firmware(void)
 		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
 		image.segments++;
 	}
-	if (image.segments == 0 || lowest != MPSS_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
+	if (image.segments == 0 || lowest != mpss_memory || 52 + 32 * count + (uint64_t)hashes != size) {
 		printf("mpss: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
 		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - MPSS_MEMORY;
+	image.size = ((highest + 0xfff) & ~0xfffu) - mpss_memory;
 	printf("mpss: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
 	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
-	    image.segments, files, image.size, MPSS_MEMORY_SIZE, MPSS_MEMORY);
+	    image.segments, files, image.size, MPSS_MEMORY_SIZE, mpss_memory);
 	announce("read the modem's four file systems from the phone's storage into memory of ours (rmtfs below)");
 	{
 		unsigned loaded = rmtfs_load();
@@ -1393,7 +1396,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	need(&ipcc);
 	value_at = at + SMP2P_AT_VALUE((uint32_t)entry);
 	printf("mpss: %u: about to ask the DSP to stop: bit 0 of our entry \"%s\" at %#lx, and its SMP2P doorbell\n", step,
-	    OUR_ENTRY_STOP, SMEM_PHYS + value_at);
+	    OUR_ENTRY_STOP, smem_phys + value_at);
 	snprintf(last_write, sizeof(last_write), "step %u asked the modem to stop", step);
 	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
 	settle();
@@ -1502,12 +1505,12 @@ step_header(void)
 	printf("mpss: %u: TRUSTZONE ACCEPTS THE MODEM'S SIGNATURE FROM THIS KERNEL\n", step);
 
 	announce("tell TrustZone where the image will be: the whole of the modem's memory, as Linux does");
-	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_MPSS, MPSS_MEMORY, MPSS_MEMORY_SIZE, 0, &answer);
+	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_MPSS, mpss_memory, MPSS_MEMORY_SIZE, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT TAKE THE PLACE: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
 	}
-	printf("mpss: %u: TrustZone takes the place: %#x bytes at %#x (the image takes %#x of them)\n", step, MPSS_MEMORY_SIZE, MPSS_MEMORY,
+	printf("mpss: %u: TrustZone takes the place: %#x bytes at %#x (the image takes %#x of them)\n", step, MPSS_MEMORY_SIZE, mpss_memory,
 	    image.size);
 	return true;
 }
@@ -1576,12 +1579,12 @@ step_image(void)
 	}
 	announce("put the image's segments into the modem's memory (0x8b800000, 246 MB: memory of nobody's until TrustZone starts "
 	    "the modem), with zeroes where a segment is longer than its file, and read them back");
-	dsp_memory = (volatile uint8_t *)ml_io_map_unmappable(MPSS_MEMORY, image.size, VM_WIMG_WCOMB);
+	dsp_memory = (volatile uint8_t *)ml_io_map_unmappable(mpss_memory, image.size, VM_WIMG_WCOMB);
 	if (dsp_memory == NULL) {
 		printf("mpss: %u: the modem's memory cannot be mapped (%#x bytes)\n", step, image.size);
 		return false;
 	}
-	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, MPSS_MEMORY);
+	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, mpss_memory);
 	began = now_us();
 	for (unsigned s = 0; s < image.segments; s++) {
 		segment_put(dsp_memory, s);
@@ -1692,7 +1695,7 @@ step_our_item(void)
 	our_item = our_item_find();
 	if (our_item != 0) {
 		printf("mpss: %u: item %u is there, at %#lx: a kernel before this one made it, and it is used again\n", step,
-		    ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
+		    ITEM_SMP2P_OURS, smem_phys + our_item);
 	} else {
 		if (!our_item_make(partition, ITEM_SMP2P_OURS, sizeof(struct smp2p))) {
 			return false;
@@ -1702,7 +1705,7 @@ step_our_item(void)
 			printf("mpss: %u: THE ITEM IS NOT FOUND where it was just made\n", step);
 			return false;
 		}
-		printf("mpss: %u: item %u made, at %#lx\n", step, ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
+		printf("mpss: %u: item %u made, at %#lx\n", step, ITEM_SMP2P_OURS, smem_phys + our_item);
 	}
 	/* zeroes; from processor 0 to 1, room for 16 entries, "master-kernel" at zero, feature bit 0; last the version */
 	snprintf(last_write, sizeof(last_write), "step %u filled in our SMP2P item", step);
@@ -1961,7 +1964,8 @@ ipa_hardware_init(void)
 #define IPA_STREAM              0x480u
 #define IPA_STREAM_UC           0x482u          /* the IPA's microcontroller: its own match register */
 #define IPA_SPACE_BASE          0x80000000ull   /* a gigabyte from here, as it is */
-#define IPA_IMEM                0x14600000ull   /* the 2 MB block that holds 0x146a8000 */
+#define IPA_IMEM_DEFAULT        0x14600000u   /* the 2 MB block that holds the SoC internal memory (dt: qcom,msm-imem) */
+static uint32_t ipa_imem = IPA_IMEM_DEFAULT;
 static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
 static struct block apps_smmu_second = { "apps smmu", 0, 0x1000 };
 static struct block apps_smmu_context = { "apps smmu, the IPA's context", 0, 0x1000 };
@@ -2095,20 +2099,20 @@ ipa_space_on(void)
 	for (unsigned i = 0; i < 512; i++) {
 		ddr[i] = (IPA_SPACE_BASE + (uint64_t)i * 0x200000) | IPA_BLOCK;
 	}
-	soc[(IPA_IMEM >> 21) & 0x1ff] = IPA_IMEM | IPA_BLOCK_DEVICE;
+	soc[(ipa_imem >> 21) & 0x1ff] = ipa_imem | IPA_BLOCK_DEVICE;
 	root[IPA_SPACE_BASE >> 30] = kvtophys((vm_offset_t)ddr) | IPA_TABLE;
 	/* the rest of DDR (the phone has 6 or 8 GB from 0x80000000), as 1 GB blocks of the root: the data path's rings and
 	 * buffers (hakios.ipa.c) are wherever the kernel's memory is */
 	for (unsigned g = (IPA_SPACE_BASE >> 30) + 1; g < (IPA_SPACE_BASE >> 30) + 8; g++) {
 		root[g] = ((uint64_t)g << 30) | IPA_BLOCK;
 	}
-	root[IPA_IMEM >> 30] = kvtophys((vm_offset_t)soc) | IPA_TABLE;
+	root[ipa_imem >> 30] = kvtophys((vm_offset_t)soc) | IPA_TABLE;
 	FlushPoC_DcacheRegion(ipa_space.tables, 3 * 4096);
 	settle();
 	ttbr = kvtophys(ipa_space.tables) | (uint64_t)ipa_space.context << 48;
 	printf("mpss: ipa: THE SMMU IS ABOUT TO BE WRITTEN: context %u gets our tables (root %#llx: DDR from %#llx as it is, 1 GB, and "
 	    "the SoC's memory at %#llx) and match registers %u and %u send streams %#x and %#x through it (before: smr %#x s2cr %#x, "
-	    "smr %#x s2cr %#x, sctlr %#x)\n", ipa_space.context, ttbr & 0x0000fffffffff000ull, IPA_SPACE_BASE, IPA_IMEM, ipa_space.match,
+	    "smr %#x s2cr %#x, sctlr %#x)\n", ipa_space.context, ttbr & 0x0000fffffffff000ull, IPA_SPACE_BASE, ipa_imem, ipa_space.match,
 	    ipa_space.match_uc, IPA_STREAM, IPA_STREAM_UC, ipa_space.old_smr, ipa_space.old_s2cr, ipa_space.old_smr_uc, ipa_space.old_s2cr_uc,
 	    ipa_space.old_sctlr);
 	wr(apps_smmu_context.base + SMMU_CB_SCTLR, 0);
@@ -2646,7 +2650,7 @@ glink_reset(void)
 		return;
 	}
 	printf("mpss: %u: GLINK's descriptor at %#lx: our queue read to %#x and written to %#x, the DSP's read to %#x and written "
-	    "to %#x\n", step, SMEM_PHYS + descriptor, smem_word(descriptor + GLINK_OUR_TAIL), smem_word(descriptor + GLINK_OUR_HEAD),
+	    "to %#x\n", step, smem_phys + descriptor, smem_word(descriptor + GLINK_OUR_TAIL), smem_word(descriptor + GLINK_OUR_HEAD),
 	    smem_word(descriptor + GLINK_THEIR_TAIL), smem_word(descriptor + GLINK_THEIR_HEAD));
 	if (smem_word(descriptor + GLINK_OUR_HEAD) != 0 || smem_word(descriptor + GLINK_THEIR_TAIL) != 0) {
 		printf("mpss: %u: about to write our two marks there (+4, +8): 0\n", step);
@@ -3610,7 +3614,7 @@ rmtfs_load(void)
  * no-map: nothing of ours uses it, and the CDSP is never started here), through an uncached
  * window, as the modem reads it.
  */
-#define RMTFS_BUFFER_PA         0x9c700000ull
+#define RMTFS_BUFFER_PA_DEFAULT 0x9c700000ull   /* dt: a window into reserved-memory cdsp@... (the CDSP is not started here) */
 
 static bool
 rmtfs_buffer_make(void)
@@ -3618,7 +3622,7 @@ rmtfs_buffer_make(void)
 	if (rmtfs_window != NULL) {
 		return true;
 	}
-	rmtfs_buffer_pa = RMTFS_BUFFER_PA;
+	rmtfs_buffer_pa = RMTFS_BUFFER_PA_DEFAULT;
 	PE_parse_boot_argn("modem_buffer", &rmtfs_buffer_pa, sizeof(rmtfs_buffer_pa));      /* (another region, to try) */
 	rmtfs_window = (volatile uint8_t *)ml_io_map_unmappable((vm_offset_t)rmtfs_buffer_pa, RMTFS_BUFFER_SIZE, VM_WIMG_WCOMB);
 	if (rmtfs_window == NULL) {
@@ -4997,8 +5001,8 @@ step_queues(void)
 	head = smem_word(glink.descriptor + GLINK_THEIR_HEAD);
 	tail = smem_word(glink.descriptor + GLINK_THEIR_TAIL);
 	printf("mpss: %u: our queue: %u bytes at %#lx, written to %#x, read by the DSP to %#x; the DSP's: %u bytes at %#lx, written "
-	    "to %#x, read by us to %#x\n", step, glink.ours_size, SMEM_PHYS + glink.ours, smem_word(glink.descriptor + GLINK_OUR_HEAD),
-	    smem_word(glink.descriptor + GLINK_OUR_TAIL), glink.theirs_size, SMEM_PHYS + glink.theirs, head, tail);
+	    "to %#x, read by us to %#x\n", step, glink.ours_size, smem_phys + glink.ours, smem_word(glink.descriptor + GLINK_OUR_HEAD),
+	    smem_word(glink.descriptor + GLINK_OUR_TAIL), glink.theirs_size, smem_phys + glink.theirs, head, tail);
 	for (uint32_t at = 0, shown = 0; at + sizeof(message) <= head && head < glink.theirs_size && tail == 0 && shown < 8; shown++) {
 		char name[33] = "";
 		uint32_t length = sizeof(message);
@@ -6283,6 +6287,43 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/*
+ * The SoC addresses of another Qualcomm phone, from boot-args, over the first phone's built-in
+ * values. Everything the modem and the IPA touch is here: the register blocks mapped at run time
+ * (the AOSS and IPCC mailboxes, the RPMh controller, the shared-memory hardware lock, the IPA and
+ * GSI registers and the IPA's local memory, the application processors' SMMU) and the few
+ * addresses kept as values (shared memory, the command DB, the modem's memory, the SoC's internal
+ * memory). A port passes soc_<name>=0x... for each that differs; tools/soc-args.py reads them off
+ * the phone's own device tree. Anything not given keeps the built-in value, so the first phone
+ * needs no arguments. (The RMTFS buffer has its own argument, modem_buffer.)
+ */
+static void
+soc_override(void)
+{
+	static const struct { const char *arg; struct block *block; } blocks[] = {
+		{ "soc_aoss", &aoss }, { "soc_ipcc", &ipcc }, { "soc_rsc", &rsc }, { "soc_smem_lock", &smem_lock },
+		{ "soc_ipa_regs", &ipa_regs }, { "soc_ipa_sram", &ipa_sram }, { "soc_gsi_ee0", &gsi_ee0 }, { "soc_apps_smmu", &apps_smmu },
+	};
+	unsigned said = 0;
+
+	for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
+		uint32_t phys = 0;
+
+		if (PE_parse_boot_argn(blocks[i].arg, &phys, sizeof(phys)) && phys != 0 && blocks[i].block->base == 0) {
+			blocks[i].block->phys = phys;
+			said++;
+		}
+	}
+	PE_parse_boot_argn("soc_smem", &smem_phys, sizeof(smem_phys));
+	PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
+	PE_parse_boot_argn("soc_mpss_mem", &mpss_memory, sizeof(mpss_memory));
+	PE_parse_boot_argn("soc_imem", &ipa_imem, sizeof(ipa_imem));
+	if (said != 0 || smem_phys != SMEM_PHYS_DEFAULT || mpss_memory != MPSS_MEMORY_DEFAULT) {
+		printf("mpss: SoC addresses from boot-args: %u register blocks; shared memory %#x, command DB %#x, the modem's "
+		    "memory %#x, the SoC's internal memory %#x\n", said, smem_phys, cmd_db_phys, mpss_memory, ipa_imem);
+	}
+}
+
 /* Called while the system starts (bsd/dev/hakios.input.c), after the Wi-Fi's start has been set going. */
 void
 hakios_mpss_init(void)
@@ -6298,6 +6339,7 @@ hakios_mpss_init(void)
 		printf("mpss: modem=1 and modem_step=N are for the phone's modem, and this is not the phone\n");
 		return;
 	}
+	soc_override();
 	if (last_step == 0) {
 		/* all of it, on a thread of its own, and left up */
 		last_step = STEPS;
