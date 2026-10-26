@@ -86,6 +86,30 @@ def main():
     if smmu and 'reg' in smmu:
         args.append(('soc_apps_smmu', u32(smmu['reg'], 0)))
 
+    # the memory addresses: the command DB and the modem's region are reserved-memory nodes named by
+    # their address; shared memory is the reserved-memory the /soc/qcom,smem node points at; the SoC's
+    # internal memory is the msm-imem node rounded down to its 2 MB block (what the IPA's table maps).
+    by_phandle = {}
+    for path, props in nodes.items():
+        if 'phandle' in props:
+            by_phandle[u32(props['phandle'])] = (path, props)
+
+    def reserved(leaf, arg):
+        _, props = find_named(nodes, leaf)
+        if props and 'reg' in props:
+            args.append((arg, u32(props['reg'], 1)))    # reserved-memory: 2 address cells, so the low word is cell 1
+
+    reserved('cmd_db', 'soc_cmd_db')
+    reserved('mpss', 'soc_mpss_mem')
+    _, smem = find(nodes, 'qcom,smem')
+    if smem and 'memory-region' in smem:
+        target = by_phandle.get(u32(smem['memory-region']))
+        if target and 'reg' in target[1]:
+            args.append(('soc_smem', u32(target[1]['reg'], 1)))
+    _, imem = find(nodes, 'qcom,msm-imem')
+    if imem and 'reg' in imem:
+        args.append(('soc_imem', u32(imem['reg'], 0) & ~0x1fffff))   # the 2 MB block that holds it
+
     for name, value in args:
         print(f'{name}={value:#x}')
     if not args:
