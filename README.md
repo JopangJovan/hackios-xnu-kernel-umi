@@ -152,6 +152,20 @@ clock and SMMU context, and the handshake with the modem goes through. The SIM i
 subscription and NAS reads the signal. The current state and the whole story are in
 `docs/cellular.md`.
 
+## Independent, and Apple-free at the core
+
+HakiOS is an independent research project. It is **not affiliated with or endorsed by Apple**;
+"iOS", "iPhone", "XNU" and "Apple" are named only to describe what the code works with. The core
+kernel, the boot loader and the open tools build and run with nothing of Apple's:
+
+```sh
+make qemu-open      # the open kernel + a placeholder loader + a tiny raw-syscall user space, in QEMU
+```
+
+No IPSW, no iOS user space, no firmware. Booting the stock iOS user space (`make qemu`,
+`make phone`) is an optional path that needs the IPSW and the phone's firmware, which you supply
+from your own device.
+
 ## Licenses and the legal side
 
 My code is under the license of the files it changes: the XNU patch under the Apple Public Source
@@ -161,3 +175,8 @@ phone's firmware belong to their owners, are not in this repository and are not 
 everyone takes them from their own phone and their own IPSW. "iOS", "iPhone" and "Apple" are
 named only to describe what the code works with. If you believe a file here infringes anyone's
 rights, open an issue and I will remove it.
+
+The detail is in separate files: `LEGAL.md` (what is and is not distributed, and the limits of
+these statements), `COMPLIANCE.md` (how the APSL 2.0 and other terms are met, and the items still
+to verify), `THIRD_PARTY_LICENSES.md` (every third-party component with origin and license), and
+`NOTICE` (the short canonical list). None of this is legal advice.
