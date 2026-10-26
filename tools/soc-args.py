@@ -101,6 +101,7 @@ def main():
 
     reserved('cmd_db', 'soc_cmd_db')
     reserved('mpss', 'soc_mpss_mem')
+    reserved('ipa_gsi', 'modem_ipa_fw_at')              # where the IPA's firmware is loaded (the ipa_gsi reservation)
     _, smem = find(nodes, 'qcom,smem')
     if smem and 'memory-region' in smem:
         target = by_phandle.get(u32(smem['memory-region']))
