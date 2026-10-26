@@ -110,6 +110,14 @@ def main():
     if imem and 'reg' in imem:
         args.append(('soc_imem', u32(imem['reg'], 0) & ~0x1fffff))   # the 2 MB block that holds it
 
+    def stream(compatible, arg):
+        _, props = find(nodes, compatible)
+        if props and 'iommus' in props and len(props['iommus']) >= 8:
+            args.append((arg, u32(props['iommus'], 1)))   # iommus = <phandle stream mask>; the stream is the second cell
+
+    stream('qcom,ipa-smmu-ap-cb', 'soc_ipa_stream')
+    stream('qcom,ipa-smmu-uc-cb', 'soc_ipa_stream_uc')
+
     for name, value in args:
         print(f'{name}={value:#x}')
     if not args:

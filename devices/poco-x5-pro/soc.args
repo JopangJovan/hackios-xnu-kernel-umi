@@ -8,3 +8,5 @@ soc_cmd_db=0x80860000
 soc_mpss_mem=0x8b800000
 soc_smem=0x80900000
 soc_imem=0x14600000
+soc_ipa_stream=0x480
+soc_ipa_stream_uc=0x482

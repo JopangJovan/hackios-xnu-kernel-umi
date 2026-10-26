@@ -1961,8 +1961,9 @@ ipa_hardware_init(void)
  * gives the IPA's streams the mask 0, so each takes a match register of its own, with the mask 0,
  * both sending to the one context.
  */
-#define IPA_STREAM              0x480u
-#define IPA_STREAM_UC           0x482u          /* the IPA's microcontroller: its own match register */
+#define IPA_STREAM_DEFAULT      0x480u
+#define IPA_STREAM_UC_DEFAULT   0x482u          /* the IPA's microcontroller: its own match register */
+static uint32_t ipa_stream = IPA_STREAM_DEFAULT, ipa_stream_uc = IPA_STREAM_UC_DEFAULT;  /* dt: iommus of ipa_smmu_ap and ipa_smmu_uc */
 #define IPA_SPACE_BASE          0x80000000ull   /* a gigabyte from here, as it is */
 #define IPA_IMEM_DEFAULT        0x14600000u   /* the 2 MB block that holds the SoC internal memory (dt: qcom,msm-imem) */
 static uint32_t ipa_imem = IPA_IMEM_DEFAULT;
@@ -2034,7 +2035,7 @@ static bool
 ipa_space_on(void)
 {
 	bool used[256] = { false };
-	uint32_t scr0, idr0, idr1, matches, contexts, sees = 1u << 31 | IPA_STREAM, sees_uc = 1u << 31 | IPA_STREAM_UC;
+	uint32_t scr0, idr0, idr1, matches, contexts, sees = 1u << 31 | ipa_stream, sees_uc = 1u << 31 | ipa_stream_uc;
 	uint64_t *root, *ddr, *soc, ttbr;
 
 	if (ipa_space.on) {
@@ -2113,7 +2114,7 @@ ipa_space_on(void)
 	printf("mpss: ipa: THE SMMU IS ABOUT TO BE WRITTEN: context %u gets our tables (root %#llx: DDR from %#llx as it is, 1 GB, and "
 	    "the SoC's memory at %#llx) and match registers %u and %u send streams %#x and %#x through it (before: smr %#x s2cr %#x, "
 	    "smr %#x s2cr %#x, sctlr %#x)\n", ipa_space.context, ttbr & 0x0000fffffffff000ull, IPA_SPACE_BASE, ipa_imem, ipa_space.match,
-	    ipa_space.match_uc, IPA_STREAM, IPA_STREAM_UC, ipa_space.old_smr, ipa_space.old_s2cr, ipa_space.old_smr_uc, ipa_space.old_s2cr_uc,
+	    ipa_space.match_uc, ipa_stream, ipa_stream_uc, ipa_space.old_smr, ipa_space.old_s2cr, ipa_space.old_smr_uc, ipa_space.old_s2cr_uc,
 	    ipa_space.old_sctlr);
 	wr(apps_smmu_context.base + SMMU_CB_SCTLR, 0);
 	wr(apps_smmu_second.base + SMMU_CBA2R(ipa_space.context), SMMU_CBA2R_64_BIT);
@@ -2150,7 +2151,7 @@ ipa_space_on(void)
 	    !(rd(apps_smmu_context.base + SMMU_CB_SCTLR) & 1) || rd(apps_smmu_context.base + SMMU_CB_TTBR0) != (uint32_t)ttbr) {
 		lck_mtx_unlock(&hakios_smmu_lock);
 		printf("mpss: ipa: THE SMMU DID NOT TAKE WHAT WAS WRITTEN: streams %#x and %#x are not both going through context %u (smr %#x "
-		    "s2cr %#x, smr %#x s2cr %#x, sctlr %#x)\n", IPA_STREAM, IPA_STREAM_UC, ipa_space.context,
+		    "s2cr %#x, smr %#x s2cr %#x, sctlr %#x)\n", ipa_stream, ipa_stream_uc, ipa_space.context,
 		    rd(apps_smmu.base + SMMU_SMR(ipa_space.match)), rd(apps_smmu.base + SMMU_S2CR(ipa_space.match)),
 		    rd(apps_smmu.base + SMMU_SMR(ipa_space.match_uc)), rd(apps_smmu.base + SMMU_S2CR(ipa_space.match_uc)),
 		    rd(apps_smmu_context.base + SMMU_CB_SCTLR));
@@ -6318,6 +6319,8 @@ soc_override(void)
 	PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
 	PE_parse_boot_argn("soc_mpss_mem", &mpss_memory, sizeof(mpss_memory));
 	PE_parse_boot_argn("soc_imem", &ipa_imem, sizeof(ipa_imem));
+	PE_parse_boot_argn("soc_ipa_stream", &ipa_stream, sizeof(ipa_stream));
+	PE_parse_boot_argn("soc_ipa_stream_uc", &ipa_stream_uc, sizeof(ipa_stream_uc));
 	if (said != 0 || smem_phys != SMEM_PHYS_DEFAULT || mpss_memory != MPSS_MEMORY_DEFAULT) {
 		printf("mpss: SoC addresses from boot-args: %u register blocks; shared memory %#x, command DB %#x, the modem's "
 		    "memory %#x, the SoC's internal memory %#x\n", said, smem_phys, cmd_db_phys, mpss_memory, ipa_imem);
