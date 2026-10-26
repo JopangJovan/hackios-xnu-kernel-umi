@@ -1,6 +1,10 @@
 #!/bin/bash
 # Build XNU for redwood on Linux. Extra make args are passed through.
 source "$(dirname "${BASH_SOURCE[0]}")/xnu-env.sh"
+python3 "$HACKIOS_ROOT/tools/bluetooth/embed-firmware.py" \
+  --patch "$HACKIOS_ROOT/fw-bluetooth/htbtfw20.tlv" \
+  --nvm "$HACKIOS_ROOT/fw-bluetooth/htnv20.bin" \
+  --output "$XNU_SRC/bsd/dev/umi_bt_firmware.inc" || exit 1
 cd "$XNU_SRC" || exit 1
 # The Wi-Fi driver's object (tools/mk-ath11k.sh) is linked into the kernel when it is there; make
 # does not see it change, so the linked kernel is thrown away when it has.

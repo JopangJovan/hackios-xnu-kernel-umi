@@ -1,12 +1,13 @@
-/* UMI QCA6390 Bluetooth transport survey. Addresses/pins are from UMI's DT
- * and Xiaomi's GCC/GENI drivers. No UART FIFO, reset, regulator or clock is
- * written by stage 1. Stage 2 temporarily votes UART clocks on. */
+/* UMI QCA6390 Bluetooth UART, volatile firmware bootstrap and radio diagnostics.
+ * Board wiring comes from UMI DT and Xiaomi GCC/GENI drivers; Hastings NVM
+ * and unified HCI replies follow upstream btqca.c. */
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
 #include <sys/hk_bluetooth.h>
+#include "umi_bt_firmware.inc"
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern bool umi_wifi_is_board(void);
 extern void hk_tl(const char *, ...) __printflike(1, 2);
@@ -77,6 +78,231 @@ static void bt_loopback(vm_offset_t uart)
         bt_write(uart,0x618,0xffffffff); bt_write(uart,0x648,0xffffffff);
     }
 }
+#define BT_EVENT_MAX 258u
+static struct hk_bt_h4 bt_rx_packet;
+static uint32_t bt_rx_word;
+static unsigned bt_rx_left;
+static bool bt_ibs_ack_pending;
+static unsigned bt_ibs_wakes, bt_ibs_sleeps;
+static uint8_t bt_nvm_work[8192];
+
+/* Retain the unused tail of a FIFO word across packet boundaries. */
+static int bt_rx_event(vm_offset_t uart, uint8_t event[BT_EVENT_MAX], unsigned *length)
+{
+    for (unsigned budget = 0; budget < HK_BT_H4_MAX; budget++) {
+        if (!bt_rx_left) {
+            /* The UART firmware requires receive IRQ acknowledgement to rearm
+             * stale/partial-word flushing, even when we poll instead of using IRQs. */
+            uint32_t irq = bt_read(uart, 0x640);
+            if (irq) bt_write(uart, 0x648, irq);
+            uint32_t status = bt_read(uart, 0x804), words = status & 0x1ffffff;
+            if (!words) return 0;
+            if (words > ((bt_read(uart, 0xe28) >> 16) & 0x3f)) return -EIO;
+            unsigned last = (status >> 28) & 7;
+            bt_rx_left = words == 1 && (status >> 31) && last ? last : 4;
+            if (bt_rx_left > 4) return -EIO;
+            bt_rx_word = bt_read(uart, 0x780);
+        }
+        uint8_t byte = bt_rx_word & 0xff;
+        bt_rx_word >>= 8;
+        bt_rx_left--;
+        int result = hk_bt_h4_push(&bt_rx_packet, byte);
+        if (result < 0) {
+            hk_tl("UMI BT: H4 framing error=%d byte=%#x\n", result, byte);
+            memset(&bt_rx_packet, 0, sizeof(bt_rx_packet));
+            return -EILSEQ;
+        }
+        if (result == 2 && byte == 0xfd) { bt_ibs_ack_pending = true; bt_ibs_wakes++; }
+        if (result == 2 && byte == 0xfe) bt_ibs_sleeps++;
+        if (result != 1 || bt_rx_packet.bytes[0] != 4) continue;
+        if (bt_rx_packet.used > BT_EVENT_MAX) return -EMSGSIZE;
+        *length = bt_rx_packet.used;
+        memcpy(event, bt_rx_packet.bytes, *length);
+        return 1;
+    }
+    return 0;
+}
+static int bt_uart_tx(vm_offset_t uart, const uint8_t *packet, unsigned length)
+{
+    unsigned sent = 0, depth = (bt_read(uart, 0xe24) >> 16) & 0x3f;
+    if (!depth || depth > 64 || !length || length > 260) return EINVAL;
+    bt_write(uart, 0x618, 0xffffffff);
+    bt_write(uart, 0x270, length);
+    bt_write(uart, 0x600, 1u << 27);
+    for (unsigned elapsed = 0; elapsed < length * 180 + 10000; elapsed++) {
+        unsigned used = bt_read(uart, 0x800) & 0x0fffffff;
+        if (used > depth) return EIO;
+        for (unsigned free = depth - used; free && sent < length; free--)
+            bt_write(uart, 0x700, packet[sent++]);
+        uint32_t irq = bt_read(uart, 0x610);
+        if (sent == length && (irq & 1)) {
+            bt_write(uart, 0x618, irq);
+            return 0;
+        }
+        delay(1);
+    }
+    hk_tl("UMI BT: TX timeout sent=%u/%u irq=%#x fifo=%#x\n",
+        sent, length, bt_read(uart, 0x610), bt_read(uart, 0x800));
+    bt_write(uart, 0x604, 4);
+    return ETIMEDOUT;
+}
+static int bt_service_ibs(vm_offset_t uart)
+{
+    if (!bt_ibs_ack_pending) return 0;
+    const uint8_t ack = 0xfc;
+    int error = bt_uart_tx(uart, &ack, 1);
+    if (!error) bt_ibs_ack_pending = false;
+    return error;
+}
+static int bt_hci_command(vm_offset_t uart, uint16_t opcode, const uint8_t *params,
+    unsigned param_length, bool wait, uint8_t event[BT_EVENT_MAX], unsigned *event_length)
+{
+    uint8_t packet[259];
+    if (param_length > 255) return EINVAL;
+    packet[0] = 1; packet[1] = opcode & 0xff; packet[2] = opcode >> 8; packet[3] = param_length;
+    if (param_length) memcpy(packet + 4, params, param_length);
+    *event_length = 0;
+    int error = bt_uart_tx(uart, packet, param_length + 4);
+    if (error || !wait) return error;
+    for (unsigned elapsed = 0; elapsed < 100000; elapsed++) {
+        int result = bt_rx_event(uart, event, event_length);
+        if (result < 0) return -result;
+        error = bt_service_ibs(uart);
+        if (error) return error;
+        if (result == 1) {
+            int status = hk_bt_cc_status(event, *event_length, opcode);
+            if (status >= 0) {
+                if (status) hk_tl("UMI BT: HCI %#x status=%#x\n", opcode, status);
+                return status ? EIO : 0;
+            }
+            if (opcode == 0xfc00 && hk_bt_qca_tlv_ack(event, *event_length)) return 0;
+            /* Inquiry and other asynchronous commands acknowledge with Command Status. */
+            if (*event_length == 7 && event[1] == 0x0f &&
+                event[5] == (uint8_t)opcode && event[6] == (uint8_t)(opcode >> 8))
+                return event[3] ? EIO : 0;
+            hk_tl("UMI BT: unsolicited event=%#x while waiting for %#x\n", event[1], opcode);
+        }
+        *event_length = 0;
+        delay(10);
+    }
+    hk_tl("UMI BT: HCI %#x timed out RX=%#x SIRQ=%#x\n", opcode,
+        bt_read(uart, 0x804), bt_read(uart, 0x640));
+    return ETIMEDOUT;
+}
+static int bt_qca_download(vm_offset_t uart, const uint8_t *tlv, size_t size, bool skip_events)
+{
+    if (!tlv || size < 4 || size > 512 * 1024 ||
+        (tlv[1] | (uint32_t)tlv[2] << 8 | (uint32_t)tlv[3] << 16) != size - 4) return EINVAL;
+    size_t offset = 0;
+    unsigned segment = 0;
+    while (offset < size) {
+        unsigned part = (unsigned)(size - offset);
+        if (part > 243) part = 243;
+        uint8_t params[245], event[BT_EVENT_MAX]; unsigned length = 0;
+        params[0] = 0x1e; params[1] = part;
+        memcpy(params + 2, tlv + offset, part);
+        offset += part; segment++;
+        bool ack = !skip_events || offset == size;
+        int error = bt_hci_command(uart, 0xfc00, params, part + 2, ack, event, &length);
+        if (!error && ack && !hk_bt_qca_tlv_ack(event, length)) error = EIO;
+        if (error) {
+            hk_tl("UMI BT: TLV type=%u segment=%u/%u failed errno=%d\n",
+                tlv[0], segment, (unsigned)((size + 242) / 243), error);
+            return error;
+        }
+    }
+    hk_tl("UMI BT: TLV type=%u accepted: %u bytes, %u segments\n", tlv[0], (unsigned)size, segment);
+    return 0;
+}
+static uint16_t bt_le16(const uint8_t *p) { return p[0] | (uint16_t)p[1] << 8; }
+static uint32_t bt_le32(const uint8_t *p) { return bt_le16(p) | (uint32_t)bt_le16(p + 2) << 16; }
+static int bt_qca_firmware(vm_offset_t uart)
+{
+    uint8_t event[BT_EVENT_MAX]; unsigned length = 0;
+    const uint8_t version_request = 0x19;
+    int error = bt_hci_command(uart, 0xfc00, &version_request, 1, true, event, &length);
+    if (error) return error;
+    if (length != 21 || event[7] != 0x19) {
+        hk_tl("UMI BT: unsupported QCA version response length=%u\n", length);
+        return ENODEV;
+    }
+    uint32_t product = bt_le32(event + 9), soc = bt_le32(event + 17);
+    uint16_t rom = bt_le16(event + 15);
+    hk_tl("UMI BT: QCA product=%#x ROM=%#x SoC=%#x patch=%#x\n",
+        product, rom, soc, bt_le16(event + 13));
+    if (product != 0x10 || rom != 0x200 || soc != 0x400a0200) return ENODEV;
+    if (umi_bt_patch_size < 28 || umi_bt_nvm_size < 4) return ENOENT;
+    if (bt_le16(umi_bt_patch + 16) != product || bt_le16(umi_bt_patch + 18) != rom)
+        return EINVAL;
+    unsigned mode = umi_bt_patch[14];
+    if (mode != 0 && mode != 3) return EINVAL;
+    if (umi_bt_nvm_size > sizeof(bt_nvm_work)) return E2BIG;
+    memcpy(bt_nvm_work, umi_bt_nvm, umi_bt_nvm_size);
+    if (hk_bt_qca6390_nvm_prepare(bt_nvm_work, umi_bt_nvm_size)) return EINVAL;
+    hk_tl("UMI BT: loading htbtfw20/htnv20 at 115200 baud (Hastings tag17 byte1)\n");
+    error = bt_qca_download(uart, umi_bt_patch, umi_bt_patch_size, mode == 3);
+    if (error) return error;
+    delay(10000);
+    error = bt_qca_download(uart, bt_nvm_work, umi_bt_nvm_size, false);
+    if (error) return error;
+    /* QCA6390's normal Linux sequence disables diagnostic logging before reset. */
+    const uint8_t logging[] = {0x14, 0};
+    error = bt_hci_command(uart, 0xfc17, logging, sizeof(logging), true, event, &length);
+    if (error) return error;
+    error = bt_hci_command(uart, 0x0c03, NULL, 0, true, event, &length);
+    if (error) return error;
+    error = bt_hci_command(uart, 0x1001, NULL, 0, true, event, &length);
+    if (error) return error;
+    if (length != 15 || bt_le16(event + 11) != 29 || bt_le16(event + 13) == 0x0d2b) return EIO;
+    hk_tl("UMI BT: firmware running after reset: HCI=%#x LMP=%#x subversion=%#x\n",
+        event[7], event[10], bt_le16(event + 13));
+    return 0;
+}
+static int bt_radio_scan(vm_offset_t uart)
+{
+    uint8_t event[BT_EVENT_MAX]; unsigned length = 0;
+    const uint8_t mask[] = {0xff,0xff,0xfb,0xff,0x07,0xf8,0xbf,0x3d};
+    const uint8_t le_mask[] = {2,0,0,0,0,0,0,0};
+    const uint8_t params[] = {0,0x60,0,0x30,0,0,0};
+    const uint8_t enable[] = {1,1}, disable[] = {0,0};
+    int error = bt_hci_command(uart,0x0c01,mask,sizeof(mask),true,event,&length);
+    if (!error) error = bt_hci_command(uart,0x2001,le_mask,sizeof(le_mask),true,event,&length);
+    if (!error) error = bt_hci_command(uart,0x200b,params,sizeof(params),true,event,&length);
+    if (!error) error = bt_hci_command(uart,0x200c,enable,sizeof(enable),true,event,&length);
+    if (error) return error;
+    unsigned reports = 0;
+    uint64_t deadline;
+    clock_interval_to_deadline(3000, NSEC_PER_MSEC, &deadline);
+    while (mach_absolute_time() < deadline) {
+        int result = bt_rx_event(uart,event,&length);
+        if (result < 0) { error = -result; break; }
+        error = bt_service_ibs(uart);
+        if (error) break;
+        if (result == 1 && event[1] == 0x3e && length >= 5 && event[3] == 2) reports += event[4];
+        delay(100);
+    }
+    int stop = bt_hci_command(uart,0x200c,disable,sizeof(disable),true,event,&length);
+    hk_tl("UMI BT: LE passive scan reports=%u stop=%d\n",reports,stop);
+    if (error || stop) return error ? error : stop;
+    const uint8_t inquiry[] = {0x33,0x8b,0x9e,2,0};
+    error = bt_hci_command(uart,0x0401,inquiry,sizeof(inquiry),true,event,&length);
+    if (error) return error;
+    unsigned classic = 0; bool complete = false;
+    clock_interval_to_deadline(4000, NSEC_PER_MSEC, &deadline);
+    while (mach_absolute_time() < deadline) {
+        int result = bt_rx_event(uart,event,&length);
+        if (result < 0) return -result;
+        error = bt_service_ibs(uart);
+        if (error) return error;
+        if (result == 1) {
+            if ((event[1] == 2 || event[1] == 0x22 || event[1] == 0x2f) && length >= 4) classic += event[3];
+            if (event[1] == 1) { complete = true; break; }
+        }
+        delay(100);
+    }
+    hk_tl("UMI BT: classic inquiry reports=%u complete=%u IBS wakes=%u sleeps=%u\n",classic,complete,bt_ibs_wakes,bt_ibs_sleeps);
+    return complete ? 0 : ETIMEDOUT;
+}
 /* Set the documented QUPv3 fractional root to 7.3728 MHz. GPLL0_OUT_EVEN
  * is parent selector 6; 384/15625 gives an exact UART sampling clock. */
 static bool bt_uart_clock(vm_offset_t gcc)
@@ -97,9 +323,26 @@ static void bt_gpio(vm_offset_t gpio,unsigned pin,unsigned cfg,bool high)
     bt_write(gpio,pin*0x1000+4,high?2:0);
     bt_write(gpio,pin*0x1000,cfg);
 }
+static int bt_uart_quiesce(vm_offset_t uart)
+{
+    for (unsigned attempt=0; attempt<2; attempt++) {
+        uint32_t active=bt_read(uart,0x40);
+        if (!(active & 0x1001)) break;
+        if (active & 1) bt_write(uart,0x604,attempt?2:4);
+        if (active & 0x1000) bt_write(uart,0x634,attempt?2:4);
+        for (unsigned t=0; t<10000 && (bt_read(uart,0x40)&0x1001); t++) delay(1);
+    }
+    if (bt_read(uart,0x40)&0x1001) return ETIMEDOUT;
+    unsigned depth=(bt_read(uart,0xe28)>>16)&0x3f;
+    unsigned words=bt_read(uart,0x804)&0x1ffffff;
+    if (!depth || words>depth) return EIO;
+    while(words--) (void)bt_read(uart,0x780);
+    bt_write(uart,0x618,0xffffffff); bt_write(uart,0x648,0xffffffff);
+    return 0;
+}
 /* Power the radio, issue HCI Reset and Read Local Version, then leave reset
  * asserted. Firmware download is a separate step after this ROM handshake. */
-static void bt_hci_probe(vm_offset_t gcc,vm_offset_t gpio,vm_offset_t uart)
+static void bt_hci_probe(vm_offset_t gcc,vm_offset_t gpio,vm_offset_t uart,bool firmware)
 {
     uint32_t root[5]={bt_read(gcc,0x17730),bt_read(gcc,0x17734),bt_read(gcc,0x17738),bt_read(gcc,0x1773c),bt_read(gcc,0x17740)};
     uint32_t pin21=bt_read(gpio,21*0x1000),io21=bt_read(gpio,21*0x1000+4),pin124=bt_read(gpio,124*0x1000),io124=bt_read(gpio,124*0x1000+4);
@@ -113,7 +356,7 @@ static void bt_hci_probe(vm_offset_t gcc,vm_offset_t gpio,vm_offset_t uart)
     bt_write(gcc,0x52008,vote|mask);
     unsigned i;
     for(i=0;i<10000;i++) if(!((bt_read(gcc,0x17004)|bt_read(gcc,0x17008)|bt_read(gcc,0x1772c))&0x80000000)) break; else delay(1);
-    int error= i==10000 ? ETIMEDOUT : 0;
+    int error= i==10000 ? ETIMEDOUT : bt_uart_quiesce(uart);
     if(!error && !bt_uart_clock(gcc)) error=ETIMEDOUT;
     if(!error) error=umi_rpmh_bluetooth_power();
     if(error) { hk_tl("UMI BT: power/clock setup failed errno=%d\n",error); goto cleanup; }
@@ -138,37 +381,26 @@ static void bt_hci_probe(vm_offset_t gcc,vm_offset_t gpio,vm_offset_t uart)
     bt_write(uart,0x80c,1); bt_write(uart,0x810,0); bt_write(uart,0x814,6);
     bt_write(uart,0x618,0xffffffff); bt_write(uart,0x648,0xffffffff);
     bt_write(uart,0x630,(1u<<27)|0x80); /* START_READ, RFR_OPEN */
-    const uint8_t cmd[]={0x01,0x03,0x0c,0x00};
-    bt_write(uart,0x270,sizeof(cmd)); bt_write(uart,0x600,1u<<27);
-    for(unsigned b=0;b<sizeof(cmd);b++) bt_write(uart,0x700,cmd[b]);
-    uint8_t data[32]; unsigned n=0;
-    for(unsigned us=0;us<300000 && n<7;us++) {
-        uint32_t st=bt_read(uart,0x804),words=st&0x1ffffff;
-        while(words--) { unsigned bytes=4; if(!words&&(st>>31)) bytes=(st>>28)&7; uint32_t w=bt_read(uart,0x780);
-            for(unsigned b=0;b<bytes;b++) if(n<sizeof(data)) data[n++]=(w>>(b*8))&0xff; }
-        if(n>=7) break; delay(1);
-    }
-    hk_tl("UMI BT: HCI reset response bytes=%u MIRQ=%#x SIRQ=%#x RX=%#x GPIO16=%#x GPIO19=%#x:",n,bt_read(uart,0x610),bt_read(uart,0x640),bt_read(uart,0x804),bt_read(gpio,16*0x1000+4),bt_read(gpio,19*0x1000+4));
-    for(unsigned b=0;b<n;b++) hk_tl(" %02x",data[b]);
-    hk_tl("\n");
-    if(n>=7 && data[0]==4 && data[1]==0x0e && data[3]==1 && data[4]==3 && data[5]==0x0c && data[6]==0) {
-        hk_tl("UMI BT: controller answered HCI Reset; requesting local version\n");
-        const uint8_t ver[]={0x01,0x01,0x10,0x00};
-        bt_write(uart,0x618,0xffffffff); bt_write(uart,0x270,sizeof(ver)); bt_write(uart,0x600,1u<<27);
-        for(unsigned b=0;b<sizeof(ver);b++) bt_write(uart,0x700,ver[b]);
-        n=0; for(unsigned us=0;us<300000 && n<15;us++) {
-            uint32_t st=bt_read(uart,0x804),words=st&0x1ffffff;
-            while(words--) { unsigned bytes=4; if(!words&&(st>>31)) bytes=(st>>28)&7; uint32_t w=bt_read(uart,0x780);
-                for(unsigned b=0;b<bytes;b++) if(n<sizeof(data)) data[n++]=(w>>(b*8))&0xff; }
-            if(n>=15) break; delay(1);
+    memset(&bt_rx_packet,0,sizeof(bt_rx_packet));
+    bt_rx_left=0; bt_ibs_ack_pending=false; bt_ibs_wakes=bt_ibs_sleeps=0;
+    uint8_t event[BT_EVENT_MAX]; unsigned length=0;
+    error=bt_hci_command(uart,0x0c03,NULL,0,true,event,&length);
+    if(!error) error=bt_hci_command(uart,0x1001,NULL,0,true,event,&length);
+    if(!error && length==15) {
+        hk_tl("UMI BT: cold HCI=%#x manufacturer=%u LMP subversion=%#x\n",
+            event[7],bt_le16(event+11),bt_le16(event+13));
+        if(firmware) {
+            error=bt_qca_firmware(uart);
+            if(!error) error=bt_radio_scan(uart);
         }
-        hk_tl("UMI BT: HCI version response bytes=%u:",n); for(unsigned b=0;b<n;b++) hk_tl(" %02x",data[b]); hk_tl("\n");
-    }
-    bt_write(uart,0x604,4); bt_write(uart,0x634,4);
-    for(i=0;i<10000 && (bt_read(uart,0x40)&0x1001);i++) delay(1);
-    if(bt_read(uart,0x40)&0x1001) { bt_write(uart,0x604,2); bt_write(uart,0x634,2); }
-    bt_gpio(gpio,21,0x241,false); /* leave the controller held in reset */
+    } else if(!error) error=EILSEQ;
+    hk_tl("UMI BT: %s probe result=%d\n",firmware?"firmware/radio":"ROM HCI",error);
+    bt_gpio(gpio,21,0x241,false);
+    int stopped=bt_uart_quiesce(uart);
+    hk_tl("UMI BT: UART shutdown result=%d\n",stopped);
 cleanup:
+    for(unsigned p=0;p<sizeof(uvals)/sizeof(uvals[0]);p++) bt_write(uart,uregs[p],uvals[p]);
+    bt_write(uart,0x618,0xffffffff); bt_write(uart,0x648,0xffffffff);
     bt_write(gpio,21*0x1000+4,io21&2); bt_write(gpio,21*0x1000,pin21);
     bt_write(gpio,124*0x1000+4,io124&2); bt_write(gpio,124*0x1000,pin124);
     for(unsigned p=0;p<4;p++) bt_write(gpio,(16+p)*0x1000,pins[p]);
@@ -181,7 +413,7 @@ cleanup:
 void umi_bluetooth_init(void)
 {
     uint32_t probe = 0;
-    if (!PE_parse_boot_argn("umi_bt_probe", &probe, sizeof(probe)) || probe < 1 || probe > 4) return;
+    if (!PE_parse_boot_argn("umi_bt_probe", &probe, sizeof(probe)) || probe < 1 || probe > 5) return;
     if (!umi_wifi_is_board()) { hk_tl("UMI BT: board identity mismatch\n"); return; }
     vm_offset_t gcc = ml_io_map(0x00100000, 0x80000);
     vm_offset_t gpio = ml_io_map(0x0f900000, 0x80000);
@@ -216,7 +448,7 @@ void umi_bluetooth_init(void)
         if (uart) for (unsigned i=0; i<sizeof(regs)/sizeof(regs[0]); ++i)
             hk_tl("UMI BT: GENI %#x=%#x\n",regs[i],bt_read(uart,regs[i]));
         if (uart && probe == 3) bt_loopback(uart);
-        if (uart && probe == 4) bt_hci_probe(gcc,gpio,uart);
+        if (uart && probe >= 4) bt_hci_probe(gcc,gpio,uart,probe==5);
     }
     if (probe >= 2) {
         bt_write(gcc,0x17008,(bt_read(gcc,0x17008) & ~2u) | saved_slave_hwcg);

@@ -2787,7 +2787,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 			if (adsp_return || end - c != 13 || c[12] != '1') ok = 0;
 			adsp_return = 1;
 		} else if (starts_with(c, "umi_bt_probe=")) {
-			if (end - c != 14 || c[13] < '1' || c[13] > '4') ok = 0;
+			if (end - c != 14 || c[13] < '1' || c[13] > '5') ok = 0;
 		} else if (starts_with(c, "umi_amp_probe=")) {
 			if (umi_amp_probe || end - c != 15 || c[14] < '1' || c[14] > '5') ok = 0;
 			umi_amp_probe = 1;

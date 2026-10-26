@@ -1,64 +1,86 @@
 # UMI Bluetooth bring-up
 
-UMI uses the Hastings QCA6390 Bluetooth controller over QUPv3 SE6 UART
-(0x00998000), not the Wi-Fi PCIe transport. Stock Android identifies HCI 5.2,
-manufacturer 29, LMP subversion 0x27ec.
+UMI's Hastings QCA6390 Bluetooth controller uses QUPv3 SE6 UART at
+0x00998000. Its Bluetooth connection is separate from the Wi-Fi PCIe transport.
 
-## Board wiring
+## Verified hardware
 
-UART CTS/RTS/TX/RX are GPIO16/17/18/19 (qup6); reset is GPIO21 and
-SW_CTRL is GPIO124, on NORTH TLMM at 0x0f900000. GCC is at 0x00100000.
-SE6 RCG is 0x17730 and its branch 0x1772c. Clock votes at 0x52008 use
-bits 6, 7, and 16. The slave AHB branch 0x17008 requires temporarily
-clearing HWCG bit 1 to access the idle engine. Diagnostic probes restore
-that bit and only remove votes they introduced.
+UART CTS/RTS/TX/RX use GPIO16/17/18/19, alternate function qup6. Reset is
+GPIO21; SW_CTRL is GPIO124. NORTH TLMM is at 0x0f900000 and GCC at 0x00100000.
+SE6's RCG is 0x17730 and its branch is 0x1772c. Votes at 0x52008 use bits
+6, 7, and 16. Temporarily clearing the slave AHB HWCG bit at 0x17008 permits
+idle-engine access. Diagnostic cleanup restores inherited votes and HWCG.
 
-Stock firmware comes from /vendor/bt_firmware/image, a separate firmware
-partition. Keep htbtfw10.tlv, htbtfw20.tlv, htnv10.bin and htnv20.bin under
-local fw-bluetooth/. The userland build copies these into fw/qca6390-bt.
-Firmware and per-device NVM are not committed.
+The stock Bluetooth rail order and minimum voltages are smpa6 (AON, 950 mV),
+smpf2 (digital, 950 mV), smpa5 (RFA1, 1900 mV), smpc8 (RFA2, 1350 mV), and
+ldoa16 (ASD, 3025 mV). Rail votes remain active until reset because some rails
+are shared with Wi-Fi. Reset is held low for 56 ms, then released for 56 ms.
 
-## Diagnostics
+The QUPv3 UART microcode is already present (protocol 2, revision 3). The
+fractional root uses GPLL0-even, M/N 384/15625, to generate 7.3728 MHz. A
+serial divider of 4 with 16x sampling gives 115200 baud, 8N1.
 
-umi_bt_probe=1 surveys clocks and GPIO without writes. Stage 2 temporarily
-votes clocks and reads GENI status without accessing FIFO. Hardware tests
-confirmed protocol 2 revision 3 firmware already loaded, FIFO mode available,
-and idle command engines. Stage 3 performs bounded internal eight-byte UART
-loopback, then cancels the engines and restores configuration. Hardware loopback passed all eight bytes in 33 microseconds and cleanup
-reported both sequencers idle (logs/204055-run.log). No probe
-powers the Bluetooth controller or changes its pinmux/reset.
+## Firmware
 
-Run the diagnostic with bootcpu=7 cpus=1, without starting iOS.
-The loader whitelist accepts stages 1 through 4. Stage 4 now sequences the
-stock Bluetooth rails, sideband GPIO, reset delay, QUP6 pins and 115200-baud
-GENI clock, then requests HCI Reset and Read Local Version. It holds reset
-low again and restores UART and clock configuration before returning. The live UMI probe completed HCI Reset and Read Local Version. The controller
-reported HCI/LMP version 0x09 (Bluetooth 5.2), manufacturer 0x001d (Qualcomm),
-and LMP subversion 0x0d2b. See logs/100309-run.log. The ROM response matches
-the stock Android-reported controller family; firmware download has not yet
-been attempted.
+Pull htbtfw10.tlv, htbtfw20.tlv, htnv10.bin, and htnv20.bin from the stock
+/vendor/bt_firmware/image partition into local fw-bluetooth/. They are not
+committed. The userland build packages them under fw/qca6390-bt, and
+xnu-build.sh generates an ignored C include for the local ROM2 patch/NVM.
+Missing local files produce an unavailable-firmware stub rather than stale data.
 
-Host validation:
+QCA's vendor version request confirms product 0x10, ROM 0x200, and SoC
+0x400a0200 before ROM2 firmware is selected. TLV data uses 243-byte segments.
+Hastings acknowledges downloads with unified Command Complete responses:
+04 0e 05 01 00 fc 00 1e. Both status and subopcode are checked.
+
+Hastings/WCN3991+ NVM tag 17 stores UART baud in payload byte **1**, unlike
+Rome's byte 2. Set byte 1 to QCA_BAUDRATE_115200 (0) and preserve byte 2.
+Changing the Rome byte left the running firmware responsive until reset,
+when the UART changed speed. The NVM helper validates the entire container
+before editing it. SoC diagnostic logging is disabled before HCI Reset.
+
+The firmware sends QCA IBS controls: wake indication 0xfd requires an
+acknowledgement 0xfc, including while receiving scans without sending commands.
+0xfe is a sleep indication. IBS is recognized only between H4 frames.
+
+## Diagnostics and results
+
+Use bootcpu=7 cpus=1 and umi_bt_probe=N. Every diagnostic returns to xnuloader.
+
+- 1: read-only GCC/GPIO survey.
+- 2: temporary UART clock votes and non-FIFO GENI survey.
+- 3: internal eight-byte FIFO loopback (passed; logs/204055-run.log).
+- 4: power, reset, HCI Reset and Read Local Version without downloading firmware.
+- 5: verified ROM selection, patch/NVM download, reset, LE scan and classic inquiry.
+
+A cold controller reports HCI/LMP 0x09 (Bluetooth 5.0), manufacturer 29, and
+LMP subversion 0x0d2b. After firmware download and reset it reports HCI/LMP
+0x0b (Bluetooth 5.2), manufacturer 29, and subversion 0x27ec, matching Android.
+logs/103151-run.log confirms 776 patch segments and 24 NVM segments accepted,
+one LE advertising report, one classic inquiry report, inquiry completion,
+four IBS wake/sleep cycles, and clean UART shutdown. Peer addresses are not logged.
+
+Polling acknowledges GENI receive IRQs to rearm stale-word flushing. A partial
+FIFO word is retained across H4 packet boundaries, and event copies are bounded
+by the maximum 258-byte HCI event. Shutdown cancels/aborts sequencers and drains
+stale FIFO bytes before another kernel run.
+
+Host checks:
 
     cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined tools/bluetooth/test-h4.c -o /tmp/umi-h4-test
     /tmp/umi-h4-test
+    cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined tools/bluetooth/test-qca.c -o /tmp/umi-qca-test
+    /tmp/umi-qca-test
     python3 tools/bluetooth/inspect-qca-firmware.py fw-bluetooth/*
 
-The H4 parser bounds commands, ACL, SCO, events and ISO to 4096 bytes and
-recognizes QCA IBS only between frames. The firmware validator checks TLV
-lengths, patch metadata and NVM tag boundaries without printing tag payloads.
+## iOS integration remaining
 
-## Remaining work
+The hardware diagnostic can discover Bluetooth devices. Normal iOS pairing
+is not connected yet. Stock bluetoothd includes an H4 transport and a POSIX
+kernel-control driver; its BT_HCI_TRANSPORT setting can select those directly.
+The next layer is a persistent raw H4 endpoint and native-daemon integration.
+BlueTool's Broadcom firmware loader must not replace the QCA startup sequence.
 
-Board regulator sequencing, external UART HCI responses, ROM version-based
-firmware selection/download, IBS wake/sleep and the native iOS transport
-bridge remain unimplemented. Stock bluetoothd expects AppleBluetoothModule
-and AppleBluetoothModuleUserClient services; enabling its launch job alone
-will not provide controller support. iOS scanning and pairing are not yet
-working.
-
-Hardware references: local Xiaomi SM8250 sources in workspace/xiaomi_sm8250,
-msm_geni_serial.c, qcom-geni-se.c, gcc-kona.c, pinctrl-kona.c and UMI DT.
-
-Verified supply mapping: AON smpa6 950 mV, digital smpf2 950 mV,
-RFA1 smpa5 1900 mV, RFA2 smpc8 1350 mV, ASD ldoa16 3025 mV.
+References: local Xiaomi SM8250 msm_geni_serial.c, qcom-geni-se.c, gcc-kona.c,
+pinctrl-kona.c and UMI DT; upstream Qualcomm-specific NVM/unified-event behavior
+in https://github.com/torvalds/linux/blob/master/drivers/bluetooth/btqca.c.
