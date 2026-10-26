@@ -65,8 +65,8 @@ int main(void)
     assert(hakios_nas_apply(&state, lte_signal, sizeof(lte_signal)) == 1);
     assert(state.has_signal && !state.registered && state.bars == 0);
     assert(hakios_nas_apply(&state, registered, sizeof(registered)) == 1);
-    assert(state.registered && state.bars == 0);
-    assert(hakios_nas_apply(&state, lte_signal, sizeof(lte_signal)) == 1);
+    assert(state.registered && state.bars == 4);     /* the reading from before the registration counts */
+    assert(hakios_nas_apply(&state, lte_signal, sizeof(lte_signal)) == 0);   /* the same reading again: no change */
     assert(state.radio_interface == 8 && state.dbm == -95 && state.bars == 4);
     assert(hakios_nas_apply(&state, failed_signal, sizeof(failed_signal)) == 0);
     assert(state.bars == 4);
@@ -75,7 +75,10 @@ int main(void)
         assert(state.bars == 4);
     }
     assert(hakios_nas_apply(&state, disconnected, sizeof(disconnected)) == 1);
-    assert(!state.registered && !state.has_signal && state.bars == 0);
+    assert(!state.registered && state.has_signal && state.bars == 0);   /* the last reading is kept, no bars */
+    assert(hakios_nas_apply(&state, registered, sizeof(registered)) == 1);
+    assert(state.registered && state.bars == 4);     /* ... and they come back with the registration */
+    assert(hakios_nas_apply(&state, disconnected, sizeof(disconnected)) == 1);
     struct hakios_nas_client client;
     assert(hakios_nas_client_open(&client, &transport, changed, &client) == 0);
     assert(requests == 2);
@@ -87,6 +90,6 @@ int main(void)
     server(callback_context, false, 3, 1, 0, 7, 9);
     assert(!client.state.registered && client.state.bars == 0 && updates == 3);
     hakios_nas_client_close(&client);
-    puts("nas-test: registration gates bars; QRTR lookup, polling and disconnect verified");
+    puts("nas-test: registration gates bars, the last reading kept across a lost registration; QRTR lookup, polling and disconnect verified");
     return 0;
 }

@@ -65,11 +65,15 @@ hakios_nas_apply(struct hakios_nas_state *state, const void *frame, size_t lengt
 				    "CS %u, PS %u, network %u, %u radios%s%u\n", value[0], value[1], value[2], value[3], value[4],
 				    value[4] ? ", the first " : "", value[4] ? value[5] : 0);
 			}
+			/*
+			 * The modem answers the serving system and the signal strength in separate messages, and
+			 * on this phone the two alternate ("registered, no reading" / "not registered, -86 dBm",
+			 * cycles 39 to 41). The last reading is kept across a "not registered" sample, so that
+			 * the bars come back with the registration instead of waiting for the next reading:
+			 * bars only while registered, from the last reading there is.
+			 */
 			next.registered = value[0] == 1;
-			if (!next.registered) {
-				next.has_signal = false;
-				next.bars = 0;
-			}
+			next.bars = next.registered && next.has_signal ? bars_for(next.dbm) : 0;
 			serving = true;
 		} else if (message == 0x24 && type == 0x10 && size >= 5 && size >= (size_t)5 + value[4]) {
 			/* the current PLMN: MCC, MNC (16 bits each), the description's length and bytes */
