@@ -276,6 +276,14 @@ static void (*original_update_signal_item)(id self, SEL sel, long item, void *da
 static id cellular_aggregator;
 static int cellular_last_bars = -2, cellular_said;
 
+/* The getters and setters are blocks (their type is "@?"): called through the block's own invoke pointer, with the block first. */
+struct block_layout {
+	void *isa;
+	int flags, reserved;
+	void (*invoke)(void *, ...);
+};
+#define BLOCK_CALL(block, type, ...) ((type)((struct block_layout *)(block))->invoke)((block), __VA_ARGS__)
+
 static void
 update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter, void *setter)
 {
@@ -291,7 +299,7 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 		    item, data, (void *)sim, getter, setter, up, registered, bars);
 	}
 	if (up > 0 && registered > 0 && bars >= 0 && bars <= 5 && setter != NULL && data != NULL) {
-		((void (*)(void *, int))setter)(data, bars);
+		BLOCK_CALL(setter, void (*)(void *, void *, int), data, bars);
 		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
 		if (bars != cellular_last_bars) {
 			say("hakios: cellular: %d bars shown (item %ld)\n", bars, item);
@@ -303,23 +311,41 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 static void (*original_update_service_item)(id self, SEL sel, long item, void *data, id sim, id other, void *g1, void *s1, void *g2, void *s2,
     void *g3, void *s3, void *g4, void *s4);
 
-/* The service item ("No SIM", the network's name): looked at first; its string setter is for the next step. */
+/*
+ * The service item ("No SIM", the network's name): once the kernel's modem is registered, the
+ * network's name (sysctl kern.hakios.cellular_operator) goes in through the item's string setter
+ * and the item is switched on.
+ */
 static void
 update_service_item(id self, SEL sel, long item, void *data, id sim, id other, void *g1, void *s1, void *g2, void *s2, void *g3, void *s3,
     void *g4, void *s4)
 {
 	static int said;
+	static char shown[64];
+	char name[64] = "";
+	size_t size = sizeof(name) - 1;
+	int registered = sysctl_int("kern.hakios.cellular_registered");
 
 	if (original_update_service_item) {
 		original_update_service_item(self, sel, item, data, sim, other, g1, s1, g2, s2, g3, s3, g4, s4);
 	}
+	sysctlbyname("kern.hakios.cellular_operator", name, &size, NULL, 0);
 	if (said++ < 4) {
-		char name[64] = "";
-		size_t size = sizeof(name) - 1;
-
-		sysctlbyname("kern.hakios.cellular_operator", name, &size, NULL, 0);
 		say("hakios: cellular: service item %ld: data %p, SIM info %p, other %p; string getter %p setter %p, content type getter %p "
 		    "setter %p; the kernel's network \"%s\"\n", item, data, (void *)sim, (void *)other, g1, s1, g3, s3, name);
+	}
+	if (registered > 0 && name[0] != 0 && s1 != NULL && data != NULL) {
+		CFStringRef string = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+
+		if (string != NULL) {
+			BLOCK_CALL(s1, void (*)(void *, void *, CFStringRef), data, string);
+			((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
+			if (strcmp(shown, name) != 0) {
+				snprintf(shown, sizeof(shown), "%s", name);
+				say("hakios: cellular: service \"%s\" shown (item %ld)\n", name, item);
+			}
+			CFRelease(string);
+		}
 	}
 }
 

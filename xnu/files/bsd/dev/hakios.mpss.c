@@ -77,6 +77,7 @@
 #include <sys/vnode_internal.h>
 #include <vm/vm_kern.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.ipa.h>
 #include <sys/hakios.nas.h>
 #include <sys/hakios.qrtr.h>
 #include <sys/sysctl.h>
@@ -2096,6 +2097,11 @@ ipa_space_on(void)
 	}
 	soc[(IPA_IMEM >> 21) & 0x1ff] = IPA_IMEM | IPA_BLOCK_DEVICE;
 	root[IPA_SPACE_BASE >> 30] = kvtophys((vm_offset_t)ddr) | IPA_TABLE;
+	/* the rest of DDR (the phone has 6 or 8 GB from 0x80000000), as 1 GB blocks of the root: the data path's rings and
+	 * buffers (hakios.ipa.c) are wherever the kernel's memory is */
+	for (unsigned g = (IPA_SPACE_BASE >> 30) + 1; g < (IPA_SPACE_BASE >> 30) + 8; g++) {
+		root[g] = ((uint64_t)g << 30) | IPA_BLOCK;
+	}
 	root[IPA_IMEM >> 30] = kvtophys((vm_offset_t)soc) | IPA_TABLE;
 	FlushPoC_DcacheRegion(ipa_space.tables, 3 * 4096);
 	settle();
@@ -2344,6 +2350,10 @@ ipa_firmware_load(void)
 	if (!option("modem_ipa_raw")) {
 		ipa_memory_init();
 		ipa_hardware_init();
+		/* this processor's own channels and endpoints, and the IPA's tables, before the modem (hakios.ipa.c); then en1 on them */
+		if (hakios_ipa_data_setup()) {
+			hakios_cell_attach();
+		}
 	}
 	ok = true;
 out:
@@ -5309,10 +5319,75 @@ static bool keep;                       /* (defined below: the DSP and the link 
 #define QMI_WDS                 0x01
 #define WDS_START_NETWORK_INTERFACE 0x0020
 #define WDS_GET_CURRENT_SETTINGS 0x002d
-static struct hakios_qrtr_port *wds_port;
-static uint32_t wds_node, wds_port_number;
-static volatile bool wds_started, wds_up;
+#define WDS_BIND_MUX_DATA_PORT  0x00a2
+#define QMI_WDA                 0x1a
+#define WDA_SET_DATA_FORMAT     0x0020
+#define DATA_ENDPOINT_EMBEDDED  4               /* the IPA, "interface" 1: where the packets of this session go (as ModemManager binds it) */
+#define DATA_ENDPOINT_INTERFACE 1
+#define DATA_MUX                1               /* the QMAP mux id (hakios.cell.c carries mux 1) */
+static struct hakios_qrtr_port *wds_port, *wda_port;
+static uint32_t wds_node, wds_port_number, wda_node, wda_port_number;
+static volatile bool wds_started, wds_up, wds_bound, wda_set;
 static uint32_t wds_handle;
+static void wds_send_start(void);
+
+/*
+ * Before the session: the modem is told how the packets of the embedded port (the IPA) are
+ * framed -- raw IP in QMAP, without checksum offload, aggregated up to 16 packets or 14 KB
+ * downlink -- (WDA Set Data Format 0x20, as ModemManager does for the IPA), and our WDS client is
+ * bound to QMAP mux 1 of that port (WDS Bind Mux Data Port 0xa2), so that this session's packets
+ * are the ones with mux 1 that hakios.ipa.c sends and receives.
+ */
+static void
+wda_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint16_t size = 0;
+	const uint8_t *v;
+	uint32_t result = ~0u, error = ~0u, link = 0, ul = 0, dl = 0;
+
+	if (length < 7 || m[0] != 2 || (uint16_t)(m[3] | m[4] << 8) != WDA_SET_DATA_FORMAT) {
+		return;
+	}
+	probe_dump("wda", m, length);
+	if ((v = qmi_tlv(m, length, 2, &size)) != NULL && size >= 4) {
+		result = (uint32_t)(v[0] | v[1] << 8);
+		error = (uint32_t)(v[2] | v[3] << 8);
+	}
+	if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 4) { link = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
+	if ((v = qmi_tlv(m, length, 0x12, &size)) != NULL && size >= 4) { ul = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
+	if ((v = qmi_tlv(m, length, 0x13, &size)) != NULL && size >= 4) { dl = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
+	wda_set = result == 0;
+	tell("mpss: wda: the data format %s: result %u error %u; link layer %u (2: raw IP), aggregation up %u down %u (5: QMAP)\n",
+	    result == 0 ? "is set" : "IS REFUSED", result, error, link, ul, dl);
+}
+
+static void
+wda_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	if (service != QMI_WDA) {
+		return;
+	}
+	if (arrived) {
+		/* raw IP, QMAP both ways, downlink at most 16 packets or 14 KB per aggregate, on the embedded port */
+		uint8_t request[7 + 7 + 7 + 7 + 7 + 7 + 11] = { 0, 0x43, 0, WDA_SET_DATA_FORMAT & 0xff, WDA_SET_DATA_FORMAT >> 8, 0, 0,
+			0x11, 4, 0, 2, 0, 0, 0,
+			0x12, 4, 0, 5, 0, 0, 0,
+			0x13, 4, 0, 5, 0, 0, 0,
+			0x15, 4, 0, 16, 0, 0, 0,
+			0x16, 4, 0, 0x00, 0x38, 0, 0,
+			0x17, 8, 0, DATA_ENDPOINT_EMBEDDED, 0, 0, 0, DATA_ENDPOINT_INTERFACE, 0, 0, 0 };
+
+		wda_node = node;
+		wda_port_number = port;
+		request[5] = sizeof(request) - 7;
+		tell("mpss: wda: about to set the data format of the embedded port: raw IP in QMAP, no checksum offload\n");
+		qrtr_send(wda_port, node, port, request, sizeof(request));
+	} else if (node == wda_node && port == wda_port_number) {
+		wda_node = wda_port_number = 0;
+	}
+}
 
 static void
 ip4_string(char *to, size_t size, uint32_t address)
@@ -5353,6 +5428,17 @@ wds_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 			tell("mpss: wds: THE DATA SESSION IS REFUSED: result %u, error %u, call end reason %u\n", result, error, reason);
 			wds_started = false;            /* (asked again on the next change of NAS's state) */
 		}
+	} else if (m[0] == 2 && message == WDS_BIND_MUX_DATA_PORT) {
+		uint32_t result = ~0u, error = ~0u;
+
+		if ((v = qmi_tlv(m, length, 2, &size)) != NULL && size >= 4) {
+			result = (uint32_t)(v[0] | v[1] << 8);
+			error = (uint32_t)(v[2] | v[3] << 8);
+		}
+		wds_bound = result == 0;
+		tell("mpss: wds: the client %s to mux %u of the embedded port (result %u, error %u); the session is started %s\n",
+		    wds_bound ? "is bound" : "IS NOT BOUND", DATA_MUX, result, error, wds_bound ? "on it" : "all the same");
+		wds_send_start();
 	} else if (m[0] == 2 && message == WDS_GET_CURRENT_SETTINGS) {
 		uint32_t ip = 0, gw = 0, mask = 0, dns1 = 0, dns2 = 0, mtu = 0;
 		char a[20], g[20], d1[20], d2[20], mk[20];
@@ -5377,6 +5463,9 @@ wds_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 			wds_up = true;
 		}
 		tell("mpss: wds: THE DATA SESSION'S SETTINGS: address %s, gateway %s, netmask %s, DNS %s %s, MTU %u\n", a, g, mk, d1, d2, mtu);
+		if (ip != 0) {
+			hakios_cell_session(true, ip, mask, gw, dns1, dns2, mtu);   /* en1 (hakios.cell.c) */
+		}
 	}
 }
 
@@ -5404,20 +5493,44 @@ wds_open(void)
 			qrtr_lookup(wds_port, QMI_WDS, 0, 0);
 		}
 	}
+	if (wda_port == NULL && !option("modem_data_off")) {
+		wda_port = qrtr_open(wda_receive, wda_server, NULL);
+		if (wda_port != NULL) {
+			qrtr_lookup(wda_port, QMI_WDA, 0, 0);
+		}
+	}
 }
 
-/* The session, started: from the link's thread, when NAS says the modem is registered. */
+/* The session, started: from the link's thread, when NAS says the modem is registered. First the binding to the mux. */
 static void
 wds_start(void)
 {
-	uint8_t request[7 + 4 + 3 + 100];
-	unsigned at = 7;
-	char apn[64] = "";
+	uint8_t bind[7 + 11 + 4] = { 0, 0x44, 0, WDS_BIND_MUX_DATA_PORT & 0xff, WDS_BIND_MUX_DATA_PORT >> 8, 15, 0,
+		0x10, 8, 0, DATA_ENDPOINT_EMBEDDED, 0, 0, 0, DATA_ENDPOINT_INTERFACE, 0, 0, 0,
+		0x11, 1, 0, DATA_MUX };
 
 	if (wds_port == NULL || wds_port_number == 0 || wds_started) {
 		return;
 	}
 	wds_started = true;
+	if (option("modem_data_nobind")) {
+		wds_send_start();
+		return;
+	}
+	tell("mpss: wds: about to bind the client to mux %u of the embedded port (the IPA)\n", DATA_MUX);
+	qrtr_send(wds_port, wds_node, wds_port_number, bind, sizeof(bind));
+}
+
+static void
+wds_send_start(void)
+{
+	uint8_t request[7 + 4 + 3 + 100];
+	unsigned at = 7;
+	char apn[64] = "";
+
+	if (wds_port == NULL || wds_port_number == 0) {
+		return;
+	}
 	request[0] = 0; request[1] = 0x41; request[2] = 0;
 	request[3] = WDS_START_NETWORK_INTERFACE & 0xff; request[4] = WDS_START_NETWORK_INTERFACE >> 8;
 	request[at++] = 0x19; request[at++] = 1; request[at++] = 0; request[at++] = 4;      /* IPv4 */
@@ -5440,8 +5553,15 @@ wds_close(void)
 		qrtr_close(wds_port);
 		wds_port = NULL;
 	}
-	wds_node = wds_port_number = 0;
-	wds_started = wds_up = false;
+	if (wda_port != NULL) {
+		qrtr_close(wda_port);
+		wda_port = NULL;
+	}
+	wds_node = wds_port_number = wda_node = wda_port_number = 0;
+	wds_started = wds_up = wds_bound = wda_set = false;
+	if (cellular_data) {
+		hakios_cell_session(false, 0, 0, 0, 0, 0, 0);
+	}
 	cellular_data = 0;
 	cellular_ip[0] = cellular_gateway[0] = cellular_dns[0] = 0;
 }
@@ -5546,7 +5666,9 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 				if (card == 1 && state == 7 && sim_slot_ready == 0) {
 					sim_slot_ready = slot + 1;
 				}
-				if (slot == 0 && card == 1 && state == 7 && (type == 2 || type == 1) && aid <= 32 && at + 7 + aid <= size) {
+				/* a USIM (or SIM) in logical slot 1 that is READY, or only "detected" (cycle 37: the card sits in slot 1 with its
+				 * application detected and never initialized, as no provisioning session names it): either is provisioned below */
+				if (slot == 0 && card == 1 && (state == 7 || state == 1) && (type == 2 || type == 1) && aid <= 32 && at + 7 + aid <= size) {
 					ready_aid[0] = (uint8_t)aid;
 					memcpy(ready_aid + 1, v + at + 7, aid);
 				}
@@ -5580,7 +5702,8 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 			n += ready_aid[0];
 			pr[5] = (uint8_t)(n - 7); pr[6] = (uint8_t)((n - 7) >> 8);
 			sim_provisioned = true;
-			tell("mpss: uim: THE USIM OF SLOT 1 IS MADE THE PRIMARY GW APPLICATION (AID of %u bytes)\n", ready_aid[0]);
+			tell("mpss: uim: THE USIM OF SLOT 1 IS MADE THE PRIMARY GW APPLICATION (AID of %u bytes; its state is looked at again)\n",
+			    ready_aid[0]);
 			qrtr_send(uim_port, uim_node, uim_port_number, pr, n);
 		}
 		if (first_card != 1 && sim_slot_ready > 1 && !sim_slot_switched && !option("modem_sim_switch_off") && uim_port != NULL) {

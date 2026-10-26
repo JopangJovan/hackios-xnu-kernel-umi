@@ -41,7 +41,7 @@ Not in the repository, never:
 
 | Works | Not yet |
 |---|---|
-| Lock screen, home screen, Control Center, gestures, the stock apps | Cellular: the modem boots, sees the network, the SIM is bound; registration and the status bar bars are in progress (`docs/cellular.md`) |
+| Lock screen, home screen, Control Center, gestures, the stock apps | Cellular: the modem boots, sees the network, the SIM is bound, the IPA data path and `en1` are in place; registration, the data session and the status bar bars are in progress (`docs/cellular.md`) |
 | Touch screen, multitouch, power and volume buttons | Bluetooth |
 | All 8 CPU cores, the big core at 2.4 GHz | Charging under this kernel |
 | GPU rendering on Adreno (`gpu=1`, OpenGL ES through Mesa) | Metal (there is a shader compiler, no Metal) |
@@ -125,7 +125,7 @@ module, or the open lzfse library gets built). User space and the images: `REST=
 | Directory | Contents |
 |---|---|
 | `xnu/` | the kernel patch and files; `apply.sh`, `export.sh`; a README about the kernel |
-| `xnu/files/bsd/dev/hakios_*.c` | my drivers: display, touch, UFS, GPU, Wi-Fi, audio, modem (`hakios.mpss.c`), SIM/NAS, haptics, cameras |
+| `xnu/files/bsd/dev/hakios.*.c` | my drivers: display, touch, UFS, GPU, Wi-Fi, audio, modem (`hakios.mpss.c`), its packets (`hakios.ipa.c`, `hakios.cell.c`), SIM/NAS, haptics, cameras |
 | `xnuloader/` | the boot loader (a UEFI application) |
 | `userland/` | my programs and libraries (`src/`), the image build, launchd jobs |
 | `sysimage/` | scripts that fetch and unpack the OS files from the IPSW (none of the files themselves) |
@@ -140,7 +140,7 @@ module, or the open lzfse library gets built). User space and the images: `REST=
 The kernel, loader and user space are shared. Everything about one phone lives in
 `devices/<name>/`: its UEFI, device tree, firmware list and tools. Today there is one,
 `devices/poco-x5-pro/`, and its README is the map of what a port to another Qualcomm phone must bring.
-The phone's drivers are the files `xnu/files/bsd/dev/hakios_*.c`; the head of each says where its
+The phone's drivers are the files `xnu/files/bsd/dev/hakios.*.c`; the head of each says where its
 numbers came from.
 
 ## Cellular

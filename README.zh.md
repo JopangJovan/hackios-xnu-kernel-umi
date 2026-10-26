@@ -102,7 +102,7 @@ make images       # 用户空间和镜像
 | 目录 | 内容 |
 |---|---|
 | `xnu/` | 内核补丁和文件；`apply.sh`、`export.sh`；内核 README |
-| `xnu/files/bsd/dev/hakios_*.c` | 我的驱动：显示、触摸、UFS、GPU、Wi-Fi、音频、调制解调器、SIM/NAS、振动、摄像头 |
+| `xnu/files/bsd/dev/hakios.*.c` | 我的驱动：显示、触摸、UFS、GPU、Wi-Fi、音频、调制解调器、SIM/NAS、振动、摄像头 |
 | `xnuloader/` | 引导程序（UEFI 应用） |
 | `userland/` | 我的程序和库（`src/`）、镜像构建、launchd 任务 |
 | `sysimage/` | 从 IPSW 取得并解包系统文件的脚本（不含文件本身） |
