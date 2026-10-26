@@ -441,7 +441,7 @@ static void bt_control_worker(void *unused,wait_result_t result)
         bool fault=bt_control_fault;
         if(generation!=bt_control_generation) {
             generation=bt_control_generation;
-            memset(&tx,0,sizeof(tx)); receive_length=0;
+            memset(&tx,0,sizeof(tx)); receive_length=0; commands=0;
         }
         while(unit && !fault && !tx.complete && bt_tx_head!=bt_tx_tail) {
             uint8_t byte=bt_tx_queue[bt_tx_tail++&(BT_TX_QUEUE_SIZE-1)];
@@ -463,8 +463,12 @@ static void bt_control_worker(void *unused,wait_result_t result)
                 } else if(mach_absolute_time()>=wake_deadline) error=ETIMEDOUT;
             } else {
                 waking=false;
-                if(tx.bytes[0]==1 && commands++<64)
+                if(tx.bytes[0]==1 && commands++<128)
                     hk_tl("UMI BT: iOS HCI opcode=%#x length=%u\n",bt_le16(tx.bytes+1),tx.used);
+                if(tx.bytes[0]==1 && tx.used>=6 && bt_le16(tx.bytes+1)==0x200c)
+                    hk_tl("UMI BT: scan enable=%#x duplicates=%#x\n",tx.bytes[4],tx.bytes[5]);
+                if(tx.bytes[0]==1 && tx.used==11 && bt_le16(tx.bytes+1)==0x200b)
+                    hk_tl("UMI BT: scan params type=%#x interval=%u window=%u own-address=%#x policy=%#x\n",tx.bytes[4],bt_le16(tx.bytes+5),bt_le16(tx.bytes+7),tx.bytes[9],tx.bytes[10]);
                 error=bt_uart_tx(bt_control_uart,tx.bytes,tx.used);
                 memset(&tx,0,sizeof(tx));
             }
@@ -472,6 +476,8 @@ static void bt_control_worker(void *unused,wait_result_t result)
         if(!error && !receive_length) {
             int state=bt_rx_frame(bt_control_uart,receive,sizeof(receive),&receive_length,false);
             if(state<0) error=-state;
+            if(state>0 && receive_length>=7 && receive[0]==4 && receive[1]==0x0e && receive[6])
+                hk_tl("UMI BT: HCI command rejected opcode=%#x status=%#x\n",bt_le16(receive+4),receive[6]);
         }
         if(!error) error=bt_service_ibs(bt_control_uart);
         if(error && !fault) {

@@ -99,9 +99,23 @@ Apple model-derived Broadcom/Apple vendor capability ranges are also disabled
 with UUID and instruction checks; the native feature initializer still clears
 its flags and preserves standard HCI feature discovery. This prevents the
 Olympic antenna preference command from entering a 15-second restart loop.
+Native debug preferences disable low-power-core/vendor scan parameters. The
+legacy profile also skips the optional periodic-advertiser list query, which
+otherwise selects extended HCI mode on QCA6390 and causes later legacy scan
+parameters (0x200b) and advertising power reads (0x2007) to fail with status
+0x0c (Command Disallowed). That init step instead submits a real LE Set Random
+Address command through the native dispatcher and waits for its completion:
+the native scan selects random own-address mode, which otherwise fails Scan
+Enable with status 0x12 because no random address has been programmed. The
+initial static random address is freshly generated per daemon process and is
+not logged. Native address rotation and LE pairing identity need validation.
+These choices do not change the controller mask.
 It does not change HCI replies or advertise unsupported commands. Unknown
-images are left unchanged. Native Settings discovery and pairing still require
-validation; hardware LE/classic discovery alone is not proof of either.
+images are left unchanged. The 17:01:18 test boot confirms successful native LE scanning, an enabled
+Bluetooth switch in Settings, and discovery of a named nearby classic device.
+One bluetoothd SIGSEGV occurred before Settings discovery recovered; its cause
+and long-term stability remain under investigation. Pairing, LE identity
+rotation and Bluetooth audio are not yet validated.
 
 References: local Xiaomi SM8250 msm_geni_serial.c, qcom-geni-se.c, gcc-kona.c,
 pinctrl-kona.c and UMI DT; upstream Qualcomm-specific NVM/unified-event behavior
