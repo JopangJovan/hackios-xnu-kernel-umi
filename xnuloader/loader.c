@@ -15,7 +15,8 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
-#define PAYLOAD_BASE        0xF0000000ULL
+static uint64_t payload_base = 0xF0000000ULL;
+#define PAYLOAD_BASE        payload_base
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -548,6 +549,15 @@ static const struct platform platform_redwood = {
 	 * 2.5 times as fast. The kernel uses the small ones only when the big ones are all busy
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
 	 */
+	.small_cores = 0x0f,
+};
+
+static const struct platform platform_marble = {
+	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
+	.name = "marble", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17100000, .gic_redist = 0x17180000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	/* Cores 0-3 are Cortex-A510s, 4-6 Cortex-A710s, 7 Cortex-X2 */
 	.small_cores = 0x0f,
 };
 
@@ -2511,6 +2521,11 @@ parse_number(const char *c, unsigned base)
 static int
 parse_payload(struct payload_info *pi, int verbose)
 {
+	if (*(const uint32_t *)0xB0000000ULL == PAYLOAD_MAGIC) {
+		payload_base = 0xB0000000ULL;
+	} else if (*(const uint32_t *)0xF0000000ULL == PAYLOAD_MAGIC) {
+		payload_base = 0xF0000000ULL;
+	}
 	struct payload_header *ph = (struct payload_header *)PAYLOAD_BASE;
 
 	memset(pi, 0, sizeof(*pi));
@@ -3932,6 +3947,8 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (SCREEN.base == 0xB8000000ULL) {
+			PLAT = &platform_marble;
 		} else {
 			ramfb_phone_screen();
 		}

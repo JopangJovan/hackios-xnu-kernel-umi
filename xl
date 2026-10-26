@@ -139,6 +139,9 @@ run() { # run <oem command> <label>
 		# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
 		# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
 		local args=${XL_CMDLINE--v}
+		local dev=${DEVICE:-poco-f5}
+		local soc_args_file=${SOC_ARGS:-devices/$dev/soc.args}
+		[ -s "$soc_args_file" ] && args="$(tr '\n' ' ' < "$soc_args_file") $args"
 		case " $args " in
 		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
 		esac

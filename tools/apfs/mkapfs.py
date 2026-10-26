@@ -114,6 +114,9 @@ def div_up(a, b):
 class Node:
     def __init__(self, name, mode, source=None, target=None):
         self.name = name                # str
+        # Strip group/world write unless sticky (launchd rejects group/world writable plists and directories)
+        if not (mode & stat.S_ISVTX):
+            mode &= ~0o022
         self.mode = mode                # st_mode
         self.uid = self.gid = 0
         self.source = source            # a regular file's path on this machine

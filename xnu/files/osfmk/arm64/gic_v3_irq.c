@@ -399,8 +399,9 @@ gic_find_redistributor(void)
 	/* GICR_TYPER[63:32] packs Aff3.Aff2.Aff1.Aff0 */
 	uint32_t affinity = (uint32_t)(((mpidr >> 32) & 0xff) << 24 | (mpidr & 0xffffff));
 
-	for (vm_offset_t frame = gicr_base; frame + GICR_FRAME_SIZE <= gicr_base + gicr_size; frame += GICR_FRAME_SIZE) {
+	for (vm_offset_t frame = gicr_base; frame + 0x20000 <= gicr_base + gicr_size;) {
 		uint64_t typer = *(volatile uint64_t *)(frame + GICR_TYPER);
+		uint32_t step = (typer & (1ULL << 24)) ? 0x40000 : 0x20000;
 
 		if ((uint32_t)(typer >> 32) == affinity) {
 			return frame;
@@ -408,6 +409,7 @@ gic_find_redistributor(void)
 		if (typer & GICR_TYPER_LAST) {
 			break;
 		}
+		frame += step;
 	}
 	panic("gic: no redistributor for MPIDR 0x%llx", mpidr);
 }
