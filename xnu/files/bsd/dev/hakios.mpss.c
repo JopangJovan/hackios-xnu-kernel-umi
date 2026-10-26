@@ -5113,6 +5113,8 @@ static volatile uint32_t dms_result, dms_error;
 static uint16_t dms_transaction;
 static int cellular_up, cellular_registered, cellular_bars, cellular_dbm, cellular_radio;
 static char cellular_operator[40];               /* "MCC MNC name" of the serving network; "" when none */
+static char cellular_ip[20], cellular_gateway[20], cellular_dns[44];  /* the data session's addresses; "" until it is up */
+static int cellular_data, cellular_mtu;         /* 1 once the data session is up */
 static uint32_t nas_polls, nas_changes;
 
 SYSCTL_DECL(_kern_hakios);
@@ -5123,6 +5125,11 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_registered, CTLFLAG_RD | CTLFLAG_LOC
 SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_bars, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_bars, 0, "signal, 0 to 4 bars");
 SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_operator, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_operator, 0,
     "the serving network: its name as the modem gives it; empty when none");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_data, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_data, 0, "1: the data session is up");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_mtu, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_mtu, 0, "the data session's MTU");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_ip, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_ip, 0, "the data session's IPv4 address");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_gateway, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_gateway, 0, "its gateway");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_dns, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_dns, 0, "its DNS servers, space-separated");
 SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_dbm, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_dbm, 0, "signal, dBm; 0: none read");
 SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_radio, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_radio, 0,
     "the radio (QMI NAS): 4 GSM, 5 UMTS, 8 LTE, 12 NR");
@@ -5132,6 +5139,9 @@ radio_name(uint8_t radio)
 {
 	return radio == 4 ? "GSM" : radio == 5 ? "UMTS" : radio == 8 ? "LTE" : radio == 12 ? "NR" : "?";
 }
+
+static void wds_start(void);
+static void probe_dump(const char *who, const uint8_t *m, size_t length);
 
 /* From the link's thread, when what NAS says has changed. */
 static void
@@ -5143,6 +5153,9 @@ nas_changed(__unused void *context, const struct hakios_nas_state *state)
 	cellular_bars = state->bars;
 	cellular_dbm = state->has_signal ? state->dbm : 0;
 	cellular_radio = state->has_signal ? state->radio_interface : 0;
+	if (state->registered) {
+		wds_start();
+	}
 	tell("mpss: nas: %s%s%s (%u-%u); signal %s%d dBm (%s): %u bars\n", state->registered ? "REGISTERED WITH A NETWORK" : "not registered",
 	    state->operator_name[0] ? ", network " : "", state->operator_name, state->mcc, state->mnc,
 	    state->has_signal ? "" : "none read, ", state->has_signal ? state->dbm : 0, radio_name(state->radio_interface), state->bars);
@@ -5279,6 +5292,158 @@ dms_online(void)
 		return dms_set_mode(DMS_ONLINE);
 	}
 	return false;
+}
+
+/*
+ * ---- the data session (QMI WDS, service 1) ----
+ *
+ * Once NAS says the modem is registered, a packet data session is started (Start Network
+ * Interface 0x20: IPv4, the SIM's default profile -- what Android does for the default APN) and
+ * its settings asked for (Get Current Settings 0x2d: the address, gateway, netmask, DNS, MTU),
+ * which go to the log and to sysctl kern.hakios.cellular_ip, _gateway, _dns, _mtu, _data. The
+ * packets themselves need the IPA's endpoints for the application processor, which is the next
+ * step (the modem's side of the session is independent of them). modem_data=0: not started;
+ * modem_apn=NAME: a session to that APN instead of the default profile.
+ */
+static bool keep;                       /* (defined below: the DSP and the link stay up with modem=1) */
+#define QMI_WDS                 0x01
+#define WDS_START_NETWORK_INTERFACE 0x0020
+#define WDS_GET_CURRENT_SETTINGS 0x002d
+static struct hakios_qrtr_port *wds_port;
+static uint32_t wds_node, wds_port_number;
+static volatile bool wds_started, wds_up;
+static uint32_t wds_handle;
+
+static void
+ip4_string(char *to, size_t size, uint32_t address)
+{
+	snprintf(to, size, "%u.%u.%u.%u", address >> 24, (address >> 16) & 0xff, (address >> 8) & 0xff, address & 0xff);
+}
+
+static void
+wds_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint16_t size = 0, message;
+	const uint8_t *v;
+
+	if (length < 7) {
+		return;
+	}
+	probe_dump("wds", m, length);
+	message = (uint16_t)(m[3] | m[4] << 8);
+	if (m[0] == 2 && message == WDS_START_NETWORK_INTERFACE) {
+		uint32_t result = ~0u, error = ~0u, reason = ~0u;
+
+		if ((v = qmi_tlv(m, length, 2, &size)) != NULL && size >= 4) {
+			result = (uint32_t)(v[0] | v[1] << 8);
+			error = (uint32_t)(v[2] | v[3] << 8);
+		}
+		if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 2) {
+			reason = (uint32_t)(v[0] | v[1] << 8);
+		}
+		if (result == 0 && (v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 4) {
+			uint8_t ask[14] = { 0, 0x42, 0, WDS_GET_CURRENT_SETTINGS & 0xff, WDS_GET_CURRENT_SETTINGS >> 8, 7, 0, 0x10, 4, 0,
+					    0x10, 0xa3, 0, 0 };      /* DNS, the address, the gateway, the MTU, the IP family */
+
+			wds_handle = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24);
+			tell("mpss: wds: THE DATA SESSION IS STARTED (handle %#x); its settings asked for\n", wds_handle);
+			qrtr_send(wds_port, wds_node, wds_port_number, ask, sizeof(ask));
+		} else {
+			tell("mpss: wds: THE DATA SESSION IS REFUSED: result %u, error %u, call end reason %u\n", result, error, reason);
+			wds_started = false;            /* (asked again on the next change of NAS's state) */
+		}
+	} else if (m[0] == 2 && message == WDS_GET_CURRENT_SETTINGS) {
+		uint32_t ip = 0, gw = 0, mask = 0, dns1 = 0, dns2 = 0, mtu = 0;
+		char a[20], g[20], d1[20], d2[20], mk[20];
+
+		if ((v = qmi_tlv(m, length, 0x1e, &size)) != NULL && size >= 4) { ip = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
+		if ((v = qmi_tlv(m, length, 0x20, &size)) != NULL && size >= 4) { gw = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
+		if ((v = qmi_tlv(m, length, 0x21, &size)) != NULL && size >= 4) { mask = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
+		if ((v = qmi_tlv(m, length, 0x15, &size)) != NULL && size >= 4) { dns1 = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
+		if ((v = qmi_tlv(m, length, 0x16, &size)) != NULL && size >= 4) { dns2 = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
+		if ((v = qmi_tlv(m, length, 0x29, &size)) != NULL && size >= 4) { mtu = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24); }
+		ip4_string(a, sizeof(a), ip);
+		ip4_string(g, sizeof(g), gw);
+		ip4_string(mk, sizeof(mk), mask);
+		ip4_string(d1, sizeof(d1), dns1);
+		ip4_string(d2, sizeof(d2), dns2);
+		if (ip != 0) {
+			snprintf(cellular_ip, sizeof(cellular_ip), "%s", a);
+			snprintf(cellular_gateway, sizeof(cellular_gateway), "%s", g);
+			snprintf(cellular_dns, sizeof(cellular_dns), "%s%s%s", dns1 ? d1 : "", dns1 && dns2 ? " " : "", dns2 ? d2 : "");
+			cellular_mtu = (int)mtu;
+			cellular_data = 1;
+			wds_up = true;
+		}
+		tell("mpss: wds: THE DATA SESSION'S SETTINGS: address %s, gateway %s, netmask %s, DNS %s %s, MTU %u\n", a, g, mk, d1, d2, mtu);
+	}
+}
+
+static void
+wds_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	if (service != QMI_WDS) {
+		return;
+	}
+	if (arrived) {
+		wds_node = node;
+		wds_port_number = port;
+	} else if (node == wds_node && port == wds_port_number) {
+		wds_node = wds_port_number = 0;
+	}
+}
+
+static void
+wds_open(void)
+{
+	if (wds_port == NULL && !option("modem_data_off")) {
+		wds_port = qrtr_open(wds_receive, wds_server, NULL);
+		if (wds_port != NULL) {
+			qrtr_lookup(wds_port, QMI_WDS, 0, 0);
+		}
+	}
+}
+
+/* The session, started: from the link's thread, when NAS says the modem is registered. */
+static void
+wds_start(void)
+{
+	uint8_t request[7 + 4 + 3 + 100];
+	unsigned at = 7;
+	char apn[64] = "";
+
+	if (wds_port == NULL || wds_port_number == 0 || wds_started) {
+		return;
+	}
+	wds_started = true;
+	request[0] = 0; request[1] = 0x41; request[2] = 0;
+	request[3] = WDS_START_NETWORK_INTERFACE & 0xff; request[4] = WDS_START_NETWORK_INTERFACE >> 8;
+	request[at++] = 0x19; request[at++] = 1; request[at++] = 0; request[at++] = 4;      /* IPv4 */
+	if (PE_parse_boot_argn("modem_apn", apn, sizeof(apn)) && apn[0] != 0) {
+		size_t n = strlen(apn);
+
+		request[at++] = 0x14; request[at++] = (uint8_t)n; request[at++] = 0;
+		memcpy(request + at, apn, n);
+		at += n;
+	}
+	request[5] = (uint8_t)(at - 7); request[6] = (uint8_t)((at - 7) >> 8);
+	tell("mpss: wds: about to start the data session (IPv4, %s%s)\n", apn[0] ? "APN " : "the default profile", apn);
+	qrtr_send(wds_port, wds_node, wds_port_number, request, at);
+}
+
+static void
+wds_close(void)
+{
+	if (wds_port != NULL) {
+		qrtr_close(wds_port);
+		wds_port = NULL;
+	}
+	wds_node = wds_port_number = 0;
+	wds_started = wds_up = false;
+	cellular_data = 0;
+	cellular_ip[0] = cellular_gateway[0] = cellular_dns[0] = 0;
 }
 
 /*
@@ -5599,6 +5764,7 @@ step_nas(void)
 	if (!probed) {
 		sim_probe_open();
 	}
+	wds_open();
 	began = now_us();
 	while (now_us() - began < wait_seconds * 1000000ull) {
 		if (online && !is_online && dms_port_number != 0 && now_us() - asked_online > 5000000ull) {
@@ -5644,6 +5810,9 @@ step_nas(void)
 	}
 	cellular_up = nas.connected;
 	sim_probe_close();
+	if (!keep) {
+		wds_close();
+	}
 	if (ipa_loaded && !option("modem_ipa_quiet")) {
 		ipa_status("at the end of step 11");
 		ipa_space_faults("at the end of step 11");
