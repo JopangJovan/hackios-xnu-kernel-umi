@@ -10,9 +10,18 @@
 #   xnuloader/mkidentity.py        the header from the decoded tree
 #
 # usage: xnuloader/mkidentity.sh [DeviceTree.im4p]   (an im4p already at hand skips the download)
+#        xnuloader/mkidentity.sh --placeholder       (no IPSW: an identity.h with no Apple data,
+#                                                     enough to build and boot the open kernel under
+#                                                     QEMU with an Apple-free user space, not iOS)
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 TOP=$(cd "$HERE/.." && pwd)
+if [ "$1" = --placeholder ] || [ "${PLACEHOLDER:-}" = 1 ]; then
+	python3 "$HERE/mkidentity.py" --placeholder > "$HERE/identity.h.new"
+	mv "$HERE/identity.h.new" "$HERE/identity.h"
+	echo "mkidentity.sh: xnuloader/identity.h made WITHOUT an IPSW (placeholder; no Apple data, not for iOS)"
+	exit 0
+fi
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/mkidentity.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 IM4P=${1:-$WORK/dt.im4p}
