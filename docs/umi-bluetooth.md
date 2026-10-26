@@ -81,6 +81,7 @@ handshake; socket callbacks enqueue fragmented H4 writes. RX is framed before
 being delivered to the native daemon. Transport faults clear the registry
 readiness property instead of returning synthetic HCI success.
 
+The UMI defaults now include `umi_bt=1` and `BLUETOOTH=1`.
 Build userland with `BLUETOOTH=1` to select
 `BT_HCI_TRANSPORT=H4:POSIX:com.hackios.bluetooth,115200`, include bluetoothd and
 the project's BlueTool XPC bootstrap helper, and inject the compatibility library.
@@ -114,8 +115,11 @@ It does not change HCI replies or advertise unsupported commands. Unknown
 images are left unchanged. The 17:01:18 test boot confirms successful native LE scanning, an enabled
 Bluetooth switch in Settings, and discovery of a named nearby classic device.
 One bluetoothd SIGSEGV occurred before Settings discovery recovered; its cause
-and long-term stability remain under investigation. Pairing, LE identity
-rotation and Bluetooth audio are not yet validated.
+and long-term stability remain under investigation. Classic pairing was then confirmed by the user, native pairing result 0, and
+encryptionComplete status 0/encryptionMode 1 at 17:05 on 26 October 2026. LE
+identity rotation, reconnection across boots and Bluetooth audio are not yet
+validated. A fault-location reporter is built for the next boot to investigate
+the observed daemon SIGSEGVs; it has not yet captured one.
 
 References: local Xiaomi SM8250 msm_geni_serial.c, qcom-geni-se.c, gcc-kona.c,
 pinctrl-kona.c and UMI DT; upstream Qualcomm-specific NVM/unified-event behavior
