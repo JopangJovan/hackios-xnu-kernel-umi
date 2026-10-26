@@ -5150,7 +5150,8 @@ radio_name(uint8_t radio)
 	return radio == 4 ? "GSM" : radio == 5 ? "UMTS" : radio == 8 ? "LTE" : radio == 12 ? "NR" : "?";
 }
 
-static void wds_start(void);
+static void wds_advance(void);
+static volatile bool wds_registered;      /* NAS says the modem is registered (set by nas_changed) */
 static void probe_dump(const char *who, const uint8_t *m, size_t length);
 
 /* From the link's thread, when what NAS says has changed. */
@@ -5163,9 +5164,8 @@ nas_changed(__unused void *context, const struct hakios_nas_state *state)
 	cellular_bars = state->bars;
 	cellular_dbm = state->has_signal ? state->dbm : 0;
 	cellular_radio = state->has_signal ? state->radio_interface : 0;
-	if (state->registered) {
-		wds_start();
-	}
+	wds_registered = state->registered;
+	wds_advance();          /* bind once, start the session once registered, retry if refused */
 	tell("mpss: nas: %s%s%s (%u-%u); signal %s%d dBm (%s): %u bars\n", state->registered ? "REGISTERED WITH A NETWORK" : "not registered",
 	    state->operator_name[0] ? ", network " : "", state->operator_name, state->mcc, state->mnc,
 	    state->has_signal ? "" : "none read, ", state->has_signal ? state->dbm : 0, radio_name(state->radio_interface), state->bars);
@@ -5328,6 +5328,8 @@ static bool keep;                       /* (defined below: the DSP and the link 
 static struct hakios_qrtr_port *wds_port, *wda_port;
 static uint32_t wds_node, wds_port_number, wda_node, wda_port_number;
 static volatile bool wds_started, wds_up, wds_bound, wda_set;
+static volatile bool wds_bind_sent, wds_start_pending;
+static uint64_t wds_last_try;           /* when the bind or the session was last sent, for the retry */
 static uint32_t wds_handle;
 static void wds_send_start(void);
 
@@ -5425,8 +5427,10 @@ wds_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 			tell("mpss: wds: THE DATA SESSION IS STARTED (handle %#x); its settings asked for\n", wds_handle);
 			qrtr_send(wds_port, wds_node, wds_port_number, ask, sizeof(ask));
 		} else {
-			tell("mpss: wds: THE DATA SESSION IS REFUSED: result %u, error %u, call end reason %u\n", result, error, reason);
-			wds_started = false;            /* (asked again on the next change of NAS's state) */
+			tell("mpss: wds: the data session is refused for now: result %u, error %u%s, call end reason %u (will retry)\n",
+			    result, error, error == 70 ? " (invalid operation: the packet domain is not attached yet)" : "", reason);
+			wds_start_pending = false;      /* retried by wds_advance() after a few seconds */
+			wds_last_try = now_us();
 		}
 	} else if (m[0] == 2 && message == WDS_BIND_MUX_DATA_PORT) {
 		uint32_t result = ~0u, error = ~0u;
@@ -5436,9 +5440,10 @@ wds_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 			error = (uint32_t)(v[2] | v[3] << 8);
 		}
 		wds_bound = result == 0;
-		tell("mpss: wds: the client %s to mux %u of the embedded port (result %u, error %u); the session is started %s\n",
-		    wds_bound ? "is bound" : "IS NOT BOUND", DATA_MUX, result, error, wds_bound ? "on it" : "all the same");
-		wds_send_start();
+		tell("mpss: wds: the client %s to mux %u of the embedded port (result %u, error %u); the session waits for registration%s\n",
+		    wds_bound ? "is bound" : "IS NOT BOUND", DATA_MUX, result, error, wds_bound ? "" : " (started all the same)");
+		wds_last_try = now_us();        /* give the session a moment after the bind */
+		wds_advance();
 	} else if (m[0] == 2 && message == WDS_GET_CURRENT_SETTINGS) {
 		uint32_t ip = 0, gw = 0, mask = 0, dns1 = 0, dns2 = 0, mtu = 0;
 		char a[20], g[20], d1[20], d2[20], mk[20];
@@ -5493,7 +5498,9 @@ wds_open(void)
 			qrtr_lookup(wds_port, QMI_WDS, 0, 0);
 		}
 	}
-	if (wda_port == NULL && !option("modem_data_off")) {
+	/* WDA Set Data Format is for USB/PCIe rmnet; the embedded IPA's format is set by the IPA
+	 * driver (INIT_DRIVER), so WDA returns InvalidOperation here. Opt in with modem_wda=1. */
+	if (wda_port == NULL && option("modem_wda") && !option("modem_data_off")) {
 		wda_port = qrtr_open(wda_receive, wda_server, NULL);
 		if (wda_port != NULL) {
 			qrtr_lookup(wda_port, QMI_WDA, 0, 0);
@@ -5501,24 +5508,38 @@ wds_open(void)
 	}
 }
 
-/* The session, started: from the link's thread, when NAS says the modem is registered. First the binding to the mux. */
+/*
+ * The data session, step by step, idempotent and retry-aware: bind the client to the mux once,
+ * then -- only once NAS is registered, and the packet domain has had a moment to attach -- start
+ * the session, retrying every few seconds while it is refused (error 70 right after registration
+ * means the packet domain is not attached yet). Called from nas_changed(), from the bind reply,
+ * and every second from step_nas's loop. From the link's thread.
+ */
+#define WDS_RETRY_US    6000000ull
 static void
-wds_start(void)
+wds_advance(void)
 {
 	uint8_t bind[7 + 11 + 4] = { 0, 0x44, 0, WDS_BIND_MUX_DATA_PORT & 0xff, WDS_BIND_MUX_DATA_PORT >> 8, 15, 0,
 		0x10, 8, 0, DATA_ENDPOINT_EMBEDDED, 0, 0, 0, DATA_ENDPOINT_INTERFACE, 0, 0, 0,
 		0x11, 1, 0, DATA_MUX };
 
-	if (wds_port == NULL || wds_port_number == 0 || wds_started) {
+	if (wds_port == NULL || wds_port_number == 0 || wds_up) {
 		return;
 	}
-	wds_started = true;
-	if (option("modem_data_nobind")) {
+	/* bind once (unless modem_data_nobind), before or after registration */
+	if (!wds_bind_sent && !option("modem_data_nobind")) {
+		wds_bind_sent = true;
+		wds_last_try = now_us();
+		tell("mpss: wds: about to bind the client to mux %u of the embedded port (the IPA)\n", DATA_MUX);
+		qrtr_send(wds_port, wds_node, wds_port_number, bind, sizeof(bind));
+		return;
+	}
+	/* start the session only once registered, and retry while it is refused */
+	if (wds_registered && !wds_start_pending && now_us() - wds_last_try >= WDS_RETRY_US) {
+		wds_start_pending = true;
+		wds_last_try = now_us();
 		wds_send_start();
-		return;
 	}
-	tell("mpss: wds: about to bind the client to mux %u of the embedded port (the IPA)\n", DATA_MUX);
-	qrtr_send(wds_port, wds_node, wds_port_number, bind, sizeof(bind));
 }
 
 static void
@@ -5559,6 +5580,8 @@ wds_close(void)
 	}
 	wds_node = wds_port_number = wda_node = wda_port_number = 0;
 	wds_started = wds_up = wds_bound = wda_set = false;
+	wds_bind_sent = wds_start_pending = wds_registered = false;
+	wds_last_try = 0;
 	if (cellular_data) {
 		hakios_cell_session(false, 0, 0, 0, 0, 0, 0);
 	}
@@ -5864,13 +5887,15 @@ step_nas(void)
 	uint32_t wait_seconds = 90, online = 1;
 	uint64_t began, asked_online = 0;
 	bool registered = false, is_online = false, probed = option("modem_sim_probe_off"), probed_again = false;
-	uint64_t probed_at = 0, watched_at = 0;
+	uint64_t probed_at = 0, watched_at = 0, data_deadline = 0;
+	uint32_t data_wait = 40;        /* seconds to keep trying the data session after registration */
 
 	if (!glink.channel[CHANNEL_QRTR].open) {
 		return false;
 	}
 	PE_parse_boot_argn("modem_nas_wait", &wait_seconds, sizeof(wait_seconds));
 	PE_parse_boot_argn("modem_online", &online, sizeof(online));
+	PE_parse_boot_argn("modem_data_wait", &data_wait, sizeof(data_wait));
 	announce("look the modem's services up as they come (they take some 30 s): DMS asked to put the modem online as soon as it is "
 	    "there (modem_online=0: not), NAS asked for the serving system and the signal every second, until the modem is registered "
 	    "with a signal read or modem_nas_wait seconds (default 90) are over");
@@ -5925,10 +5950,18 @@ step_nas(void)
 		if (nas.connected) {
 			nas_polls += hakios_nas_client_poll(&nas) == 0;
 		}
+		wds_advance();          /* bind / start / retry the data session on its own clock */
 		sleep_ms(1000);
 		if (nas.state.registered && nas.state.has_signal) {
-			registered = true;
-			break;
+			if (!registered) {
+				registered = true;
+				data_deadline = now_us() + (uint64_t)data_wait * 1000000ull;
+				tell("mpss: nas: registered; the data session is given up to %u s to come up\n", data_wait);
+			}
+			/* stay in the loop until the data session is up or the data deadline passes */
+			if (wds_up || option("modem_data_off") || now_us() > data_deadline) {
+				break;
+			}
 		}
 	}
 	cellular_up = nas.connected;
