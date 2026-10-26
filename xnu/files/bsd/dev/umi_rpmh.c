@@ -13,6 +13,7 @@ extern void hk_tl(const char *, ...) __printflike(1, 2);
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 int umi_rpmh_vreg_enable(const char *res, unsigned mv);
 int umi_rpmh_wifi_power(void);
+int umi_rpmh_bluetooth_power(void);
 
 /* Live downstream DT has two positional reg entries, no reg-names. */
 #define RH_RSC_PA       0x18220000u
@@ -394,6 +395,33 @@ umi_rpmh_wifi_power(void)
 		error = rh_lookup(rails[i].resource, &addresses[i]);
 	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); ++i) {
 		printf("UMI RPMH: Wi-Fi/PCIe %s minimum=%u mV\n", rails[i].resource, rails[i].mv);
+		error = rh_send(addresses[i], rails[i].mv, false);
+	}
+out:
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
+}
+
+/* QCA6390 BT rails from the UMI stock DT; all are shared with WLAN. */
+int
+umi_rpmh_bluetooth_power(void)
+{
+	static const struct { const char *resource; unsigned mv; } rails[] = {
+		{ "smpa6", 950 },  /* AON */
+		{ "smpf2", 950 },  /* digital */
+		{ "smpa5", 1900 }, /* RFA1 */
+		{ "smpc8", 1350 }, /* RFA2 */
+		{ "ldoa16", 3025 },/* ASD, minimum of stock 3025-3300 mV range */
+	};
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	int error = EIO;
+	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
+	if (rh_poisoned) goto out;
+	error = rh_map();
+	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); ++i)
+		error = rh_lookup(rails[i].resource, &addresses[i]);
+	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); ++i) {
+		printf("UMI RPMH: Bluetooth %s minimum=%u mV\n", rails[i].resource, rails[i].mv);
 		error = rh_send(addresses[i], rails[i].mv, false);
 	}
 out:
