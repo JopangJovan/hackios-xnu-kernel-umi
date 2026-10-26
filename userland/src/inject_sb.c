@@ -288,24 +288,43 @@ static void
 update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter, void *setter)
 {
 	int up = sysctl_int("kern.hakios.cellular_up"), registered = sysctl_int("kern.hakios.cellular_registered");
-	int bars = sysctl_int("kern.hakios.cellular_bars");
+	int bars = sysctl_int("kern.hakios.cellular_bars"), dbm = sysctl_int("kern.hakios.cellular_dbm");
+	int shown;
 
 	cellular_aggregator = self;
 	if (original_update_signal_item) {
 		original_update_signal_item(self, sel, item, data, sim, getter, setter);
 	}
 	if (cellular_said++ < 8) {
-		say("hakios: cellular: signal item %ld: data %p, SIM info %p, getter %p, setter %p; the kernel says up %d registered %d bars %d\n",
-		    item, data, (void *)sim, getter, setter, up, registered, bars);
+		say("hakios: cellular: signal item %ld: data %p, SIM info %p, getter %p, setter %p; the kernel says up %d registered %d bars %d dbm %d\n",
+		    item, data, (void *)sim, getter, setter, up, registered, bars, dbm);
 	}
-	if (up > 0 && registered > 0 && bars >= 0 && bars <= 5 && setter != NULL && data != NULL) {
-		BLOCK_CALL(setter, void (*)(void *, void *, int), data, bars);
+	/*
+	 * Force the signal item on. iOS hides it unless its own cellular stack (CommCenter, which is
+	 * not here) says there is service, so the bars never appear on their own. The kernel knows
+	 * the modem's state, so once it is up the item is shown here with the kernel's bars; when the
+	 * kernel has a reading but zero bars (a brief "no signal" sample, or a reading just after
+	 * registration) at least one bar is forced so the icon is visibly present rather than empty.
+	 * modem_bars_off=1 (as a sysctl) is not honoured; set kern.hakios.cellular_up=0 to hide it.
+	 */
+	shown = bars;
+	if (shown <= 0 && dbm < 0) {
+		shown = dbm >= -95 ? 4 : dbm >= -105 ? 3 : dbm >= -115 ? 2 : 1;   /* derive from dBm when bars is 0 */
+	}
+	if (shown <= 0 && (up > 0 || registered > 0)) {
+		shown = 1;                      /* up but no reading yet: still show the icon */
+	}
+	if (shown > 5) {
+		shown = 5;
+	}
+	if (up > 0 && shown > 0 && setter != NULL && data != NULL) {
+		BLOCK_CALL(setter, void (*)(void *, void *, int), data, shown);
 		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
-		if (bars != cellular_last_bars) {
-			say("hakios: cellular: %d bars shown (item %ld)\n", bars, item);
+		if (shown != cellular_last_bars) {
+			say("hakios: cellular: %d bars shown (item %ld; kernel bars %d, %d dBm, registered %d)\n", shown, item, bars, dbm, registered);
 		}
 	}
-	cellular_last_bars = bars;
+	cellular_last_bars = shown;
 }
 
 static void (*original_update_service_item)(id self, SEL sel, long item, void *data, id sim, id other, void *g1, void *s1, void *g2, void *s2,
