@@ -95,6 +95,10 @@ optional Write Default Erroneous Data Reporting command (command mask byte 18,
 bit 3), which Apple's initialization treats as mandatory. The userland shim
 skips only that optional init step when the capability is absent, the daemon
 UUID matches iOS 16.5 build 20F66, and the function/table fingerprints match.
+Apple model-derived Broadcom/Apple vendor capability ranges are also disabled
+with UUID and instruction checks; the native feature initializer still clears
+its flags and preserves standard HCI feature discovery. This prevents the
+Olympic antenna preference command from entering a 15-second restart loop.
 It does not change HCI replies or advertise unsupported commands. Unknown
 images are left unchanged. Native Settings discovery and pairing still require
 validation; hardware LE/classic discovery alone is not proof of either.
