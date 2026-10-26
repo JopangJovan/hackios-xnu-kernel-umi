@@ -47,6 +47,7 @@
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <pexpert/device_tree.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
@@ -93,22 +94,34 @@ wr(vm_offset_t address, uint32_t value)
 
 /* ---- the PMIC arbiter ---------------------------------------------------------------------------- */
 
-#define ARB_CORE_PHYS           0x0c440000UL    /* "core": the version, and which peripheral each channel is */
-#define ARB_CORE_SIZE           0x1100UL
-#define ARB_CNFG_PHYS           0x0c40a000UL    /* "cnfg": which system owns each channel */
-#define ARB_CNFG_SIZE           0x1000UL
-#define ARB_OBSERVER_PHYS       0x0e600000UL    /* "obsrvr": 0x10000 per system, 0x80 per channel in it */
-#define ARB_OBSERVER_SIZE       0x10000UL       /* ours is the first */
+static vm_offset_t arb_core_phys = 0x0c440000UL;    /* "core": the version, and which peripheral each channel is */
+static vm_offset_t arb_core_size = 0x1100UL;
+static vm_offset_t arb_cnfg_phys = 0x0c40a000UL;    /* "cnfg": which system owns each channel */
+static vm_offset_t arb_cnfg_size = 0x1000UL;
+static vm_offset_t arb_observer_phys = 0x0e600000UL;/* "obsrvr": 0x10000 per system, 0x80 per channel in it */
+static vm_offset_t arb_observer_size = 0x10000UL;   /* ours is the first */
 #define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" */
 
 #define ARB_VERSION             0x000
 #define ARB_VERSION_5           0x50000000u     /* what follows is version 5's; 7 moved things again */
 #define ARB_VERSION_7           0x70000000u
 #define ARB_FEATURES            0x004           /* [10:0] the number of channels */
-#define ARB_CHANNEL(n)          (0x900 + 4 * (n))       /* core: [19:8] slave and peripheral, [24] interrupts go to the owner */
 #define ARB_CHANNEL_INTERRUPTS  (1u << 24)
-#define ARB_OWNER(n)            (0x700 + 4 * (n))       /* cnfg: [2:0] the system that may write through channel n */
 #define ARB_MAX_CHANNELS        512
+
+static bool is_v7 = false;
+
+static inline uint32_t
+arb_channel_offset(uint32_t n)
+{
+	return is_v7 ? (0x2000 + 4 * n) : (0x900 + 4 * n);
+}
+
+static inline uint32_t
+arb_owner_offset(uint32_t n)
+{
+	return is_v7 ? (0x000 + 4 * n) : (0x700 + 4 * n);
+}
 
 #define OBSERVER_COMMAND        0x00
 #define OBSERVER_STATUS         0x08
@@ -164,7 +177,12 @@ static struct {
 static const char *
 spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t count)
 {
-	vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
+	vm_offset_t channel;
+	if (is_v7) {
+		channel = arb_observer + 0x8000UL * ARB_SYSTEM + 0x20UL * p->channel;
+	} else {
+		channel = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
+	}
 	uint64_t start = mach_absolute_time(), now, interval, taken;
 	uint32_t status, data[2];
 	const char *problem = NULL;
@@ -182,11 +200,11 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 
 	if (!(status & STATUS_DONE)) {
 		problem = "no answer from the arbiter";
-	} else if (status & STATUS_DENIED) {
+	} else if (status & (STATUS_DENIED | (1u << 5))) {
 		problem = "the arbiter refuses";
-	} else if (status & STATUS_FAILURE) {
+	} else if (status & (STATUS_FAILURE | (1u << 1))) {
 		problem = "the transfer failed (nobody at that address?)";
-	} else if (status & STATUS_DROPPED) {
+	} else if (status & (STATUS_DROPPED | (1u << 6))) {
 		problem = "the transfer was dropped";
 	} else {
 		for (uint32_t i = 0; i < count; i++) {
@@ -214,12 +232,12 @@ static void
 find_channel(struct peripheral *p, uint32_t channels)
 {
 	for (uint32_t n = 0; n < channels; n++) {
-		uint32_t map = rd(arb_core + ARB_CHANNEL(n)), owner;
+		uint32_t map = rd(arb_core + arb_channel_offset(n)), owner;
 
 		if (map == 0 || ((map >> 8) & 0xfff) != p->id) {
 			continue;
 		}
-		owner = rd(arb_cnfg + ARB_OWNER(n)) & 7;
+		owner = rd(arb_cnfg + arb_owner_offset(n)) & 7;
 		printf("buttons: channel %u is %s (%#x); written by system %u%s\n", n, p->name, map, owner,
 		    (map & ARB_CHANNEL_INTERRUPTS) ? ", which also gets its interrupts" : "");
 		if (!p->found || owner == ARB_SYSTEM) {
@@ -409,7 +427,7 @@ static void
 pin_input(void)
 {
 	const char *problem;
-	uint8_t c[8], status = 0;
+	uint8_t c[8], status = 0, subtype = 0;
 	unsigned mode, pull;
 
 	printf("buttons: next: read the setup and the level of %s (registers 0x8d40 to 0x8d47, 0x8d10)\n", pin.name);
@@ -417,11 +435,18 @@ pin_input(void)
 	if (problem == NULL) {
 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
 	}
+	if (problem == NULL) {
+		spmi_read(&pin, REG_SUBTYPE, &subtype, 1);
+	}
 	if (problem != NULL) {
 		printf("buttons: %s: %s\n", pin.name, problem);
 		return;
 	}
-	mode = c[0] & 3;
+	if (subtype >= 0x10) {
+		mode = c[0] & 3;
+	} else {
+		mode = (c[0] >> 4) & 7;
+	}
 	pull = c[GPIO_REG_PULL - GPIO_REG_MODE] & 7;
 	printf("buttons: volume up's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
 	    "%02x %02x; level %s\n", mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
@@ -452,21 +477,49 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 {
 	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
 	bool pon_known, pin_known;
+	uint32_t soc_rsc = 0;
+	DTEntry arm_io;
+	void const *dev_type = NULL;
+	unsigned int prop_size = 0;
+	bool is_marble = false;
 
-	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
-	    ARB_OBSERVER_PHYS);
-	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
-	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
-	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	if (SecureDTLookupEntry(NULL, "/arm-io", &arm_io) == kSuccess &&
+	    SecureDTGetProperty(arm_io, "device_type", &dev_type, &prop_size) == kSuccess) {
+		if (strncmp((const char *)dev_type, "marble", 6) == 0) {
+			is_marble = true;
+		}
+	}
+	if (PE_parse_boot_argn("soc_rsc", &soc_rsc, sizeof(soc_rsc)) && soc_rsc == 0x17a20000) {
+		is_marble = true;
+	}
+
+	if (is_marble) {
+		arb_core_phys = 0x0c400000UL;
+		arb_core_size = 0x3000UL;
+		arb_cnfg_phys = 0x0c42d000UL;
+		arb_cnfg_size = 0x4000UL;
+		arb_observer_phys = 0x0c440000UL;
+		arb_observer_size = 0x80000UL;
+		pin.name = "GPIO6 of the PM8350";
+	}
+
+	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", arb_core_phys, arb_cnfg_phys,
+	    arb_observer_phys);
+	arb_core = ml_io_map(arb_core_phys, arb_core_size);
+	arb_cnfg = ml_io_map(arb_cnfg_phys, arb_cnfg_size);
+	arb_observer = ml_io_map(arb_observer_phys, arb_observer_size);
 	version = rd(arb_core + ARB_VERSION);
 	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
 	printf("buttons: PMIC arbiter version %#x, %u channels\n", version, channels);
-	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
-		printf("buttons: this driver knows version 5 of the arbiter only: no buttons\n");
+	if (version >= ARB_VERSION_7) {
+		is_v7 = true;
+	} else if (version < ARB_VERSION_5) {
+		printf("buttons: this driver knows version 5 and 7 of the arbiter only: no buttons\n");
 		goto out;
 	}
-	if (channels == 0 || channels > ARB_MAX_CHANNELS) {
-		channels = ARB_MAX_CHANNELS;
+	uint32_t max_ch = is_v7 ? 1024 : ARB_MAX_CHANNELS;
+	if (channels == 0 || channels > max_ch) {
+		channels = max_ch;
 	}
 	if (steps < 2) {
 		goto out;
@@ -481,7 +534,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
 	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
-	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
+	pin_known = identify(&pin, GPIO_TYPE, 0x01, 0x15);
 	if (steps < 4) {
 		goto out;
 	}
