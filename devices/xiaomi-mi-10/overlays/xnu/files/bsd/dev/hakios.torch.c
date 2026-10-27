@@ -1,9 +1,11 @@
-/* UMI PM8150L flashlight: SPMI SID5, peripheral 0xd300, channels 0 and 1.
+/* UMI PM8150L flashlight: SPMI SID5, peripheral 0xd300, channel 0.
+ * Android trace: channel 0 ramps up normally; channel 1 raises STATUS1=0x08.
+ * Keep channel 1 off rather than suppressing its hardware fault.
  * Register layout and software-strobe sequence verified against Xiaomi umi-q-oss
  * drivers/leds/leds-qpnp-flash-v2.c and the UMI device tree.
- * Each channel is capped at 125 mA (stock permits 500 mA). Minimum 25 mA
+ * The working channel is capped at 125 mA (stock permits 500 mA). Minimum 25 mA
  * avoids the PM8150L low-current resolution workaround. Hardware protection
- * configuration is preserved. Only the two connected channels are controlled.
+ * configuration is preserved. Only channel 0 is enabled; both channels are disabled during cleanup.
  * torch=1 reads identification only; torch=3 exposes /dev/hakios-torch.
  * Faults, a 45 C battery, or 30 seconds continuous use switch the light off.
  */
@@ -251,6 +253,8 @@ spmi_read_once(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t
 #define FLASH_IRESOLUTION       0x47            /* two bits per channel: 0 selects 12.5 mA */
 #define FLASH_STROBE_CTRL0      0x49            /* [6:4] hardware strobe's kind, [2] hardware strobe */
 #define FLASH_EN_LED_CTRL       0x4c            /* a bit per channel */
+#define FLASH_HDRM_AUTO_MODE     0x50
+#define FLASH_ISC_DELAY          0x52
 #define FLASH_OTST2_CFG1        0x78
 #define FLASH_OTST1_CFG1        0x7a
 
@@ -264,7 +268,7 @@ spmi_read_once(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t
 
 static const uint8_t writable_regs[] = {
 	FLASH_SAFETY_TIMER0, FLASH_SAFETY_TIMER0 + 1, FLASH_ITARGET0, FLASH_ITARGET0 + 1,
-	FLASH_MODULE_EN, FLASH_IRESOLUTION, FLASH_STROBE_CTRL0, FLASH_STROBE_CTRL0 + 1, FLASH_EN_LED_CTRL,
+	FLASH_MODULE_EN, FLASH_IRESOLUTION, FLASH_HDRM_AUTO_MODE, FLASH_ISC_DELAY, FLASH_STROBE_CTRL0, FLASH_STROBE_CTRL0 + 1, FLASH_EN_LED_CTRL,
 };
 
 static void
@@ -453,7 +457,11 @@ static bool
 configure(void)
 {
     if (configured) return true;
-    for (unsigned ch = 0; ch < 2; ch++) {
+    /* Android explicitly resets headroom auto mode and sets the inrush/short
+     * detection delay to 192 us. Firmware leaves delay zero: do not start
+     * either LED with that uninitialized setting. Protection remains enabled. */
+    if (!put(FLASH_HDRM_AUTO_MODE, 0) || !put_bits(FLASH_ISC_DELAY, 0x03, 3)) return false;
+    for (unsigned ch = 0; ch < 1; ch++) {
         if (!put_bits(FLASH_STROBE_CTRL0 + ch, 0x04, 0) ||
             !put(FLASH_SAFETY_TIMER0 + ch, 0x13)) return false;
     }
@@ -475,15 +483,14 @@ light(uint32_t permille)
         (void)dark();
         return false;
     }
-    if (!configure() || !put_bits(FLASH_IRESOLUTION, 0x0f, 0) ||
-        !put_bits(FLASH_ITARGET0, 0x7f, (uint8_t)code) ||
-        !put_bits(FLASH_ITARGET0 + 1, 0x7f, (uint8_t)code)) {
+    if (!configure() || !put_bits(FLASH_IRESOLUTION, 0x03, 0) ||
+        !put_bits(FLASH_ITARGET0, 0x7f, (uint8_t)code)) {
         (void)dark();
         return false;
     }
     if (!lit) {
         lit = true; /* even a write whose readback fails must be rolled back */
-        if (!put(FLASH_MODULE_EN, 0x80) || !put_bits(FLASH_EN_LED_CTRL, 0x07, 0x03)) {
+        if (!put(FLASH_MODULE_EN, 0x80) || !put_bits(FLASH_EN_LED_CTRL, 0x07, 0x01)) {
             (void)dark();
             return false;
         }

@@ -23,7 +23,7 @@ static void give_up(const char *why) { (void)why; broken=true; }
 static bool put(uint8_t reg, uint8_t value) {
     if (broken) return false;
     assert(reg==0x40 || reg==0x41 || reg==0x43 || reg==0x44 || reg==0x46 ||
-           reg==0x47 || reg==0x49 || reg==0x4a || reg==0x4c);
+           reg==0x47 || reg==0x50 || reg==0x52 || reg==0x49 || reg==0x4a || reg==0x4c);
     regs[reg]=value;
     if (++writes==fail_at) { broken=true; return false; }
     return true;
@@ -38,14 +38,15 @@ for name in ('off_write','dark','configure','light'):
 program += r'''
 int main(void) {
     assert(light(1000));
-    assert(lit && regs[0x4c]==3 && regs[0x46]==0x80);
-    assert(regs[0x43]==9 && regs[0x44]==9);
-    assert(regs[0x40]==0x13 && regs[0x41]==0x13);
+    assert(regs[0x50]==0 && regs[0x52]==3);
+    assert(lit && regs[0x4c]==1 && regs[0x46]==0x80);
+    assert(regs[0x43]==9 && regs[0x44]==0);
+    assert(regs[0x40]==0x13 && regs[0x41]==0);
     assert(dark() && !lit && !regs[0x4c] && !regs[0x46]);
-    assert(light(1) && regs[0x43]==1 && regs[0x44]==1);
-    assert(light(UINT32_MAX) && regs[0x43]==9 && regs[0x44]==9);
+    assert(light(1) && regs[0x43]==1 && regs[0x44]==0);
+    assert(light(UINT32_MAX) && regs[0x43]==9 && regs[0x44]==0);
     assert(dark());
-    for (unsigned fail=1; fail<=9; fail++) {
+    for (unsigned fail=1; fail<=8; fail++) {
         broken=configured=lit=false; writes=0; fail_at=fail;
         for (unsigned i=0;i<256;i++) regs[i]=0;
         assert(!light(1000) && broken);
@@ -54,7 +55,7 @@ int main(void) {
     }
     broken=configured=lit=false; fail_at=0; fault=true;
     assert(!light(1000) && broken && !regs[0x4c] && !regs[0x46]);
-    puts("PASS: both channels, current bounds, timer disable, partial-write rollback and fault shutoff");
+    puts("PASS: working channel only, current bounds, timer disable, partial-write rollback and fault shutoff");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='umi-torch-') as d:
