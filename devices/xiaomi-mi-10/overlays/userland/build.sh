@@ -503,12 +503,25 @@ fi
 # the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
 # hakios_<maker>_<sensor>_<camera>.bin, in ../fw-camera (the vendor's: neither they nor the tables are in the
 # repository): camera-<sensor>.tab
+if [ "${DEVICE:-}" = umi ]; then
+	module=../fw-camera/com.qti.sensormodule.umi_semco_s5khmx.bin
+	if [ -f "$module" ]; then
+		mkdir -p root/fw
+		# UMI's V2 module contains separate revision 3 and 0x13 settings.
+		# Keep both named explicitly until the hardware probe selects a revision.
+		for version in 3 19; do
+			python3 ../devices/xiaomi-mi-10/tools/umi-camsensor-v2.py "$module" \
+				--sensor-version "$version" --output "root/fw/camera-s5khmx-v$version.tab" >/dev/null
+		done
+	fi
+else
 for module in ../fw-camera/com.qti.sensormodule.hakios_*.bin; do
 	[ -f "$module" ] || continue
 	sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.hakios_[a-z]*_\([a-z0-9]*\)_.*/\1/')
 	mkdir -p root/fw
 	../tools/camsensor.py "$module" "root/fw/camera-$sensor.tab" >/dev/null
 done
+fi
 # ... and their colour tuning (libhakios.media's processor, src/camera_isp.c), made by tools/camtuning.py out of the
 # cameras' tuning files beside them, com.qti.tuned.hakios_<maker>_<sensor>_<camera>.bin: camera-<sensor>.isp
 for tuned in ../fw-camera/com.qti.tuned.hakios_*.bin; do

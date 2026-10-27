@@ -1,5 +1,5 @@
 /*
- * UMI overlay status: cam=1 performs a UMI-specific read-only CamCC/ISP ID
+ * UMI overlay status: cam=1 performs a UMI-specific read-only GPIO/CamCC/ISP ID
  * probe, and cam=5 cam_fake=1 supplies synthetic frames for iOS integration.
  * Every inherited hardware capture mode is refused before touching MMIO; the
  * register maps and sensor power sequence below are still Redwood-specific.
@@ -4186,11 +4186,36 @@ look(void)
 #define UMI_CAM_CBCR_OFF        (1u << 31)
 
 static void
+umi_camera_pins_readonly(void)
+{
+	/* Kona GPIOs span tiles: reset 62 is SOUTH; MCLK1/CCI0 are NORTH.
+	 * Mapping these pages locally keeps the inherited Redwood TLMM state
+	 * unset, including the quiesce path that uses it to decide to write.
+	 */
+	static const struct { unsigned pin; uint32_t tile; const char *name; } pins[] = {
+		{ 62, 0x0f500000, "main reset" },
+		{ 95, 0x0f900000, "MCLK1" },
+		{ 103, 0x0f900000, "CCI0 master1 data" },
+		{ 104, 0x0f900000, "CCI0 master1 clock" },
+	};
+	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); ++i) {
+		vm_offset_t pin = ml_io_map(pins[i].tile + 0x1000UL * pins[i].pin, 0x1000);
+		if (!pin) {
+			say("camera: UMI GPIO%u mapping failed\n", pins[i].pin);
+			continue;
+		}
+		say("camera: UMI GPIO%u (%s) cfg %#x io %#x; read only\n",
+		    pins[i].pin, pins[i].name, rd(pin), rd(pin + 4));
+	}
+}
+
+static void
 umi_camera_readonly(void)
 {
 	vm_offset_t cc = ml_io_map(UMI_CAMCC_PHYS, UMI_CAMCC_SIZE);
 	uint32_t gdsc, ahb, axi, ife_clk, csid_clk;
 
+	umi_camera_pins_readonly();
 	if (cc == 0) {
 		say("camera: UMI CamCC mapping failed; no registers touched\n");
 		return;
@@ -4202,6 +4227,10 @@ umi_camera_readonly(void)
 	csid_clk = rd(cc + 0xc034);
 	say("camera: UMI read-only CamCC: titan-top GDSCR %#x, IFE-lite AHB %#x AXI %#x IFE %#x CSID %#x\n",
 	    gdsc, ahb, axi, ife_clk, csid_clk);
+	/* camcc-kona.c: CCI0 RCG 0xc0bc/branch 0xc0d4, MCLK1 0x501c/0x5034. */
+	say("camera: UMI CCI0 cfg %#x M %#x N %#x D %#x branch %#x; MCLK1 cfg %#x M %#x N %#x D %#x branch %#x\n",
+	    rd(cc + 0xc0c0), rd(cc + 0xc0c4), rd(cc + 0xc0c8), rd(cc + 0xc0cc), rd(cc + 0xc0d4),
+	    rd(cc + 0x5020), rd(cc + 0x5024), rd(cc + 0x5028), rd(cc + 0x502c), rd(cc + 0x5034));
 	if (!(gdsc & GDSC_ON)) {
 		say("camera: UMI Titan-top is power-gated; skipped IFE-lite/CSID-lite MMIO\n");
 		return;
