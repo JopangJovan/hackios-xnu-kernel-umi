@@ -1150,6 +1150,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatScanWaits++;
 		if (scan != NULL && hakios_display_wait_copy(fCopyNs, scan->frame_ns * 3 / 2)) {
 			uint64_t copy_start = mach_absolute_time(), copy_ns;
+			shown = copy_start;
 			memcpy(fBase, fComposeBase, (size_t)fRowBytes * fPanelHeight);
 			__asm__ volatile("dsb oshst" ::: "memory");
 			absolutetime_to_nanoseconds(mach_absolute_time() - copy_start, &copy_ns);

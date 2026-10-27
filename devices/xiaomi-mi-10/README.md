@@ -70,6 +70,15 @@ follows upstream's unfinished Metal status; it does not claim a Metal compositor
 The UMI display variant retains the validated staging/cache fixes and releases
 source ownership after staging so rendering can overlap panel presentation.
 
+The physical panel buffer and the CPU staging buffer each hold a complete
+1080 x 2340 frame (10,108,800 bytes with the bootloader's stride). Increasing
+their dimensions adds memory traffic. Command-mode copies instead use the full
+measured DMA idle interval, subject to the copy duration plus a safety margin,
+rather than accepting frames only in its first 128 lines (about 0.9 ms).
+The DMA completion is checked between two phase reads to reject refresh wraps.
+The wait sleeps through the known active scan interval and polls only near the
+idle boundary, rather than spinning a CPU core throughout the wait.
+
 ## Validation
 
 The kernel, Wi-Fi object, Mesa, userland images and UMI loader build. The actual

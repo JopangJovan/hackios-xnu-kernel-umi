@@ -169,15 +169,36 @@ hakios_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns)
 	if (!hakios_display_command_mode()) return 0;
 	uint64_t budget = copy_ns + copy_ns / 4 + 500000;
 	for (;;) {
-		uint32_t phase = hakios_display_line(NULL);
+		uint32_t before = hakios_display_line(NULL);
 		if (!scan.ok) return 0;
 		uint32_t written = rd(intf, 0x2b0) & 0xffff;
+		uint32_t phase = hakios_display_line(NULL);
+		if (!scan.ok) return 0;
 		uint64_t used = (uint64_t)phase * scan.line_ns;
-		if (phase >= te_idle_start && phase < te_idle_start + 128 && written >= scan.shown &&
+		/* A completed DMA stays idle until the next TE. Restricting admission
+		 * to the first 128 lines of that idle interval made a frame arriving
+		 * slightly later wait an entire refresh, even with ample copy time.
+		 * Use the measured copy budget instead. Read phase around the DMA
+		 * status so a TE wrap cannot pair an old completion with a new frame.
+		 */
+		if (phase >= before && phase >= te_idle_start && written >= scan.shown &&
 		    used < scan.frame_ns && budget < scan.frame_ns - used) return 1;
 		absolutetime_to_nanoseconds(mach_absolute_time() - start, &elapsed);
 		if (elapsed >= limit_ns) return 0;
-		delay_for_interval(50, NSEC_PER_USEC);
+		/* A 50 us poll spins in XNU. Sleep through the known active interval
+		 * instead of occupying a rendering core for several milliseconds.
+		 * Recheck the registers after waking; only the final 200 us is polled.
+		 */
+		uint64_t ahead = 0, nap = 50000;
+		if (phase < te_idle_start) {
+			ahead = (uint64_t)(te_idle_start - phase) * scan.line_ns;
+		} else if (used >= scan.frame_ns || budget >= scan.frame_ns - used) {
+			ahead = (used < scan.frame_ns ? scan.frame_ns - used : 0) +
+			    (uint64_t)te_idle_start * scan.line_ns;
+		}
+		if (ahead > 400000) nap = ahead - 200000;
+		if (nap > limit_ns - elapsed) nap = limit_ns - elapsed;
+		delay_for_interval((uint32_t)((nap + 999) / 1000), NSEC_PER_USEC);
 	}
 }
 
