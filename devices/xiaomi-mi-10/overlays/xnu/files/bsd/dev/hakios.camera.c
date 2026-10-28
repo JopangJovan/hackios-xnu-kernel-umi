@@ -1,6 +1,7 @@
 /*
  * UMI overlay status: cam=1 performs a UMI-specific read-only GPIO/CamCC/ISP ID
- * probe, and cam=5 cam_fake=1 supplies synthetic frames for iOS integration.
+ * probe, cam=2 powers and identifies S5KHMX through umi_camera.c, and
+ * cam=5 cam_fake=1 supplies synthetic frames for iOS integration.
  * Every inherited hardware capture mode is refused before touching MMIO; the
  * register maps and sensor power sequence below are still Redwood-specific.
  */
@@ -4185,6 +4186,9 @@ look(void)
 #define UMI_CAM_IFE_LITE0       0x0acd9000UL
 #define UMI_CAM_CBCR_OFF        (1u << 31)
 
+extern int umi_camera_probe(void);
+extern void umi_camera_probe_quiesce(void);
+
 static void
 umi_camera_pins_readonly(void)
 {
@@ -4212,9 +4216,21 @@ umi_camera_pins_readonly(void)
 static void
 umi_camera_readonly(void)
 {
-	vm_offset_t cc = ml_io_map(UMI_CAMCC_PHYS, UMI_CAMCC_SIZE);
+	vm_offset_t gcc_map = ml_io_map(0x00100000, 0x80000);
+	vm_offset_t cc;
 	uint32_t gdsc, ahb, axi, ife_clk, csid_clk;
 
+	if (!gcc_map) {
+		say("camera: UMI GCC mapping failed; skipped camera register reads\n");
+		return;
+	}
+	uint32_t camera_bus = rd(gcc_map + 0xb008);
+	say("camera: UMI read-only GCC camera AHB %#x\n", camera_bus);
+	if (!(camera_bus & 1)) {
+		say("camera: UMI camera bus clock is gated; skipped CamCC/ISP reads\n");
+		return;
+	}
+	cc = ml_io_map(UMI_CAMCC_PHYS, UMI_CAMCC_SIZE);
 	umi_camera_pins_readonly();
 	if (cc == 0) {
 		say("camera: UMI CamCC mapping failed; no registers touched\n");
@@ -4256,6 +4272,12 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	char which[16] = "";
 
 	(void)PE_parse_boot_argn("cam_after", &secs, sizeof(secs));
+	if (!fake && level == 2) {
+		wait_ms(secs * 1000);
+		(void)umi_camera_probe();
+		thread_terminate(current_thread());
+		return;
+	}
 	if (!fake && level == 1) {
 		wait_ms(secs * 1000);
 		umi_camera_readonly();
@@ -4369,6 +4391,7 @@ hakios_camera_init(void)
 void
 hakios_camera_quiesce(void)
 {
+	umi_camera_probe_quiesce();
 	if (level < 2 || tlmm == 0) {
 		return;
 	}

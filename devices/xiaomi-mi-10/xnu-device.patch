@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,6 +112,14 @@
+@@ -112,6 +112,15 @@
  bsd/dev/hakios.input.c		standard
  bsd/dev/hakios.virtio_input.c	standard
  bsd/dev/hakios.goodix.c	standard
@@ -12,10 +12,11 @@
 +bsd/dev/umi_bluetooth.c		standard
 +bsd/dev/umi_mhi.c		standard
 +bsd/dev/umi_pcie.c		standard
++bsd/dev/umi_camera.c		standard
  bsd/dev/hakios.buttons.c	standard
  bsd/dev/hakios.battery.c	standard
  bsd/dev/hakios.ufs.c	standard
-@@ -639,3 +647,8 @@
+@@ -639,3 +648,8 @@
  bsd/skywalk/packet/pbufpool.c			optional skywalk
  bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
  bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
@@ -24,6 +25,15 @@
 +bsd/dev/hakios.board.c standard
 +bsd/dev/hakios.thermal.c standard
 +bsd/dev/hakios.display.c standard
+--- a/bsd/conf/Makefile.arm64
++++ b/bsd/conf/Makefile.arm64
+@@ -1,3 +1,6 @@
++# Camera probe runs on a kernel thread without a userspace SIMD context.
++umi_camera.o_CFLAGS_ADD += -mgeneral-regs-only
++
+ ######################################################################
+ #BEGIN  Machine dependent Makefile fragment for arm
+ ######################################################################
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -149,6 +149,7 @@
@@ -94,6 +104,15 @@
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -394,4 +394,4 @@
+ {
+-#pragma unused (state, esr, far)
+-	panic_plain("Unhandled implementation specific error\n");
++	panic("Unhandled implementation specific error ESR=%#x FAR=%p PC=%p",
++	    esr, (void *)far, (void *)get_saved_state_pc(state));
+ }
 --- a/osfmk/arm/io_map.c
 +++ b/osfmk/arm/io_map.c
 @@ -62,7 +62,8 @@
@@ -106,3 +125,15 @@
  
  __startup_data static struct mach_vm_range io_range;
  static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
+@@ -82,3 +83,11 @@
++/* UMI camera diagnostics must not overrun the permanent MMIO window. */
++uint64_t umi_camera_iomap_free(void);
++uint64_t
++umi_camera_iomap_free(void)
++{
++	return io_submap && io_submap->size < IO_MAP_SIZE ? IO_MAP_SIZE - io_submap->size : 0;
++}
++
+ /*
+  * Allocate and map memory for devices that may need to be mapped before
+  * Mach VM is running. Allows caller to specify mapping protection

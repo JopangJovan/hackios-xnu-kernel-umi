@@ -5,15 +5,18 @@
 #include <sys/systm.h>
 #include <sys/errno.h>
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <machine/machine_routines.h>
 
 /* Preserve hardware diagnostics in the USB log even in quiet UI boots. */
 extern void hakios_tl(const char *, ...) __printflike(1, 2);
 #define printf hakios_tl
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+extern lck_mtx_t hakios_rsc_lock;
 int umi_rpmh_vreg_enable(const char *res, unsigned mv);
 int umi_rpmh_wifi_power(void);
 int umi_rpmh_bluetooth_power(void);
+int umi_rpmh_camera_vreg(unsigned rail, bool enable);
 
 /* Live downstream DT has two positional reg entries, no reg-names. */
 #define RH_RSC_PA       0x18220000u
@@ -48,11 +51,12 @@ int umi_rpmh_bluetooth_power(void);
 #define RH_VRM          4u
 #define RH_TIMEOUT_US   100000u
 
-static vm_offset_t rh_rsc, rh_tcs, rh_db;
+static vm_offset_t rh_rsc, rh_tcs, rh_db, rh_gic;
 static uint32_t rh_db_size;
 static unsigned rh_ncpt;
 static unsigned rh_lock;
 static bool rh_poisoned;
+static uint32_t rh_uncertain_irq;
 
 static uint32_t
 rh_read(vm_offset_t base, uint32_t off)
@@ -102,6 +106,7 @@ rh_range(uint32_t off, uint32_t size)
 static int
 rh_map(void)
 {
+	if (!rh_gic) rh_gic = ml_io_map(0x17a00000, 0x10000);
 	if (!rh_rsc) {
 		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
 	}
@@ -226,7 +231,7 @@ rh_free(unsigned t)
 }
 
 static int
-rh_send(uint32_t address, unsigned mv, bool set_ldo_mode)
+rh_send_state_locked(uint32_t address, unsigned mv, bool set_ldo_mode, bool enable)
 {
 	int chosen = -1;
 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
@@ -260,6 +265,7 @@ rh_send(uint32_t address, unsigned mv, bool set_ldo_mode)
 	if (irq_en == 0xffffffffu || !rh_free(t)) {
 		return EBUSY;
 	}
+	rh_uncertain_irq = bit;
 	/* Only this TCS's source is masked. Other sources/CPU IRQs remain intact. */
 	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
 		rh_poisoned = true;
@@ -277,11 +283,11 @@ rh_send(uint32_t address, unsigned mv, bool set_ldo_mode)
 	/* Touch's PMIC5 LDO needs HPM. Wi-Fi's shared SMPS/LDO rails retain
 	 * their inherited mode; a PMIC5 LDO mode must not be applied to an SMPS. */
 	const uint32_t offsets[3] = {0, set_ldo_mode ? 8u : 4u, 4};
-	const uint32_t values[3] = {mv, set_ldo_mode ? 7u : 1u, 1};
+	const uint32_t values[3] = {mv, set_ldo_mode ? 7u : (uint32_t)enable, (uint32_t)enable};
 	unsigned commands = set_ldo_mode ? 3 : 2;
 	uint32_t command_mask = (1u << commands) - 1;
-	printf("UMI RPMH: TCS%u ACTIVE %u mV commands=%u enable=1 irq-enable=%#x\n",
-	    t, mv, commands, irq_en);
+	printf("UMI RPMH: TCS%u ACTIVE %u mV commands=%u enable=%u irq-enable=%#x\n",
+	    t, mv, commands, enable, irq_en);
 	for (unsigned c = 0; c < commands; ++c) {
 		uint32_t cmd = b + c * RH_CMD_STRIDE;
 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
@@ -294,6 +300,15 @@ rh_send(uint32_t address, unsigned mv, bool set_ldo_mode)
 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
 		return EIO;
 	}
+	/* The live DT's DRV2 interrupt is SPI5 (GIC INTID37), level high.
+	 * Latch a completion IRQ only while that line is masked at the GIC and
+	 * belongs to nonsecure Group1. No GIC state is changed. Without this
+	 * latch, a fast transaction can finish before the first busy sample and
+	 * leave only CMD_STATUS values identical to the previous transaction.
+	 */
+	bool latch_irq = rh_gic && (rh_read(rh_gic, 0x84) & (1u << 5)) &&
+	    !(rh_read(rh_gic, 0x104) & (1u << 5)) && !(rh_read(rh_gic, 0xc08) & (2u << 10));
+	if (latch_irq && !rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) | bit)) return EIO;
 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
 	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
 	bool done = false, progress = false;
@@ -315,14 +330,15 @@ rh_send(uint32_t address, unsigned mv, bool set_ldo_mode)
 		}
 		delay(1);
 	}
-	printf("UMI RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
-	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
+	printf("UMI RPMH: TCS%u done=%d latch=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+	    t, done, latch_irq, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
 	if (!done) {
 		printf("UMI RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
 		return ETIMEDOUT;
 	}
 	/* Proven completion: clear trigger before mode, then free only our commands. */
-	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, inherited_control) ||
+	if (!rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) & ~bit) ||
+	    !rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, inherited_control) ||
 	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
 		return EIO;
 	}
@@ -334,6 +350,61 @@ rh_send(uint32_t address, unsigned mv, bool set_ldo_mode)
 	rh_poisoned = false;
 	printf("UMI RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
 	return 0;
+}
+
+static int
+rh_send_state(uint32_t address, unsigned mv, bool set_ldo_mode, bool enable)
+{
+	/* Share the sequencer lock with ADSP/MPSS. Panic cleanup cannot wait for
+	 * a mutex held by another stopped CPU.
+	 */
+	if (ml_get_interrupts_enabled()) lck_mtx_lock(&hakios_rsc_lock);
+	else if (!lck_mtx_try_lock(&hakios_rsc_lock)) return EBUSY;
+	int error = rh_send_state_locked(address, mv, set_ldo_mode, enable);
+	if (rh_poisoned && rh_uncertain_irq) {
+		uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
+		if (irq_en != 0xffffffffu) (void)rh_sync(RH_IRQ_EN, irq_en & ~rh_uncertain_irq);
+	}
+	if (!rh_poisoned) rh_uncertain_irq = 0;
+	lck_mtx_unlock(&hakios_rsc_lock);
+	return error;
+}
+
+static int
+rh_send(uint32_t address, unsigned mv, bool set_ldo_mode)
+{
+	return rh_send_state(address, mv, set_ldo_mode, true);
+}
+
+/* Camera owns these three PM8009 supplies. Wi-Fi, Bluetooth and touch use
+ * other resources. Drop only votes successfully established by this client.
+ * Values are the actual Android rear-1x startup requests, including L1's
+ * PMIC voltage-step rounding to 1104 mV.
+ */
+int
+umi_rpmh_camera_vreg(unsigned rail, bool enable)
+{
+	static const struct { const char *resource; unsigned mv; } rails[] = {
+		{ "ldof6", 2850 }, { "ldof7", 1800 }, { "ldof1", 1104 },
+	};
+	static bool owned[3];
+	if (rail >= sizeof(rails) / sizeof(rails[0])) return EINVAL;
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	int error = 0;
+	uint32_t address = 0;
+	if (owned[rail] == enable) goto out;
+	if (rh_poisoned) { error = EIO; goto out; }
+	error = rh_map();
+	if (!error) error = rh_lookup(rails[rail].resource, &address);
+	if (!error) error = rh_send_state(address, rails[rail].mv, true, enable);
+	if (!error) owned[rail] = enable;
+	printf("UMI RPMH: camera %s %u mV enable=%u error=%d\n",
+	    rails[rail].resource, rails[rail].mv, enable, error);
+out:
+	if (error) printf("UMI RPMH: camera supply %u enable=%u refused errno=%d poisoned=%u\n",
+	    rail, enable, error, rh_poisoned);
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
 }
 
 int

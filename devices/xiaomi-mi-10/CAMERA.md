@@ -3,7 +3,30 @@
 The iOS capture bridge displays synthetic frames with `cam=5 cam_fake=1`.
 Physical capture is still disabled in the UMI kernel overlay. `cam=1` reads
 UMI GPIO and CamCC state and, when powered and clocked, the IFE-lite/CSID-lite identifiers.
+It first checks GCC's camera AHB vote and skips camera register reads when
+that bus is gated; CamCC reads with the bus off raise an external abort.
 Seeing color bars does not establish that a sensor is streaming.
+
+`cam=2` runs the UMI-specific S5KHMX power/identification path in
+`overlays/xnu/files/bsd/dev/umi_camera.c`. It uses the traced PM8150L GPIO
+sequence, camera-only PM8009 RPMh votes, MCLK1 at 19.2 MHz, and bounded
+GPIO I2C transfers on CCI0 master 1. It reads chip identification and
+revision, then restores GPIO/clock state and releases its camera votes.
+It refuses an already-enabled MCLK or an active camera GPIO supply.
+The module EEPROM map reads 0x2000 bytes at addresses 0 and 0x2000 from
+slave 0xa0, then appends a one-byte read from sensor slave 0x7a register
+0x000e. Its `SensorVersionOffset=0x4000` points to that appended sensor
+value; it is not an EEPROM address or the chip revision at register 2.
+The probe logs a full word from 0x000e before table selection is enabled.
+This path does not initialize a sensor mode or produce capture frames.
+The probe is compiled with `-mgeneral-regs-only`; its kernel thread does
+not own a userspace SIMD context. The power fault-injection check can also
+check the actual compiled object:
+
+```sh
+python3 devices/xiaomi-mi-10/tools/test-camera-power.py --object \
+  out/xiaomi-mi-10/xnu/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/umi_camera.o
+```
 
 The main rear sensor is S5KHMX. Its stock Android kernel reports ID `0x1ad0`
 and CamX slave address `0x7a` (CCI SID `0x3d`). The live device tree and the
@@ -16,6 +39,7 @@ Android rear 1× startup trace captured on 2026-10-27 identify this path:
 | CCI pins | TLMM 103 data, 104 clock |
 | Reset | TLMM 62, active high |
 | MCLK | MCLK1, TLMM 95, 19.2 MHz |
+| Camera bus | GCC AHB `0xb008` and XO `0xb040`, enable before any CamCC access |
 | CSI | CSIPHY 3, three C-PHY trios, assignment `0x210`, settle count 19 |
 | VAF | PM8009 L6 (`ldof6`), 2.85 V during stock preview |
 | VIO | PM8009 L7 (`ldof7`), 1.8 V |
@@ -58,7 +82,23 @@ The UMI userland build packages `camera-s5khmx-v3.tab` and
 It does not select a default revision or enable physical capture. Vendor
 modules, generated register tables and Android captures remain ignored.
 
-Remaining hardware work includes sensor-version identification, UMI RPMh
-and PM8150L power control with cleanup, Kona TLMM/CCI and CamCC setup,
-CSIPHY v1.2.1, CSID480/IFE48x capture, and the camera SMMU path. The inherited
-Redwood register map must remain gated until those UMI paths are implemented.
+The power/ID probe implements UMI RPMh votes, PM8150L supply switches,
+TLMM GPIO I2C, and the CamCC MCLK path. The device test read S5KHMX ID `0x1ad0` and revision register `0xa000`,
+then successfully released all three camera regulator votes. Remaining capture
+work includes sensor-version selection and mode programming, CSIPHY v1.2.1,
+CSID480/IFE48x, and the camera SMMU path. The inherited Redwood capture
+register map remains gated.
+
+The RPMh client shares the ADSP sequencer mutex. It can latch its own TCS
+completion source when the DRV2 SPI5 interrupt is nonsecure, level-triggered,
+and masked at the GIC; it does not modify GIC configuration. Otherwise it
+requires an observed execution transition. Stale command status alone is
+never treated as completion. Run the transaction model with:
+
+```sh
+python3 devices/xiaomi-mi-10/tools/test-rpmh.py
+```
+
+Clock and GPIO register definitions are from Xiaomi's
+[UMI GCC driver](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/umi-q-oss/drivers/clk/qcom/gcc-kona.c)
+and [Kona pin controller](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/umi-q-oss/drivers/pinctrl/qcom/pinctrl-kona.c).
