@@ -27,6 +27,53 @@ programs `init` followed by `res3` (3008×2256). It reads back dimensions,
 line/frame lengths, and the disabled stream register. Only versions 3 and
 0x13 are accepted; malformed settings and stream-on writes are rejected.
 This diagnostic always powers down afterward. CSI/IFE capture is not started.
+`cam=4` extends mode verification with a Kona-v2 ISP clock/reset probe.
+It uses XO at 19.2 MHz for the six camera RCGs, checks that required clock
+branches are unused before reparenting, and enables the IFE/CSID/PHY3
+clock dependencies. Configuration AHB and IFE/CSID core clocks come on first so inherited
+DMA/path enables can be inspected with CAMNOC/GCC camera AXI clocks still off;
+active write masters are refused before they can resume. It maps IFE-lite0 at `0x0acd9000` once and derives
+CSID-lite0 at offset `0x200`, avoiding overlapping independent mappings.
+The probe reads block IDs and tests CSID480 and IFE-lite48x reset.
+IFE top-v3 uses reset command `2` and completion bit 17 at status `0x40`;
+the inherited top-v2 command/bit are incompatible. No write master, sensor
+stream, SMMU mapping, or PLL is enabled. Cleanup restores parents and
+only disables branches enabled by this probe. Live IDs are IFE `0x10000001`,
+bus `0x20000000`, and CSID `0x20000001`. The inherited IFE reset mask
+`0x20000` is accepted and restored; each disabled write master reads `0x10`,
+whose bit 0 is clear. Other IRQ enables, enabled RDIs or enabled write
+masters remain grounds to refuse the probe. Both CSID reset phases and IFE-lite48x reset passed on the device.
+The optional core-AHB branch at `0xc150` is not a required IFE/CSID DT
+clock dependency and did not retain its enable bit in the first test.
+It is excluded from this probe.
+
+```sh
+python3 devices/xiaomi-mi-10/tools/test-camera-isp.py
+```
+
+`cam=6` adds a hardware-generated 320×240 RAW10 test frame through
+CSID480 RDI0 and IFE-lite48x's bus-v3 write master. This is separate from
+the CPU-generated frames used by `cam=5 cam_fake=1`; neither is a physical
+sensor preview. `umi_camera_dma.c` owns the diagnostic's buffer, page tables,
+SMMU context and stream matches. It rejects occupied routes, checks context
+and route readbacks before enabling a writer, bounds the capture wait, and
+restores its SMMU state after stopping the engines. The buffer remains wired
+for the loader's `camera` export. Buffer guards and completion/data checks
+must pass before it reports a frame. Device validation captured one complete
+frame with no SMMU faults and intact guards; the exported RAW10 decodes to
+clean color bars.
+
+UMI accepted the DT-shaped `0x800/0x400` stream match, but rejected a combined
+`0x800/0x441` match and the odd `0x801/0x400` entry. The diagnostic now requests
+only data writers `0x800` and `0x840`, each with mask `0x400`; both routes
+read back correctly and the hardware TPG capture completed. Physical sensor
+frame capture remains disabled. Reserved FSR bit `0x400` is not a context fault:
+only the architected `0xc00001fe` fault bits are tested or acknowledged.
+
+```sh
+python3 devices/xiaomi-mi-10/tools/test-camera-dma.py
+```
+
 The host parser/transaction test uses the locally generated tables:
 
 ```sh
@@ -106,8 +153,9 @@ passed hardware readback: version 0x13 applied 259 initialization and
 179 mode writes; width/height were 0x0bc0/0x08d0, line/frame lengths
 0x3ea0/0x0945, and stream register 0x0100 remained zero. All three
 camera regulator votes were released afterward.
-Remaining capture work includes CSIPHY v1.2.1, CSID480/IFE48x, and the
-camera SMMU path. The inherited Redwood capture
+Remaining capture work includes high-rate CamCC power/clock setup,
+CSIPHY v1.2.1, the live sensor stream, and its iOS capture integration.
+The CSID480/IFE48x DMA and camera SMMU path passed the hardware TPG test. The inherited Redwood capture
 register map remains gated.
 
 The RPMh client shares the ADSP sequencer mutex. It can latch its own TCS

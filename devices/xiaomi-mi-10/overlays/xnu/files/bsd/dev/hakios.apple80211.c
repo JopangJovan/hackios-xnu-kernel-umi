@@ -693,6 +693,8 @@ note(const struct apple80211req *request, bool is_set, int error)
 	lck_mtx_unlock(&apple80211_lock);
 }
 
+/* loader_return calls this with interrupts disabled: keep diagnostics in USB RAM. */
+extern void hakios_tl(const char *, ...) __printflike(1, 2);
 void
 hakios_apple80211_summary(void)
 {
@@ -703,10 +705,10 @@ hakios_apple80211_summary(void)
 	}
 	said = true;
 	for (unsigned i = 0; i < kind_count; i++) {
-		printf("apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
+		hakios_tl("apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
 		    type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error == 0 ? "\n" : "");
 		if (kinds[i].last_error != 0) {
-			printf("; the last refusal: %d%s\n", kinds[i].last_error, kinds[i].last_error == EOPNOTSUPP ? " (not built)" : "");
+			hakios_tl("; the last refusal: %d%s\n", kinds[i].last_error, kinds[i].last_error == EOPNOTSUPP ? " (not built)" : "");
 		}
 	}
 }

@@ -22,6 +22,7 @@ source = source.replace('/darwin-hakios-phone', '/hackios-phone')
 (sandbox / 'xl').chmod(0o755)
 for name, target in {'xnuloader': ROOT / 'xnuloader', 'prebuilt': ROOT / 'prebuilt',
                      'mkxnuimg.py': DEVICE / 'tools/mkimage.py',
+                     'tools': ROOT / 'tools',
                      'userland': OUT / 'userland-build/userland'}.items():
     path = sandbox / name
     if not path.exists() and not path.is_symlink():

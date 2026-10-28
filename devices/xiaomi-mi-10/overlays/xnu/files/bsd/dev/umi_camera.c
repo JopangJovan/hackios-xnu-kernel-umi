@@ -1,5 +1,6 @@
 /* UMI main-camera bring-up. cam=2 identifies; cam=3 also programs mode 3.
- * Neither diagnostic starts a sensor stream.
+ * cam=4 verifies ISP reset; cam=6 also tests hardware TPG capture.
+ * These diagnostics never start a sensor stream.
  * Board wiring and sequencing come from the live UMI DT, V2 sensor module,
  * and Android rear-1x GPIO/regulator/SPMI traces. The PM8150L GPIO sequence
  * below is the traced sequence, including its input/output mode and pull.
@@ -17,6 +18,10 @@ extern int umi_rpmh_camera_vreg(unsigned, bool);
 extern uint64_t umi_camera_iomap_free(void);
 int umi_camera_probe(void);
 int umi_camera_prepare(void);
+int umi_camera_isp_probe(void);
+int umi_camera_capture_tpg(void);
+extern int umi_camera_tpg(vm_offset_t, vm_offset_t);
+extern void umi_camera_dma_quiesce(bool);
 extern const uint8_t *hakios_wifi_file(const char *, uint64_t *);
 void umi_camera_probe_quiesce(void);
 
@@ -352,10 +357,183 @@ uclock_on(void)
 	return true;
 }
 
+/* Kona-v2 ISP diagnostic: establish MMIO/reset operation at XO frequency.
+ * No PLL, stream, DMA master, or SMMU entry is enabled at this stage.
+ * All affected clock branches must be unused before their parents change.
+ */
+static struct {
+	unsigned cmd; uint32_t saved; bool changed;
+} isp_rcgs[] = {
+	{ .cmd = 0x7058 }, /* slow AHB */
+	{ .cmd = 0xc0f8 }, /* CAMNOC AXI */
+	{ .cmd = 0xa068 }, /* C-PHY RX */
+	{ .cmd = 0x6060 }, /* PHY3 timer */
+	{ .cmd = 0xc000 }, /* IFE-lite */
+	{ .cmd = 0xc01c }, /* IFE-lite CSID */
+};
+static struct {
+	unsigned reg; bool gcc, delay_only, changed;
+} isp_branches[] = {
+	{ .reg = 0xb02c, .gcc = true }, { .reg = 0xb030, .gcc = true },
+	{ .reg = 0xc0f4 }, /* CPAS AHB */
+	{ .reg = 0xc11c }, /* CAMNOC DCD XO */
+	{ .reg = 0xc114 }, /* CAMNOC AXI */
+	{ .reg = 0xc040 }, /* IFE-lite AHB */
+	{ .reg = 0xc044 }, /* IFE-lite AXI */
+	{ .reg = 0xc018 }, /* IFE-lite */
+	{ .reg = 0xc034 }, /* IFE-lite CSID */
+	{ .reg = 0xc03c }, /* IFE-lite C-PHY RX */
+	{ .reg = 0x6078 }, /* PHY3 timer */
+	{ .reg = 0x607c }, /* PHY3 */
+};
+static vm_offset_t isp_ife, isp_csid;
+static bool isp_resetting;
+static uint32_t isp_saved_ife_mask;
+
+static void
+uisp_down(void)
+{
+	umi_camera_dma_quiesce(uc.panic);
+	if (isp_resetting) {
+		/* Mask/clear only reset IRQs owned by this diagnostic. */
+		uw(isp_ife, 0x28, 0); uw(isp_ife, 0x34, 1u << 17); uw(isp_ife, 0x24, 1);
+		uw(isp_ife, 0x28, isp_saved_ife_mask);
+		uw(isp_csid, 0x74, 0); uw(isp_csid, 0x78, 1); uw(isp_csid, 0x80, 1);
+		isp_resetting = false;
+	}
+	for (unsigned n = sizeof(isp_branches)/sizeof(isp_branches[0]); n; --n) {
+		unsigned i = n-1;
+		if (!isp_branches[i].changed) continue;
+		vm_offset_t base = isp_branches[i].gcc ? uc.gcc : uc.cc;
+		uw(base, isp_branches[i].reg, ur(base, isp_branches[i].reg) & ~1u);
+		isp_branches[i].changed = false;
+	}
+	for (unsigned n = sizeof(isp_rcgs)/sizeof(isp_rcgs[0]); n; --n) {
+		unsigned i = n-1, cmd = isp_rcgs[i].cmd;
+		if (!isp_rcgs[i].changed) continue;
+		uw(uc.cc, cmd+4, isp_rcgs[i].saved);
+		uw(uc.cc, cmd, ur(uc.cc, cmd) | 1);
+		if (!upoll(uc.cc, cmd, 1, 0, 1000))
+			hakios_tl("UMI camera: ISP clock %#x restore timed out\n", cmd);
+		isp_rcgs[i].changed = false;
+	}
+}
+
+static int
+uisp_probe(void)
+{
+	/* Check every consumer before changing any source. This is not a way
+	 * to take ownership of an ISP already used by another driver.
+	 */
+	for (unsigned i = 0; i < sizeof(isp_branches)/sizeof(isp_branches[0]); ++i) {
+		vm_offset_t base = isp_branches[i].gcc ? uc.gcc : uc.cc;
+		if (ur(base, isp_branches[i].reg) & 1) {
+			hakios_tl("UMI camera: ISP branch %#x already enabled; refusing reparent\n", isp_branches[i].reg);
+			return EBUSY;
+		}
+	}
+	for (unsigned i = 0; i < sizeof(isp_rcgs)/sizeof(isp_rcgs[0]); ++i) {
+		unsigned cmd = isp_rcgs[i].cmd;
+		isp_rcgs[i].saved = ur(uc.cc, cmd+4);
+		isp_rcgs[i].changed = true;
+		uw(uc.cc, cmd+4, (isp_rcgs[i].saved & ~0x371fu) | 1); /* XO / 1 */
+		uw(uc.cc, cmd, ur(uc.cc, cmd) | 1);
+		if (!upoll(uc.cc, cmd, 1, 0, 1000)) return ETIMEDOUT;
+	}
+	/* Register access also needs IFE/CSID core clocks. Keep the entire
+	 * external memory path (CAMNOC AXI and both GCC camera AXI branches)
+	 * gated while inspecting inherited DMA/path enables.
+	 */
+	for (unsigned i = 0; i < sizeof(isp_branches)/sizeof(isp_branches[0]); ++i) {
+		if (isp_branches[i].gcc || isp_branches[i].reg == 0xc114) continue;
+		vm_offset_t base = uc.cc;
+		unsigned reg = isp_branches[i].reg;
+		isp_branches[i].changed = true;
+		uw(base, reg, ur(base, reg) | 1);
+		if (isp_branches[i].delay_only) delay(10);
+		if (!(ur(base, reg) & 1) || (!isp_branches[i].delay_only &&
+		    !upoll(base, reg, 1u<<31, 0, 2000))) {
+			hakios_tl("UMI camera: ISP branch %#x failed to start, value %#x\n", reg, ur(base, reg));
+			return EIO;
+		}
+	}
+	/* Physical regions overlap: map IFE once, derive CSID's 0x200 offset. */
+	if (!isp_ife) isp_ife = umap(0x0acd9000, 0x2200);
+	if (!isp_ife) return ENOMEM;
+	isp_csid = isp_ife + 0x200;
+	hakios_tl("UMI camera: reading IFE core version\n");
+	uint32_t ife_version = ur(isp_ife, 0);
+	hakios_tl("UMI camera: IFE core version %#x; reading local bus version\n", ife_version);
+	uint32_t bus_version = ur(isp_ife, 0x1a00);
+	hakios_tl("UMI camera: bus version %#x; reading CSID version\n", bus_version);
+	uint32_t csid_version = ur(isp_csid, 0);
+	hakios_tl("UMI camera: XO-clocked ISP IDs IFE=%#x bus=%#x CSID=%#x\n", ife_version, bus_version, csid_version);
+	if (!ife_version || ife_version == ~0u || !bus_version || bus_version == ~0u ||
+	    !csid_version || csid_version == ~0u) return ENODEV;
+	/* An inherited reset-only mask is harmless and restored afterward.
+	 * WM bit0 is enable; reset-default bit4 alone does not enable DMA. */
+	hakios_tl("UMI camera: ISP inherited masks CSID top=%#x RX=%#x IFE=%#x/%#x/%#x\n",
+	    ur(isp_csid, 0x74), ur(isp_csid, 0x24), ur(isp_ife, 0x28), ur(isp_ife, 0x2c), ur(isp_ife, 0x30));
+	bool busy = ur(isp_csid, 0x74) || ur(isp_csid, 0x24) || (ur(isp_ife, 0x28) & ~(1u<<17)) ||
+	    ur(isp_ife, 0x2c) || ur(isp_ife, 0x30);
+	for (unsigned i = 0; i < 4; ++i) {
+		uint32_t cfg = ur(isp_csid, 0x200+0x100*i), mask = ur(isp_csid, 0x34+0x10*i), wm = ur(isp_ife, 0x1c00+0x100*i);
+		hakios_tl("UMI camera: ISP inherited RDI%u cfg=%#x mask=%#x WM=%#x\n", i, cfg, mask, wm);
+		busy |= (cfg & (1u<<31)) || mask || (wm & 1);
+	}
+	if (busy) return EBUSY;
+	isp_saved_ife_mask = ur(isp_ife, 0x28);
+	for (unsigned i = 0; i < sizeof(isp_branches)/sizeof(isp_branches[0]); ++i) {
+		if (isp_branches[i].changed) continue;
+		vm_offset_t base = isp_branches[i].gcc ? uc.gcc : uc.cc;
+		unsigned reg = isp_branches[i].reg;
+		isp_branches[i].changed = true;
+		uw(base, reg, ur(base, reg) | 1);
+		if (isp_branches[i].delay_only) delay(10);
+		if (!(ur(base, reg) & 1) || (!isp_branches[i].delay_only &&
+		    !upoll(base, reg, 1u<<31, 0, 2000))) {
+			hakios_tl("UMI camera: ISP branch %#x failed to start, value %#x\n", reg, ur(base, reg));
+			return EIO;
+		}
+	}
+	isp_resetting = true;
+	uw(isp_csid, 0x28, 0x0fffffff);
+	for (unsigned i = 0; i < 4; ++i) uw(isp_csid, 0x38+0x10*i, 0x7fff);
+	uw(isp_csid, 0x104, 0x80);
+	for (unsigned i = 0; i < 4; ++i) uw(isp_csid, 0x200+0x100*i, 2);
+	/* The SM8250 driver's global reset performs hardware, then registers. */
+	for (unsigned step = 0; step < 2; ++step) {
+		bool hw = step == 0;
+		uw(isp_csid, 0x78, 1); uw(isp_csid, 0x80, 1);
+		if (!upoll(isp_csid, 0x70, 1, 0, 1000)) return EIO;
+		if (hw) { uw(isp_csid, 0x74, 1); uw(isp_csid, 0x80, 1); }
+		uw(isp_csid, 0x10, hw ? 0x1e : 1);
+		if (!hw) { uw(isp_csid, 0x74, 1); uw(isp_csid, 0x80, 1); }
+		if (!upoll(isp_csid, 0x70, 1, 1, 100000)) {
+			hakios_tl("UMI camera: CSID %s reset timed out, IRQ %#x\n", hw ? "hardware" : "register", ur(isp_csid, 0x70));
+			return ETIMEDOUT;
+		}
+		uw(isp_csid, 0x78, 1); uw(isp_csid, 0x80, 1);
+	}
+	/* VFE lite48x/top-v3: command 2 resets HW+registers; bit17 ACK.
+	 * Redwood's top-v2 command 0x3f9f/bit31 must never be used here.
+	 */
+	uw(isp_ife, 0x34, 1u<<17); uw(isp_ife, 0x24, 1);
+	if (!upoll(isp_ife, 0x40, 1u<<17, 0, 1000)) return EIO;
+	uw(isp_ife, 0x28, 1u<<17); uw(isp_ife, 0xc, 2);
+	if (!upoll(isp_ife, 0x40, 1u<<17, 1u<<17, 100000)) {
+		hakios_tl("UMI camera: IFE-lite48x reset timed out, IRQ %#x\n", ur(isp_ife, 0x40));
+		return ETIMEDOUT;
+	}
+	hakios_tl("UMI camera: CSID480 and IFE-lite48x resets complete; DMA remains disabled\n");
+	return 0;
+}
+
 static void
 ucleanup(void)
 {
 	if (!uc.active) return;
+	uisp_down();
 	if (uc.clock_changed) {
 		uw(uc.cc, 0x5034, uc.clock_branch);
 		(void)upoll(uc.cc, 0x5034, 1u << 31, 1u << 31, 1000);
@@ -409,7 +587,7 @@ umi_camera_probe_quiesce(void)
 }
 
 static int
-uprobe(bool initialize)
+uprobe(unsigned stage)
 {
 	if (uc.active) return EBUSY;
 	uc.panic = false;
@@ -510,7 +688,9 @@ uprobe(bool initialize)
 	if (usensor_read(0x000e, &selector))
 		hakios_tl("UMI camera: module sensor-version source register 0x000e=%#x\n", selector);
 	else hakios_tl("UMI camera: module sensor-version source did not answer\n");
-	error = initialize ? umode_prepare(selector >> 8) : 0;
+	error = stage >= 3 ? umode_prepare(selector >> 8) : 0;
+	if (!error && stage >= 4) error = uisp_probe();
+	if (!error && stage == 6) error = umi_camera_tpg(isp_ife, isp_csid);
 done:
 	ucleanup();
 	hakios_tl("UMI camera: sensor probe finished error=%d; sensor stream was not started\n", error);
@@ -520,11 +700,23 @@ done:
 int
 umi_camera_probe(void)
 {
-	return uprobe(false);
+	return uprobe(2);
 }
 
 int
 umi_camera_prepare(void)
 {
-	return uprobe(true);
+	return uprobe(3);
+}
+
+int
+umi_camera_isp_probe(void)
+{
+	return uprobe(4);
+}
+
+int
+umi_camera_capture_tpg(void)
+{
+	return uprobe(6);
 }
