@@ -1,4 +1,5 @@
-/* UMI main-camera power/identification. cam=2 only; no sensor stream is started.
+/* UMI main-camera bring-up. cam=2 identifies; cam=3 also programs mode 3.
+ * Neither diagnostic starts a sensor stream.
  * Board wiring and sequencing come from the live UMI DT, V2 sensor module,
  * and Android rear-1x GPIO/regulator/SPMI traces. The PM8150L GPIO sequence
  * below is the traced sequence, including its input/output mode and pull.
@@ -15,6 +16,8 @@ extern void hakios_tl(const char *, ...) __printflike(1, 2);
 extern int umi_rpmh_camera_vreg(unsigned, bool);
 extern uint64_t umi_camera_iomap_free(void);
 int umi_camera_probe(void);
+int umi_camera_prepare(void);
+extern const uint8_t *hakios_wifi_file(const char *, uint64_t *);
 void umi_camera_probe_quiesce(void);
 
 static struct {
@@ -243,6 +246,97 @@ usensor_read(uint16_t reg, uint16_t *value)
 	return ok;
 }
 
+/* Validate the complete container before issuing any initialization writes.
+ * The diagnostic uses only init/res3; the stream-on table is never applied.
+ */
+static uint32_t
+utab_u32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static bool
+usensor_write(uint16_t reg, uint16_t value)
+{
+	bool ok = ustart() && uput(0x7a) && uput(reg >> 8) && uput(reg) &&
+	    uput(value >> 8) && uput(value);
+	ustop();
+	return ok;
+}
+
+static int
+umode_prepare(unsigned version)
+{
+	if (version != 3 && version != 0x13) return ENODEV;
+	uint64_t size = 0;
+	const char *name = version == 3 ? "camera-s5khmx-v3.tab" : "camera-s5khmx-v19.tab";
+	const uint8_t *file = hakios_wifi_file(name, &size);
+	if (!file || size < 40 || size > 65536 || memcmp(file, "RWCTAB02", 8) ||
+	    utab_u32(file+8) != 0x7a || utab_u32(file+12) != 2 || utab_u32(file+16) != 2 ||
+	    utab_u32(file+20) != 0 || utab_u32(file+24) != 0x1ad0 ||
+	    utab_u32(file+32) != 0x210 || utab_u32(file+36) != 7) return EINVAL;
+	uint64_t offset = 40 + 7*48;
+	if (offset > size) return EINVAL;
+	const uint8_t *mode = file + 40 + 3*48;
+	if (utab_u32(mode) != 3008 || utab_u32(mode+4) != 2256 ||
+	    utab_u32(mode+16) != 3 || utab_u32(mode+20) != 1 || utab_u32(mode+44) != 0x2b) return EINVAL;
+	for (unsigned p = 0; p < 2; ++p) {
+		if (size-offset < 12) return EINVAL;
+		uint64_t bytes = 12 + 12ull*utab_u32(file+offset+8);
+		if (bytes > size-offset) return EINVAL;
+		offset += bytes;
+	}
+	if (size-offset < 4) return EINVAL;
+	unsigned tables = utab_u32(file+offset); offset += 4;
+	if (!tables || tables > 32) return EINVAL;
+	const uint8_t *selected[2] = { NULL, NULL };
+	unsigned counts[2] = { 0, 0 };
+	for (unsigned t = 0; t < tables; ++t) {
+		if (size-offset < 12) return EINVAL;
+		const uint8_t *table = file+offset;
+		unsigned count = utab_u32(table+8);
+		uint64_t bytes = 12 + 12ull*count;
+		if (bytes > size-offset) return EINVAL;
+		int slot = !memcmp(table, "init\0\0\0\0", 8) ? 0 :
+		    !memcmp(table, "res3\0\0\0\0", 8) ? 1 : -1;
+		if (slot >= 0) {
+			if (selected[slot] || !count || count > 4096) return EINVAL;
+			selected[slot] = table+12; counts[slot] = count;
+			for (unsigned i = 0; i < count; ++i) {
+				const uint8_t *e = table+12+12*i;
+				if (e[4] != 2 || e[5] != 2 || e[6] || e[7] || utab_u32(e+8) > 100000 ||
+				    (e[0] == 0 && e[1] == 1 && (e[2] || e[3]))) return EINVAL;
+			}
+		}
+		offset += bytes;
+	}
+	if (offset != size || !selected[0] || !selected[1]) return EINVAL;
+	hakios_tl("UMI camera: initialize version %#x mode 3 without stream-on (%u+%u writes)\n", version, counts[0], counts[1]);
+	for (unsigned t = 0; t < 2; ++t)
+		for (unsigned i = 0; i < counts[t]; ++i) {
+			const uint8_t *e = selected[t]+12*i;
+			uint16_t reg = (uint16_t)(e[0] | e[1] << 8), value = (uint16_t)(e[2] | e[3] << 8);
+			if (!usensor_write(reg, value)) {
+				hakios_tl("UMI camera: table %u entry %u register %#x NACK\n", t, i, reg);
+				return EIO;
+			}
+			unsigned us = utab_u32(e+8);
+			if (us >= 1000) ums(us/1000);
+			if (us%1000) delay(us%1000);
+		}
+	/* Restore the indirect-write page before verifying direct output registers. */
+	if (!usensor_write(0x6028, 0x4000)) return EIO;
+	static const unsigned regs[5] = { 0x034c, 0x034e, 0x0342, 0x0340, 0x0100 };
+	const unsigned expected[5] = { 3008, 2256, utab_u32(mode+32), utab_u32(mode+36), 0 };
+	for (unsigned i = 0; i < 5; ++i) {
+		uint16_t value = 0;
+		if (!usensor_read(regs[i], &value)) return EIO;
+		hakios_tl("UMI camera: mode register %#x=%#x expected %#x\n", regs[i], value, expected[i]);
+		if (value != expected[i]) return EIO;
+	}
+	return 0;
+}
+
 static bool
 uclock_on(void)
 {
@@ -314,8 +408,8 @@ umi_camera_probe_quiesce(void)
 	ucleanup();
 }
 
-int
-umi_camera_probe(void)
+static int
+uprobe(bool initialize)
 {
 	if (uc.active) return EBUSY;
 	uc.panic = false;
@@ -416,9 +510,21 @@ umi_camera_probe(void)
 	if (usensor_read(0x000e, &selector))
 		hakios_tl("UMI camera: module sensor-version source register 0x000e=%#x\n", selector);
 	else hakios_tl("UMI camera: module sensor-version source did not answer\n");
-	error = 0;
+	error = initialize ? umode_prepare(selector >> 8) : 0;
 done:
 	ucleanup();
 	hakios_tl("UMI camera: sensor probe finished error=%d; sensor stream was not started\n", error);
 	return error;
+}
+
+int
+umi_camera_probe(void)
+{
+	return uprobe(false);
+}
+
+int
+umi_camera_prepare(void)
+{
+	return uprobe(true);
 }

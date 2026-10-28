@@ -80,6 +80,7 @@ static void mock_write(uintptr_t a,uint32_t v) {
 vm_offset_t ml_io_map(vm_offset_t p,vm_size_t s){(void)s;return p;}
 uint64_t umi_camera_iomap_free(void){return mapping_free;}
 void hakios_tl(const char *f,...){(void)f;}
+const uint8_t *hakios_wifi_file(const char *n,uint64_t *s){(void)n;*s=0;return NULL;}
 int umi_rpmh_camera_vreg(unsigned r,bool enabled){assert(r<3);if(enabled&&(int)r==fail_rail)return EIO;rail_state[r]=enabled;return 0;}
 static void reset_fixture(void){
  memset(&uc,0,sizeof(uc));used=write_count=fail_write=0;fail_rail=-1;fail_clock=0;

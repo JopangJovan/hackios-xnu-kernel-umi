@@ -17,8 +17,24 @@ The module EEPROM map reads 0x2000 bytes at addresses 0 and 0x2000 from
 slave 0xa0, then appends a one-byte read from sensor slave 0x7a register
 0x000e. Its `SensorVersionOffset=0x4000` points to that appended sensor
 value; it is not an EEPROM address or the chip revision at register 2.
-The probe logs a full word from 0x000e before table selection is enabled.
-This path does not initialize a sensor mode or produce capture frames.
+The device returned `0x1301` at 0x000e: the first byte selects version
+`0x13`. The distinct register-2 revision remains `0xa000`.
+The `cam=2` path does not initialize a sensor mode or produce capture frames.
+
+`cam=3` additionally selects the table from the high byte of register 0x000e,
+validates the entire RWCTAB02 container before initialization writes, and
+programs `init` followed by `res3` (3008×2256). It reads back dimensions,
+line/frame lengths, and the disabled stream register. Only versions 3 and
+0x13 are accepted; malformed settings and stream-on writes are rejected.
+This diagnostic always powers down afterward. CSI/IFE capture is not started.
+The host parser/transaction test uses the locally generated tables:
+
+```sh
+python3 devices/xiaomi-mi-10/tools/test-camera-tables.py \
+  out/xiaomi-mi-10/camera-reference/camera-s5khmx-v3.tab \
+  out/xiaomi-mi-10/camera-reference/camera-s5khmx-v19.tab
+```
+
 The probe is compiled with `-mgeneral-regs-only`; its kernel thread does
 not own a userspace SIMD context. The power fault-injection check can also
 check the actual compiled object:
@@ -83,10 +99,15 @@ It does not select a default revision or enable physical capture. Vendor
 modules, generated register tables and Android captures remain ignored.
 
 The power/ID probe implements UMI RPMh votes, PM8150L supply switches,
-TLMM GPIO I2C, and the CamCC MCLK path. The device test read S5KHMX ID `0x1ad0` and revision register `0xa000`,
-then successfully released all three camera regulator votes. Remaining capture
-work includes sensor-version selection and mode programming, CSIPHY v1.2.1,
-CSID480/IFE48x, and the camera SMMU path. The inherited Redwood capture
+TLMM GPIO I2C, and the CamCC MCLK path. The device test read S5KHMX ID
+`0x1ad0`, revision register `0xa000`, and table selector `0x13`, then
+successfully released all three camera regulator votes. Mode programming
+passed hardware readback: version 0x13 applied 259 initialization and
+179 mode writes; width/height were 0x0bc0/0x08d0, line/frame lengths
+0x3ea0/0x0945, and stream register 0x0100 remained zero. All three
+camera regulator votes were released afterward.
+Remaining capture work includes CSIPHY v1.2.1, CSID480/IFE48x, and the
+camera SMMU path. The inherited Redwood capture
 register map remains gated.
 
 The RPMh client shares the ADSP sequencer mutex. It can latch its own TCS

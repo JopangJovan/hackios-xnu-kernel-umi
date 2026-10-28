@@ -1,6 +1,7 @@
 /*
  * UMI overlay status: cam=1 performs a UMI-specific read-only GPIO/CamCC/ISP ID
- * probe, cam=2 powers and identifies S5KHMX through umi_camera.c, and
+ * probe, cam=2 identifies S5KHMX, cam=3 verifies mode programming without
+ * streaming through umi_camera.c, and
  * cam=5 cam_fake=1 supplies synthetic frames for iOS integration.
  * Every inherited hardware capture mode is refused before touching MMIO; the
  * register maps and sensor power sequence below are still Redwood-specific.
@@ -4187,6 +4188,7 @@ look(void)
 #define UMI_CAM_CBCR_OFF        (1u << 31)
 
 extern int umi_camera_probe(void);
+extern int umi_camera_prepare(void);
 extern void umi_camera_probe_quiesce(void);
 
 static void
@@ -4272,9 +4274,10 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	char which[16] = "";
 
 	(void)PE_parse_boot_argn("cam_after", &secs, sizeof(secs));
-	if (!fake && level == 2) {
+	if (!fake && (level == 2 || level == 3)) {
 		wait_ms(secs * 1000);
-		(void)umi_camera_probe();
+		if (level == 3) (void)umi_camera_prepare();
+		else (void)umi_camera_probe();
 		thread_terminate(current_thread());
 		return;
 	}
@@ -4365,7 +4368,7 @@ hakios_camera_init(void)
 	uint32_t fake_n = 0;
 
 	fake = level == 5 && PE_parse_boot_argn("cam_fake", &fake_n, sizeof(fake_n)) && fake_n != 0;
-	if (level >= 3) {
+	if (level >= 4) {
 		/*
 		 * Memory in one piece for the host (cam_keep_mb, default 24: a 12-megapixel NV12 picture of cam=5,
 		 * or two frames of cam=3 and cam=4 up to 12 MB each), taken now, while the system's memory still
