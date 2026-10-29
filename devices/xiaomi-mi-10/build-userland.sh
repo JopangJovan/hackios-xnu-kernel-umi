@@ -11,6 +11,10 @@ export RC_JOBS=${RC_JOBS:-rc.jobs.umi-boot}
 if [ "${UMI_METAL_TEST:-0}" = 1 ]; then
   export RC_JOBS=rc.jobs.umi-metal
 fi
+if [ "${UMI_METAL_SHADERS:-0}" = 1 ]; then
+  export AIR=1 RC_JOBS=rc.jobs.umi-shaders
+  "$ROOT/tools/mk-mesa.sh"
+fi
 # A cached system image from before Metal integration lacks the plugin link.
 # Rebuild it once when this device's system layout changes, then cache it again.
 layout="umi-native-metal-v1"
@@ -28,4 +32,7 @@ fi
 # Keep the validation image separate from the ordinary boot image.
 if [ "${UMI_METAL_TEST:-0}" = 1 ]; then
   cp "$ROOT/out/xiaomi-mi-10/root.apfs" "$ROOT/out/xiaomi-mi-10/metal-test.apfs"
+fi
+if [ "${UMI_METAL_SHADERS:-0}" = 1 ]; then
+  cp "$ROOT/out/xiaomi-mi-10/root.apfs" "$ROOT/out/xiaomi-mi-10/metal-shader-test.apfs"
 fi

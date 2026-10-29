@@ -1,0 +1,5 @@
+# Experimental AIR shader execution; screen output remains on the ordinary renderer.
+/redwood/bin/hello_dyn UMI-AIR-shader-execution
+/redwood/bin/metal_test blits
+/redwood/bin/air_run --disasm /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib clearFragment01
+/redwood/bin/hakios-metal-probe

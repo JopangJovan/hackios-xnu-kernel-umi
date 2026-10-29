@@ -85,3 +85,39 @@ The corrected hardware run reports:
 Local evidence: `out/xiaomi-mi-10/metal-validation/passed-run.log`.
 These validate native Metal buffers, command queues and blits, not shader
 execution or Metal composition of the home screen.
+
+## Isolated shader execution experiment
+
+```sh
+UMI_METAL_SHADERS=1 devices/xiaomi-mi-10/build-userland.sh
+# Rebuild normally afterward if root.apfs should use the ordinary job list.
+devices/xiaomi-mi-10/run.sh reload
+devices/xiaomi-mi-10/run.sh ramdisk
+UMI_METAL_SHADERS=1 devices/xiaomi-mi-10/run-metal-test.sh
+```
+
+This profile builds `air_run` explicitly (Mesa's normal library cache does not
+build that optional executable), packages it in `metal-shader-test.apfs`, and
+runs `clearFragment01` from Apple's installed Metal shader library. It asks
+for native IR3 disassembly, renders a 4x4 quad and reads a float RGBA pixel.
+The native Metal blit tests and probe run in the same boot.
+
+UMI hardware run on 2026-10-29: `air_run` identifies FD650, prints native
+fragment instructions for `clearFragment01`, completes the draw, and returns:
+
+```
+2.10170319e-18  0.178894654  1.48687698e+16  1.21394141e+33
+```
+
+All four values match an independent host interpretation of the input buffer.
+Both Metal log checkers pass. Local evidence is
+`out/xiaomi-mi-10/metal-shader-test/passed-run.log`.
+
+```sh
+python3 devices/xiaomi-mi-10/tools/check-metal-shader-log.py path/to/log
+```
+
+This proves **AIR -> NIR -> Mesa/IR3 -> Adreno 650 shader execution**. It does
+not connect the native hakios-metal command queue to a render encoder or
+make CoreAnimation use Metal. The home screen remains on its working renderer;
+normal boot arguments and the paused camera/display experiments are unchanged.
