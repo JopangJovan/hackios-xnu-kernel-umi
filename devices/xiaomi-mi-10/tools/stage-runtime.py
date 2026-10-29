@@ -9,13 +9,15 @@ OUT = ROOT / 'out/xiaomi-mi-10'
 sandbox = OUT / 'runtime'
 sandbox.mkdir(parents=True, exist_ok=True)
 source = (ROOT / 'xl').read_text()
-source = source.replace('K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837',
-                        'K=${XL_KERNEL:?UMI kernel path required}')
-source = source.replace('[ -f $K ] || K=prebuilt/mach.development.bcm2837',
-                        '[ -f "$K" ] || { echo "Build the UMI kernel first" >&2; exit 1; }')
-source = source.replace('L=xnuloader/loader.efi', 'L=${XL_LOADER:?UMI loader path required}')
-source = source.replace('[ -f $L ] || L=prebuilt/loader.efi',
-                        '[ -f "$L" ] || { echo "Build the UMI loader first" >&2; exit 1; }')
+# Upstream renamed the kernel artifact and changed its fallback block. Replace
+# the complete artifact-selection block, and fail rather than boot a prebuilt.
+start = source.index('\nK=') + 1
+end = source.index('mkdir -p logs', start)
+source = source[:start] + '''K=${XL_KERNEL:?UMI kernel path required}
+L=${XL_LOADER:?UMI loader path required}
+[ -f "$K" ] || { echo "Build the UMI kernel first" >&2; exit 1; }
+[ -f "$L" ] || { echo "Build the UMI loader first" >&2; exit 1; }
+''' + source[end:]
 # Use the existing host's phone lock across old and new UMI workspaces.
 source = source.replace('/darwin-hakios-phone', '/hackios-phone')
 (sandbox / 'xl').write_text(source)
@@ -23,6 +25,8 @@ source = source.replace('/darwin-hakios-phone', '/hackios-phone')
 for name, target in {'xnuloader': ROOT / 'xnuloader', 'prebuilt': ROOT / 'prebuilt',
                      'mkxnuimg.py': DEVICE / 'tools/mkimage.py',
                      'tools': ROOT / 'tools',
+                     'VERSION': ROOT / 'VERSION',
+                     '.config': OUT / 'umi.config',
                      'userland': OUT / 'userland-build/userland'}.items():
     path = sandbox / name
     if not path.exists() and not path.is_symlink():

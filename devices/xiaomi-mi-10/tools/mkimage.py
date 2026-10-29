@@ -66,8 +66,8 @@ if TARGET != 'redwood':
             f'-DFD_SIZE={FD_SIZE:#x}', f'-DPAYLOAD_BASE={PAYLOAD_BASE:#x}', '-o', obj])
         subprocess.check_call(['aarch64-linux-gnu-objcopy', '-O', 'binary', obj, raw])
         shim = open(raw, 'rb').read()
-    parts = {'fd': fd_path, 'dtb': dtb_path, 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
-             'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
+    parts = {'fd': fd_path, 'dtb': dtb_path, 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
+             'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
 elif os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
     shim_dir = os.path.join(MU, 'BootShim')
     for f in ('BootShim.elf', 'BootShim.bin'):
@@ -81,8 +81,8 @@ elif os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
              'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
 else:
     parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),
-             'dtb': os.path.join(PREBUILT, 'redwood.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
-             'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
+             'dtb': os.path.join(PREBUILT, 'redwood.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
+             'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
     if os.environ.get('UEFI_FD'): parts['fd'] = os.environ['UEFI_FD']
 if TARGET == 'redwood':
     shim = open(parts['shim'], 'rb').read()
