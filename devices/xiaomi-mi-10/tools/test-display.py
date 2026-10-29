@@ -16,6 +16,11 @@ def function(name):
 
 defines = '\n'.join(re.findall(
     r'^#define (?:GCC_DISP_AHB_CBCR|DISPCC_MDSS_CORE_GDSCR|DISPCC_MDSS_AHB_CBCR|'
+    r'DSI_CTRL|DSI_STATUS|DSI_COMMAND_MODE_DMA_CTRL|DSI_DMA_CMD_LENGTH|DSI_TRIG_CTRL|'
+    r'DSI_CMD_MODE_DMA_SW_TRIGGER|DSI_INT_CTRL|DSI_TEST_PATTERN_GEN_CTRL|'
+    r'DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL|DSI_TPG_DMA_FIFO_RESET|DSI_CTRL_ENABLE|'
+    r'DSI_CTRL_CMD_MODE_EN|DSI_STATUS_CMD_BUSY|DSI_INT_CMD_DMA_DONE|'
+    r'DSI_INT_CMD_DMA_DONE_MASK|UMI_BL_MIN_LEVEL|UMI_BL_MAX_LEVEL|'
     r'CBCR_ENABLE|CBCR_OFF|GDSC_POWER_ON|INTF_FRAME_COUNT|INTF_LINE_COUNT)\s+.*$', source, re.M))
 program = r'''
 #include <assert.h>
@@ -35,7 +40,10 @@ static uint64_t mach_absolute_time(void) { return fake_ns; }
 static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns=t; }
 static unsigned frame_reads, interface_reads, writes;
 static uint32_t clock_value;
-static vm_offset_t gcc_map=1, dispcc_map=2, intf=3;
+static vm_offset_t gcc_map=1, dispcc_map=2, intf=3, dsi0=5;
+static uint32_t dsi_ctrl=0x5, dsi_status=0, dsi_dma_ctrl=0x14000000, dsi_trig=0x4, dsi_int=0x1;
+static uint32_t dsi_tpg_ctrl, dsi_fifo[4], dsi_cmd_len, dsi_sw_trig, dsi_fifo_resets;
+static unsigned dsi_fifo_count;
 static struct { int ok; uint32_t lines, shown; uint64_t line_ns, frame_ns; } scan;
 static void delay_for_interval(unsigned a, unsigned b) {
     uint64_t ns=(uint64_t)a*b;
@@ -49,6 +57,13 @@ static uint32_t rd(vm_offset_t base, uint32_t offset) {
         if (offset == (umi ? 0x3000 : 0x1004)) return 0x80000000;
         assert(offset == (umi ? 0x2080 : 0x1050)); return 1;
     }
+    if (base == dsi0) {
+        if (offset == 0x0004) return dsi_ctrl;
+        if (offset == 0x0008) return dsi_status;
+        if (offset == 0x003c) return dsi_dma_ctrl;
+        if (offset == 0x0084) return dsi_trig;
+        if (offset == 0x0110) return dsi_int;
+    }
     assert(base == 3); interface_reads++;
     if (offset == 0x298) {
         uint32_t phase=te_phase;
@@ -60,6 +75,17 @@ static uint32_t rd(vm_offset_t base, uint32_t offset) {
     assert(offset == 0xb0); return 77;
 }
 static void wr(vm_offset_t base, uint32_t offset, uint32_t value) {
+    if (base == dsi0) {
+        if (offset == 0x003c) { dsi_dma_ctrl = value; return; }
+        if (offset == 0x004c) { dsi_cmd_len = value; return; }
+        if (offset == 0x0084) { dsi_trig = value; return; }
+        if (offset == 0x0090) { dsi_sw_trig = value; dsi_int |= 1u; return; }
+        if (offset == 0x0110) { dsi_int &= ~(value & 1u); return; }
+        if (offset == 0x015c) { dsi_tpg_ctrl = value; return; }
+        if (offset == 0x017c) { assert(dsi_fifo_count < 4); dsi_fifo[dsi_fifo_count++] = value; return; }
+        if (offset == 0x01ec) { if (value == 1u) dsi_fifo_resets++; return; }
+        assert(!"unexpected DSI register write");
+    }
     assert(base == 4 && offset == 0); writes++; clock_value = value;
 }
 '''
@@ -69,6 +95,9 @@ program += 'static int\n' + function('clock_on') + '\n'
 program += 'uint32_t\n' + function('hakios_display_line') + '\n'
 program += 'int hakios_display_command_mode(void) { return scan.ok && command_mode; }\n'
 program += 'int\n' + function('hakios_display_wait_copy') + '\n'
+program += 'static uint32_t\n' + function('umi_permille_to_level') + '\n'
+program += 'static void\n' + function('umi_dsi_backlight_packet') + '\n'
+program += 'static int\n' + function('umi_dsi_send_backlight') + '\n'
 program += r'''
 int main(void) {
     uint32_t frame=0;
@@ -110,6 +139,19 @@ int main(void) {
     te_phase=1300; te_reads=0; te_wrap_on_read=true; fake_ns=0;
     assert(!hakios_display_wait_copy(2000000, 0));
     puts("PASS: command copy uses the full safe idle interval, rejects busy DMA, insufficient budget and TE wraps");
+    te_wrap_on_read=false; te_phase=1300; te_written=2340;
+    assert(umi_permille_to_level(0) == 16 && umi_permille_to_level(1000) == 2047);
+    uint32_t w0=0, w1=0;
+    umi_dsi_backlight_packet(0x07ff, &w0, &w1);
+    assert(w0 == 0xc0390003u && w1 == 0xffff0751u);
+    dsi_fifo_count=0; dsi_fifo_resets=0; dsi_trig=0x0; dsi_dma_ctrl=0x80000000u;
+    assert(umi_dsi_send_backlight(0x04d3u));
+    assert(dsi_fifo_count == 2 && dsi_fifo[0] == 0xc0390003u && dsi_fifo[1] == 0xffd30451u);
+    assert(dsi_cmd_len == 8u && dsi_sw_trig == 1u && dsi_tpg_ctrl == 0u && dsi_fifo_resets == 1);
+    assert(dsi_trig == 0x0u && dsi_dma_ctrl == 0x80000000u);
+    dsi_status=0x2; dsi_fifo_count=0;
+    assert(!umi_dsi_send_backlight(0x0400u) && dsi_fifo_count == 0);
+    puts("PASS: UMI DSI backlight encodes big-endian DCS 0x51, kicks TPG FIFO DMA, and restores controller state");
     return 0;
 }
 '''

@@ -22,13 +22,16 @@
  * Registers: Linux drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c (INTF), drivers/clk/qcom/dispcc-sc7280.c.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
+#include <sys/errno.h>
 #include <sys/hakios.display.h>
 #include <sys/hakios.board.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -42,6 +45,25 @@ extern void hakios_tl(const char *, ...) __printflike(1, 2);
 #define DISPCC_MDSS_CORE_GDSCR  (umi ? 0x3000 : 0x1004)
 #define DISPCC_MDSS_AHB_CBCR    (umi ? 0x2080 : 0x1050)
 #define INTF1_PHYS              hakios_board_addr("intf", umi ? 0x0ae6b800UL : 0x0ae36000UL)
+#define DSI0_PHYS               hakios_board_addr("dsi0", 0x0ae94000UL)
+#define DSI_CTRL                0x0004
+#define DSI_STATUS              0x0008
+#define DSI_COMMAND_MODE_DMA_CTRL 0x003c
+#define DSI_DMA_CMD_LENGTH      0x004c
+#define DSI_TRIG_CTRL           0x0084
+#define DSI_CMD_MODE_DMA_SW_TRIGGER 0x0090
+#define DSI_INT_CTRL            0x0110
+#define DSI_TEST_PATTERN_GEN_CTRL 0x015c
+#define DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL 0x017c
+#define DSI_TPG_DMA_FIFO_RESET  0x01ec
+#define DSI_CTRL_ENABLE         (1u << 0)
+#define DSI_CTRL_CMD_MODE_EN    (1u << 2)
+#define DSI_STATUS_CMD_BUSY     ((1u << 1) | (1u << 2))
+#define DSI_INT_CMD_DMA_DONE    (1u << 0)
+#define DSI_INT_CMD_DMA_DONE_MASK (1u << 24)
+#define UMI_BL_MIN_LEVEL        16u
+#define UMI_BL_MAX_LEVEL        2047u
+#define UMI_BL_DEFAULT_PERMILLE 600
 #define CBCR_ENABLE             (1u << 0)
 #define CBCR_OFF                (1u << 31)
 #define GDSC_POWER_ON           (1u << 31)
@@ -54,7 +76,7 @@ extern void hakios_tl(const char *, ...) __printflike(1, 2);
 #define INTF_FRAME_COUNT        0x0ac
 #define INTF_LINE_COUNT         0x0b0
 
-static vm_offset_t intf, gcc_map, dispcc_map;
+static vm_offset_t intf, gcc_map, dispcc_map, dsi0;
 static struct hakios_display_scan scan;
 static bool umi;
 static bool command_mode;
@@ -202,6 +224,130 @@ hakios_display_wait_copy(uint64_t copy_ns, uint64_t limit_ns)
 	}
 }
 
+static uint32_t
+umi_permille_to_level(int permille)
+{
+	if (permille <= 0) {
+		return UMI_BL_MIN_LEVEL;
+	}
+	if (permille >= 1000) {
+		return UMI_BL_MAX_LEVEL;
+	}
+	return UMI_BL_MIN_LEVEL + ((UMI_BL_MAX_LEVEL - UMI_BL_MIN_LEVEL) * (uint32_t)permille + 500u) / 1000u;
+}
+
+static void
+umi_dsi_backlight_packet(uint32_t level, uint32_t *word0, uint32_t *word1)
+{
+	if (level > UMI_BL_MAX_LEVEL) {
+		level = UMI_BL_MAX_LEVEL;
+	}
+	*word0 = 0xc0390003u;
+	*word1 = 0xff000051u | (((level >> 8) & 0xffu) << 8) | ((level & 0xffu) << 16);
+}
+
+static int
+umi_dsi_send_backlight(uint32_t level)
+{
+	uint32_t word0, word1, old_dma_ctrl, old_trig;
+	int done = 0;
+
+	if (!umi || dsi0 == 0 || !scan.ok || !regs_alive()) {
+		return 0;
+	}
+	if ((rd(dsi0, DSI_CTRL) & (DSI_CTRL_ENABLE | DSI_CTRL_CMD_MODE_EN)) !=
+	    (DSI_CTRL_ENABLE | DSI_CTRL_CMD_MODE_EN)) {
+		return 0;
+	}
+	if (hakios_display_command_mode()) {
+		(void)hakios_display_wait_copy(500000, 12000000);
+	}
+	for (unsigned i = 0; i < 40; i++) {
+		if (!regs_alive()) {
+			return 0;
+		}
+		if ((rd(dsi0, DSI_STATUS) & DSI_STATUS_CMD_BUSY) == 0) {
+			break;
+		}
+		if (i == 39) {
+			return 0;
+		}
+		delay_for_interval(50, NSEC_PER_USEC);
+	}
+	umi_dsi_backlight_packet(level, &word0, &word1);
+	old_dma_ctrl = rd(dsi0, DSI_COMMAND_MODE_DMA_CTRL);
+	old_trig = rd(dsi0, DSI_TRIG_CTRL);
+	wr(dsi0, DSI_INT_CTRL, (rd(dsi0, DSI_INT_CTRL) & ~DSI_INT_CMD_DMA_DONE_MASK) | DSI_INT_CMD_DMA_DONE);
+	if ((old_trig & 0xfu) != 0x4u) {
+		wr(dsi0, DSI_TRIG_CTRL, (old_trig & ~0xfu) | 0x4u);
+	}
+	wr(dsi0, DSI_TEST_PATTERN_GEN_CTRL, 0x00030006u);
+	wr(dsi0, DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL, word0);
+	wr(dsi0, DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL, word1);
+	wr(dsi0, DSI_COMMAND_MODE_DMA_CTRL, (old_dma_ctrl & ~0xc0000000u) | 0x14000000u);
+	wr(dsi0, DSI_DMA_CMD_LENGTH, 8u);
+	wr(dsi0, DSI_CMD_MODE_DMA_SW_TRIGGER, 1u);
+	for (unsigned i = 0; i < 100; i++) {
+		if (rd(dsi0, DSI_INT_CTRL) & DSI_INT_CMD_DMA_DONE) {
+			wr(dsi0, DSI_INT_CTRL,
+			    (rd(dsi0, DSI_INT_CTRL) & ~DSI_INT_CMD_DMA_DONE_MASK) | DSI_INT_CMD_DMA_DONE);
+			done = 1;
+			break;
+		}
+		delay_for_interval(50, NSEC_PER_USEC);
+	}
+	wr(dsi0, DSI_TEST_PATTERN_GEN_CTRL, 0u);
+	wr(dsi0, DSI_TPG_DMA_FIFO_RESET, 1u);
+	delay_for_interval(2, NSEC_PER_USEC);
+	wr(dsi0, DSI_TPG_DMA_FIFO_RESET, 0u);
+	wr(dsi0, DSI_COMMAND_MODE_DMA_CTRL, old_dma_ctrl);
+	if ((old_trig & 0xfu) != 0x4u) {
+		wr(dsi0, DSI_TRIG_CTRL, old_trig);
+	}
+	return done;
+}
+
+static LCK_GRP_DECLARE(brightness_lck_grp, "hakios-brightness");
+static LCK_MTX_DECLARE(brightness_mtx, &brightness_lck_grp);
+static int brightness_permille = UMI_BL_DEFAULT_PERMILLE;
+static uint32_t brightness_last_level;
+static unsigned brightness_logged;
+
+SYSCTL_DECL(_kern_hakios);
+
+static int
+sysctl_brightness(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = brightness_permille, error;
+	uint32_t level;
+
+	error = sysctl_io_number(req, value, sizeof(value), &value, NULL);
+	if (error != 0 || req->newptr == 0) {
+		return error;
+	}
+	if (value < 0) value = 0;
+	if (value > 1000) value = 1000;
+	lck_mtx_lock(&brightness_mtx);
+	brightness_permille = value;
+	level = umi_permille_to_level(value);
+	if (level != brightness_last_level) {
+		int ok = umi_dsi_send_backlight(level);
+		if (ok) {
+			brightness_last_level = level;
+		}
+		if (brightness_logged < 8 || !ok) {
+			brightness_logged++;
+			printf("display: UMI backlight %d permille -> DCS 0x51 level %u (%s)\n",
+			    value, level, ok ? "ok" : "skipped");
+		}
+	}
+	lck_mtx_unlock(&brightness_mtx);
+	return 0;
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    NULL, 0, sysctl_brightness, "I", "display brightness in permille (0..1000)");
+
 static int
 command_scan_start(void)
 {
@@ -343,6 +489,9 @@ hakios_display_scan_start(void)
 	}
 	intf = ml_io_map(INTF1_PHYS, 0x1000);
 	if (!intf) return 0;
+	if (umi) {
+		dsi0 = ml_io_map(DSI0_PHYS, 0x1000);
+	}
 	printf("display: %s scan registers at %#lx, engine=%#x; GCC AHB=%#x DISPCC AHB=%#x GDSC=%#x\n",
 	    umi ? "UMI/Kona" : "Yupik", (unsigned long)INTF1_PHYS,
 	    rd(intf, INTF_TIMING_ENGINE_EN), rd(gcc, GCC_DISP_AHB_CBCR & 0xfffu),
