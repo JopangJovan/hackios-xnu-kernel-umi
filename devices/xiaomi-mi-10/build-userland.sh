@@ -2,6 +2,8 @@
 set -euo pipefail
 DEVICE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$DEVICE_DIR/../.." && pwd)
+"$DEVICE_DIR/build-metal.sh"
+export HAKIOS_METAL=${HAKIOS_METAL:-$ROOT/work/upstream-hakios-metal}
 python3 "$DEVICE_DIR/prepare.py" userland
 export DEVICE=umi BLUETOOTH=1 GL=1
 export RC_JOBS=rc.jobs.umi-boot

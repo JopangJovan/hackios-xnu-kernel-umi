@@ -1,3 +1,19 @@
+## Common upstream integration (2026-10-29)
+
+The source build now uses `hakios-uefi` at
+`687fa6c6a5a70f43184de92980e0a76eea5f2c4b`, based on Mu-Silicium
+`e51cd877e31c8fbb322032dc4cb6715e83d25ad3`. Run `uefi/apply.sh` and
+`PREPARE=1 uefi/build.sh` from this device directory. These wrappers assemble
+common BootShim/branding changes and the UMI platform into
+`out/xiaomi-mi-10/Mu-Silicium`. `MU=/absolute/path` overrides the output.
+The root `Mu-Silicium` checkout and tested prebuilt image remain the previous
+hardware-verified version. A newly compiled FD must be RAM-boot-tested before
+replacing that image. The UMI-specific RAM-only boot manager is retained.
+Vendor modules are copied locally from `Mu-Silicium/Binaries/umi` when present;
+a new machine must extract its own modules with `extract.py`.
+
+The following record describes the earlier, device-tested base.
+
 # Fresh UMI UEFI port
 
 Mu-Silicium base: `42fe563791e51bf5500c2e470ed294ca0c94b97c`.
@@ -52,7 +68,7 @@ Keep local firmware dumps out of git. From the kernel repository:
 ```sh
 # A clean checkout must be at uefi/umi/BASE, with its pinned submodules:
 git clone https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
-git -C Mu-Silicium checkout "$(cat uefi/umi/BASE)"
+git -C Mu-Silicium checkout "42fe563791e51bf5500c2e470ed294ca0c94b97c"
 git -C Mu-Silicium submodule update --init --recursive
 python3 -m venv venv-uefi
 venv-uefi/bin/pip install -r Mu-Silicium/pip-requirements.txt uefi_firmware==1.16

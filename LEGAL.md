@@ -11,10 +11,37 @@ claim that any use of the project is lawful in your jurisdiction. Running the fu
 requires software and firmware you must obtain and are licensed to use yourself; whether you may
 do so is your responsibility. If in doubt, consult a lawyer.
 
+## Three layers, and who decides what
+
+HakiOS is an adaptation of the Darwin kernel to hardware that is not Apple's, in the way Android is an adaptation of
+Linux to phones. It has three layers, and the project says plainly which one it stands behind.
+
+1. **The open core.** The kernel port (a patch to Apple's open-source XNU, APSL 2.0), the boot loader, the drivers,
+   the tools, the configurations. All of it is source in this repository, builds and runs with nothing of Apple's and
+   nothing of any phone's (`make qemu-open`), and is what this project develops, documents and supports.
+2. **What you put on top of it.** The kernel can start an operating-system user space that you supply. The project
+   ships none, distributes none, and does not decrypt, circumvent or patch anything to obtain one: the tools only lay
+   out, on your own machine, files that you have downloaded yourself from the vendor. **Whether you may use such
+   software on this hardware is your decision and your responsibility.** Be aware of what you are deciding: Apple's
+   software licence for iOS ties it to Apple-branded hardware and restricts copying and modification, courts have
+   treated that differently (see `docs/legal-review.md`), and the answer depends on your country and on what you do.
+   The project does not tell you that it is permitted, and does not tell you that it is not; it tells you that it is
+   not the project's to decide.
+3. **Apple's services.** Activation, Apple ID, iCloud, iMessage, the App Store: not supported and not a goal. Nothing
+   here makes a device pass as an iPhone to Apple's servers, and a change that tries to is refused.
+
+## What the project writes to your phone
+
+By default the boot loader runs from RAM (`fastboot boot`) and a reboot restores Android. It does write one thing: its
+own log, a few KB, to the phone's `logdump` partition at the end of a run. Only if you turn on `ufs_write=1` does the
+kernel write, and then only to a partition called `darwin` that you created yourself (`tools/userdata-carve.py` prints
+the commands and changes nothing). Every other write is refused by the loader. `tools/provenance.allow` lists each
+program that can write to flash, and CI fails if one appears that is not listed.
+
 ## What this repository contains
 
 - **The kernel changes**: a patch to Apple's open-source XNU (`xnu/hakios.patch`) and added
-  source files (`xnu/files/`). These are a derivative work of XNU and are licensed under the
+  source files (`xnu/files/`, `drivers/`). These are a derivative work of XNU and are licensed under the
   Apple Public Source License 2.0 (`LICENSE.APSL`). See `COMPLIANCE.md` for how the APSL terms
   are met.
 - **Our own original code**: the boot loader (`xnuloader/`), user-space programs
@@ -29,9 +56,9 @@ do so is your responsibility. If in doubt, consult a lawyer.
 ## What this repository does NOT contain and never distributes
 
 - **No part of iOS**: no iOS binary, image, cache, font, picture or screenshot. The user-space
-  half of the system image is built on your machine from the iOS 16.5 IPSW, which
-  `sysimage/fetch.sh` downloads from Apple's public servers under Apple's license, to your
-  machine only. Nothing of it is committed here.
+  half of the system image is built on your machine from the iOS 16.5 IPSW, which you
+  get yourself, under Apple's license, and hand to `sysimage/unpack.sh` on your machine; no script
+  here downloads it. Nothing of it is committed here.
 - **No device firmware**: the GPU, Wi-Fi, audio DSP, modem, haptics and camera firmware is the
   vendor's (Qualcomm/Xiaomi). It is pulled from your own phone (`make firmware`) and is git-ignored.
 - **No keys, certificates, activation data, or anything to impersonate a genuine Apple device to

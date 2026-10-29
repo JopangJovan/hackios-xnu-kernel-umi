@@ -27,6 +27,13 @@
 #   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
 #               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls)
 #   XL_SECS     seconds after which the kernel returns to the loader on its own (default 8)
+#   XL_FOLLOW=N fetch the kernel's log every N seconds during a run (default 10; XL_FOLLOW= for never), so that a kernel
+#               that hangs leaves what it said in logs/<time>-run.log.live; after a hang `run` brings the phone back to
+#               Android itself, or says what to press if it is stuck on the logo
+#   XL_HOME=fastboot   after a hang, keep the phone in its bootloader instead of sending it to Android (and send it
+#               there from Android): a long session of runs never waits for Android to start
+#   XL_REBOOT_AFTER=1  when the run is over, send the phone back to Android (it charges there; in the loader it does not,
+#               and its screen stays on: a phone left in the loader overnight is a flat one by morning)
 #   XL_SB_DELAY seconds SpringBoard waits before it starts (default 8; see userland/src/inject_sb.c)
 #               Among XL_CMDLINE, for the phone: bootcpu=7 runs the kernel on the biggest core instead of
 #               the small one the firmware starts on (the loader then watches from the first core, and a
@@ -47,14 +54,21 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # On a Mac: flock, GNU timeout and stat, and Android's platform-tools, from tools/macos-bin (see its README)
 [ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin:$PWD/tools/macos-bin/platform-tools:$PATH
 # the kernel and the loader built here, or else the ones that come with the repository
-K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
-[ -f $K ] || K=prebuilt/mach.development.bcm2837
+K=hakios-kernel                 # make kernel makes it
+[ -f $K ] || K=prebuilt/hakios-kernel
 L=xnuloader/loader.efi
-[ -f $L ] || L=prebuilt/loader.efi
+if [ ! -f $L ]; then
+	L=prebuilt/loader.efi
+	echo "xl: no xnuloader/loader.efi: using prebuilt/loader.efi, which has no iPhone identity in it (iOS will not start; make loader builds one from your own IPSW)" >&2
+fi
 mkdir -p logs
 # There is one phone, whichever working copy (tools/new-workspace.sh) talks to it: the locks are
 # outside all of them.
 PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
+# adb starts a server of its own the first time, and the server inherits every open descriptor: started during a run it
+# kept the run's lock (descriptor 8, below) for as long as it lived, and every later command said a run was in progress
+# (27 October). So adb never gets that descriptor.
+adb() { command adb "$@" 8>&-; }
 
 # one fastboot at a time (a run in one terminal, "xl screenshot" in another): each takes the lock for itself
 fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
@@ -71,6 +85,37 @@ state() {
 wait_for() { # wait_for <state> <seconds>
 	local i
 	for ((i = 0; i < $2; i += 2)); do [ "$(state)" = "$1" ] && return 0; sleep 2; done
+	return 1
+}
+
+# After a hang the watchdog resets the phone, and what comes up is not always Android: it can stop in its bootloader (it
+# charges badly there and a person has to notice), or on the logo, where it does not show on USB at all. Wait for Android;
+# a phone that appears in the bootloader or in this loader is sent on to Android at once; if nothing has come back after
+# two and a half minutes, say what a person has to do, because nothing here can reach a phone that is not on USB.
+# XL_HOME=fastboot: the other way round, for a session of many runs: the phone is kept in its bootloader, where the next
+# run starts at once, and one that comes up in Android is sent there (the logo is the one place nothing here can help).
+recover_phone() {
+	local i s
+	for ((i = 0; i < 150; i += 3)); do
+		s=$(state)
+		if [ "${XL_HOME:-android}" = fastboot ]; then
+			case "$s" in
+			fastboot) echo "xl: phone is back in its bootloader (XL_HOME=fastboot)"; return 0 ;;
+			android) echo "xl: the phone came up in Android: sending it to its bootloader (XL_HOME=fastboot)"; adb reboot bootloader ;;
+			loader) echo "xl: the phone is in this loader: restarting it (it comes up in Android, and goes on from there)"; fb reboot >/dev/null ;;
+			esac
+		else
+			case "$s" in
+			android) echo "xl: phone is back in Android"; return 0 ;;
+			fastboot) echo "xl: the phone stopped in its bootloader: sending it on to Android"; timeout 10 fastboot reboot >/dev/null 2>&1 ;;
+			loader) echo "xl: the phone is in this loader: sending it on to Android"; fb reboot >/dev/null ;;
+			esac
+		fi
+		sleep 3
+	done
+	echo "xl: the phone has not come back (state: $(state)): it is on the logo, off, or not on this cable."
+	echo "xl:   hold the power button for about 15 seconds; it restarts into Android."
+	echo "xl:   for the bootloader (fastboot) hold power and volume-down while it restarts."
 	return 1
 }
 
@@ -91,7 +136,7 @@ enter() {
 	for try in 1 2; do
 		FB_TIMEOUT=40 fb boot xnu-usb.img | grep -q OKAY || { sleep 3; continue; }
 		sleep 6
-		wait_for loader 30 && return 0
+		wait_for loader 30 && { rm -f $PHONE.ran; return 0; }
 		[ "$(state)" = fastboot ] || break
 	done
 	echo "xl: loader did not come up on USB (state: $(state))"; return 1
@@ -103,7 +148,13 @@ fetch_log() { # fetch_log <file>
 	[ -s "$1" ] && tr -d '\0' < "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
+# A second kernel in one session of the loader dies at once (27 October, four runs: every run after one that returned,
+# whatever its arguments, gave no answer within 5 s; every first run of a session lived). Restart the phone into its own
+# bootloader between runs ("xl run" warns when this session has run a kernel already).
 run() { # run <oem command> <label>
+	if [ "$(state)" = loader ] && [ -f $PHONE.ran ]; then
+		echo "xl: warning: a kernel has already run in this session of the loader, and a second one has died at once every time it was tried"
+	fi
 	enter || return 1
 	exec 8> $PHONE.run
 	flock -n 8 || { echo "xl: a run is in progress, started from $(cat $PHONE.who 2>/dev/null) (xl stop ends it)"; return 1; }
@@ -151,6 +202,7 @@ run() { # run <oem command> <label>
 		# the loader goes on answering: ask every two seconds until the result is no longer "running".
 		# XL_FOLLOW=N: fetch the log as it stands every N seconds as well, so that a phone that
 		# resets without a word leaves all it said up to then ($log.live)
+		local XL_FOLLOW=${XL_FOLLOW-10}      # (a run that hangs leaves $log.live: what the kernel said up to a few seconds before)
 		local deadline=$(( $(date +%s) + ${XL_SECS:-8} + 100 )) followed=$(date +%s)
 		while :; do
 			result=$(FB_TIMEOUT=15 fb getvar result | grep '^result:')
@@ -170,10 +222,12 @@ run() { # run <oem command> <label>
 	fi
 	if [ -z "$result" ]; then
 		echo "xl: no answer — the kernel hung; waiting for the watchdog to reset the phone"
-		wait_for android 120 && echo "xl: phone is back in Android" || echo "xl: phone did not come back (state: $(state))"
+		[ -f "$log.live" ] && echo "xl: what the kernel said before it stopped answering: $log.live"
+		recover_phone
 		return 2
 	fi
 	fetch_log "$log"
+	touch $PHONE.ran                # (this session of the loader has run its kernel: see fresh_session)
 	ln -sf "$(basename "$log")" logs/last.log
 	echo "$result  [$log]"
 	case "$result" in
@@ -183,6 +237,12 @@ run() { # run <oem command> <label>
 		fb reboot >/dev/null
 		return 2 ;;
 	esac
+	# XL_REBOOT_AFTER=1: the run is over and the phone goes back to Android, which charges it. A phone left in the loader
+	# keeps its screen on and charges nothing, so a battery is flat by morning; for a run nobody waits for.
+	if [ -n "$XL_REBOOT_AFTER" ]; then
+		echo "xl: XL_REBOOT_AFTER: the phone goes back to Android (it charges there)"
+		fb reboot >/dev/null
+	fi
 }
 
 recording() { # recording [file.mp4]

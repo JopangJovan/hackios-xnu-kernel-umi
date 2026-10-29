@@ -1,0 +1,5 @@
+{
+  "kernel": {"url": "https://github.com/oosexgang/hakios-xnu-kernel.git", "revision": "7867dc140043cdc3151886d67735b3894414e7bf", "branch": "hakios"},
+  "metal": {"url": "https://github.com/oosexgang/hakios-metal.git", "revision": "54a46fadec5bd9684ebd77f3a0834c84b5eb01a6", "path": "work/upstream-hakios-metal"},
+  "uefi": {"url": "https://github.com/oosexgang/hakios-uefi.git", "revision": "687fa6c6a5a70f43184de92980e0a76eea5f2c4b", "path": "uefi"}
+}

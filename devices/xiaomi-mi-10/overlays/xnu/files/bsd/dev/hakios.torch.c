@@ -28,6 +28,8 @@ extern void loader_log_putc(char c);
 
 static uint32_t level;
 static bool broken, leaving;
+/* set only while dark() runs: the "turn off" writes may pass the `broken' latch (a lit LED must always get its off writes) */
+static volatile bool forcing;
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -294,7 +296,7 @@ put(uint8_t reg, uint8_t value)
 	for (size_t i = 0; i < sizeof(writable_regs); i++) {
 		allowed |= writable_regs[i] == reg;
 	}
-	if (broken || !allowed || !flash.writable || flash.write == 0 || flash.id != 0x5d3) {
+	if ((broken && !forcing) || !allowed || !flash.writable || flash.write == 0 || flash.id != 0x5d3) {
 		give_up(allowed ? "a write that may not be made" : "a register that is not to be written");
 		return false;
 	}
@@ -702,6 +704,9 @@ torch_thread(__unused void *parameter, __unused wait_result_t result)
 				note("off again after %u s", secs);
 			}
 			show_registers();
+		} else if (lit) {
+			/* light() failed after it may have enabled the channel: switch it off again */
+			(void)dark();
 		}
 	} else {
 		serve();

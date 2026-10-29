@@ -1,0 +1,16 @@
+driver UMI
+    default n
+    help Xiaomi Mi 10 board drivers, selected only by umi_defconfig
+    file bsd/dev/hakios.umi_touch.c
+    file bsd/dev/hakios.umi_keys.c
+    file bsd/dev/hakios.umi_rpmh.c
+    file bsd/dev/hakios.umi_touch_boost.c
+    file bsd/dev/hakios.umi_wifi.c
+    file bsd/dev/hakios.umi_bluetooth.c
+    file bsd/dev/hakios.umi_mhi.c
+    file bsd/dev/hakios.umi_pcie.c
+    file bsd/dev/hakios.umi_camera.c
+    file bsd/dev/hakios.umi_camera_dma.c
+    file bsd/dev/hakios.board.c
+    file bsd/dev/hakios.display.c
+    file iokit/Kernel/hakios.bluetooth.cpp iokitcpp

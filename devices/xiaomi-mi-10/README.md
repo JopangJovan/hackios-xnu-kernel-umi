@@ -1,18 +1,19 @@
 # Xiaomi Mi 10 (UMI, Snapdragon 865)
 
-This device port follows unified upstream `88513176b1e96ecf0b764cd62c6f4e6ac71345e3`.
+This device port follows the `hakios` branch of unified upstream `7867dc140043cdc3151886d67735b3894414e7bf`.
 The previous UMI kernel and userland history is retained by the integration merge.
 
 ## Source isolation
 
-All UMI implementations live here. Shared upstream sources in `xnu/files/`,
+All UMI implementations live here. Shared upstream sources in `drivers/`, `xnu/files/`,
 `userland/src/`, `wifi/lx/`, the shared loader, and `xnu/hakios.patch` remain
 unchanged. `upstream-templates.sha256` records their contents;
 `python3 devices/xiaomi-mi-10/prepare.py verify` checks that invariant.
 
 `overlays/xnu/files/` contains the UMI-specific driver variants and helpers.
-`xnu-device.patch` adds their build entries and startup calls to the generated
-Apple source tree; it is applied after upstream's patch. It also retains the
+`drivers/umi/conf` selects the device wrappers through `CONFIG_HAKIOS_UMI`.
+`prepare.py` stages implementations and the Bluetooth startup hook into the
+generated Apple tree. `xnu-device.patch` also retains the
 32 MiB peripheral mapping window required by the working UMI port.
 
 `overlays/wifi/` selects QCA6390 PCIe/MHI and retains UMI authentication fixes.
@@ -23,6 +24,9 @@ copies under `out/xiaomi-mi-10/`; they do not replace upstream templates.
 The loader and UEFI source port are likewise device-local (`loader/`, `uefi/`).
 The supplied device tree is `prebuilt/device-tree.dtb`. Firmware, generated Apple
 identity headers, build output, captures, and credentials remain outside git.
+
+See [the upstream integration record](UPSTREAM-SYNC.md) for pinned Metal/UEFI
+dependencies, the native defconfig and validation limits.
 
 ## Building
 
