@@ -2889,7 +2889,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 			if (gpu || end - c != 5 || c[4] != '1') ok = 0;
 			gpu = 1;
 		} else if (starts_with(c, "metal=")) {
-			if (metal || end - c != 7 || c[6] != '1') ok = 0;
+			if (metal || end - c != 7 || c[6] < '1' || c[6] > '3') ok = 0;
 			metal = 1;
 		} else if (starts_with(c, "cpufreq=")) {
 			if (cpufreq || end - c != 9 || c[8] != '1') ok = 0;
@@ -2967,7 +2967,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 		return 0;
 	}
 	if (metal && !gpu) {
-		print("UMI: metal=1 requires gpu=1\n");
+		print("UMI: metal requires gpu=1\n");
 		return 0;
 	}
 	if (umi_wifi_step != umi_wifi_return || (umi_wifi_step && wifi_on)) {
