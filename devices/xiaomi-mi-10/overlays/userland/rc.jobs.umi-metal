@@ -1,0 +1,6 @@
+# Explicit Metal validation boot; never run these benchmarks in a normal session.
+/redwood/bin/hello_dyn UMI-native-Metal-validation
+/redwood/bin/metal_test plugins
+/redwood/bin/metal_test objects
+/redwood/bin/metal_test blits
+/redwood/bin/hakios-metal-probe
