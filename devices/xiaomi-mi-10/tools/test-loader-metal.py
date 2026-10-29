@@ -20,7 +20,7 @@ static int starts_with(const char *s, const char *p) { return strncmp(s, p, strl
 '''
 test = r'''
 int main(void) {
- const char *good[] = { "gpu=1 metal=1", "gpu=1 metal=2", "gpu=1 metal=3" };
+ const char *good[] = { "gpu=1 metal=1", "gpu=1 metal=2", "gpu=1 metal=3", "gpu=1 metal=1 battery=1" };
  const char *bad[] = { "metal=3", "gpu=1 metal=0", "gpu=1 metal=4", "gpu=1 metal=33", "gpu=1 metal=x", "gpu=1 metal=3 metal=1" };
  struct payload_info p = {0};
  for (unsigned i = 0; i < sizeof(good)/sizeof(*good); i++) { p.cmdline=good[i]; assert(umi_bootargs_ok(&p)); }

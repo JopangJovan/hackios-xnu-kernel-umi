@@ -2268,7 +2268,7 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
-	if (charger_enabled || PLAT != &platform_redwood) {
+	if (charger_enabled || (PLAT != &platform_redwood && PLAT != &platform_umi)) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
@@ -2805,10 +2805,11 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
 		/* Narrowly allow the existing frame-latency diagnostics on UMI. */
 		"touch_lat=1", "cpuload=1000", "thermal=2",
-		"torch=1", "torch=2", "torch=3", "cam=1", "cam=2", "cam=3", "cam=4", "cam=5", "cam=6", "cam_fake=1",
+		"torch=1", "torch=2", "torch=3", "cam=1", "cam=2", "cam=3", "cam=4", "cam=5", "cam=6", "cam=7", "cam_fake=1",
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=", "wifi_mac=", "wifi=1", "umi_bt_probe=", "umi_bt=",
+		"battery=1",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};
