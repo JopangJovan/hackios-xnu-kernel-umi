@@ -266,7 +266,12 @@ lx_os_firmware(const char *name, const void **data, unsigned long *size)
 int
 lx_os_rproc_boot(void)
 {
-	if (umi_wifi_is_board()) return umi_wifi_radio_boot();
+	if (umi_wifi_is_board()) {
+		hakios_wifi_tell("lx: rproc boot asked (the firmware restart after calibration)\n");
+		int error = umi_wifi_radio_boot();
+		hakios_wifi_tell("lx: rproc boot returned %d\n", error);
+		return error;
+	}
 	return hakios_wifi_dsp_is_up() ? 0 : ENXIO;
 }
 

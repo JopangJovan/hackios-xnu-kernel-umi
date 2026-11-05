@@ -55,6 +55,29 @@ static vm_offset_t rh_rsc, rh_tcs, rh_db, rh_gic;
 static uint32_t rh_db_size;
 static unsigned rh_ncpt;
 static unsigned rh_lock;
+
+/*
+ * One arbiter, and three drivers that start during the same boot (Bluetooth, Wi-Fi's
+ * service thread, the camera). Taking the lock without waiting made whichever came
+ * second fail its whole bring-up with EBUSY: Wi-Fi did, while Bluetooth voted its rails.
+ * Wait for the other transaction instead; a vote is a handful of TCS commands.
+ */
+static int
+rh_acquire(void)
+{
+	for (unsigned us = 0; us < 1000000u; us += 100) {
+		if (!__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+			if (us != 0) {
+				printf("UMI RPMH: arbiter busy for %u us; the vote goes ahead\n", us);
+			}
+			return 0;
+		}
+		delay(100);
+	}
+	printf("UMI RPMH: arbiter still busy after 1 s\n");
+	return EBUSY;
+}
+
 static bool rh_poisoned;
 static uint32_t rh_uncertain_irq;
 
@@ -456,7 +479,7 @@ umi_rpmh_wifi_power(void)
 		{ "ldoa9", 1200 }, /* PCIe vreg-1p8: DT actually requests 1.2 V */
 		{ "ldoa5", 880 },  /* PCIe vreg-0p9 */
 	};
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (rh_acquire() != 0) return EBUSY;
 	int error = EIO;
 	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
 	if (rh_poisoned) goto out;
@@ -484,7 +507,7 @@ umi_rpmh_bluetooth_power(void)
 		{ "smpc8", 1350 }, /* RFA2 */
 		{ "ldoa16", 3025 },/* ASD, minimum of stock 3025-3300 mV range */
 	};
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (rh_acquire() != 0) return EBUSY;
 	int error = EIO;
 	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
 	if (rh_poisoned) goto out;

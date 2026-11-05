@@ -72,6 +72,7 @@ static LCK_MTX_DECLARE(umi_mhi_lock, &umi_wifi_lck_grp);
 static bool umi_poll_wanted, umi_poll_finished;
 static struct umi_pcie *umi_active_pcie;
 static bool umi_normal_session, umi_service_wanted, umi_service_finished = true;
+static bool umi_stopping;        /* (the run is ending: do not restart a firmware being stopped) */
 static struct {
 	unsigned type;
 	unsigned long size;
@@ -628,6 +629,8 @@ umi_mhi_sync(void *context, const struct umi_mhi_dma *dma)
 
 struct umi_fw_test { struct umi_pcie *pcie; unsigned step; };
 
+int umi_wifi_radio_boot(void);   /* (the cold boot calibration's restart, called by the reset below) */
+
 void
 umi_wifi_radio_reset(void)
 {
@@ -645,6 +648,12 @@ umi_wifi_radio_reset(void)
 		hakios_tl("UMI Wi-Fi: endpoint reset; firmware and CAL allocations retained\n");
 	}
 	lck_mtx_unlock(&umi_mhi_lock);
+	if (!umi_stopping && umi_active_pcie != NULL) {
+		/* (the cold boot calibration's restart: give the firmware back before the driver asks
+		 *  it for mission mode, whether or not its own power_up comes) */
+		int restart = umi_wifi_radio_boot();
+		hakios_tl("UMI Wi-Fi: the firmware is booted again after the reset: %d\n", restart);
+	}
 }
 
 int
@@ -654,11 +663,15 @@ umi_wifi_radio_boot(void)
 	struct umi_mhi *mhi = umi_qrtr.mhi;
 	struct umi_pcie *pcie = umi_active_pcie;
 	int error = ENXIO;
-	if (!mhi || !pcie) goto out;
-	if (mhi->ipcr_started && !mhi->poisoned) { error = 0; goto out; }
+	hakios_tl("UMI Wi-Fi: radio boot: entry (mhi %p, pcie %p)\n", mhi, pcie);
+	if (!mhi || !pcie) { hakios_tl("UMI Wi-Fi: radio boot: no mhi or pcie\n"); goto out; }
+	if (mhi->ipcr_started && !mhi->poisoned) { error = 0; hakios_tl("UMI Wi-Fi: radio boot: already up\n"); goto out; }
 	const struct umi_mhi_io *mhi_io = mhi->io;
 	const struct umi_pcie_io *pcie_io = pcie->io;
-	if (!mhi_io || !pcie_io) goto out;
+	if (!mhi_io || !pcie_io) {
+		hakios_tl("UMI Wi-Fi: radio boot: no io (mhi %p, pcie %p)\n", mhi_io, pcie_io);
+		goto out;
+	}
 	memset(pcie, 0, sizeof(*pcie));
 	error = umi_pcie_enumerate(pcie, pcie_io);
 	if (error) goto out;
@@ -798,9 +811,16 @@ umi_wifi_service_thread(__unused void *argument)
 void
 umi_wifi_stop(void)
 {
+	umi_stopping = true;
 	os_atomic_store(&umi_service_wanted, false, release);
 	wakeup(&umi_service_wanted);
-	for (unsigned i = 0; i < 400 && !os_atomic_load(&umi_service_finished, acquire); i++) {
+	/*
+	 * Two seconds, not forty: the driver's own stop sends the firmware "mode 4" and waits for
+	 * the answer, which on this firmware takes longer than the return to the loader allows --
+	 * iOS sat frozen on SpringBoard's spinner for it. The request is made (best effort) and the
+	 * hardware is quiesced below whatever the firmware answered.
+	 */
+	for (unsigned i = 0; i < 20 && !os_atomic_load(&umi_service_finished, acquire); i++) {
 		struct timespec pause = { .tv_sec = 0, .tv_nsec = 100 * NSEC_PER_MSEC };
 		msleep(&umi_service_finished, NULL, PZERO, "umi-wifi-end", &pause);
 	}

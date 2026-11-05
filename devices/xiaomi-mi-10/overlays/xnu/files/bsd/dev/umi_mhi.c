@@ -6,6 +6,7 @@
 #include <sys/umi_mhi.h>
 #include <sys/errno.h>
 #include <libkern/libkern.h>
+#include <sys/systm.h>
 
 #define SEGMENT_SIZE (512u * 1024u)
 #define IMAGE_LIMIT (16u * 1024u * 1024u)
@@ -98,7 +99,12 @@ ring_pointer_valid(uint64_t base, size_t length, uint64_t pointer)
 static void
 report(struct umi_mhi *host, const char *stage, uint32_t value)
 {
-	if (host->io->report) host->io->report(host->io->context, stage, value);
+	if (host->io->report) {
+		host->io->report(host->io->context, stage, value);
+		return;
+	}
+	/* The firmware diagnostic's io has no callback: keep the line anyway. */
+	printf("UMI MHI: %s = 0x%x\n", stage, value);
 }
 
 int
@@ -333,7 +339,10 @@ umi_mhi_download_sbl(struct umi_mhi *host, const void *image, size_t size)
 	write_reg(host, host->bhi + 0x10, (uint32_t)length);
 	dma_write_barrier();
 	write_reg(host, host->bhi + 0x18, sequence);
+	printf("UMI MHI: SBL %lu KB to 0x%llx, BHI doorbell %u\n",
+	    (unsigned long)(length / 1024), host->sbl.address, sequence);
 	error = wait_transfer(host, host->bhi + 0x2c, sequence, false);
+	printf("UMI MHI: SBL transfer -> %d\n", error);
 	if (!error) host->sbl_sent = true;
 	return error;
 }
