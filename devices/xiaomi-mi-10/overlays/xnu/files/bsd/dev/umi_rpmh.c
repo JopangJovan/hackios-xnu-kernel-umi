@@ -409,10 +409,11 @@ umi_rpmh_camera_vreg(unsigned rail, bool enable)
 {
 	static const struct { const char *resource; unsigned mv; } rails[] = {
 		{ "ldof6", 2850 }, { "ldof7", 1800 }, { "ldof1", 1104 },
+		{ "ldof4", 1104 }, /* front S5K3T2 digital supply: live DT/trace */
 	};
-	static bool owned[3];
+	static bool owned[4];
 	if (rail >= sizeof(rails) / sizeof(rails[0])) return EINVAL;
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (rh_acquire() != 0) return EBUSY;
 	int error = 0;
 	uint32_t address = 0;
 	if (owned[rail] == enable) goto out;

@@ -180,8 +180,8 @@ def table_entries(data, pool, symbols, sid):
 
 
 def export_main(data, pool, symbols, sensor_name, version, output, source):
-    if sensor_name != "s5khmx":
-        raise ValueError("table export currently supports only UMI's main s5khmx module")
+    if sensor_name not in ("s5khmx", "s5k3t2_umi"):
+        raise ValueError("table export supports only verified UMI S5KHMX/S5K3T2 module layouts")
     probe = probe_fields(data, pool, symbols)
     if probe is None:
         raise ValueError("unrecognized sensor probe layout")
@@ -202,11 +202,16 @@ def export_main(data, pool, symbols, sensor_name, version, output, source):
     for has_version, version_id, count, resolution_id in array("resolutionInfo", 4):
         version_symbol = symbols.get(version_id)
         resolution = symbols.get(resolution_id)
-        if has_version != 1 or not version_symbol or version_symbol["name"] != "sensorVersion":
+        if has_version not in (0, 1) or not version_symbol or version_symbol["name"] != "sensorVersion":
             raise ValueError("unsupported resolution version selector")
         if not resolution or resolution["name"] != "resolutionData":
             raise ValueError("invalid resolutionData reference")
-        variant = as_words(value(data, pool, version_symbol))
+        if has_version == 0:
+            if sensor_name != "s5k3t2_umi" or version_symbol["size"] != 0:
+                raise ValueError("unversioned settings are only known for this S5K3T2 module")
+            variant = (0,)
+        else:
+            variant = as_words(value(data, pool, version_symbol))
         if len(variant) != 1 or variant[0] in variants:
             raise ValueError("ambiguous sensorVersion")
         modes = resolution_modes(data, pool, symbols, resolution)

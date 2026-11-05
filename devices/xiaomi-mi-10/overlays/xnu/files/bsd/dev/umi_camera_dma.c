@@ -17,6 +17,8 @@ extern uint64_t loader_recording[3];
 extern lck_mtx_t hakios_smmu_lock;
 extern void hakios_tl(const char *, ...) __printflike(1, 2);
 int umi_camera_tpg(vm_offset_t, vm_offset_t);
+int umi_camera_sensor_frame(vm_offset_t, vm_offset_t, int (*)(bool));
+int umi_camera_front_frame(vm_offset_t, vm_offset_t, int (*)(bool));
 void umi_camera_dma_quiesce(bool);
 
 #define UD_IOVA 0x40000000ull
@@ -28,13 +30,17 @@ void umi_camera_dma_quiesce(bool);
 #define UD_STRIDE 400u
 #define UD_BYTES (UD_STRIDE*UD_HEIGHT)
 static struct {
-	vm_offset_t ife, csid, smmu, gr1, cb, memory, tables;
-	vm_size_t size;
+	vm_offset_t ife, csid, smmu, gr1, cb, memory, tables, cb_physical;
+	vm_size_t size,capacity;
+	unsigned width,height,stride,frame_bytes;
 	unsigned smr, context, installed;
 	unsigned slots[2];
 	uint32_t old_smrs[2], old_s2crs[2];
 	uint32_t old_smr, old_s2cr, old_cbar, old_cba2r, old_cb[9];
-	bool mapped, running, context_changed;
+	bool mapped, running, context_changed, physical_buffer;
+	int (*sensor_stream)(bool);
+	bool sensor_started;
+	int sensor_stop_error;
 } ud;
 static const unsigned ud_cbregs[9] = {0,0x10,0x20,0x24,0x28,0x2c,0x30,0x38,0x3c};
 struct ud_header {
@@ -103,9 +109,10 @@ dmap(void)
 	unsigned cb;
 	for(cb=0;cb<contexts;cb++) {
 		if(used[cb])continue;
-		vm_offset_t mapped=ml_io_map(0x15000000+(uint64_t)(pages+cb)*page,0x1000);
+		vm_offset_t physical=0x15000000+(uint64_t)(pages+cb)*page;
+		vm_offset_t mapped=ud.cb&&ud.cb_physical==physical?ud.cb:ml_io_map(physical,0x1000);
 		if(!mapped)return ENOMEM;
-		if(!(dr(mapped,0)&1)&&!(dr(mapped,0x58)&UD_FSR_FAULT)) {ud.cb=mapped;break;}
+		if(!(dr(mapped,0)&1)&&!(dr(mapped,0x58)&UD_FSR_FAULT)) {ud.cb=mapped;ud.cb_physical=physical;break;}
 	}
 	if(cb==contexts)return EBUSY;
 	ud.context=cb;ud.smr=free_match;
@@ -118,12 +125,17 @@ dmap(void)
 	ud.old_cbar=dr(ud.gr1,4*cb);ud.old_cba2r=dr(ud.gr1,0x800+4*cb);
 	for(unsigned i=0;i<9;i++)ud.old_cb[i]=dr(ud.cb,ud_cbregs[i]);
 	hakios_tl("UMI camera DMA: selected CB%u at %#lx SMR%u old CBAR=%#x CBA2R=%#x SCTLR=%#x FSR=%#x\n",cb,(unsigned long)(0x15000000+(uint64_t)(pages+cb)*page),free_match,ud.old_cbar,ud.old_cba2r,ud.old_cb[0],dr(ud.cb,0x58));
-	uint64_t *l1=(uint64_t *)ud.tables,*l2=(uint64_t *)(ud.tables+4096),*l3=(uint64_t *)(ud.tables+8192);
+	uint64_t *l1=(uint64_t *)ud.tables,*l2=(uint64_t *)(ud.tables+4096);
 	l1[(UD_IOVA>>30)&511]=kvtophys((vm_offset_t)l2)|3;
-	l2[(UD_IOVA>>21)&511]=kvtophys((vm_offset_t)l3)|3;
-	for(unsigned p=0;p<ud.size/4096;p++)
-		l3[p]=kvtophys(ud.memory+4096ull*p)|3ull|(1ull<<6)|(2ull<<8)|(1ull<<10)|(1ull<<11);
-	dcache(ud.tables,16384);
+	unsigned table_pages=(unsigned)((ud.size+0x1fffff)/0x200000);
+	if(table_pages>6)return E2BIG;
+	for(unsigned t=0;t<table_pages;t++)
+		l2[((UD_IOVA>>21)&511)+t]=kvtophys(ud.tables+8192+4096ull*t)|3;
+	for(unsigned p=0;p<ud.size/4096;p++) {
+		uint64_t *l3=(uint64_t *)(ud.tables+8192+4096ull*(p/512));
+		l3[p%512]=kvtophys(ud.memory+4096ull*p)|3ull|(1ull<<6)|(2ull<<8)|(1ull<<10)|(1ull<<11);
+	}
+	dcache(ud.tables,32768);
 	ud.context_changed=true;
 	dw(ud.cb,0,0);dw(ud.gr1,0x800+4*cb,1);dw(ud.gr1,4*cb,1u<<16|3u<<8|15u<<12);
 	dw(ud.cb,0x10,1u|1u<<4|7u<<15);dw(ud.cb,0x30,25u|1u<<8|1u<<10|3u<<12|1u<<23);
@@ -168,6 +180,12 @@ dmap(void)
 void
 umi_camera_dma_quiesce(bool panic)
 {
+	if(ud.sensor_started) {
+		int error=ud.sensor_stream(false);
+		if(error)ud.sensor_stop_error=error;
+		hakios_tl("UMI camera DMA: physical sensor stopped error=%d\n",error);
+		ud.sensor_started=false;
+	}
 	if(ud.running) {
 		dw(ud.csid,0x600,0); /* TPG first, then the receiver and writer. */
 		dw(ud.csid,0x208,2);dw(ud.csid,0x200,dr(ud.csid,0x200)&~(1u<<31));
@@ -199,55 +217,104 @@ umi_camera_dma_quiesce(bool panic)
 	if(!panic)lck_mtx_unlock(&hakios_smmu_lock);
 }
 
-int
-umi_camera_tpg(vm_offset_t ife,vm_offset_t csid)
+static int
+umi_camera_frame(vm_offset_t ife,vm_offset_t csid,bool physical,int (*stream)(bool),unsigned sensor)
 {
-	if(ud.memory)return EBUSY; /* one retained capture per diagnostic boot */
-	ud.ife=ife;ud.csid=csid;ud.size=round_page(4096+UD_BYTES);
-	if(kmem_alloc_contig(kernel_map,&ud.memory,ud.size,PAGE_MASK,0,0,KMA_KOBJECT|KMA_ZERO|KMA_DATA,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
-	if(kmem_alloc(kernel_map,&ud.tables,16384,KMA_KOBJECT|KMA_ZERO|KMA_DATA,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
+	if(physical && sensor!=1 && sensor!=2)return EINVAL;
+	if(ud.memory&&(!physical||!ud.physical_buffer||ud.running||ud.context_changed))return EBUSY;
+	ud.ife=ife;ud.csid=csid;ud.sensor_stream=stream;ud.sensor_stop_error=0;
+	ud.width=physical?(sensor==2?2592:3008):UD_WIDTH;ud.height=physical?(sensor==2?1940:2256):UD_HEIGHT;
+	ud.stride=(ud.width*5/4+15u)&~15u;ud.frame_bytes=ud.stride*ud.height;ud.size=round_page(4096+ud.frame_bytes);
+	if(!ud.memory) {
+        vm_size_t capacity=physical?round_page(4096+3008u*2256u*5u/4u):ud.size;
+        if(kmem_alloc_contig(kernel_map,&ud.memory,capacity,PAGE_MASK,0,0,KMA_KOBJECT|KMA_ZERO|KMA_DATA,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
+        ud.capacity=capacity;ud.physical_buffer=physical;
+    }
+    if(ud.size>ud.capacity)return ENOMEM;
+	if(!ud.tables&&kmem_alloc(kernel_map,&ud.tables,32768,KMA_KOBJECT|KMA_ZERO|KMA_DATA,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
+	memset((void *)ud.memory,0,ud.size);memset((void *)ud.tables,0,32768);
 	struct ud_header *h=(struct ud_header *)ud.memory;
-	memcpy(h->magic,"RWCAM001",8);h->width=UD_WIDTH;h->height=UD_HEIGHT;h->stride=UD_STRIDE;
-	h->format=1;h->bayer=0;h->frame_bytes=UD_BYTES;h->source=0;strlcpy(h->sensor,"UMI CSID TPG",sizeof(h->sensor));
-	memset((void *)(ud.memory+4096),0xa5,UD_BYTES);dcache(ud.memory,ud.size);
+	memcpy(h->magic,"RWCAM001",8);h->width=ud.width;h->height=ud.height;h->stride=ud.stride;
+	h->format=1;h->bayer=physical?1:0;h->frame_bytes=ud.frame_bytes;h->source=physical?1:0;strlcpy(h->sensor,physical?(sensor==2?"UMI S5K3T2":"UMI S5KHMX"):"UMI CSID TPG",sizeof(h->sensor));
+	memset((void *)(ud.memory+4096),0xa5,ud.frame_bytes);dcache(ud.memory,ud.size);
 	lck_mtx_lock(&hakios_smmu_lock);int error=dmap();lck_mtx_unlock(&hakios_smmu_lock);
 	if(error){umi_camera_dma_quiesce(false);return error;}
 	/* CSID480 RAW10 RDI0, internal test generator; no PHY is selected. */
 	ud.running=true;
-	dw(csid,0x100,3u|0x3210u<<4);dw(csid,0x104,1u<<6|1u);
-	dw(csid,0x200,0x2bu<<16|15u<<12|1u<<2|3u);dw(csid,0x204,2);
+	dw(csid,0x100,physical?(sensor==2?(3u|0x3210u<<4|4u<<20):(2u|0x210u<<4|1u<<24|3u<<20)):(3u|0x3210u<<4));dw(csid,0x104,1u<<6|1u);
+	uint32_t rdi=0x2bu<<16|1u<<2|3u;
+	rdi|=15u<<12; /* packed RAW10 bypass: retain the complete sensor field */
+	dw(csid,0x200,rdi);dw(csid,0x204,2);
 	static const unsigned rdi_regs[]={0x20c,0x210,0x214,0x218,0x224,0x228,0x22c,0x230};
 	for(unsigned i=0;i<8;i++)dw(csid,rdi_regs[i],i&1?1:0);
-	dw(csid,0x200,1u<<31|0x2bu<<16|15u<<12|1u<<2|3u);dw(csid,0x208,1);
+
+	dw(csid,0x200,1u<<31|rdi);dw(csid,0x208,1);
 	/* VFE bus-v3 frame mode, RDI0 at 1c00, completion group bit4. */
 	dw(ife,0x1a08,0x3ffffff);dw(ife,0x1a34,0);dw(ife,0x1adc,0);
-	dw(ife,0x1c64,15);dw(ife,0x1c0c,0xffff);dw(ife,0x1c10,0);dw(ife,0x1c14,UD_STRIDE);dw(ife,0x1c18,0);
+	dw(ife,0x1c64,15);dw(ife,0x1c0c,0xffff);dw(ife,0x1c10,0);dw(ife,0x1c14,ud.stride);dw(ife,0x1c18,0);
 	dw(ife,0x1c08,0);dw(ife,0x1c30,0);dw(ife,0x1c34,1);dw(ife,0x1c38,0);dw(ife,0x1c3c,1);
 	dw(ife,0x1a20,1u<<4);dw(ife,0x1a30,1);dw(ife,0x1a18,1u<<4);
 	dw(ife,0x1c04,(uint32_t)(UD_IOVA+4096));dw(ife,0x1c00,0x10001);dw(ife,0x20,1);
+	if(!physical) {
 	dw(csid,0x604,1u<<10);dw(csid,0x608,0x3ffu<<12|0x740);
 	dw(csid,0x60c,0x12345678);dw(csid,0x610,UD_WIDTH<<16|UD_HEIGHT);
 	dw(csid,0x614,0x2b);dw(csid,0x618,2u<<16|8);dw(csid,0x640,1u<<5);dw(csid,0x648,0);
 	dw(csid,0x600,4u<<20|0x80u<<8|3u<<4|7u);
+	} else {
+		dw(csid,0x600,0);
+		ud.sensor_started=true; /* include a partially accepted stream-on in cleanup */
+		int started=stream(true);
+		if(started) {umi_camera_dma_quiesce(false);return started;}
+	}
+
 	bool done=false;
 	for(unsigned ms=0;ms<2000;ms+=10){
 		delay_for_interval(10,NSEC_PER_MSEC);
 		if(dr(ife,0x1a28)&(1u<<4)){done=true;break;}
 		if(dr(ud.cb,0x58)&UD_FSR_FAULT)break;
 	}
-	hakios_tl("UMI camera DMA: TPG done=%u IFE IRQ=%#x/%#x bus=%#x/%#x CSID RDI=%#x status=%#x size=%#x/%#x\n",done,dr(ife,0x40),dr(ife,0x44),dr(ife,0x1a28),dr(ife,0x1a2c),dr(csid,0x30),dr(csid,0x250),dr(ife,0x1a68),dr(ife,0x1a70));
+	hakios_tl("UMI camera DMA: source=%s done=%u IFE IRQ=%#x/%#x bus=%#x/%#x CSID RDI=%#x status=%#x size=%#x/%#x\n",physical?(sensor==2?"S5K3T2":"S5KHMX"):"TPG",done,dr(ife,0x40),dr(ife,0x44),dr(ife,0x1a28),dr(ife,0x1a2c),dr(csid,0x30),dr(csid,0x250),dr(ife,0x1a68),dr(ife,0x1a70));
 	bool faulted=(dr(ud.cb,0x58)&UD_FSR_FAULT)!=0;
 	hakios_tl("UMI camera DMA: SMMU global fault=%#x stream=%#x\n",dr(ud.smmu,0x48),dr(ud.smmu,0x54));
 	umi_camera_dma_quiesce(false);dcache(ud.memory,ud.size);
 	const uint8_t *frame=(const uint8_t *)(ud.memory+4096);
 	bool changed=false,varied=false;
-	for(unsigned i=0;i<UD_BYTES;i++){changed|=frame[i]!=0xa5;varied|=frame[i]!=frame[0];}
-	bool guards=!memcmp(h->magic,"RWCAM001",8)&&h->width==UD_WIDTH&&h->height==UD_HEIGHT&&h->stride==UD_STRIDE;
-	for(unsigned i=4096+UD_BYTES;i<ud.size;i++)guards&=((const uint8_t *)ud.memory)[i]==0;
-	h->frames=done&&changed&&varied&&guards&&!faulted?1:0;
+	for(unsigned i=0;i<ud.frame_bytes;i++){changed|=frame[i]!=0xa5;varied|=frame[i]!=frame[0];}
+	bool guards=!memcmp(h->magic,"RWCAM001",8)&&h->width==ud.width&&h->height==ud.height&&h->stride==ud.stride;
+	for(unsigned i=4096+ud.frame_bytes;i<ud.size;i++)guards&=((const uint8_t *)ud.memory)[i]==0;
+	h->frames=done&&changed&&varied&&guards&&!faulted&&!ud.sensor_stop_error?1:0;
 	hakios_tl("UMI camera DMA: buffer guards=%u context fault=%u\n",guards,faulted);
 	hakios_tl("UMI camera DMA: frame changed=%u varied=%u frames=%u first=%02x %02x %02x %02x\n",changed,varied,h->frames,frame[0],frame[1],frame[2],frame[3]);
 	dcache(ud.memory,4096);
 	loader_recording[0]=kvtophys(ud.memory);loader_recording[1]=ud.size;loader_recording[2]=ud.memory;
-	return h->frames?0:EIO;
+	/* A failed stream-off requires the caller to reset/power down the sensor;
+	 * it must never be treated as a successful retained-session frame. */
+	return ud.sensor_stop_error?ud.sensor_stop_error:h->frames?0:EIO;
+}
+
+int
+umi_camera_tpg(vm_offset_t ife,vm_offset_t csid)
+{
+	return umi_camera_frame(ife,csid,false,NULL,1);
+}
+
+int
+umi_camera_sensor_frame(vm_offset_t ife,vm_offset_t csid,int (*stream)(bool))
+{
+	if(!stream)return EINVAL;
+	return umi_camera_frame(ife,csid,true,stream,1);
+}
+
+const uint8_t *
+umi_camera_sensor_data(void)
+{
+	if(!ud.memory)return NULL;
+	struct ud_header *h=(struct ud_header *)ud.memory;
+	return h->frames==1&&h->source==1?(const uint8_t *)(ud.memory+4096):NULL;
+}
+
+int
+umi_camera_front_frame(vm_offset_t ife,vm_offset_t csid,int (*stream)(bool))
+{
+    return umi_camera_frame(ife,csid,true,stream,2);
 }

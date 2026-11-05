@@ -10,6 +10,10 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--object', type=Path, help='also reject SIMD/FP instructions in the compiled ARM64 probe object')
 args = parser.parse_args()
 source=(Path(__file__).resolve().parents[1] / 'overlays/xnu/files/bsd/dev/umi_camera.c').read_text()
+source=source.replace('#include "umi_camera_phy.h"', (Path(__file__).resolve().parents[1] / 'overlays/xnu/files/bsd/dev/umi_camera_phy.h').read_text())
+source=source.replace('#include "umi_camera_focus.h"', (Path(__file__).resolve().parents[1] / 'overlays/xnu/files/bsd/dev/umi_camera_focus.h').read_text())
+source=source.replace('#include "umi_camera_session.h"', (Path(__file__).resolve().parents[1] / 'overlays/xnu/files/bsd/dev/umi_camera_session.h').read_text())
+source=source.replace('#include "umi_camera_front_tables.h"', (Path(__file__).resolve().parents[1] / 'overlays/xnu/files/bsd/dev/umi_camera_front_tables.h').read_text())
 source=re.sub(r'^#include .*\n','',source,flags=re.M)
 source=re.sub(r'static uint32_t\nur\([^\n]*\)\n\{.*?\n\}', 'static uint32_t\nur(vm_offset_t p, unsigned o) { return mock_read(p+o); }',source,flags=re.S)
 source=re.sub(r'static void\nuw\([^\n]*\)\n\{.*?\n\}', 'static void\nuw(vm_offset_t p, unsigned o, uint32_t v) { mock_write(p+o,v); }',source,flags=re.S)
@@ -24,6 +28,7 @@ typedef uintptr_t vm_offset_t;
 typedef unsigned long vm_size_t;
 #define __printflike(a,b)
 #define NSEC_PER_MSEC 1000000
+#define HAKIOS_CAMERA_NO_FOCUS 0xffffffffu
 static uint32_t mock_read(uintptr_t);
 static void mock_write(uintptr_t,uint32_t);
 static void delay(unsigned n) { (void)n; }
@@ -35,7 +40,7 @@ post=r'''
 static struct { uintptr_t a; uint32_t v; } registers[2048];
 static unsigned used, write_count, fail_write;
 static int fail_rail, fail_clock;
-static bool rail_state[3];
+static bool rail_state[4];
 static uint64_t mapping_free;
 static uint32_t initial_pin_cfg[4], initial_gcc[2];
 static uint8_t gpio_regs[3][256], initial_gpio[3][256];
@@ -64,8 +69,8 @@ static void mock_write(uintptr_t a,uint32_t v) {
  if(a==0x0010b008 && fail_clock==3){set(a,0);return;}
  if(a==0x0010b040 && fail_clock==4){set(a,0);return;}
  if(a==0x0ad0c144){set(a,(v&~0x80000000u)|((!(v&1)&&fail_clock!=1)?0x80000000u:0));return;}
- if(a==0x0ad0501c){if(fail_clock!=2)set(a,v&~1u);return;}
- if(a==0x0ad05034){set(a,(v&~0x80000000u)|((v&1)?0:0x80000000u));return;}
+ if(a==0x0ad0501c||a==0x0ad05070){if(fail_clock!=2)set(a,v&~1u);return;}
+ if(a==0x0ad05034||a==0x0ad05088){set(a,(v&~0x80000000u)|((v&1)?0:0x80000000u));return;}
  if(a>=0x0e600000 && a<0x0e610000 && !(a&127)){
   unsigned c=(a-0x0e600000)/128,reg=(v>>4)&255;
   assert(c>=100 && c<103);set(a+8,1);set(a+0x18,gpio_regs[c-100][reg]);return;
@@ -82,10 +87,12 @@ uint64_t umi_camera_iomap_free(void){return mapping_free;}
 void hakios_tl(const char *f,...){(void)f;}
 const uint8_t *hakios_wifi_file(const char *n,uint64_t *s){(void)n;*s=0;return NULL;}
 int umi_camera_tpg(vm_offset_t a,vm_offset_t b){(void)a;(void)b;return ENODEV;}
+int umi_camera_sensor_frame(vm_offset_t a,vm_offset_t b,int (*s)(bool)){(void)a;(void)b;(void)s;return ENODEV;}
+int umi_camera_front_frame(vm_offset_t a,vm_offset_t b,int (*s)(bool)){(void)a;(void)b;(void)s;return ENODEV;}
 void umi_camera_dma_quiesce(bool p){(void)p;}
-int umi_rpmh_camera_vreg(unsigned r,bool enabled){assert(r<3);if(enabled&&(int)r==fail_rail)return EIO;rail_state[r]=enabled;return 0;}
+int umi_rpmh_camera_vreg(unsigned r,bool enabled){assert(r<4);if(enabled&&(int)r==fail_rail)return EIO;rail_state[r]=enabled;return 0;}
 static void reset_fixture(void){
- memset(&uc,0,sizeof(uc));used=write_count=fail_write=0;fail_rail=-1;fail_clock=0;
+ memset(&uc,0,sizeof(uc));umap_count=0;memset(umaps,0,sizeof(umaps));used=write_count=fail_write=0;fail_rail=-1;fail_clock=0;
  mapping_free=32ull<<20;
  memset(initial_pin_cfg,0,sizeof(initial_pin_cfg));memset(initial_gcc,0,sizeof(initial_gcc));
  memset(rail_state,0,sizeof(rail_state));memset(gpio_regs,0,sizeof(gpio_regs));
@@ -97,16 +104,25 @@ static void reset_fixture(void){
  }
  memcpy(initial_gpio,gpio_regs,sizeof(gpio_regs));
  set(0x0c440000,0x50000000);set(0x0c440004,512);
- set(0x0ad05020,0x12340000);set(0x0ad05034,0x80000000);set(0x0ad0c144,1);
+ set(0x0ad05020,0x12340000);set(0x0ad05034,0x80000000);set(0x0ad05074,0x12340000);set(0x0ad05088,0x80000000);set(0x0ad0c144,1);
 }
 static void check_cleanup(void){
- assert(!uc.active);assert(!rail_state[0]&&!rail_state[1]&&!rail_state[2]);
+ assert(!uc.active);assert(!rail_state[0]&&!rail_state[1]&&!rail_state[2]&&!rail_state[3]);
+ if(memcmp(initial_gpio,gpio_regs,sizeof(gpio_regs))) {
+  fprintf(stderr,"GPIO restore mismatch fail_write=%u write_count=%u\n",fail_write,write_count);
+  for(unsigned g=0;g<3;g++)for(unsigned n=0;n<256;n++)if(initial_gpio[g][n]!=gpio_regs[g][n])fprintf(stderr,"gate%u reg%x expected%x got%x\n",g,n,initial_gpio[g][n],gpio_regs[g][n]);
+ }
  assert(!memcmp(initial_gpio,gpio_regs,sizeof(gpio_regs)));
- assert(get(0x0ad05020)==0x12340000);assert(get(0x0ad05034)==0x80000000);assert(get(0x0ad0c144)==1);
+ assert(get(0x0ad05074)==0x12340000&&get(0x0ad05088)==0x80000000);assert(get(0x0ad05020)==0x12340000);assert(get(0x0ad05034)==0x80000000);assert(get(0x0ad0c144)==1);
  assert(get(0x0010b008)==initial_gcc[0]&&get(0x0010b040)==initial_gcc[1]);
  for(unsigned p=0;p<4;p++)assert(get(uc.pin[p])==initial_pin_cfg[p]);
 }
 int main(void){
+ reset_fixture();assert(umi_camera_front_probe()==EIO);check_cleanup();
+ assert(uc.pin[0]==0xf96d000&&uc.pin[1]==0xf962000&&uc.pin[2]==0xf969000&&uc.pin[3]==0xf96a000);assert(!uc.front);
+ for(int n=1;n<=4;n++){reset_fixture();fail_clock=n;assert(umi_camera_front_probe()==EIO);check_cleanup();}
+ for(int n=1;n<=3;n+=2){reset_fixture();fail_rail=n;assert(umi_camera_front_probe()==EIO);check_cleanup();}
+ for(unsigned n=1;n<=24;n++){reset_fixture();fail_write=n;assert(umi_camera_front_probe()==EIO);check_cleanup();}
  reset_fixture();assert(umi_camera_probe()==EIO);check_cleanup();
  for(unsigned n=1;n<=24;n++){reset_fixture();fail_write=n;assert(umi_camera_probe()==EIO);check_cleanup();}
  for(int n=0;n<3;n++){reset_fixture();fail_rail=n;assert(umi_camera_probe()==EIO);check_cleanup();}
@@ -129,7 +145,7 @@ with tempfile.TemporaryDirectory(prefix='umi-camera-check-') as temp:
  subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',str(p/'probe.c'),'-o',str(p/'probe')],check=True)
  subprocess.run([str(p/'probe')],check=True)
 if args.object:
- disassembly=subprocess.check_output(['llvm-objdump','-d',str(args.object)],text=True)
+ disassembly=subprocess.check_output(['llvm-objdump','-d','--no-show-raw-insn',str(args.object)],text=True)
  offenders=[line for line in disassembly.splitlines() if re.search(r'\b(?:[qds]\d{1,2}|v\d{1,2}\.\d*[bhsd])\b',line.partition(':')[2])]
  if offenders: raise SystemExit('Probe contains SIMD/FP register use:\n'+'\n'.join(offenders))
  print('PASS: compiled ARM64 probe uses only general registers')
