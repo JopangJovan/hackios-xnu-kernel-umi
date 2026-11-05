@@ -2809,7 +2809,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "sound_below=", "sound_gain=", "mic=", "mic_adc=", "mic_input=", "mic_secs=", "mic_main=", "mic_test=", "mic_tap=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=", "wifi_mac=", "wifi=1", "umi_bt_probe=", "umi_bt=",
-		"battery=1",
+		"battery=1", "slpi=", "slpi_attach=1", "slpi_root=1",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};

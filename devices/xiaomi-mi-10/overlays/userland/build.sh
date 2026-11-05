@@ -414,6 +414,21 @@ if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
 fi
+# ... and the sensor DSP's image (SLPI), from /vendor/firmware_mnt/image of the same Android into
+# ../fw-slpi (8.2 MB): the kernel's probe (boot-arg slpi=1) hands it to TrustZone and loads it.
+if [ -d ../fw-slpi ]; then
+	mkdir -p root/fw
+	cp ../fw-slpi/slpi.* root/fw/
+fi
+# The Qualcomm sensor DSP requests its persistent registry back from APSS
+# through FastRPC.  Keep the registry pulled from this UMI's Android install
+# as a read-only archive: it is copied into the small image and never written
+# back to Android.  The SLPI listener will unpack only the registry paths it
+# serves once its RPC endpoint is registered.
+if [ -f ../fw-sensors/registry.tar ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-sensors/registry.tar root/fw/sensors-registry.tar
+fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (drivers/wifi/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
