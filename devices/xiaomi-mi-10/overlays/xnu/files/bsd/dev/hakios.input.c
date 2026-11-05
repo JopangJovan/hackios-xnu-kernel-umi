@@ -2251,6 +2251,8 @@ static uint32_t slpi_fastrpc_listener_invoke_scalars;
 static int slpi_fastrpc_platform_open_index = -1;
 static uint32_t slpi_fastrpc_platform_read_offset;
 static bool slpi_fastrpc_waiting_listener_next;
+static uint32_t slpi_fastrpc_tx_sequence;
+static uint32_t slpi_fastrpc_rx_sequence;
 static bool slpi_fastrpc_root_decision_made;
 static uint32_t slpi_fastrpc_root_listener_module;
 static uint32_t *slpi_fastrpc_root_listener_open_output;
@@ -2280,8 +2282,10 @@ slpi_fastrpc_watch_wait(uint32_t poll_ms)
 			busy++;
 		}
 	}
-	hakios_tl("slpi: fastrpc: next2 ctx 0x5002 still awaiting callback at poll +%u ms (phase %u, GLINK broken %u, TX busy %u, SMMU FSR %#x)\n",
-	    poll_ms, slpi_fastrpc_phase, slpi_glink.broken, busy,
+	hakios_tl("slpi: fastrpc: next2 ctx 0x5002 still awaiting callback at poll +%u ms (phase %u, TX/RX %u/%u, invoke %#x/%#x/%#x, GLINK broken %u, TX busy %u, SMMU FSR %#x)\n",
+	    poll_ms, slpi_fastrpc_phase, slpi_fastrpc_tx_sequence, slpi_fastrpc_rx_sequence,
+	    slpi_fastrpc_listener_invoke_context, slpi_fastrpc_listener_invoke_handle,
+	    slpi_fastrpc_listener_invoke_scalars, slpi_glink.broken, busy,
 	    slpi_smmu_read(slpi_fastrpc_memory.context, SLPI_SMMU_CB_FSR));
 }
 
@@ -2455,8 +2459,10 @@ slpi_fastrpc_send_request(uint32_t handle, uint32_t scalars, uint64_t context, b
 		slpi_fastrpc_phase = SLPI_FASTRPC_IDLE;
 		return false;
 	}
-	hakios_tl("slpi: fastrpc: sent request (ctx %#llx, pid %d, tid %#x, handle %#x, sc %#x)\n",
-	    context, message.client_id, message.tid, handle, scalars);
+	slpi_fastrpc_tx_sequence++;
+	hakios_tl("slpi: fastrpc: TX #%u request (ctx %#llx, pid %d, tid %#x, handle %#x, sc %#x, args %#llx/%u)\n",
+	    slpi_fastrpc_tx_sequence, context, message.client_id, message.tid, handle, scalars,
+	    message.address, message.size);
 	return true;
 }
 
@@ -2947,6 +2953,10 @@ slpi_fastrpc_dispatch_listener_input(void)
 static void
 slpi_fastrpc_handle_reply(uint64_t context, int32_t result)
 {
+	slpi_fastrpc_rx_sequence++;
+	hakios_tl("slpi: fastrpc: RX #%u ctx %#llx result %d phase %u (waiting next2 %u)\n",
+	    slpi_fastrpc_rx_sequence, context, result, slpi_fastrpc_phase,
+	    slpi_fastrpc_waiting_listener_next);
 	if (context == 0x5002) {
 		slpi_fastrpc_waiting_listener_next = false;
 	}
@@ -3080,6 +3090,10 @@ slpi_fastrpc_handle_reply(uint64_t context, int32_t result)
 	case 0x5002:
 		slpi_fastrpc_invalidate_page();
 		if (slpi_fastrpc_listener_next_output != NULL) {
+			hakios_tl("slpi: fastrpc: next2 #%u output: invoke ctx %#x, handle %#x, sc %#x, input %u\n",
+			    slpi_fastrpc_rx_sequence, slpi_fastrpc_listener_next_output[0],
+			    slpi_fastrpc_listener_next_output[1], slpi_fastrpc_listener_next_output[2],
+			    slpi_fastrpc_listener_next_output[3]);
 			slpi_fastrpc_listener_invoke_context = slpi_fastrpc_listener_next_output[0];
 			slpi_fastrpc_listener_invoke_handle = slpi_fastrpc_listener_next_output[1];
 			slpi_fastrpc_listener_invoke_scalars = slpi_fastrpc_listener_next_output[2];
