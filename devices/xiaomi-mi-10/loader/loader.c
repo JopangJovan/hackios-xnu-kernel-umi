@@ -2806,7 +2806,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 		/* Narrowly allow the existing frame-latency diagnostics on UMI. */
 		"touch_lat=1", "cpuload=1000", "thermal=2",
 		"torch=1", "torch=2", "torch=3", "cam=1", "cam=2", "cam=3", "cam=4", "cam=5", "cam=6", "cam=7", "cam_fake=1",
-		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
+		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "sound_below=", "sound_gain=", "mic=", "mic_adc=", "mic_input=", "mic_secs=", "mic_main=", "mic_test=", "mic_tap=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=", "wifi_mac=", "wifi=1", "umi_bt_probe=", "umi_bt=",
 		"battery=1",
