@@ -26,7 +26,7 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define KERNEL_VIRT_BASE    0xFFFFFFF004000000ULL /* boot_args.virtBase */
 #define KERNEL_LINK_OFFSET  0x03000000ULL         /* kernel text sits 48 MB above the base */
 #define BASE_ALIGN          0x02000000ULL         /* 32 MB: L2 block size with 16K pages */
-#define MAX_MEM_SIZE        0x180000000ULL        /* 6 GB; the kernel's bootstrap page tables cover 8 */
+#define MAX_MEM_SIZE        0x200000000ULL        /* 8 GB; the kernel's bootstrap page tables cover 8 (the phone has 12) */
 /*
  * A root image too big for the payload area is placed here, at a fixed
  * offset inside the kernel's memory window, once; it then survives any
