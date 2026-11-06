@@ -532,6 +532,12 @@ if [ "${DEVICE:-}" = umi ]; then
 				--sensor-version "$version" --output "root/fw/camera-s5khmx-v$version.tab" >/dev/null
 		done
 	fi
+front_module=../fw-camera/com.qti.sensormodule.umi_sunny_s5k3t2.bin
+if [ -f "$front_module" ]; then
+    mkdir -p root/fw
+    python3 ../devices/xiaomi-mi-10/tools/umi-camsensor-v2.py "$front_module" \
+        --sensor-version 0 --output root/fw/camera-s5k3t2.tab >/dev/null
+fi
 else
 for module in ../fw-camera/com.qti.sensormodule.hakios_*.bin; do
 	[ -f "$module" ] || continue
@@ -690,7 +696,8 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	mkdir -p sysroot/System/Volumes/iOS
 	# the applications iOS installs on its first boot are system applications here (see select-system.py)
 	if [ -d sysroot/private/var/staged_system_apps ]; then
-		mv sysroot/private/var/staged_system_apps/* sysroot/Applications/
+		# (a merge: an app that the system image already has would stop a plain mv)
+		cp -a sysroot/private/var/staged_system_apps/. sysroot/Applications/ 2>/dev/null || true
 		rm -rf sysroot/private/var
 	fi
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.ios
@@ -764,6 +771,13 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	done
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
+	# dyld's standard path for the shared cache: a boot whose root IS this volume has no
+	# cryptex graft, and dyld looks in /System/Library/Caches, not under Cryptexes.
+	if [ -d sysroot/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld ]; then
+		mkdir -p sysroot/System/Library/Caches
+		ln -sfn ../../Cryptexes/OS/System/Library/Caches/com.apple.dyld \
+			sysroot/System/Library/Caches/com.apple.dyld
+	fi
 	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=$IOS/system.manifest
 	rm -rf sysroot
