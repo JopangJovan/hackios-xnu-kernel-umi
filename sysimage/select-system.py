@@ -83,7 +83,7 @@ BIG_CATALOGS = ('System/Library/PrivateFrameworks/SFSymbols.framework/',)
 # (/Library is the wallpapers and a few tables of regional settings, apart from the sounds)
 HEALTH = 'System/Library/Health/'
 SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra/',
-               'usr/standalone/', 'Library/Audio/', 'Library/Ringtones/',
+               'usr/standalone/', 'Library/Audio/',
                HEALTH + 'Assets/FitnessUIAssets.bundle/') + \
     tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
