@@ -14,6 +14,7 @@
 #include <sys/proc.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <sys/uio.h>
 #include <pexpert/pexpert.h>
 
@@ -846,7 +847,7 @@ static struct {
 	unsigned local_intents;
 } slpi_glink;
 
-enum { SLPI_QRTR_DATA = 1, SLPI_QRTR_HELLO = 2, SLPI_QRTR_NEW_SERVER = 4 };
+enum { SLPI_QRTR_DATA = 1, SLPI_QRTR_HELLO = 2, SLPI_QRTR_NEW_SERVER = 4, SLPI_QRTR_RESUME_TX = 7 };
 #define SLPI_QRTR_CONTROL       0xfffffffeu
 #define SLPI_QRTR_US            1u
 #define SLPI_QRTR_FIRST_PORT    0x4000u
@@ -857,6 +858,7 @@ enum { SLPI_QRTR_DATA = 1, SLPI_QRTR_HELLO = 2, SLPI_QRTR_NEW_SERVER = 4 };
 #define SLPI_SNS_SUID_EVENT      768u
 #define SLPI_SNS_LOOKUP_DATA_TYPE "resampler"
 #define SLPI_SNS_MAG_DATA_TYPE    "mag"
+#define SLPI_SNS_ORIENTATION_DATA_TYPE "orientation"
 struct slpi_qrtr_header { uint32_t version, type, from_node, from_port, confirm, size, to_node, to_port; };
 struct slpi_qrtr_control { uint32_t command, words[4]; };
 struct hakios_qrtr_port {
@@ -972,6 +974,22 @@ slpi_glink_offer(uint16_t channel, uint32_t size)
 	words[0] = size;
 	words[1] = i + 1;
 	return slpi_glink_send(SLPI_GLINK_INTENT, channel, 1, words, sizeof(words));
+}
+
+/* Per-packet FastRPC tracing is what located every earlier fault, but a
+ * full registry pass is ~1000 reverse callbacks: traced packet by packet it
+ * overflows the kernel log and loses the very lines that matter.  Trace the
+ * first SLPI_FASTRPC_VERBOSE_REPLIES replies in full (all with slpi_trace=1,
+ * which the UMI loader's boot-argument allow-list must also let through);
+ * after that only file-level events, denials (rate limited) and milestones. */
+#define SLPI_FASTRPC_VERBOSE_REPLIES 160u
+static uint32_t slpi_fastrpc_replies_seen;
+static bool slpi_fastrpc_trace_all;
+
+static inline bool
+slpi_fastrpc_verbose(void)
+{
+	return slpi_fastrpc_trace_all || slpi_fastrpc_replies_seen < SLPI_FASTRPC_VERBOSE_REPLIES;
 }
 
 static bool
@@ -1142,6 +1160,7 @@ slpi_glink_pump(void)
 						struct slpi_fastrpc_reply_v2 reply;
 
 						memcpy(&reply, slpi_glink.local_intent[intent].data, sizeof(reply));
+						if (slpi_fastrpc_verbose())
 						hakios_tl("slpi: fastrpc: attach reply (ctx %#llx, result %d, flags %#x, early wake %u, version %u)\n",
 						    reply.context, reply.result, reply.flags, reply.early_wake_time, reply.version);
 						fastrpc_context = reply.context;
@@ -1151,6 +1170,7 @@ slpi_glink_pump(void)
 						struct slpi_fastrpc_reply_v1 reply;
 
 						memcpy(&reply, slpi_glink.local_intent[intent].data, sizeof(reply));
+						if (slpi_fastrpc_verbose())
 						hakios_tl("slpi: fastrpc: attach reply (ctx %#llx, result %d)\n", reply.context, reply.result);
 						fastrpc_context = reply.context;
 						fastrpc_result = reply.result;
@@ -1161,7 +1181,7 @@ slpi_glink_pump(void)
 					}
 				}
 				slpi_glink.local_intent[intent].fill = 0;
-				slpi_glink_send(SLPI_GLINK_DONE_REUSE, message.param1, message.param2, NULL, 0);
+				slpi_glink_send(SLPI_GLINK_DONE_REUSE, ipcrtr ? 1u : 2u, message.param2, NULL, 0);
 				if (have_fastrpc_reply) {
 					slpi_fastrpc_handle_reply(fastrpc_context, fastrpc_result);
 				}
@@ -1344,6 +1364,36 @@ static const struct hakios_qrtr_ops slpi_qrtr_ops = {
 	.close = slpi_qrtr_close,
 };
 
+/* QRTR flow control: a sender marks a packet confirm_rx (every fifth one)
+ * and, with ten unconfirmed packets outstanding, stops sending until the
+ * receiver answers RESUME_TX naming itself -- Linux's qrtr_send_resume_tx().
+ * Without it the SNS client manager's ak0991x stream stalled after exactly
+ * ten packets to this port (replies, SUID events, the first 4 samples). */
+static void
+slpi_qrtr_resume_tx(const struct slpi_qrtr_header *received)
+{
+	struct { struct slpi_qrtr_header header; struct slpi_qrtr_control control; } resume = { 0 };
+	static uint32_t resumed;
+
+	resume.header.version = 1;
+	resume.header.type = SLPI_QRTR_RESUME_TX;
+	resume.header.from_node = SLPI_QRTR_US;
+	resume.header.from_port = received->to_port;
+	resume.header.size = sizeof(resume.control);
+	resume.header.to_node = received->from_node;
+	resume.header.to_port = received->from_port;
+	resume.control.command = SLPI_QRTR_RESUME_TX;
+	resume.control.words[0] = SLPI_QRTR_US;
+	resume.control.words[1] = received->to_port;
+	if (!slpi_qrtr_send(&resume, sizeof(resume))) {
+		hakios_tl("slpi: qrtr: cannot send RESUME_TX to %u:%u\n", received->from_node, received->from_port);
+		return;
+	}
+	if (++resumed <= 3 || resumed % 50 == 0) {
+		hakios_tl("slpi: qrtr: RESUME_TX #%u to %u:%u\n", resumed, received->from_node, received->from_port);
+	}
+}
+
 static void
 slpi_qrtr_input(const uint8_t *data, uint32_t size)
 {
@@ -1382,6 +1432,9 @@ slpi_qrtr_input(const uint8_t *data, uint32_t size)
 		}
 		slpi_qrtr_port.receive(slpi_qrtr_port.context, header.from_node, header.from_port,
 		    data + sizeof(header), header.size);
+		if (header.confirm != 0) {
+			slpi_qrtr_resume_tx(&header);
+		}
 		return;
 	}
 	switch (control.command) {
@@ -1434,6 +1487,31 @@ static bool slpi_sns_suid_sent;
 static struct qmi_txn slpi_sns_mag_txn;
 static struct qmi_response_type_v01 slpi_sns_mag_response;
 static bool slpi_sns_mag_sent;
+static struct qmi_txn slpi_sns_orientation_txn;
+static struct qmi_response_type_v01 slpi_sns_orientation_response;
+static bool slpi_sns_orientation_sent;
+/* The magnetometer stream: once the SUID lookup names the ak0991x "mag"
+ * sensor, ask it for samples with the standard SEE sensor configuration. */
+#define SLPI_SNS_STD_SENSOR_CONFIG 513u
+#define SLPI_SNS_STD_SENSOR_PHYSICAL_CONFIG_EVENT 768u
+#define SLPI_SNS_STD_SENSOR_EVENT 1025u
+#define SLPI_SNS_STD_ERROR_EVENT 130u
+#define SLPI_SNS_MAG_SAMPLE_RATE_BITS 0x41200000u     /* 10.0f Hz, IEEE-754 single */
+#define SLPI_SNS_MAG_SAMPLES_LOGGED 24u
+static uint64_t slpi_sns_mag_suid_low, slpi_sns_mag_suid_high;
+static bool slpi_sns_mag_suid_valid;
+static uint64_t slpi_sns_orientation_suid_low, slpi_sns_orientation_suid_high;
+static bool slpi_sns_orientation_suid_valid;
+static struct qmi_txn slpi_sns_stream_txn;
+static struct qmi_response_type_v01 slpi_sns_stream_response;
+static bool slpi_sns_stream_sent;       /* attempted (once per boot) */
+static bool slpi_sns_stream_live;       /* its transaction is in flight or done */
+static uint32_t slpi_sns_mag_samples;
+static int64_t slpi_sns_mag_min[3], slpi_sns_mag_max[3];
+static struct qmi_txn slpi_sns_orientation_stream_txn;
+static struct qmi_response_type_v01 slpi_sns_orientation_stream_response;
+static bool slpi_sns_orientation_stream_sent;
+static bool slpi_sns_orientation_stream_live;
 
 struct slpi_sns_client_request {
 	uint32_t payload_len;
@@ -1626,7 +1704,8 @@ slpi_sns_decode_suid_event(const uint8_t *data, uint32_t length)
 		}
 	}
 	if (!have_type || (strcmp(data_type, SLPI_SNS_LOOKUP_DATA_TYPE) != 0 &&
-	    strcmp(data_type, SLPI_SNS_MAG_DATA_TYPE) != 0)) {
+	    strcmp(data_type, SLPI_SNS_MAG_DATA_TYPE) != 0 &&
+	    strcmp(data_type, SLPI_SNS_ORIENTATION_DATA_TYPE) != 0)) {
 		return false;
 	}
 	if (count == 0) {
@@ -1637,6 +1716,258 @@ slpi_sns_decode_suid_event(const uint8_t *data, uint32_t length)
 		hakios_tl("slpi: sns: SUID event \"%s\": low %#llx high %#llx\n",
 		    data_type, suids[i].low, suids[i].high);
 	}
+	/* UMI has exactly one magnetometer (ak0991x_0): its first SUID is it. */
+	if (strcmp(data_type, SLPI_SNS_MAG_DATA_TYPE) == 0 && !slpi_sns_mag_suid_valid) {
+		slpi_sns_mag_suid_low = suids[0].low;
+		slpi_sns_mag_suid_high = suids[0].high;
+		slpi_sns_mag_suid_valid = true;
+	} else if (strcmp(data_type, SLPI_SNS_ORIENTATION_DATA_TYPE) == 0 &&
+	    !slpi_sns_orientation_suid_valid) {
+		slpi_sns_orientation_suid_low = suids[0].low;
+		slpi_sns_orientation_suid_high = suids[0].high;
+		slpi_sns_orientation_suid_valid = true;
+	}
+	return true;
+}
+
+/* IEEE-754 single precision to a signed integer in thousandths of its unit,
+ * on integer registers only (the kernel is not built to use the FPU).
+ * Non-finite values come back as INT64_MIN. */
+static int64_t
+slpi_sns_float_milli(uint32_t bits)
+{
+	uint32_t biased = (bits >> 23) & 0xffu;
+	uint64_t scaled = ((uint64_t)(bits & 0x7fffffu) | 0x800000u) * 1000u;
+	int32_t shift = (int32_t)biased - 127 - 23;
+
+	if (biased == 0xffu) {
+		return INT64_MIN;
+	}
+	if (biased == 0) {
+		return 0;                       /* zero or subnormal: below a thousandth */
+	}
+	if (shift >= 0) {
+		scaled = shift > 28 ? (uint64_t)INT64_MAX : scaled << shift;
+	} else {
+		scaled = -shift >= 64 ? 0 : scaled >> -shift;
+	}
+	if (scaled > (uint64_t)INT64_MAX) {
+		scaled = (uint64_t)INT64_MAX;
+	}
+	return (bits >> 31) != 0 ? -(int64_t)scaled : (int64_t)scaled;
+}
+
+/* ---- the magnetometer for iOS: sysctl kern.hakios.mag (sys/hakios.input.h) ---- */
+/*
+ * Hard iron: the phone's own constant field adds to the earth's on every axis -- here about
+ * (about -99, 114, -383) uT, measured on this UMI in its iOS sessions
+ * (Android's persisted mag_cal bias is only a few uT, so part of it is something powered on
+ * here). Turning the phone around sweeps the earth's field across each axis; the middle of what
+ * an axis has spanned is that axis's hard-iron offset. Until the phone has been turned far
+ * enough, the measured offset above stands in, reported as not calibrated.
+ */
+#define SLPI_MAG_SPAN_LOW_NT    30000   /* the earth's horizontal field is ~35 uT: ~half a turn */
+#define SLPI_MAG_SPAN_HIGH_NT   50000   /* ~three quarters of a turn */
+#define SLPI_MAG_GLITCH_NT      200000  /* a jump this big between two samples 0.1 s apart is a glitch... */
+#define SLPI_MAG_GLITCH_RUN     5       /* ... unless it persists: then the field really changed */
+/* Android's compass reported north while the same stationary iOS-session
+ * samples clustered around (-98.5, 136.5) uT; an east-facing sample put y
+ * near 114 uT.  This is only the pre-calibration fallback: a complete flat
+ * turn (both horizontal spans >= 50 uT) replaces it with measured extrema. */
+static const int32_t slpi_mag_seed_center[3] = { -98500, 114000, -383000 };
+static LCK_GRP_DECLARE(slpi_mag_lck_grp, "hakios-mag");
+static LCK_MTX_DECLARE(slpi_mag_lock, &slpi_mag_lck_grp);
+static struct hakios_mag_state slpi_mag_state = {
+	.size = sizeof(struct hakios_mag_state), .version = HAKIOS_MAG_VERSION,
+	.center = { -98500, 114000, -383000 },
+};
+static int32_t slpi_mag_min[3], slpi_mag_max[3];
+static uint32_t slpi_mag_glitches, slpi_mag_glitch_run;
+
+static void
+slpi_mag_publish(const int64_t axis[3], uint64_t status)
+{
+	int32_t value[3];
+	bool jump = false;
+
+	for (unsigned i = 0; i < 3; i++) {
+		value[i] = axis[i] > INT32_MAX ? INT32_MAX : axis[i] < -INT32_MAX ? -INT32_MAX : (int32_t)axis[i];
+	}
+	lck_mtx_lock(&slpi_mag_lock);
+	for (unsigned i = 0; i < 3 && slpi_mag_state.samples != 0; i++) {
+		int64_t delta = (int64_t)value[i] - slpi_mag_state.raw[i];
+
+		jump |= delta > SLPI_MAG_GLITCH_NT || delta < -SLPI_MAG_GLITCH_NT;
+	}
+	if (jump && ++slpi_mag_glitch_run < SLPI_MAG_GLITCH_RUN) {
+		slpi_mag_glitches++;
+		lck_mtx_unlock(&slpi_mag_lock);
+		return;
+	}
+	slpi_mag_glitch_run = 0;
+	for (unsigned i = 0; i < 3; i++) {
+		if (slpi_mag_state.samples == 0 || value[i] < slpi_mag_min[i]) {
+			slpi_mag_min[i] = value[i];
+		}
+		if (slpi_mag_state.samples == 0 || value[i] > slpi_mag_max[i]) {
+			slpi_mag_max[i] = value[i];
+		}
+		slpi_mag_state.raw[i] = value[i];
+		slpi_mag_state.span[i] = slpi_mag_max[i] - slpi_mag_min[i];
+	}
+	slpi_mag_state.samples++;
+	slpi_mag_state.time = mach_absolute_time();
+	slpi_mag_state.status = (int32_t)MIN(status, 3u);
+	if (slpi_mag_state.span[0] >= SLPI_MAG_SPAN_LOW_NT && slpi_mag_state.span[1] >= SLPI_MAG_SPAN_LOW_NT) {
+		slpi_mag_state.calibration = slpi_mag_state.span[0] >= SLPI_MAG_SPAN_HIGH_NT &&
+		    slpi_mag_state.span[1] >= SLPI_MAG_SPAN_HIGH_NT ? 2 : 1;
+		if (slpi_mag_state.calibration == 2) {
+			for (unsigned i = 0; i < 3; i++) {
+				slpi_mag_state.center[i] = (int32_t)(((int64_t)slpi_mag_min[i] + slpi_mag_max[i]) / 2);
+			}
+			/* z spans only when the phone is turned over: keep the measured z until it has */
+			if (slpi_mag_state.span[2] < SLPI_MAG_SPAN_LOW_NT) {
+				slpi_mag_state.center[2] = slpi_mag_seed_center[2];
+			}
+		} else {
+			memcpy(slpi_mag_state.center, slpi_mag_seed_center, sizeof(slpi_mag_state.center));
+		}
+	} else {
+		slpi_mag_state.calibration = 0;
+		memcpy(slpi_mag_state.center, slpi_mag_seed_center, sizeof(slpi_mag_state.center));
+	}
+	lck_mtx_unlock(&slpi_mag_lock);
+}
+
+static void
+slpi_mag_publish_orientation(const int64_t axis[3], uint64_t status)
+{
+	int64_t heading = axis[0] % 360000;
+
+	if (heading < 0) {
+		heading += 360000;
+	}
+	lck_mtx_lock(&slpi_mag_lock);
+	slpi_mag_state.orientation_samples++;
+	slpi_mag_state.orientation_time = mach_absolute_time();
+	slpi_mag_state.heading_millidegrees = (int32_t)heading;
+	slpi_mag_state.pitch_millidegrees = axis[1] > INT32_MAX ? INT32_MAX :
+	    axis[1] < -INT32_MAX ? -INT32_MAX : (int32_t)axis[1];
+	slpi_mag_state.roll_millidegrees = axis[2] > INT32_MAX ? INT32_MAX :
+	    axis[2] < -INT32_MAX ? -INT32_MAX : (int32_t)axis[2];
+	slpi_mag_state.orientation_status = (int32_t)MIN(status, 3u);
+	lck_mtx_unlock(&slpi_mag_lock);
+}
+
+static int
+slpi_mag_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	struct hakios_mag_state copy;
+
+	lck_mtx_lock(&slpi_mag_lock);
+	copy = slpi_mag_state;
+	lck_mtx_unlock(&slpi_mag_lock);
+	return SYSCTL_OUT(req, &copy, sizeof(copy));
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, mag, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+    slpi_mag_sysctl, "S,hakios_mag_state", "the magnetometer: last sample and hard-iron estimate (sys/hakios.input.h)");
+
+/* sns_std_sensor_event { repeated float data = 1; optional status = 2; }:
+ * the ak0991x reports x, y, z in microtesla.  Accept both the unpacked and
+ * the packed encoding of the repeated float. */
+static bool
+slpi_sns_decode_mag_sample(const uint8_t *data, uint32_t length, uint64_t timestamp)
+{
+	struct slpi_pb_cursor cursor = { data, length, 0 };
+	struct slpi_pb_field field;
+	int64_t axis[3] = { 0 };
+	uint32_t values = 0;
+	uint64_t status = 0;
+
+	while (cursor.at < cursor.size) {
+		if (!slpi_pb_next(&cursor, &field)) {
+			return false;
+		}
+		if (field.number == 1 && field.wire == 5) {
+			if (values < 3) {
+				axis[values] = slpi_sns_float_milli((uint32_t)slpi_pb_le(field.data, 4));
+			}
+			values++;
+		} else if (field.number == 1 && field.wire == 2 && field.size % 4 == 0) {
+			for (uint32_t at = 0; at < field.size; at += 4, values++) {
+				if (values < 3) {
+					axis[values] = slpi_sns_float_milli((uint32_t)slpi_pb_le(field.data + at, 4));
+				}
+			}
+		} else if (field.number == 2 && field.wire == 0) {
+			status = field.scalar;
+		}
+	}
+	if (values < 3) {
+		hakios_tl("slpi: sns: mag event with %u values\n", values);
+		return true;
+	}
+	for (unsigned i = 0; i < 3; i++) {
+		if (slpi_sns_mag_samples == 0 || axis[i] < slpi_sns_mag_min[i]) {
+			slpi_sns_mag_min[i] = axis[i];
+		}
+		if (slpi_sns_mag_samples == 0 || axis[i] > slpi_sns_mag_max[i]) {
+			slpi_sns_mag_max[i] = axis[i];
+		}
+	}
+	slpi_sns_mag_samples++;
+	slpi_mag_publish(axis, status);
+	if (slpi_sns_mag_samples <= SLPI_SNS_MAG_SAMPLES_LOGGED || slpi_sns_mag_samples % 20 == 0) {
+		hakios_tl("slpi: sns: MAG SAMPLE #%u t %llu: x %lld y %lld z %lld nT (status %llu)\n",
+		    slpi_sns_mag_samples, timestamp, axis[0], axis[1], axis[2], status);
+	}
+	return true;
+}
+
+/* The UMI fusion sensor publishes Android's orientation triple in degrees:
+ * magnetic azimuth (clockwise from north), pitch, and roll.  It consumes the
+ * DSP's accel/gyro/mag_cal streams internally, so it remains stable while a
+ * raw hard-iron estimate is still converging. */
+static bool
+slpi_sns_decode_orientation_sample(const uint8_t *data, uint32_t length, uint64_t timestamp)
+{
+	static uint32_t events;
+	struct slpi_pb_cursor cursor = { data, length, 0 };
+	struct slpi_pb_field field;
+	int64_t axis[3] = { 0 };
+	uint32_t values = 0;
+	uint64_t status = 0;
+
+	while (cursor.at < cursor.size) {
+		if (!slpi_pb_next(&cursor, &field)) {
+			return false;
+		}
+		if (field.number == 1 && field.wire == 5) {
+			if (values < 3) {
+				axis[values] = slpi_sns_float_milli((uint32_t)slpi_pb_le(field.data, 4));
+			}
+			values++;
+		} else if (field.number == 1 && field.wire == 2 && field.size % 4 == 0) {
+			for (uint32_t at = 0; at < field.size; at += 4, values++) {
+				if (values < 3) {
+					axis[values] = slpi_sns_float_milli((uint32_t)slpi_pb_le(field.data + at, 4));
+				}
+			}
+		} else if (field.number == 2 && field.wire == 0) {
+			status = field.scalar;
+		}
+	}
+	if (values < 3) {
+		hakios_tl("slpi: sns: orientation event with %u values\n", values);
+		return true;
+	}
+	slpi_mag_publish_orientation(axis, status);
+	events++;
+	if (events <= 12 || events % 100 == 0) {
+		hakios_tl("slpi: sns: ORIENTATION #%u t %llu: heading %lld pitch %lld roll %lld millidegrees (status %llu)\n",
+		    events, timestamp, axis[0], axis[1], axis[2], status);
+	}
 	return true;
 }
 
@@ -1645,17 +1976,30 @@ slpi_sns_decode_client_event(const uint8_t *data, uint32_t length)
 {
 	struct slpi_pb_cursor cursor = { data, length, 0 };
 	struct slpi_pb_field field;
-	bool found = false;
+	uint64_t source_low = 0, source_high = 0;
+	bool found = false, from_mag = false, from_orientation = false;
 
 	while (cursor.at < cursor.size) {
 		if (!slpi_pb_next(&cursor, &field)) {
 			return false;
 		}
-		if (field.number == 2 && field.wire == 2) {
+		/* sns_client_event_msg.suid (field 1) names the event's source, and
+		 * precedes its events: message 768 is a SUID event from the SUID
+		 * sensor but a physical-config event from the magnetometer. */
+		if (field.number == 1 && field.wire == 2) {
+			if (slpi_sns_decode_suid(field.data, field.size, &source_low, &source_high)) {
+				from_mag = slpi_sns_mag_suid_valid && source_low == slpi_sns_mag_suid_low &&
+				    source_high == slpi_sns_mag_suid_high;
+				from_orientation = slpi_sns_orientation_suid_valid &&
+				    source_low == slpi_sns_orientation_suid_low &&
+				    source_high == slpi_sns_orientation_suid_high;
+			}
+		} else if (field.number == 2 && field.wire == 2) {
 			struct slpi_pb_cursor event = { field.data, field.size, 0 };
 			struct slpi_pb_field item;
 			const uint8_t *payload = NULL;
 			uint32_t payload_length = 0, message = 0;
+			uint64_t timestamp = 0;
 
 			while (event.at < event.size) {
 				if (!slpi_pb_next(&event, &item)) {
@@ -1663,12 +2007,40 @@ slpi_sns_decode_client_event(const uint8_t *data, uint32_t length)
 				}
 				if (item.number == 1 && item.wire == 5) {
 					message = (uint32_t)slpi_pb_le(item.data, item.size);
+				} else if (item.number == 2 && item.wire == 1) {
+					timestamp = slpi_pb_le(item.data, item.size);
 				} else if (item.number == 3 && item.wire == 2) {
 					payload = item.data;
 					payload_length = item.size;
 				}
 			}
-			if (message == SLPI_SNS_SUID_EVENT && payload != NULL) {
+			if (from_mag) {
+				if (message == SLPI_SNS_STD_SENSOR_EVENT && payload != NULL) {
+					if (!slpi_sns_decode_mag_sample(payload, payload_length, timestamp)) {
+						return false;
+					}
+				} else if (message == SLPI_SNS_STD_SENSOR_PHYSICAL_CONFIG_EVENT) {
+					hakios_tl("slpi: sns: mag physical config event (%u bytes)\n", payload_length);
+				} else if (message == SLPI_SNS_STD_ERROR_EVENT) {
+					hakios_tl("slpi: sns: MAG ERROR EVENT (%u bytes)\n", payload_length);
+				} else {
+					hakios_tl("slpi: sns: mag event message %u (%u bytes)\n", message, payload_length);
+				}
+				found = true;
+			} else if (from_orientation) {
+				if (message == SLPI_SNS_STD_SENSOR_EVENT && payload != NULL) {
+					if (!slpi_sns_decode_orientation_sample(payload, payload_length, timestamp)) {
+						return false;
+					}
+				} else if (message == SLPI_SNS_STD_SENSOR_PHYSICAL_CONFIG_EVENT) {
+					hakios_tl("slpi: sns: orientation physical config event (%u bytes)\n", payload_length);
+				} else if (message == SLPI_SNS_STD_ERROR_EVENT) {
+					hakios_tl("slpi: sns: ORIENTATION ERROR EVENT (%u bytes)\n", payload_length);
+				} else {
+					hakios_tl("slpi: sns: orientation event message %u (%u bytes)\n", message, payload_length);
+				}
+				found = true;
+			} else if (message == SLPI_SNS_SUID_EVENT && payload != NULL) {
 				if (!slpi_sns_decode_suid_event(payload, payload_length)) {
 					return false;
 				}
@@ -1679,19 +2051,38 @@ slpi_sns_decode_client_event(const uint8_t *data, uint32_t length)
 	return found;
 }
 
+static void slpi_sns_send_mag_stream(void);
+static void slpi_sns_send_orientation_lookup(void);
+static void slpi_sns_send_orientation_stream(void);
+
 static void
 slpi_sns_report_handler(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *from,
     __unused struct qmi_txn *txn, const void *decoded)
 {
 	const struct slpi_sns_client_report *report = decoded;
 	uint32_t shown = MIN(report->payload_len, 64u);
+	static uint32_t reports;
 
-	hakios_tl("slpi: sns: report indication: %u protobuf bytes\n", report->payload_len);
+	if (++reports <= 8) {
+		hakios_tl("slpi: sns: report indication: %u protobuf bytes\n", report->payload_len);
+	}
 	if (report->payload_len == 0 || report->payload_len > sizeof(report->payload)) {
 		hakios_tl("slpi: sns: report has no valid protobuf payload\n");
 		return;
 	}
 	if (slpi_sns_decode_client_event(report->payload, report->payload_len)) {
+		/* The ak0991x has a SUID now: subscribe to its samples, once. */
+		if (slpi_sns_mag_suid_valid && !slpi_sns_stream_sent) {
+			slpi_sns_send_mag_stream();
+		}
+		/* Wait for a real mag sample before starting the second request.  This
+		 * transport has one remote GLINK TX intent, so requests are sequenced. */
+		if (slpi_sns_mag_samples != 0 && !slpi_sns_orientation_sent) {
+			slpi_sns_send_orientation_lookup();
+		}
+		if (slpi_sns_orientation_suid_valid && !slpi_sns_orientation_stream_sent) {
+			slpi_sns_send_orientation_stream();
+		}
 		return;
 	}
 	hakios_tl("slpi: sns: report has no complete SUID event\n");
@@ -1705,6 +2096,118 @@ slpi_sns_report_handler(__unused struct qmi_handle *qmi, __unused struct sockadd
 		line[MIN(at, (uint32_t)sizeof(line) - 1)] = 0;
 		hakios_tl("slpi: sns: report +%u: %s\n", offset, line);
 	}
+}
+
+/* sns_client_request_msg { suid = 1; fixed32 msg_id = 2; susp_config = 3
+ * { client_proc_type = APSS, delivery_type = WAKEUP }; request = 4 { payload
+ * = 2: sns_std_sensor_config { float sample_rate = 1 } } }: the standard SEE
+ * stream request, here for the ak0991x at 10 Hz. */
+static uint32_t
+slpi_sns_encode_std_stream(uint64_t suid_low, uint64_t suid_high, uint8_t *payload, uint32_t capacity)
+{
+	uint32_t rate = SLPI_SNS_MAG_SAMPLE_RATE_BITS;
+	uint32_t message = SLPI_SNS_STD_SENSOR_CONFIG;
+	uint8_t *at = payload;
+
+	if (capacity < 46) {
+		return 0;
+	}
+	*at++ = 0x0a;                   /* suid */
+	*at++ = 0x12;
+	*at++ = 0x09;                   /* suid_low, fixed64 */
+	for (unsigned i = 0; i < 8; i++) {
+		*at++ = (uint8_t)(suid_low >> (8 * i));
+	}
+	*at++ = 0x11;                   /* suid_high, fixed64 */
+	for (unsigned i = 0; i < 8; i++) {
+		*at++ = (uint8_t)(suid_high >> (8 * i));
+	}
+	*at++ = 0x15;                   /* msg_id, fixed32 */
+	for (unsigned i = 0; i < 4; i++) {
+		*at++ = (uint8_t)(message >> (8 * i));
+	}
+	*at++ = 0x1a;                   /* susp_config: APSS, wakeup delivery */
+	*at++ = 0x04;
+	*at++ = 0x08;
+	*at++ = 0x01;
+	*at++ = 0x10;
+	*at++ = 0x00;
+	*at++ = 0x22;                   /* request */
+	*at++ = 0x07;
+	*at++ = 0x12;                   /* request.payload: sns_std_sensor_config */
+	*at++ = 0x05;
+	*at++ = 0x0d;                   /* sample_rate, float */
+	for (unsigned i = 0; i < 4; i++) {
+		*at++ = (uint8_t)(rate >> (8 * i));
+	}
+	return (uint32_t)(at - payload);
+}
+
+static void
+slpi_sns_send_mag_stream(void)
+{
+	struct slpi_sns_client_request request = { 0 };
+	int error;
+
+	if (slpi_sns_stream_sent || !slpi_sns_mag_suid_valid) {
+		return;
+	}
+	slpi_sns_stream_sent = true;    /* one attempt per boot, success or not */
+	request.payload_len = slpi_sns_encode_std_stream(slpi_sns_mag_suid_low, slpi_sns_mag_suid_high,
+	    request.payload, sizeof(request.payload));
+	if (request.payload_len == 0) {
+		hakios_tl("slpi: sns: cannot encode the mag stream request\n");
+		return;
+	}
+	error = qmi_txn_init(&slpi_sns_qmi, &slpi_sns_stream_txn, slpi_sns_response_ei, &slpi_sns_stream_response);
+	if (error < 0) {
+		hakios_tl("slpi: sns: cannot prepare the mag stream request: %d\n", error);
+		return;
+	}
+	error = qmi_send_request(&slpi_sns_qmi, NULL, &slpi_sns_stream_txn, SLPI_SNS_CLIENT_REQUEST, 1024,
+	    slpi_sns_client_request_ei, &request);
+	if (error != 0) {
+		qmi_txn_cancel(&slpi_sns_stream_txn);
+		hakios_tl("slpi: sns: cannot send the mag stream request: %d\n", error);
+		return;
+	}
+	slpi_sns_stream_live = true;
+	hakios_tl("slpi: sns: requested the mag stream at 10 Hz (message %u, %u protobuf bytes)\n",
+	    SLPI_SNS_STD_SENSOR_CONFIG, request.payload_len);
+}
+
+static void
+slpi_sns_send_orientation_stream(void)
+{
+	struct slpi_sns_client_request request = { 0 };
+	int error;
+
+	if (slpi_sns_orientation_stream_sent || !slpi_sns_orientation_suid_valid) {
+		return;
+	}
+	slpi_sns_orientation_stream_sent = true;
+	request.payload_len = slpi_sns_encode_std_stream(slpi_sns_orientation_suid_low,
+	    slpi_sns_orientation_suid_high, request.payload, sizeof(request.payload));
+	if (request.payload_len == 0) {
+		hakios_tl("slpi: sns: cannot encode the orientation stream request\n");
+		return;
+	}
+	error = qmi_txn_init(&slpi_sns_qmi, &slpi_sns_orientation_stream_txn, slpi_sns_response_ei,
+	    &slpi_sns_orientation_stream_response);
+	if (error < 0) {
+		hakios_tl("slpi: sns: cannot prepare the orientation stream request: %d\n", error);
+		return;
+	}
+	error = qmi_send_request(&slpi_sns_qmi, NULL, &slpi_sns_orientation_stream_txn,
+	    SLPI_SNS_CLIENT_REQUEST, 1024, slpi_sns_client_request_ei, &request);
+	if (error != 0) {
+		qmi_txn_cancel(&slpi_sns_orientation_stream_txn);
+		hakios_tl("slpi: sns: cannot send the orientation stream request: %d\n", error);
+		return;
+	}
+	slpi_sns_orientation_stream_live = true;
+	hakios_tl("slpi: sns: requested the fused orientation stream at 10 Hz (message %u, %u protobuf bytes)\n",
+	    SLPI_SNS_STD_SENSOR_CONFIG, request.payload_len);
 }
 
 static const struct qmi_msg_handler slpi_sns_qmi_handlers[] = {
@@ -1812,6 +2315,39 @@ slpi_sns_send_mag_lookup(void)
 	    SLPI_SNS_MAG_DATA_TYPE, SLPI_SNS_SUID_REQUEST, request.payload_len);
 }
 
+static void
+slpi_sns_send_orientation_lookup(void)
+{
+	struct slpi_sns_client_request request = { 0 };
+	int error;
+
+	if (slpi_sns_orientation_sent) {
+		return;
+	}
+	request.payload_len = slpi_sns_encode_suid_lookup(SLPI_SNS_ORIENTATION_DATA_TYPE, true,
+	    request.payload, sizeof(request.payload));
+	if (request.payload_len == 0) {
+		hakios_tl("slpi: sns: cannot encode orientation SUID lookup\n");
+		return;
+	}
+	error = qmi_txn_init(&slpi_sns_qmi, &slpi_sns_orientation_txn, slpi_sns_response_ei,
+	    &slpi_sns_orientation_response);
+	if (error < 0) {
+		hakios_tl("slpi: sns: cannot prepare orientation SUID lookup: %d\n", error);
+		return;
+	}
+	error = qmi_send_request(&slpi_sns_qmi, NULL, &slpi_sns_orientation_txn,
+	    SLPI_SNS_CLIENT_REQUEST, 1024, slpi_sns_client_request_ei, &request);
+	if (error != 0) {
+		qmi_txn_cancel(&slpi_sns_orientation_txn);
+		hakios_tl("slpi: sns: cannot send orientation SUID lookup: %d\n", error);
+		return;
+	}
+	slpi_sns_orientation_sent = true;
+	hakios_tl("slpi: sns: sent SUID lookup for \"%s\" (message %u, %u protobuf bytes)\n",
+	    SLPI_SNS_ORIENTATION_DATA_TYPE, SLPI_SNS_SUID_REQUEST, request.payload_len);
+}
+
 static int
 slpi_sns_server(struct qmi_handle *qmi, struct qmi_service *service)
 {
@@ -1851,106 +2387,141 @@ slpi_sns_qmi_probe(void)
 	hakios_tl("slpi: sns: looking up the Sensor Client Manager service %#x\n", SLPI_SNS_CLIENT_SERVICE);
 }
 
+/*
+ * Finish FastRPC's channel setup once SLPI has acknowledged our proactive
+ * open: offer our 64 local receive intents, then request two of SLPI's own
+ * remote intents so slpi_glink_send_data() has somewhere to put a FastRPC
+ * invocation.  Pulled out of the old slpi_glink_open_fastrpc_probe() so it
+ * can be invoked from the combined channel-open loop below as soon as the
+ * acknowledgement arrives, whether or not IPCRTR has opened yet.
+ */
 static bool
-slpi_glink_open_ipcrtr(void)
+slpi_glink_finish_fastrpc_open(void)
+{
+	for (unsigned i = 0; i < SLPI_FASTRPC_INTENT_COUNT; i++) {
+		if (!slpi_glink_offer(2, SLPI_FASTRPC_INTENT_SIZE)) {
+			hakios_tl("slpi: glink: cannot offer FastRPC intent %u\n", i);
+			return false;
+		}
+	}
+	hakios_tl("slpi: glink: FastRPC channel open (ours 2, SLPI %u)\n",
+	    slpi_glink.fastrpc_remote_channel);
+	hakios_tl("slpi: glink: FastRPC offered 64 intents\n");
+	for (unsigned requested = 0; requested < SLPI_FASTRPC_REMOTE_INTENTS; requested++) {
+		bool available = false;
+
+		if (!slpi_glink_send(SLPI_GLINK_INTENT_REQUEST, 2, SLPI_FASTRPC_REQUEST_SIZE, NULL, 0)) {
+			hakios_tl("slpi: glink: cannot request FastRPC remote intent %u\n", requested);
+			return false;
+		}
+		for (uint32_t wait = 0; wait < 1000 && !slpi_glink.broken; wait++) {
+			unsigned count = 0;
+
+			slpi_glink_pump();
+			for (unsigned i = 0; i < slpi_glink.remote_intents; i++) {
+				count += slpi_glink.remote_intent[i].channel == 2;
+			}
+			if (count > requested) {
+				available = true;
+				break;
+			}
+			delay_for_interval(1, NSEC_PER_MSEC);
+		}
+		if (!available) {
+			hakios_tl("slpi: glink: FastRPC did not provide remote intent %u\n", requested);
+			return requested != 0;
+		}
+	}
+	hakios_tl("slpi: glink: FastRPC requested %u 48-byte remote intents\n",
+	    SLPI_FASTRPC_REMOTE_INTENTS);
+	return true;
+}
+
+/*
+ * SLPI's own sensors registry daemon makes its one pass over the persist
+ * registry on its own schedule soon after the DSP starts, driven entirely
+ * by its FastRPC reverse-listener session with APSS: it does not wait for
+ * us, and a file it has already asked for once is not asked for again.
+ * This driver used to open "fastrpcglink-apps-dsp" (FastRPC's reverse
+ * listener channel) strictly *after* proving IPCRTR was fully open and
+ * acknowledged -- an unnecessary coupling, since FastRPC's own channel only
+ * needs the shared GLINK wire version agreed, not IPCRTR's channel-specific
+ * ack. Real UMI probes also established the other boundary: originating a
+ * FastRPC OPEN immediately after the version handshake is too early.  SLPI
+ * ACKs our local id but has not published its own channel id, leaving it at
+ * zero and making remote-intent requests impossible.  The fix is to pump
+ * both channels concurrently and reciprocate FastRPC's OPEN immediately
+ * when SLPI publishes its half, without waiting for IPCRTR's separate
+ * open/ack round trip.  Whichever channel completes first proceeds first.
+ * This gives the listener the earliest protocol-valid start.
+ */
+#define SLPI_GLINK_CHANNEL_TIMEOUT_MS 5000u
+
+static void
+slpi_glink_open_channels(bool *ipcrtr_ready, bool *fastrpc_ready)
 {
 	struct slpi_smem_partition header;
 	uint32_t partition, descriptor_size;
-	bool opened = false;
+	bool fastrpc_sent = false;
 
+	*ipcrtr_ready = *fastrpc_ready = false;
 	if (!slpi_transport_partition(&partition, &header) ||
 	    !slpi_transport_item(partition, &header, SLPI_ITEM_GLINK_DESCRIPTOR, &slpi_glink.descriptor, &descriptor_size) ||
 	    descriptor_size != 32 || !slpi_transport_item(partition, &header, SLPI_ITEM_GLINK_OUR_QUEUE, &slpi_glink.ours, &slpi_glink.ours_size) ||
 	    !slpi_transport_item(partition, &header, SLPI_ITEM_GLINK_THEIR_QUEUE, &slpi_glink.theirs, &slpi_glink.theirs_size) ||
 	    slpi_glink.ours_size < 1024 || slpi_glink.theirs_size < 1024) {
 		hakios_tl("slpi: glink: validated queues are no longer available\n");
-		return false;
+		return;
 	}
 	slpi_glink.agreed = slpi_glink.opened = slpi_glink.acknowledged = slpi_glink.broken = false;
 	slpi_glink.fastrpc_opened = slpi_glink.fastrpc_acknowledged = false;
 	slpi_glink.fastrpc_remote_channel = 0;
 	slpi_glink.remote_channel = 0;
 	slpi_glink_send(SLPI_GLINK_VERSION, 1, 1, NULL, 0);
-	for (uint32_t ms = 0; ms < 3000 && !slpi_glink.broken; ms++) {
+	for (uint32_t ms = 0; ms < SLPI_GLINK_CHANNEL_TIMEOUT_MS && !slpi_glink.broken &&
+	    (!*ipcrtr_ready || !*fastrpc_ready); ms++) {
 		slpi_glink_pump();
-		if (!opened && slpi_glink.agreed && slpi_glink.remote_channel != 0 && slpi_glink.acknowledged) {
+		/* Do not originate this OPEN before SLPI publishes its half of the
+		 * bidirectional channel.  UMI will ACK such an early OPEN but leave
+		 * fastrpc_remote_channel zero, so no remote intent can ever be named.
+		 * Reciprocating here is still independent of IPCRTR readiness. */
+		if (!fastrpc_sent && slpi_glink.agreed && slpi_glink.fastrpc_remote_channel != 0) {
+			fastrpc_sent = true;
+			if (slpi_glink_send(SLPI_GLINK_OPEN, 2, sizeof(SLPI_GLINK_FASTRPC_CHANNEL),
+			    SLPI_GLINK_FASTRPC_CHANNEL, sizeof(SLPI_GLINK_FASTRPC_CHANNEL))) {
+				slpi_glink.fastrpc_opened = true;
+				hakios_tl("slpi: glink: FastRPC open requested at +%u ms\n", ms);
+			} else {
+				hakios_tl("slpi: glink: cannot send FastRPC channel open\n");
+			}
+		}
+		if (!*ipcrtr_ready && slpi_glink.agreed && slpi_glink.remote_channel != 0 && slpi_glink.acknowledged) {
 			hakios_tl("slpi: glink: IPCRTR open (ours 1, SLPI %u)\n", slpi_glink.remote_channel);
-			opened = true;
+			*ipcrtr_ready = true;
+			hakios_tl("slpi: glink: IPCRTR ready at +%u ms (FastRPC ready %u)\n",
+			    ms, *fastrpc_ready);
+		}
+		if (!*fastrpc_ready && slpi_glink.fastrpc_acknowledged && slpi_glink.fastrpc_remote_channel != 0) {
+			/* A definitive failure here (not just "not yet") is final for
+			 * this boot, exactly as the old implementation treated it;
+			 * IPCRTR, tracked separately, is unaffected either way. */
+			if (!slpi_glink_finish_fastrpc_open()) {
+				break;
+			}
+			*fastrpc_ready = true;
+			hakios_tl("slpi: glink: FastRPC ready at +%u ms (IPCRTR ready %u)\n",
+			    ms, *ipcrtr_ready);
 		}
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
-	if (opened && !slpi_glink.broken) {
-		return true;
+	if (!*ipcrtr_ready) {
+		hakios_tl("slpi: glink: IPCRTR not open (version %u, remote %u, ack %u, broken %u)\n",
+		    slpi_glink.agreed, slpi_glink.remote_channel, slpi_glink.acknowledged, slpi_glink.broken);
 	}
-	hakios_tl("slpi: glink: IPCRTR not open (version %u, remote %u, ack %u, broken %u)\n", slpi_glink.agreed,
-	    slpi_glink.remote_channel, slpi_glink.acknowledged, slpi_glink.broken);
-	return false;
-}
-
-/*
- * The sensor registry is fetched by SLPI through Qualcomm's FastRPC reverse
- * listener, which lives on a second GLINK channel.  This first step only
- * proves that the signed UMI firmware accepts that channel; it deliberately
- * does not issue an RPC or expose any file data yet.
- */
-static bool
-slpi_glink_open_fastrpc_probe(void)
-{
-	if (slpi_glink.broken || !slpi_glink.acknowledged || slpi_glink.fastrpc_opened) {
-		return false;
+	if (!*fastrpc_ready) {
+		hakios_tl("slpi: glink: FastRPC channel not open (ack %u, remote %u, broken %u)\n",
+		    slpi_glink.fastrpc_acknowledged, slpi_glink.fastrpc_remote_channel, slpi_glink.broken);
 	}
-	if (!slpi_glink_send(SLPI_GLINK_OPEN, 2, sizeof(SLPI_GLINK_FASTRPC_CHANNEL),
-	    SLPI_GLINK_FASTRPC_CHANNEL, sizeof(SLPI_GLINK_FASTRPC_CHANNEL))) {
-		hakios_tl("slpi: glink: cannot send FastRPC channel open\n");
-		return false;
-	}
-	slpi_glink.fastrpc_opened = true;
-	for (uint32_t ms = 0; ms < 3000 && !slpi_glink.broken; ms++) {
-		slpi_glink_pump();
-		if (slpi_glink.fastrpc_acknowledged) {
-			for (unsigned i = 0; i < SLPI_FASTRPC_INTENT_COUNT; i++) {
-				if (!slpi_glink_offer(2, SLPI_FASTRPC_INTENT_SIZE)) {
-					hakios_tl("slpi: glink: cannot offer FastRPC intent %u\n", i);
-					return false;
-				}
-			}
-			hakios_tl("slpi: glink: FastRPC channel open (ours 2, SLPI %u)\n",
-			    slpi_glink.fastrpc_remote_channel);
-			hakios_tl("slpi: glink: FastRPC offered 64 intents\n");
-			for (unsigned requested = 0; requested < SLPI_FASTRPC_REMOTE_INTENTS; requested++) {
-				bool available = false;
-
-				if (!slpi_glink_send(SLPI_GLINK_INTENT_REQUEST, 2, SLPI_FASTRPC_REQUEST_SIZE, NULL, 0)) {
-					hakios_tl("slpi: glink: cannot request FastRPC remote intent %u\n", requested);
-					return false;
-				}
-				for (uint32_t wait = 0; wait < 1000 && !slpi_glink.broken; wait++) {
-					unsigned count = 0;
-
-					slpi_glink_pump();
-					for (unsigned i = 0; i < slpi_glink.remote_intents; i++) {
-						count += slpi_glink.remote_intent[i].channel == 2;
-					}
-					if (count > requested) {
-						available = true;
-						break;
-					}
-					delay_for_interval(1, NSEC_PER_MSEC);
-				}
-				if (!available) {
-					hakios_tl("slpi: glink: FastRPC did not provide remote intent %u\n", requested);
-					return requested != 0;
-				}
-			}
-			hakios_tl("slpi: glink: FastRPC requested %u 48-byte remote intents\n",
-			    SLPI_FASTRPC_REMOTE_INTENTS);
-			return true;
-		}
-		delay_for_interval(1, NSEC_PER_MSEC);
-	}
-	hakios_tl("slpi: glink: FastRPC channel not open (ack %u, remote %u, broken %u)\n",
-	    slpi_glink.fastrpc_acknowledged, slpi_glink.fastrpc_remote_channel, slpi_glink.broken);
-	return false;
 }
 
 /* ---- two APSS 4-KiB FastRPC pages: sensors PD and optional root PD ------------------------------------- */
@@ -2163,22 +2734,43 @@ slpi_fastrpc_prepare_memory(void)
 #define SLPI_FASTRPC_APPS_STD_HANDLE 0x100u
 #define SLPI_FASTRPC_APPS_STD_ERROR_CAPACITY 255u
 #define SLPI_FASTRPC_APPS_STD_FOPEN_WITH_ENV 19u
+#define SLPI_FASTRPC_APPS_STD_STAT 31u
+#define SLPI_FASTRPC_APPS_STD_STAT_SIZE 96u
 #define SLPI_FASTRPC_AEE_EFAILED 1u
+#define SLPI_FASTRPC_ATTACH_RETRY_COUNT 50u
+#define SLPI_FASTRPC_ATTACH_REPLY_TIMEOUT_MS 250u
+#define SLPI_FASTRPC_ATTACH_RETRY_DELAY_MS 1u
 #define SLPI_FASTRPC_ROOT_DENIAL_LIMIT 16u
 #define SLPI_FASTRPC_PLATFORM_HANDLE_BASE 0x200u
-/* Every value below was read back from this exact UMI's own Android install
- * (dumped via sysfs and cross-checked against sscrpcd's own FastRPC trace):
- * these are read-only hardware identifiers, not guessed protocol content.
+/* Every platform value below was read back from this exact UMI's own Android
+ * install (dumped via sysfs and cross-checked against sscrpcd's own FastRPC
+ * trace): these are read-only hardware identifiers, not guessed content.
  *
- * The ak0991x_0* entries are this device's own magnetometer persist registry
- * files, extracted from fw-sensors/registry.tar (whose tar member names are
- * themselves "registry/registry/<name>") and cross-checked byte-for-byte
- * against sscrpcd's own openat()/read() trace on Android, which reads them
- * from "/mnt/vendor/persist/sensors/registry/registry/<name>" -- the exact
- * path prefix used below. Without these, the SNS registry on the DSP has no
- * record of the ak0991x driver instance and will never hand out a non-empty
- * "mag" SUID, regardless of how well the FastRPC listener itself behaves. */
+ * The persist registry itself is not listed here.  sns_reg_config's
+ * "file=output=" names a directory, /mnt/vendor/persist/sensors/registry/
+ * registry, which the DSP stats, lists with opendir/readdir and then reads
+ * file by file -- on this phone 187 files (every sensor, not only ak0991x),
+ * plus ../sns_reg_version.  build-kernel.sh generates umi_sensor_registry.inc
+ * from this device's own fw-sensors/registry.tar (byte-exact, in the
+ * archive's member order, which is the order Android's getdents64 listed). */
 struct slpi_fastrpc_platform_file { const char *path, *content; };
+struct slpi_fastrpc_apps_std_stat {
+	uint64_t tsz;
+	uint64_t dev;
+	uint64_t ino;
+	uint32_t mode;
+	uint32_t nlink;
+	uint64_t rdev;
+	uint64_t size;
+	int64_t atime;
+	int64_t atimensec;
+	int64_t mtime;
+	int64_t mtimensec;
+	int64_t ctime;
+	int64_t ctimensec;
+};
+_Static_assert(sizeof(struct slpi_fastrpc_apps_std_stat) == SLPI_FASTRPC_APPS_STD_STAT_SIZE,
+    "apps_std_STAT ABI size");
 static const struct slpi_fastrpc_platform_file slpi_fastrpc_platform_files[] = {
 	{ "/sys/devices/soc0/hw_platform", "UMI\n" },
 	{ "/sys/devices/soc0/platform_subtype", "Unknown\n" },
@@ -2186,35 +2778,47 @@ static const struct slpi_fastrpc_platform_file slpi_fastrpc_platform_files[] = {
 	{ "/sys/devices/soc0/platform_version", "589824\n" },
 	{ "/sys/devices/soc0/soc_id", "356\n" },
 	{ "/sys/devices/soc0/revision", "2.1\n" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0",
-	    "{\"ak0991x_0\":{\"owner\":\"sns_ak0991x\",\"mag\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0.mag",
-	    "{\"ak0991x_0.mag\":{\"owner\":\"sns_ak0991x\",\"config\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"},\"config_2\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0.mag.config",
-	    "{\"ak0991x_0.mag.config\":{\"owner\":\"sns_ak0991x\",\"is_dri\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"},\"hw_id\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"},\"res_idx\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"},\"sync_stream\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0.mag.config_2",
-	    "{\"ak0991x_0.mag.config_2\":{\"owner\":\"sns_ak0991x\",\"use_fifo\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"},\"nsf\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"},\"sdr\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0_platform",
-	    "{\"ak0991x_0_platform\":{\"owner\":\"sns_ak0991x\",\"config\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"},\"orient\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"},\"mag\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"},\"placement\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"},\"pdc_parameter\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0_platform.config",
-	    "{\"ak0991x_0_platform.config\":{\"owner\":\"sns_ak0991x\",\"bus_type\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"},\"bus_instance\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"1\"},\"slave_config\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"12\"},\"min_bus_speed_khz\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"400\"},\"max_bus_speed_khz\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"400\"},\"reg_addr_type\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"},\"dri_irq_num\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"119\"},\"irq_pull_type\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"3\"},\"irq_is_chip_pin\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"1\"},\"irq_drive_strength\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"},\"irq_trigger_type\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"1\"},\"num_rail\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"1\"},\"rail_on_state\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"1\"},\"vddio_rail\":{\"type\":\"str\",\"ver\":\"2\",\"data\":\"/pmic/client/sensor_vddio\"},\"rigid_body_type\":{\"type\":\"int\",\"ver\":\"0\",\"data\":\"0\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0_platform.mag",
-	    "{\"ak0991x_0_platform.mag\":{\"owner\":\"sns_ak0991x\",\"fac_cal\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0_platform.mag.fac_cal",
-	    "{\"ak0991x_0_platform.mag.fac_cal\":{\"owner\":\"sns_ak0991x\",\"corr_mat\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"},\"bias\":{\"type\":\"grp\",\"ver\":\"0\",\"data\":\"\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0_platform.mag.fac_cal.bias",
-	    "{\"ak0991x_0_platform.mag.fac_cal.bias\":{\"owner\":\"sns_ak0991x\",\"x\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"y\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"z\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0_platform.mag.fac_cal.corr_mat",
-	    "{\"ak0991x_0_platform.mag.fac_cal.corr_mat\":{\"owner\":\"sns_ak0991x\",\"0_0\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.996902\"},\"0_1\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"-0.013794\"},\"0_2\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"1_0\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"-0.013794\"},\"1_1\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.997696\"},\"1_2\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"-0.015106\"},\"2_0\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"-0.018906\"},\"2_1\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"-0.015106\"},\"2_2\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"1.005402\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0_platform.orient",
-	    "{\"ak0991x_0_platform.orient\":{\"owner\":\"sns_ak0991x\",\"x\":{\"type\":\"str\",\"ver\":\"2\",\"data\":\"-x\"},\"y\":{\"type\":\"str\",\"ver\":\"2\",\"data\":\"+y\"},\"z\":{\"type\":\"str\",\"ver\":\"1\",\"data\":\"-z\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0_platform.pdc_parameter",
-	    "{\"ak0991x_0_platform.pdc_parameter\":{\"owner\":\"sns_ak0991x\",\"0\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"120.000000\"},\"1\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"84.000000\"},\"2\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"195.000000\"},\"3\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"13.000000\"},\"4\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"99.000000\"},\"5\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"69.000000\"},\"6\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"1.000000\"},\"7\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"130.000000\"},\"8\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"213.000000\"},\"9\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"55.000000\"},\"10\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"239.000000\"},\"11\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"87.000000\"},\"12\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"8.000000\"},\"13\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"28.000000\"},\"14\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"253.000000\"},\"15\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"232.000000\"},\"16\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"254.000000\"},\"17\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"148.000000\"},\"18\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"84.000000\"},\"19\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"97.000000\"},\"20\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"192.000000\"},\"21\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"255.000000\"},\"22\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"18.000000\"},\"23\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"227.000000\"},\"24\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"11.000000\"},\"25\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"77.000000\"},\"26\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"103.000000\"}}}" },
-	{ "/mnt/vendor/persist/sensors/registry/registry/ak0991x_0_platform.placement",
-	    "{\"ak0991x_0_platform.placement\":{\"owner\":\"sns_ak0991x\",\"0\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"1\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"2\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"3\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"4\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"5\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"6\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"7\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"8\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"9\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"10\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"},\"11\":{\"type\":\"flt\",\"ver\":\"0\",\"data\":\"0.000000\"}}}" },
+	{ "/vendor/etc/sensors/sns_reg_config",
+	    "version=4\n"
+	    "file=hw_platform=/sys/devices/soc0/hw_platform\n"
+	    "file=platform_subtype=/sys/devices/soc0/platform_subtype\n"
+	    "file=platform_subtype_id=/sys/devices/soc0/platform_subtype_id\n"
+	    "file=platform_version=/sys/devices/soc0/platform_version\n"
+	    "file=soc_id=/sys/devices/soc0/soc_id\n"
+	    "file=revision=/sys/devices/soc0/revision\n"
+	    "file=output=/mnt/vendor/persist/sensors/registry/registry\n"
+	    "property=persist.vendor.sensors.enable.property=/mnt/vendor/persist/sensors/registry/file1\n"
+	    "property=persist.vendor.sensors.enable.property1=/mnt/vendor/persist/sensors/registry/file2\n" },
 };
 #define SLPI_FASTRPC_PLATFORM_FILE_COUNT \
 	(sizeof(slpi_fastrpc_platform_files) / sizeof(slpi_fastrpc_platform_files[0]))
+struct slpi_fastrpc_registry_file { const char *name; uint32_t length; const char *content; };
+#include "umi_sensor_registry.inc"
+#define SLPI_FASTRPC_REGISTRY_DIR "/mnt/vendor/persist/sensors/registry/registry"
+#define SLPI_FASTRPC_REGISTRY_VERSION_NAME "../sns_reg_version"
+/* sns_registry scans the config directory after the persist registry.  The
+ * persist registry above is already this phone's own result of that scan,
+ * so the directory is presented as existing and empty: nothing to re-parse,
+ * and no temp.json rewrite (every write open is refused). */
+#define SLPI_FASTRPC_CONFIG_DIR "/vendor/etc/sensors/config"
+/* One index space for every readable virtual file: the platform files, then
+ * the registry directory's files, then ../sns_reg_version. */
+#define SLPI_FASTRPC_VFILE_REGISTRY_BASE SLPI_FASTRPC_PLATFORM_FILE_COUNT
+#define SLPI_FASTRPC_VFILE_VERSION (SLPI_FASTRPC_VFILE_REGISTRY_BASE + SLPI_REGISTRY_FILE_COUNT)
+#define SLPI_FASTRPC_VFILE_COUNT (SLPI_FASTRPC_VFILE_VERSION + 1)
+enum slpi_fastrpc_vdir { SLPI_FASTRPC_NO_DIR, SLPI_FASTRPC_REGISTRY_VDIR, SLPI_FASTRPC_CONFIG_VDIR };
+#define SLPI_FASTRPC_DIR_HANDLE_BASE 0x5d1700ull
+#define SLPI_FASTRPC_DIR_SLOTS 4u
+#define SLPI_FASTRPC_APPS_STD_FCLOSE 3u
+#define SLPI_FASTRPC_APPS_STD_FREAD 4u
+#define SLPI_FASTRPC_APPS_STD_OPENDIR 26u
+#define SLPI_FASTRPC_APPS_STD_CLOSEDIR 27u
+#define SLPI_FASTRPC_APPS_STD_READDIR 28u
+#define SLPI_FASTRPC_APPS_STD_DIR_SIZE 8u
+/* apps_std_DIRENT { int32 ino; char name[255]; } (260 bytes) then int32 bEOF */
+#define SLPI_FASTRPC_APPS_STD_DIRENT_NAME 255u
+#define SLPI_FASTRPC_APPS_STD_READDIR_SIZE 264u
+#define SLPI_FASTRPC_MAX_ARGS 8u
 struct slpi_fastrpc_message {
 	int32_t client_id, tid;
 	uint64_t context;
@@ -2248,11 +2852,16 @@ static uint8_t *slpi_fastrpc_listener_input;
 static uint32_t slpi_fastrpc_listener_invoke_context;
 static uint32_t slpi_fastrpc_listener_invoke_handle;
 static uint32_t slpi_fastrpc_listener_invoke_scalars;
-static int slpi_fastrpc_platform_open_index = -1;
-static uint32_t slpi_fastrpc_platform_read_offset;
+static bool slpi_fastrpc_platform_open[SLPI_FASTRPC_VFILE_COUNT];
+static uint32_t slpi_fastrpc_platform_read_offset[SLPI_FASTRPC_VFILE_COUNT];
+static struct { enum slpi_fastrpc_vdir dir; uint32_t cursor; } slpi_fastrpc_dirs[SLPI_FASTRPC_DIR_SLOTS];
+static uint32_t slpi_fastrpc_files_opened, slpi_fastrpc_registry_files_read, slpi_fastrpc_bytes_served;
+static uint32_t slpi_fastrpc_denials, slpi_fastrpc_last_denied_scalars;
 static bool slpi_fastrpc_waiting_listener_next;
 static uint32_t slpi_fastrpc_tx_sequence;
 static uint32_t slpi_fastrpc_rx_sequence;
+static bool slpi_fastrpc_attach_reply_seen;
+static int32_t slpi_fastrpc_attach_reply_result;
 static bool slpi_fastrpc_root_decision_made;
 static uint32_t slpi_fastrpc_root_listener_module;
 static uint32_t *slpi_fastrpc_root_listener_open_output;
@@ -2460,6 +3069,7 @@ slpi_fastrpc_send_request(uint32_t handle, uint32_t scalars, uint64_t context, b
 		return false;
 	}
 	slpi_fastrpc_tx_sequence++;
+	if (slpi_fastrpc_verbose())
 	hakios_tl("slpi: fastrpc: TX #%u request (ctx %#llx, pid %d, tid %#x, handle %#x, sc %#x, args %#llx/%u)\n",
 	    slpi_fastrpc_tx_sequence, context, message.client_id, message.tid, handle, scalars,
 	    message.address, message.size);
@@ -2755,102 +3365,294 @@ slpi_fastrpc_send_listener_open_reply(void)
 	return slpi_fastrpc_send_listener_reply_and_next(response, sizeof(response), 0, 0x5002);
 }
 
-/* Search for a whitelisted path as a NUL-terminated substring anywhere in
- * the bounded 512-byte listener input, rather than trusting a byte offset
- * only ever observed for one path length (hw_platform's).  A failed search
- * only leads to a safe denial reply; it can never read past the fixed-size
- * input buffer. */
-static int
-slpi_fastrpc_platform_lookup(void)
+/* ---- apps_std reverse calls: the sensors PD's virtual files and dirs ---- */
+
+/* listener_buf.h serializes a reverse call's inputs as, for each input
+ * buffer, a 32-bit length, padding to an 8-byte boundary, then its bytes;
+ * after the last input come the output buffers' capacities, one unaligned
+ * 32-bit length each.  (It matches every callback logged so far: stat 74
+ * bytes, fopen_with_env 95, fread 24, fclose 12.)  A callback whose bytes
+ * are not consumed exactly by its own scalars is not trusted at all. */
+struct slpi_fastrpc_args {
+	const uint8_t *in[SLPI_FASTRPC_MAX_ARGS];
+	uint32_t in_length[SLPI_FASTRPC_MAX_ARGS];
+	uint32_t out_length[SLPI_FASTRPC_MAX_ARGS];
+};
+
+static bool
+slpi_fastrpc_parse_input(uint32_t length, struct slpi_fastrpc_args *args)
 {
-	if (slpi_fastrpc_listener_input == NULL) {
+	uint32_t in = (slpi_fastrpc_listener_invoke_scalars >> 16) & 0xffu;
+	uint32_t out = (slpi_fastrpc_listener_invoke_scalars >> 8) & 0xffu;
+	uint32_t at = 0;
+
+	bzero(args, sizeof(*args));
+	if (slpi_fastrpc_listener_input == NULL || length > SLPI_FASTRPC_LISTENER_INPUT_CAPACITY ||
+	    in > SLPI_FASTRPC_MAX_ARGS || out > SLPI_FASTRPC_MAX_ARGS) {
+		return false;
+	}
+	for (uint32_t i = 0; i < in; i++) {
+		uint32_t size;
+
+		if (length - at < sizeof(size)) {
+			return false;
+		}
+		memcpy(&size, slpi_fastrpc_listener_input + at, sizeof(size));
+		at = (at + (uint32_t)sizeof(size) + 7u) & ~7u;
+		if (at > length || size > length - at) {
+			return false;
+		}
+		args->in[i] = slpi_fastrpc_listener_input + at;
+		args->in_length[i] = size;
+		at += size;
+	}
+	for (uint32_t i = 0; i < out; i++) {
+		if (length - at < sizeof(uint32_t)) {
+			return false;
+		}
+		memcpy(&args->out_length[i], slpi_fastrpc_listener_input + at, sizeof(uint32_t));
+		at += (uint32_t)sizeof(uint32_t);
+	}
+	return at == length;
+}
+
+/* A QAIC string argument: its length counts the NUL, which must be its last
+ * byte and its only one. */
+static const char *
+slpi_fastrpc_arg_string(const struct slpi_fastrpc_args *args, unsigned i)
+{
+	uint32_t n;
+
+	if (i >= SLPI_FASTRPC_MAX_ARGS || args->in[i] == NULL || (n = args->in_length[i]) == 0 ||
+	    args->in[i][n - 1] != 0) {
+		return NULL;
+	}
+	for (uint32_t k = 0; k + 1 < n; k++) {
+		if (args->in[i][k] == 0) {
+			return NULL;
+		}
+	}
+	return (const char *)args->in[i];
+}
+
+static bool
+slpi_fastrpc_arg_word(const struct slpi_fastrpc_args *args, unsigned i, unsigned word, uint32_t *value)
+{
+	if (i >= SLPI_FASTRPC_MAX_ARGS || args->in[i] == NULL || args->in_length[i] < (word + 1) * 4u) {
+		return false;
+	}
+	memcpy(value, args->in[i] + word * 4u, sizeof(*value));
+	return true;
+}
+
+static const char *
+slpi_fastrpc_vfile_content(unsigned index, uint32_t *length)
+{
+	if (index < SLPI_FASTRPC_PLATFORM_FILE_COUNT) {
+		*length = (uint32_t)strlen(slpi_fastrpc_platform_files[index].content);
+		return slpi_fastrpc_platform_files[index].content;
+	}
+	if (index < SLPI_FASTRPC_VFILE_VERSION) {
+		*length = slpi_registry_files[index - SLPI_FASTRPC_VFILE_REGISTRY_BASE].length;
+		return slpi_registry_files[index - SLPI_FASTRPC_VFILE_REGISTRY_BASE].content;
+	}
+	/* "version=4\0": ten bytes, its NUL included, exactly as on persist */
+	*length = SLPI_REGISTRY_VERSION_LENGTH;
+	return slpi_registry_version;
+}
+
+static const char *
+slpi_fastrpc_vfile_name(unsigned index)
+{
+	if (index < SLPI_FASTRPC_PLATFORM_FILE_COUNT) {
+		return slpi_fastrpc_platform_files[index].path;
+	}
+	if (index < SLPI_FASTRPC_VFILE_VERSION) {
+		return slpi_registry_files[index - SLPI_FASTRPC_VFILE_REGISTRY_BASE].name;
+	}
+	return SLPI_FASTRPC_REGISTRY_VERSION_NAME;
+}
+
+/* Exact path match only: a platform file, or <registry dir>/<listed name>,
+ * or <registry dir>/../sns_reg_version.  Never a lookup in any filesystem. */
+static int
+slpi_fastrpc_platform_lookup(const char *path)
+{
+	static const char registry_dir[] = SLPI_FASTRPC_REGISTRY_DIR "/";
+	const char *name;
+
+	if (path == NULL) {
 		return -1;
 	}
 	for (unsigned i = 0; i < SLPI_FASTRPC_PLATFORM_FILE_COUNT; i++) {
-		const char *path = slpi_fastrpc_platform_files[i].path;
-		size_t path_len = strlen(path);
-
-		for (uint32_t at = 0; at + path_len + 1 <= SLPI_FASTRPC_LISTENER_INPUT_CAPACITY; at++) {
-			if (memcmp(slpi_fastrpc_listener_input + at, path, path_len + 1) == 0) {
-				return (int)i;
-			}
+		if (strcmp(path, slpi_fastrpc_platform_files[i].path) == 0) {
+			return (int)i;
+		}
+	}
+	if (strncmp(path, registry_dir, sizeof(registry_dir) - 1) != 0) {
+		return -1;
+	}
+	name = path + sizeof(registry_dir) - 1;
+	if (strcmp(name, SLPI_FASTRPC_REGISTRY_VERSION_NAME) == 0) {
+		return (int)SLPI_FASTRPC_VFILE_VERSION;
+	}
+	for (unsigned i = 0; i < SLPI_REGISTRY_FILE_COUNT; i++) {
+		if (strcmp(name, slpi_registry_files[i].name) == 0) {
+			return (int)(SLPI_FASTRPC_VFILE_REGISTRY_BASE + i);
 		}
 	}
 	return -1;
 }
 
+static enum slpi_fastrpc_vdir
+slpi_fastrpc_vdir_lookup(const char *path)
+{
+	size_t n;
+
+	if (path == NULL) {
+		return SLPI_FASTRPC_NO_DIR;
+	}
+	n = strlen(path);
+	while (n > 1 && path[n - 1] == '/') {
+		n--;
+	}
+	if (n == sizeof(SLPI_FASTRPC_REGISTRY_DIR) - 1 && strncmp(path, SLPI_FASTRPC_REGISTRY_DIR, n) == 0) {
+		return SLPI_FASTRPC_REGISTRY_VDIR;
+	}
+	if (n == sizeof(SLPI_FASTRPC_CONFIG_DIR) - 1 && strncmp(path, SLPI_FASTRPC_CONFIG_DIR, n) == 0) {
+		return SLPI_FASTRPC_CONFIG_VDIR;
+	}
+	return SLPI_FASTRPC_NO_DIR;
+}
+
+/* One primitive output buffer: its length, padding to 8, then its bytes
+ * (the same framing as every reply above). */
+static bool
+slpi_fastrpc_send_primitive_reply(const void *output, uint32_t length)
+{
+	uint8_t response[8 + SLPI_FASTRPC_APPS_STD_READDIR_SIZE] = { 0 };
+
+	if (length > sizeof(response) - 8) {
+		return false;
+	}
+	memcpy(response, &length, sizeof(length));
+	memcpy(response + 8, output, length);
+	return slpi_fastrpc_send_listener_reply_and_next(response, 8 + length, 0, 0x5002);
+}
+
+/* QAIC reserves scalar method 31 as an extension dispatcher.  The first
+ * primitive word selects the real extended method; sensorspd uses value 31
+ * for apps_std_stat().  Android's generated skeleton returns one 96-byte
+ * apps_std_STAT output buffer. */
+static bool
+slpi_fastrpc_send_platform_stat_reply(int index)
+{
+	struct slpi_fastrpc_apps_std_stat stat_output = { 0 };
+	uint32_t length;
+
+	(void)slpi_fastrpc_vfile_content((unsigned)index, &length);
+	stat_output.mode = 0100644u;
+	stat_output.nlink = 1u;
+	stat_output.size = length;
+	if (slpi_fastrpc_verbose()) {
+		hakios_tl("slpi: fastrpc: stat file \"%s\": %llu bytes\n",
+		    slpi_fastrpc_vfile_name((unsigned)index), stat_output.size);
+	}
+	return slpi_fastrpc_send_primitive_reply(&stat_output, SLPI_FASTRPC_APPS_STD_STAT_SIZE);
+}
+
+static bool
+slpi_fastrpc_send_dir_stat_reply(enum slpi_fastrpc_vdir dir, const char *path)
+{
+	struct slpi_fastrpc_apps_std_stat stat_output = { 0 };
+
+	stat_output.mode = 040775u;     /* S_IFDIR|0775, as fstat() reported on Android */
+	stat_output.nlink = 2u;
+	stat_output.size = dir == SLPI_FASTRPC_REGISTRY_VDIR ? 12288u : 4096u;
+	hakios_tl("slpi: fastrpc: stat directory \"%s\"\n", path);
+	return slpi_fastrpc_send_primitive_reply(&stat_output, SLPI_FASTRPC_APPS_STD_STAT_SIZE);
+}
+
 static bool
 slpi_fastrpc_send_platform_open_reply(int index)
 {
-	uint8_t response[12] = { 0 };
-	uint32_t output_length = sizeof(uint32_t);
 	uint32_t handle = SLPI_FASTRPC_PLATFORM_HANDLE_BASE + (uint32_t)index;
+	uint32_t length;
 
-	memcpy(response, &output_length, sizeof(output_length));
-	memcpy(response + 8, &handle, sizeof(handle));
-	slpi_fastrpc_platform_open_index = index;
-	slpi_fastrpc_platform_read_offset = 0;
-	hakios_tl("slpi: fastrpc: opened platform file \"%s\" (handle %#x)\n",
-	    slpi_fastrpc_platform_files[index].path, handle);
-	return slpi_fastrpc_send_listener_reply_and_next(response, sizeof(response), 0, 0x5002);
+	(void)slpi_fastrpc_vfile_content((unsigned)index, &length);
+	slpi_fastrpc_platform_open[index] = true;
+	slpi_fastrpc_platform_read_offset[index] = 0;
+	slpi_fastrpc_files_opened++;
+	if ((unsigned)index >= SLPI_FASTRPC_VFILE_REGISTRY_BASE && (unsigned)index < SLPI_FASTRPC_VFILE_VERSION) {
+		slpi_fastrpc_registry_files_read++;
+	}
+	hakios_tl("slpi: fastrpc: opened %s \"%s\" (handle %#x, %u bytes)\n",
+	    (unsigned)index < SLPI_FASTRPC_VFILE_REGISTRY_BASE ? "platform file" : "registry file",
+	    slpi_fastrpc_vfile_name((unsigned)index), handle, length);
+	return slpi_fastrpc_send_primitive_reply(&handle, sizeof(handle));
 }
 
-/* Serve one fread() call at a time out of the whitelisted content, exactly
- * like a real file: each call returns up to SLPI_FASTRPC_LISTENER_INPUT_CAPACITY
- * bytes starting at the file's current cursor, advances the cursor by that
- * much, and a call once the cursor has reached the end returns 0 bytes (EOF).
- * This is required for the several ak0991x registry files whose content
- * (up to 1384 bytes) exceeds a single 512-byte reply and must be drained
- * across multiple fread callbacks, the same way Android's own sscrpcd would
- * observe multiple openat()+read() rounds for one logical file. */
+/* Serve one fread() call at a time out of the virtual file, exactly like a
+ * real file: each call returns up to the caller's own buffer size starting at
+ * the file's current cursor and advances it; a call once the cursor is at the
+ * end returns 0 bytes (EOF).  The data buffer is echoed at the size the DSP
+ * declared (it is an output of the call), so that size must fit the shared
+ * page: SLPI_FASTRPC_READ_CAPACITY. */
+#define SLPI_FASTRPC_READ_CAPACITY 2048u
+static uint8_t slpi_fastrpc_read_response[24 + SLPI_FASTRPC_READ_CAPACITY];
+
 static bool
-slpi_fastrpc_send_platform_read_reply(void)
+slpi_fastrpc_send_platform_read_reply(unsigned index, uint32_t capacity)
 {
-	uint8_t response[24 + SLPI_FASTRPC_LISTENER_INPUT_CAPACITY] = { 0 };
+	uint8_t *response = slpi_fastrpc_read_response;
 	const char *content;
 	uint32_t content_length;
 	uint32_t primitive_length = 2 * sizeof(uint32_t);
 	uint32_t primitive_output[2];
-	uint32_t data_length = SLPI_FASTRPC_LISTENER_INPUT_CAPACITY;
 	uint32_t chunk;
 
-	if (slpi_fastrpc_platform_open_index < 0) {
+	if (index >= SLPI_FASTRPC_VFILE_COUNT || !slpi_fastrpc_platform_open[index] ||
+	    capacity == 0 || capacity > SLPI_FASTRPC_READ_CAPACITY) {
 		return false;
 	}
-	content = slpi_fastrpc_platform_files[slpi_fastrpc_platform_open_index].content;
-	content_length = (uint32_t)strlen(content);
-	if (slpi_fastrpc_platform_read_offset > content_length) {
+	content = slpi_fastrpc_vfile_content(index, &content_length);
+	if (slpi_fastrpc_platform_read_offset[index] > content_length) {
 		return false;
 	}
-	chunk = MIN(content_length - slpi_fastrpc_platform_read_offset, SLPI_FASTRPC_LISTENER_INPUT_CAPACITY);
+	chunk = MIN(content_length - slpi_fastrpc_platform_read_offset[index], capacity);
 	primitive_output[0] = chunk;
 	/* Match apps_std_fread(): reaching the end with a non-empty read does
 	 * not set feof().  The following zero-byte read is what reports EOF. */
 	primitive_output[1] = chunk == 0;
+	bzero(response, 24 + capacity);
 	memcpy(response, &primitive_length, sizeof(primitive_length));
 	memcpy(response + 8, primitive_output, sizeof(primitive_output));
-	memcpy(response + 16, &data_length, sizeof(data_length));
+	memcpy(response + 16, &capacity, sizeof(capacity));
 	if (chunk > 0) {
-		memcpy(response + 24, content + slpi_fastrpc_platform_read_offset, chunk);
+		memcpy(response + 24, content + slpi_fastrpc_platform_read_offset[index], chunk);
 	}
-	hakios_tl("slpi: fastrpc: read platform file \"%s\" +%u: %u bytes (of %u total)\n",
-	    slpi_fastrpc_platform_files[slpi_fastrpc_platform_open_index].path,
-	    slpi_fastrpc_platform_read_offset, chunk, content_length);
-	slpi_fastrpc_platform_read_offset += chunk;
-	return slpi_fastrpc_send_listener_reply_and_next(response, sizeof(response), 0, 0x5002);
+	if (slpi_fastrpc_verbose()) {
+		hakios_tl("slpi: fastrpc: read \"%s\" +%u: %u bytes (of %u total, buffer %u)\n",
+		    slpi_fastrpc_vfile_name(index), slpi_fastrpc_platform_read_offset[index], chunk,
+		    content_length, capacity);
+	}
+	slpi_fastrpc_platform_read_offset[index] += chunk;
+	slpi_fastrpc_bytes_served += chunk;
+	return slpi_fastrpc_send_listener_reply_and_next(response, 24 + capacity, 0, 0x5002);
 }
 
 static bool
-slpi_fastrpc_send_platform_close_reply(void)
+slpi_fastrpc_send_platform_close_reply(unsigned index)
 {
 	bool sent;
 
-	if (slpi_fastrpc_platform_open_index < 0) {
+	if (index >= SLPI_FASTRPC_VFILE_COUNT || !slpi_fastrpc_platform_open[index]) {
 		return false;
 	}
-	hakios_tl("slpi: fastrpc: closing platform file \"%s\"\n",
-	    slpi_fastrpc_platform_files[slpi_fastrpc_platform_open_index].path);
-	slpi_fastrpc_platform_open_index = -1;
+	if (slpi_fastrpc_verbose()) {
+		hakios_tl("slpi: fastrpc: closing platform file \"%s\"\n", slpi_fastrpc_vfile_name(index));
+	}
+	slpi_fastrpc_platform_open[index] = false;
 	sent = slpi_fastrpc_send_listener_reply_and_next(NULL, 0, 0, 0x5002);
 	if (sent && !slpi_fastrpc_root_decision_made) {
 		slpi_fastrpc_root_decision_made = true;
@@ -2863,8 +3665,72 @@ slpi_fastrpc_send_platform_close_reply(void)
 	return sent;
 }
 
+static bool
+slpi_fastrpc_send_opendir_reply(enum slpi_fastrpc_vdir dir, const char *path)
+{
+	for (unsigned slot = 0; slot < SLPI_FASTRPC_DIR_SLOTS; slot++) {
+		uint64_t handle = SLPI_FASTRPC_DIR_HANDLE_BASE + slot;
+
+		if (slpi_fastrpc_dirs[slot].dir != SLPI_FASTRPC_NO_DIR) {
+			continue;
+		}
+		slpi_fastrpc_dirs[slot].dir = dir;
+		slpi_fastrpc_dirs[slot].cursor = 0;
+		hakios_tl("slpi: fastrpc: opendir \"%s\" (handle %#llx, %u entries)\n", path, handle,
+		    dir == SLPI_FASTRPC_REGISTRY_VDIR ? SLPI_REGISTRY_FILE_COUNT : 0u);
+		return slpi_fastrpc_send_primitive_reply(&handle, SLPI_FASTRPC_APPS_STD_DIR_SIZE);
+	}
+	hakios_tl("slpi: fastrpc: opendir \"%s\": every directory slot is in use\n", path);
+	return false;
+}
+
+/* apps_std_readdir() returns readdir()'s entries, "." and ".." included,
+ * as apps_std_DIRENT { int32 ino; char name[255]; } followed by int32 bEOF. */
+static bool
+slpi_fastrpc_send_readdir_reply(unsigned slot)
+{
+	uint8_t output[SLPI_FASTRPC_APPS_STD_READDIR_SIZE] = { 0 };
+	uint32_t cursor = slpi_fastrpc_dirs[slot].cursor;
+	uint32_t entries = 2 + (slpi_fastrpc_dirs[slot].dir == SLPI_FASTRPC_REGISTRY_VDIR ? SLPI_REGISTRY_FILE_COUNT : 0u);
+	int32_t ino, eof = 0;
+
+	if (cursor < entries) {
+		const char *name = cursor == 0 ? "." : cursor == 1 ? ".." : slpi_registry_files[cursor - 2].name;
+
+		ino = (int32_t)(0x1000u + cursor);
+		memcpy(output, &ino, sizeof(ino));
+		strlcpy((char *)output + sizeof(ino), name, SLPI_FASTRPC_APPS_STD_DIRENT_NAME);
+		slpi_fastrpc_dirs[slot].cursor = cursor + 1;
+		if (slpi_fastrpc_verbose()) {
+			hakios_tl("slpi: fastrpc: readdir entry %u: \"%s\"\n", cursor, name);
+		}
+	} else {
+		eof = 1;
+		hakios_tl("slpi: fastrpc: readdir %s: end after %u entries\n",
+		    slpi_fastrpc_dirs[slot].dir == SLPI_FASTRPC_REGISTRY_VDIR ? "registry" : "config", entries);
+	}
+	memcpy(output + SLPI_FASTRPC_APPS_STD_READDIR_SIZE - sizeof(eof), &eof, sizeof(eof));
+	return slpi_fastrpc_send_primitive_reply(output, sizeof(output));
+}
+
+static int
+slpi_fastrpc_dir_slot(const struct slpi_fastrpc_args *args)
+{
+	uint64_t handle;
+
+	if (args->in[0] == NULL || args->in_length[0] != SLPI_FASTRPC_APPS_STD_DIR_SIZE) {
+		return -1;
+	}
+	memcpy(&handle, args->in[0], sizeof(handle));
+	if (handle < SLPI_FASTRPC_DIR_HANDLE_BASE || handle >= SLPI_FASTRPC_DIR_HANDLE_BASE + SLPI_FASTRPC_DIR_SLOTS ||
+	    slpi_fastrpc_dirs[handle - SLPI_FASTRPC_DIR_HANDLE_BASE].dir == SLPI_FASTRPC_NO_DIR) {
+		return -1;
+	}
+	return (int)(handle - SLPI_FASTRPC_DIR_HANDLE_BASE);
+}
+
 static uint32_t
-slpi_fastrpc_log_listener_input(void)
+slpi_fastrpc_log_listener_input(bool dump)
 {
 	uint32_t length = 0;
 
@@ -2880,7 +3746,7 @@ slpi_fastrpc_log_listener_input(void)
 			hakios_tl("slpi: fastrpc: listener returned oversized input; refusing to decode\n");
 			return length;
 		}
-		for (uint32_t offset = 0; offset < shown; offset += 16) {
+		for (uint32_t offset = 0; dump && offset < shown; offset += 16) {
 			char line[16 * 3 + 1];
 			uint32_t here = MIN(16u, shown - offset), at = 0;
 
@@ -2895,70 +3761,161 @@ slpi_fastrpc_log_listener_input(void)
 	return length;
 }
 
+/* A denial is a reply too (AEE_EFAILED, no output), never silence.  The DSP
+ * retries some calls in a tight loop (it stats the registry directory until
+ * it exists), so after the first few, an identical repeated denial -- same
+ * call, same path -- is logged only every 64th time. */
+static bool
+slpi_fastrpc_deny_listener_input(const char *why, const char *path)
+{
+	static char last_path[96];
+	bool repeat = slpi_fastrpc_listener_invoke_scalars == slpi_fastrpc_last_denied_scalars &&
+	    strncmp(last_path, path != NULL ? path : "", sizeof(last_path) - 1) == 0;
+
+	slpi_fastrpc_denials++;
+	slpi_fastrpc_last_denied_scalars = slpi_fastrpc_listener_invoke_scalars;
+	strlcpy(last_path, path != NULL ? path : "", sizeof(last_path));
+	if (slpi_fastrpc_denials <= 16 || !repeat || slpi_fastrpc_denials % 64 == 0) {
+		hakios_tl("slpi: fastrpc: listener callback not serviced (%s%s%s%s; denial %u; denying, continuing to listen)\n",
+		    why, path != NULL ? " \"" : "", path != NULL ? path : "", path != NULL ? "\"" : "",
+		    slpi_fastrpc_denials);
+		(void)slpi_fastrpc_log_listener_input(true);
+	}
+	return slpi_fastrpc_send_listener_reply_and_next(NULL, 0, SLPI_FASTRPC_AEE_EFAILED, 0x5002);
+}
+
 /* Every reverse RPC callback gets exactly one reply: a known, whitelisted
  * request succeeds; anything else is denied with AEE_EFAILED and an empty
- * output (matching Android's listener error convention), and the loop
- * keeps calling next2 either way.  The previous implementation matched
- * only one fixed context sequence and silently stopped replying to any
- * callback it did not recognize, which would leave the DSP's FastRPC
- * session waiting forever for a reply that never comes. */
+ * output (matching Android's listener error convention), and the loop keeps
+ * calling next2 either way.  Only reads are served: a write open (sns_registry
+ * rewrites ../temp.json on Android) is refused like any unknown path. */
 static bool
 slpi_fastrpc_dispatch_listener_input(void)
 {
-	uint32_t length = slpi_fastrpc_log_listener_input();
+	uint32_t length = slpi_fastrpc_listener_input_output == NULL ? 0 : slpi_fastrpc_listener_input_output[0];
+	uint32_t scalars = slpi_fastrpc_listener_invoke_scalars;
+	struct slpi_fastrpc_args args;
+	const char *path = NULL;
+	enum slpi_fastrpc_vdir dir;
+	uint32_t word, capacity;
+	int index;
 
+	if (slpi_fastrpc_verbose()) {
+		(void)slpi_fastrpc_log_listener_input(true);
+	}
 	if (slpi_fastrpc_listener_invoke_handle == 0 &&
-	    slpi_fastrpc_listener_invoke_scalars == SLPI_FASTRPC_SCALARS(0, 2, 2) &&
+	    scalars == SLPI_FASTRPC_SCALARS(0, 2, 2) &&
 	    length >= 33 && slpi_fastrpc_listener_input != NULL &&
 	    memcmp(slpi_fastrpc_listener_input + 24, "apps_std", 9) == 0) {
 		return slpi_fastrpc_send_listener_open_reply();
 	}
-	if (slpi_fastrpc_listener_invoke_handle == SLPI_FASTRPC_APPS_STD_HANDLE &&
-	    slpi_fastrpc_listener_invoke_scalars ==
-	    SLPI_FASTRPC_SCALARS(SLPI_FASTRPC_APPS_STD_FOPEN_WITH_ENV, 5, 1)) {
-		int index = slpi_fastrpc_platform_lookup();
+	if (slpi_fastrpc_listener_invoke_handle != SLPI_FASTRPC_APPS_STD_HANDLE) {
+		return slpi_fastrpc_deny_listener_input("not apps_std", NULL);
+	}
+	if (!slpi_fastrpc_parse_input(length, &args)) {
+		return slpi_fastrpc_deny_listener_input("unparsed input", NULL);
+	}
+	switch (scalars >> 24) {
+	case SLPI_FASTRPC_APPS_STD_STAT:        /* extension: word 0 is the real method */
+		if (scalars == SLPI_FASTRPC_SCALARS(SLPI_FASTRPC_APPS_STD_STAT, 2, 1) &&
+		    slpi_fastrpc_arg_word(&args, 0, 0, &word) && word == SLPI_FASTRPC_APPS_STD_STAT &&
+		    args.out_length[0] == SLPI_FASTRPC_APPS_STD_STAT_SIZE) {
+			path = slpi_fastrpc_arg_string(&args, 1);
+			if ((dir = slpi_fastrpc_vdir_lookup(path)) != SLPI_FASTRPC_NO_DIR) {
+				return slpi_fastrpc_send_dir_stat_reply(dir, path);
+			}
+			if ((index = slpi_fastrpc_platform_lookup(path)) >= 0) {
+				return slpi_fastrpc_send_platform_stat_reply(index);
+			}
+		}
+		return slpi_fastrpc_deny_listener_input("stat", path);
+	case SLPI_FASTRPC_APPS_STD_FOPEN_WITH_ENV: {
+		const char *mode;
 
-		if (index >= 0) {
+		if (scalars != SLPI_FASTRPC_SCALARS(SLPI_FASTRPC_APPS_STD_FOPEN_WITH_ENV, 5, 1) ||
+		    args.out_length[0] != sizeof(uint32_t)) {
+			break;
+		}
+		path = slpi_fastrpc_arg_string(&args, 3);
+		mode = slpi_fastrpc_arg_string(&args, 4);
+		if (mode == NULL || mode[0] != 'r' || (mode[1] != 0 && mode[1] != 'b') ||
+		    (mode[1] == 'b' && mode[2] != 0)) {
+			return slpi_fastrpc_deny_listener_input("write open refused", path);
+		}
+		if ((index = slpi_fastrpc_platform_lookup(path)) >= 0) {
 			return slpi_fastrpc_send_platform_open_reply(index);
 		}
+		return slpi_fastrpc_deny_listener_input("fopen", path);
 	}
-	if (slpi_fastrpc_listener_invoke_handle == SLPI_FASTRPC_APPS_STD_HANDLE &&
-	    slpi_fastrpc_listener_invoke_scalars == SLPI_FASTRPC_SCALARS(4, 1, 2) &&
-	    length == 24 && slpi_fastrpc_listener_input != NULL) {
-		uint32_t handle, capacity;
-
-		memcpy(&handle, slpi_fastrpc_listener_input + 8, sizeof(handle));
-		memcpy(&capacity, slpi_fastrpc_listener_input + 12, sizeof(capacity));
-		if (slpi_fastrpc_platform_open_index >= 0 &&
-		    handle == SLPI_FASTRPC_PLATFORM_HANDLE_BASE + (uint32_t)slpi_fastrpc_platform_open_index &&
-		    capacity == SLPI_FASTRPC_LISTENER_INPUT_CAPACITY) {
-			return slpi_fastrpc_send_platform_read_reply();
+	case SLPI_FASTRPC_APPS_STD_FREAD:
+		if (scalars == SLPI_FASTRPC_SCALARS(SLPI_FASTRPC_APPS_STD_FREAD, 1, 2) &&
+		    slpi_fastrpc_arg_word(&args, 0, 0, &word) && slpi_fastrpc_arg_word(&args, 0, 1, &capacity) &&
+		    word >= SLPI_FASTRPC_PLATFORM_HANDLE_BASE &&
+		    word - SLPI_FASTRPC_PLATFORM_HANDLE_BASE < SLPI_FASTRPC_VFILE_COUNT &&
+		    slpi_fastrpc_platform_open[word - SLPI_FASTRPC_PLATFORM_HANDLE_BASE] &&
+		    capacity == args.out_length[1]) {
+			index = (int)(word - SLPI_FASTRPC_PLATFORM_HANDLE_BASE);
+			if (capacity > SLPI_FASTRPC_READ_CAPACITY) {
+				return slpi_fastrpc_deny_listener_input("fread buffer larger than the shared page allows",
+				    slpi_fastrpc_vfile_name((unsigned)index));
+			}
+			return slpi_fastrpc_send_platform_read_reply((unsigned)index, capacity);
 		}
-	}
-	if (slpi_fastrpc_listener_invoke_handle == SLPI_FASTRPC_APPS_STD_HANDLE &&
-	    slpi_fastrpc_listener_invoke_scalars == SLPI_FASTRPC_SCALARS(3, 1, 0) &&
-	    length == 12 && slpi_fastrpc_listener_input != NULL) {
-		uint32_t handle;
-
-		memcpy(&handle, slpi_fastrpc_listener_input + 8, sizeof(handle));
-		if (slpi_fastrpc_platform_open_index >= 0 &&
-		    handle == SLPI_FASTRPC_PLATFORM_HANDLE_BASE + (uint32_t)slpi_fastrpc_platform_open_index) {
-			return slpi_fastrpc_send_platform_close_reply();
+		break;
+	case SLPI_FASTRPC_APPS_STD_FCLOSE:
+		if (scalars == SLPI_FASTRPC_SCALARS(SLPI_FASTRPC_APPS_STD_FCLOSE, 1, 0) &&
+		    slpi_fastrpc_arg_word(&args, 0, 0, &word) && word >= SLPI_FASTRPC_PLATFORM_HANDLE_BASE &&
+		    word - SLPI_FASTRPC_PLATFORM_HANDLE_BASE < SLPI_FASTRPC_VFILE_COUNT &&
+		    slpi_fastrpc_platform_open[word - SLPI_FASTRPC_PLATFORM_HANDLE_BASE]) {
+			index = (int)(word - SLPI_FASTRPC_PLATFORM_HANDLE_BASE);
+			return slpi_fastrpc_send_platform_close_reply((unsigned)index);
 		}
+		break;
+	case SLPI_FASTRPC_APPS_STD_OPENDIR:
+		if (scalars == SLPI_FASTRPC_SCALARS(SLPI_FASTRPC_APPS_STD_OPENDIR, 2, 1) &&
+		    args.out_length[0] == SLPI_FASTRPC_APPS_STD_DIR_SIZE) {
+			path = slpi_fastrpc_arg_string(&args, 1);
+			if ((dir = slpi_fastrpc_vdir_lookup(path)) != SLPI_FASTRPC_NO_DIR &&
+			    slpi_fastrpc_send_opendir_reply(dir, path)) {
+				return true;
+			}
+		}
+		return slpi_fastrpc_deny_listener_input("opendir", path);
+	case SLPI_FASTRPC_APPS_STD_READDIR:
+		if (scalars == SLPI_FASTRPC_SCALARS(SLPI_FASTRPC_APPS_STD_READDIR, 1, 1) &&
+		    args.out_length[0] == SLPI_FASTRPC_APPS_STD_READDIR_SIZE &&
+		    (index = slpi_fastrpc_dir_slot(&args)) >= 0) {
+			return slpi_fastrpc_send_readdir_reply((unsigned)index);
+		}
+		break;
+	case SLPI_FASTRPC_APPS_STD_CLOSEDIR:
+		if (scalars == SLPI_FASTRPC_SCALARS(SLPI_FASTRPC_APPS_STD_CLOSEDIR, 1, 0) &&
+		    (index = slpi_fastrpc_dir_slot(&args)) >= 0) {
+			slpi_fastrpc_dirs[index].dir = SLPI_FASTRPC_NO_DIR;
+			return slpi_fastrpc_send_listener_reply_and_next(NULL, 0, 0, 0x5002);
+		}
+		break;
+	default:
+		break;
 	}
-	hakios_tl("slpi: fastrpc: listener callback not serviced (denying, continuing to listen)\n");
-	return slpi_fastrpc_send_listener_reply_and_next(NULL, 0, SLPI_FASTRPC_AEE_EFAILED, 0x5002);
+	return slpi_fastrpc_deny_listener_input("apps_std call", NULL);
 }
 
 static void
 slpi_fastrpc_handle_reply(uint64_t context, int32_t result)
 {
 	slpi_fastrpc_rx_sequence++;
+	slpi_fastrpc_replies_seen++;
+	if (slpi_fastrpc_verbose())
 	hakios_tl("slpi: fastrpc: RX #%u ctx %#llx result %d phase %u (waiting next2 %u)\n",
 	    slpi_fastrpc_rx_sequence, context, result, slpi_fastrpc_phase,
 	    slpi_fastrpc_waiting_listener_next);
 	if (context == 0x5002) {
 		slpi_fastrpc_waiting_listener_next = false;
+	}
+	if (context == 0x1002) {
+		slpi_fastrpc_attach_reply_seen = true;
+		slpi_fastrpc_attach_reply_result = result;
 	}
 	if (result != 0) {
 		hakios_tl("slpi: fastrpc: listener request ctx %#llx failed: %d\n", context, result);
@@ -3090,6 +4047,7 @@ slpi_fastrpc_handle_reply(uint64_t context, int32_t result)
 	case 0x5002:
 		slpi_fastrpc_invalidate_page();
 		if (slpi_fastrpc_listener_next_output != NULL) {
+			if (slpi_fastrpc_verbose())
 			hakios_tl("slpi: fastrpc: next2 #%u output: invoke ctx %#x, handle %#x, sc %#x, input %u\n",
 			    slpi_fastrpc_rx_sequence, slpi_fastrpc_listener_next_output[0],
 			    slpi_fastrpc_listener_next_output[1], slpi_fastrpc_listener_next_output[2],
@@ -3097,6 +4055,7 @@ slpi_fastrpc_handle_reply(uint64_t context, int32_t result)
 			slpi_fastrpc_listener_invoke_context = slpi_fastrpc_listener_next_output[0];
 			slpi_fastrpc_listener_invoke_handle = slpi_fastrpc_listener_next_output[1];
 			slpi_fastrpc_listener_invoke_scalars = slpi_fastrpc_listener_next_output[2];
+			if (slpi_fastrpc_verbose())
 			hakios_tl("slpi: fastrpc: listener callback (ctx %#x, handle %#x, sc %#x, input %u bytes)\n",
 			    slpi_fastrpc_listener_invoke_context, slpi_fastrpc_listener_invoke_handle,
 			    slpi_fastrpc_listener_invoke_scalars, slpi_fastrpc_listener_next_output[3]);
@@ -3219,6 +4178,48 @@ slpi_fastrpc_send_root_attach(void)
 	return true;
 }
 
+/* The GLINK endpoint is advertised before sensorspd necessarily accepts its
+ * attach method.  Retry only RMID_ATTACH, with a hard wall-clock/attempt
+ * bound; every later listener step remains single-shot so protocol errors
+ * cannot turn into an unbounded invocation loop. */
+static bool
+slpi_fastrpc_attach_with_retry(void)
+{
+	for (uint32_t attempt = 1; attempt <= SLPI_FASTRPC_ATTACH_RETRY_COUNT; attempt++) {
+		slpi_fastrpc_attach_reply_seen = false;
+		slpi_fastrpc_attach_reply_result = 0;
+		if (!slpi_fastrpc_send_attach()) {
+			return false;
+		}
+		for (uint32_t ms = 0; ms < SLPI_FASTRPC_ATTACH_REPLY_TIMEOUT_MS &&
+		    !slpi_fastrpc_attach_reply_seen && !slpi_glink.broken; ms++) {
+			slpi_glink_pump();
+			delay_for_interval(1, NSEC_PER_MSEC);
+		}
+		if (slpi_fastrpc_attach_reply_seen && slpi_fastrpc_attach_reply_result == 0) {
+			hakios_tl("slpi: fastrpc: attach accepted on attempt %u\n", attempt);
+			return true;
+		}
+		if (slpi_glink.broken) {
+			return false;
+		}
+		if (slpi_fastrpc_attach_reply_seen) {
+			hakios_tl("slpi: fastrpc: attach attempt %u rejected: %d; retrying\n",
+			    attempt, slpi_fastrpc_attach_reply_result);
+		} else {
+			hakios_tl("slpi: fastrpc: attach attempt %u timed out; retrying\n", attempt);
+			slpi_fastrpc_phase = SLPI_FASTRPC_IDLE;
+		}
+		for (uint32_t ms = 0; ms < SLPI_FASTRPC_ATTACH_RETRY_DELAY_MS && !slpi_glink.broken; ms++) {
+			slpi_glink_pump();
+			delay_for_interval(1, NSEC_PER_MSEC);
+		}
+	}
+	hakios_tl("slpi: fastrpc: sensors PD attach exhausted %u attempts\n",
+	    SLPI_FASTRPC_ATTACH_RETRY_COUNT);
+	return false;
+}
+
 static void
 slpi_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -3273,21 +4274,42 @@ slpi_thread(__unused void *parameter, __unused wait_result_t result)
 	    slpi_image.size);
 	slpi_smem_probe();
 	if (slpi_transport_wait_ready(SLPI_QUEUE_TIMEOUT_MS)) {
-		if (slpi_glink_open_ipcrtr()) {
-			(void)slpi_glink_open_fastrpc_probe();
+		bool ipcrtr_ready = false;
+		bool fastrpc_ready = false;
+
+		/*
+		 * The two GLINK channels are opened together: FastRPC no longer
+		 * waits for IPCRTR to fully open and acknowledge before it is even
+		 * requested.  Everything below keys off the two independent ready
+		 * flags instead of a single "IPCRTR is open" gate, so a FastRPC
+		 * listener can be registered well before (or without) QRTR/QMI
+		 * coming up over IPCRTR.
+		 */
+		slpi_glink_open_channels(&ipcrtr_ready, &fastrpc_ready);
+		if (fastrpc_ready) {
 			if (slpi_fastrpc_prepare_memory()) {
 				uint32_t on = 0;
 
+				if (PE_parse_boot_argn("slpi_trace", &on, sizeof(on)) && on != 0) {
+					slpi_fastrpc_trace_all = true;
+				}
+				on = 0;
 				if (PE_parse_boot_argn("slpi_attach", &on, sizeof(on)) && on != 0) {
 					hakios_tl("slpi: fastrpc: attach enabled\n");
-					(void)slpi_fastrpc_send_attach();
+					(void)slpi_fastrpc_attach_with_retry();
 				} else {
 					hakios_tl("slpi: fastrpc: attach disabled (use slpi_attach=1)\n");
 				}
 			}
+		}
+		if (ipcrtr_ready) {
 			slpi_sns_qmi_probe();
-			/* Both service announcements and the SUID result are asynchronous. */
-			hakios_qmi_poll(&slpi_sns_qmi, 30000);
+			/* Both service announcements and the SUID result are asynchronous.
+			 * The poll also drives the FastRPC listener, and a full registry
+			 * pass is ~1000 reverse callbacks: keep serving for 40 s. */
+			hakios_qmi_poll(&slpi_sns_qmi, 40000);
+		}
+		if (ipcrtr_ready || fastrpc_ready) {
 			if (slpi_fastrpc_memory.ready) {
 				unsigned busy = 0;
 
@@ -3299,6 +4321,9 @@ slpi_thread(__unused void *parameter, __unused wait_result_t result)
 				hakios_tl("slpi: fastrpc: probe snapshot phase %u, GLINK broken %u, TX busy %u, SMMU FSR %#x\n",
 				    slpi_fastrpc_phase, slpi_glink.broken, busy,
 				    slpi_smmu_read(slpi_fastrpc_memory.context, SLPI_SMMU_CB_FSR));
+				hakios_tl("slpi: fastrpc: served %u file opens (%u of %u registry files), %u bytes; %u denials; %u replies\n",
+				    slpi_fastrpc_files_opened, slpi_fastrpc_registry_files_read, SLPI_REGISTRY_FILE_COUNT,
+				    slpi_fastrpc_bytes_served, slpi_fastrpc_denials, slpi_fastrpc_replies_seen);
 			}
 			if (slpi_sns_suid_sent) {
 				hakios_tl("slpi: sns: resampler lookup %s (QMI %d, result %u/%u)\n",
@@ -3315,6 +4340,54 @@ slpi_thread(__unused void *parameter, __unused wait_result_t result)
 				if (!slpi_sns_mag_txn.done) {
 					qmi_txn_cancel(&slpi_sns_mag_txn);
 				}
+			}
+			if (slpi_sns_stream_live) {
+				hakios_tl("slpi: sns: mag stream request %s (QMI %d, result %u/%u)\n",
+				    slpi_sns_stream_txn.done ? "replied" : "awaiting reply", slpi_sns_stream_txn.result,
+				    slpi_sns_stream_response.result, slpi_sns_stream_response.error);
+				if (!slpi_sns_stream_txn.done) {
+					qmi_txn_cancel(&slpi_sns_stream_txn);
+				}
+			}
+			if (slpi_sns_orientation_sent) {
+				hakios_tl("slpi: sns: orientation lookup %s (QMI %d, result %u/%u)\n",
+				    slpi_sns_orientation_txn.done ? "replied" : "awaiting reply",
+				    slpi_sns_orientation_txn.result, slpi_sns_orientation_response.result,
+				    slpi_sns_orientation_response.error);
+				if (!slpi_sns_orientation_txn.done) {
+					qmi_txn_cancel(&slpi_sns_orientation_txn);
+				}
+			}
+			if (slpi_sns_orientation_stream_live) {
+				hakios_tl("slpi: sns: orientation stream request %s (QMI %d, result %u/%u)\n",
+				    slpi_sns_orientation_stream_txn.done ? "replied" : "awaiting reply",
+				    slpi_sns_orientation_stream_txn.result, slpi_sns_orientation_stream_response.result,
+				    slpi_sns_orientation_stream_response.error);
+				if (!slpi_sns_orientation_stream_txn.done) {
+					qmi_txn_cancel(&slpi_sns_orientation_stream_txn);
+				}
+			}
+			hakios_tl("slpi: sns: MAG SUMMARY: %u samples; x %lld..%lld y %lld..%lld z %lld..%lld nT\n",
+			    slpi_sns_mag_samples, slpi_sns_mag_min[0], slpi_sns_mag_max[0], slpi_sns_mag_min[1],
+			    slpi_sns_mag_max[1], slpi_sns_mag_min[2], slpi_sns_mag_max[2]);
+			/* iOS reads the magnetometer (kern.hakios.mag) for as long as the session lasts:
+			 * the GLINK/QRTR pump, and with it the FastRPC listener, must keep running. */
+			if (slpi_sns_stream_live && !slpi_glink.broken) {
+				hakios_tl("slpi: sns: serving the magnetometer to iOS until the session ends\n");
+				for (uint32_t minute = 1; !slpi_glink.broken; minute++) {
+					struct hakios_mag_state state;
+
+					(void)hakios_qmi_poll(&slpi_sns_qmi, 60000);
+					lck_mtx_lock(&slpi_mag_lock);
+					state = slpi_mag_state;
+					lck_mtx_unlock(&slpi_mag_lock);
+					hakios_tl("slpi: sns: minute %u: %llu mag samples, raw %d %d %d, center %d %d %d, span %d %d %d nT, calibration %d; %llu orientation samples, heading %d.%03d, status %d; %u glitches\n",
+					    minute, state.samples, state.raw[0], state.raw[1], state.raw[2], state.center[0],
+					    state.center[1], state.center[2], state.span[0], state.span[1], state.span[2],
+					    state.calibration, state.orientation_samples, state.heading_millidegrees / 1000,
+					    state.heading_millidegrees % 1000, state.orientation_status, slpi_mag_glitches);
+				}
+				hakios_tl("slpi: sns: GLINK broke; the magnetometer is no longer served\n");
 			}
 		}
 	}

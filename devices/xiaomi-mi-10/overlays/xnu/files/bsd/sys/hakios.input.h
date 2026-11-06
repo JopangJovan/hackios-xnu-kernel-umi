@@ -35,6 +35,35 @@ struct hakios_touch {
 	uint32_t x, y;                  /* position on the display, 0 = left/top edge, 65535 = right/bottom edge */
 };
 
+/*
+ * sysctl kern.hakios.mag: the magnetometer as it stands (UMI: the ak0991x behind the sensor DSP,
+ * drivers in bsd/dev/hakios.input.c), for the code of ours inside the Compass application
+ * (userland/src/inject_compass.c). Device frame, as iOS's: x to the right, y toward the top of
+ * the screen, z out of the screen. raw is what the sensor says; center is the kernel's estimate
+ * of the phone's own constant field (hard iron: the middle of what each axis has spanned since
+ * the stream began), so that the earth's field is raw - center.
+ */
+#define HAKIOS_MAG_SYSCTL      "kern.hakios.mag"
+#define HAKIOS_MAG_VERSION     2
+
+struct hakios_mag_state {
+	uint32_t size;                  /* sizeof(struct hakios_mag_state) */
+	uint32_t version;               /* HAKIOS_MAG_VERSION */
+	uint64_t samples;               /* samples so far; 0: there is no magnetometer (yet) */
+	uint64_t time;                  /* mach_absolute_time() when the last one arrived */
+	int32_t raw[3];                 /* the last sample, nanotesla */
+	int32_t center[3];              /* the hard-iron estimate, nanotesla */
+	int32_t span[3];                /* how far each axis has ranged so far, nanotesla */
+	int32_t calibration;            /* 0 not yet (turn the phone around), 1 low, 2 high */
+	int32_t status;                 /* the sensor's own accuracy, 0 (unreliable) .. 3 (high) */
+	uint64_t orientation_samples;   /* SLPI's fused orientation events; 0 until its stream is live */
+	uint64_t orientation_time;      /* mach_absolute_time() when the last fused event arrived */
+	int32_t heading_millidegrees;   /* fused magnetic heading, clockwise from north */
+	int32_t pitch_millidegrees;
+	int32_t roll_millidegrees;
+	int32_t orientation_status;     /* the fusion sensor's accuracy */
+};
+
 #ifdef KERNEL
 /* For drivers; not from interrupt context. */
 void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
