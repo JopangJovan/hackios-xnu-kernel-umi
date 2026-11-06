@@ -861,10 +861,14 @@ lx_start(void)
 	if (!ret && bus.umi) {
 		ab->hw_params.supports_regdb = true;
 		ab->hw_params.coldboot_cal_mm = true;
-		/* (the firmware is booted by this port before the driver starts, and restarting it
-		 *  here -- ath11k's own rproc power_down/power_up -- leaves the endpoint down: the
-		 *  sessions that work are the ones where this does not happen) */
-		ab->hw_params.cbcal_restart_fw = false;
+		/* The firmware must be restarted between cold boot calibration (mode 7) and mission
+		 * mode (mode 0). ath11k does that only with cbcal_restart_fw: its power_down is
+		 * lx_os_rproc_shutdown() -> umi_wifi_radio_reset(), the endpoint reset and the
+		 * post-calibration reboot of the firmware; its power_up then finds it up again.
+		 * With false (5 Nov, 5aa9b33) none of that ran, the firmware was asked for mode 0
+		 * straight out of calibration, MHI failed (EIO) and the driver gave up 15 s in --
+		 * every session since; every session before, with true, came up. */
+		ab->hw_params.cbcal_restart_fw = true;
 	}
 	if (ret || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
 		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
