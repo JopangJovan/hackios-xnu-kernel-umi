@@ -1768,12 +1768,17 @@ slpi_sns_float_milli(uint32_t bits)
  */
 #define SLPI_MAG_SPAN_LOW_NT    30000   /* the earth's horizontal field is ~35 uT: ~half a turn */
 #define SLPI_MAG_SPAN_HIGH_NT   50000   /* ~three quarters of a turn */
+#define SLPI_MAG_LOOP_WAYPOINT_NT 3000  /* ignore stationary sensor noise when measuring the path */
+#define SLPI_MAG_LOOP_DEPART_NT 30000   /* first leave the starting direction by a useful amount */
+#define SLPI_MAG_LOOP_RETURN_NT 8000    /* finish near the starting magnetic vector */
+#define SLPI_MAG_LOOP_PATH_NT   120000  /* reject a short out-and-back movement */
+#define SLPI_MAG_LOOP_AREA_NT2  1000000000ll /* reject a line: a flat turn must enclose real area */
 #define SLPI_MAG_GLITCH_NT      200000  /* a jump this big between two samples 0.1 s apart is a glitch... */
 #define SLPI_MAG_GLITCH_RUN     5       /* ... unless it persists: then the field really changed */
 /* Android's compass reported north while the same stationary iOS-session
  * samples clustered around (-98.5, 136.5) uT; an east-facing sample put y
  * near 114 uT.  This is only the pre-calibration fallback: a complete flat
- * turn (both horizontal spans >= 50 uT) replaces it with measured extrema. */
+ * closed turn replaces it with measured extrema. */
 static const int32_t slpi_mag_seed_center[3] = { -98500, 114000, -383000 };
 static LCK_GRP_DECLARE(slpi_mag_lck_grp, "hakios-mag");
 static LCK_MTX_DECLARE(slpi_mag_lock, &slpi_mag_lck_grp);
@@ -1782,13 +1787,17 @@ static struct hakios_mag_state slpi_mag_state = {
 	.center = { -98500, 114000, -383000 },
 };
 static int32_t slpi_mag_min[3], slpi_mag_max[3];
+static int32_t slpi_mag_loop_start[2], slpi_mag_loop_waypoint[2];
+static uint64_t slpi_mag_loop_path;
+static int64_t slpi_mag_loop_area;
+static bool slpi_mag_loop_departed, slpi_mag_center_valid;
 static uint32_t slpi_mag_glitches, slpi_mag_glitch_run;
 
 static void
 slpi_mag_publish(const int64_t axis[3], uint64_t status)
 {
 	int32_t value[3];
-	bool jump = false;
+	bool jump = false, slpi_mag_loop_closed = false;
 
 	for (unsigned i = 0; i < 3; i++) {
 		value[i] = axis[i] > INT32_MAX ? INT32_MAX : axis[i] < -INT32_MAX ? -INT32_MAX : (int32_t)axis[i];
@@ -1805,6 +1814,36 @@ slpi_mag_publish(const int64_t axis[3], uint64_t status)
 		return;
 	}
 	slpi_mag_glitch_run = 0;
+	if (slpi_mag_state.samples == 0) {
+		for (unsigned i = 0; i < 2; i++) {
+			slpi_mag_loop_start[i] = value[i];
+			slpi_mag_loop_waypoint[i] = value[i];
+		}
+	} else if (!slpi_mag_center_valid) {
+		int64_t previous_x = (int64_t)slpi_mag_state.raw[0] - slpi_mag_loop_start[0];
+		int64_t previous_y = (int64_t)slpi_mag_state.raw[1] - slpi_mag_loop_start[1];
+		int64_t current_x = (int64_t)value[0] - slpi_mag_loop_start[0];
+		int64_t current_y = (int64_t)value[1] - slpi_mag_loop_start[1];
+		int64_t waypoint_x = (int64_t)value[0] - slpi_mag_loop_waypoint[0];
+		int64_t waypoint_y = (int64_t)value[1] - slpi_mag_loop_waypoint[1];
+		uint64_t waypoint_distance = (uint64_t)(waypoint_x < 0 ? -waypoint_x : waypoint_x) +
+		    (uint64_t)(waypoint_y < 0 ? -waypoint_y : waypoint_y);
+		uint64_t start_distance = (uint64_t)(current_x < 0 ? -current_x : current_x) +
+		    (uint64_t)(current_y < 0 ? -current_y : current_y);
+
+		slpi_mag_loop_area += previous_x * current_y - previous_y * current_x;
+		if (waypoint_distance >= SLPI_MAG_LOOP_WAYPOINT_NT) {
+			slpi_mag_loop_path += waypoint_distance;
+			slpi_mag_loop_waypoint[0] = value[0];
+			slpi_mag_loop_waypoint[1] = value[1];
+		}
+		if (start_distance >= SLPI_MAG_LOOP_DEPART_NT) {
+			slpi_mag_loop_departed = true;
+		}
+		int64_t enclosed_area = slpi_mag_loop_area < 0 ? -slpi_mag_loop_area : slpi_mag_loop_area;
+		slpi_mag_loop_closed = slpi_mag_loop_departed && start_distance <= SLPI_MAG_LOOP_RETURN_NT &&
+		    slpi_mag_loop_path >= SLPI_MAG_LOOP_PATH_NT && enclosed_area >= SLPI_MAG_LOOP_AREA_NT2;
+	}
 	for (unsigned i = 0; i < 3; i++) {
 		if (slpi_mag_state.samples == 0 || value[i] < slpi_mag_min[i]) {
 			slpi_mag_min[i] = value[i];
@@ -1818,22 +1857,22 @@ slpi_mag_publish(const int64_t axis[3], uint64_t status)
 	slpi_mag_state.samples++;
 	slpi_mag_state.time = mach_absolute_time();
 	slpi_mag_state.status = (int32_t)MIN(status, 3u);
-	if (slpi_mag_state.span[0] >= SLPI_MAG_SPAN_LOW_NT && slpi_mag_state.span[1] >= SLPI_MAG_SPAN_LOW_NT) {
-		slpi_mag_state.calibration = slpi_mag_state.span[0] >= SLPI_MAG_SPAN_HIGH_NT &&
-		    slpi_mag_state.span[1] >= SLPI_MAG_SPAN_HIGH_NT ? 2 : 1;
-		if (slpi_mag_state.calibration == 2) {
-			for (unsigned i = 0; i < 3; i++) {
-				slpi_mag_state.center[i] = (int32_t)(((int64_t)slpi_mag_min[i] + slpi_mag_max[i]) / 2);
-			}
-			/* z spans only when the phone is turned over: keep the measured z until it has */
-			if (slpi_mag_state.span[2] < SLPI_MAG_SPAN_LOW_NT) {
-				slpi_mag_state.center[2] = slpi_mag_seed_center[2];
-			}
-		} else {
-			memcpy(slpi_mag_state.center, slpi_mag_seed_center, sizeof(slpi_mag_state.center));
+	if (slpi_mag_loop_closed && slpi_mag_state.span[0] >= SLPI_MAG_SPAN_HIGH_NT &&
+	    slpi_mag_state.span[1] >= SLPI_MAG_SPAN_HIGH_NT) {
+		for (unsigned i = 0; i < 3; i++) {
+			slpi_mag_state.center[i] = (int32_t)(((int64_t)slpi_mag_min[i] + slpi_mag_max[i]) / 2);
 		}
+		/* z spans only when the phone is turned over: keep the measured z until it has */
+		if (slpi_mag_state.span[2] < SLPI_MAG_SPAN_LOW_NT) {
+			slpi_mag_state.center[2] = slpi_mag_seed_center[2];
+		}
+		slpi_mag_center_valid = true;
+	}
+	if (slpi_mag_center_valid) {
+		slpi_mag_state.calibration = 2;
 	} else {
-		slpi_mag_state.calibration = 0;
+		slpi_mag_state.calibration = slpi_mag_state.span[0] >= SLPI_MAG_SPAN_LOW_NT &&
+		    slpi_mag_state.span[1] >= SLPI_MAG_SPAN_LOW_NT ? 1 : 0;
 		memcpy(slpi_mag_state.center, slpi_mag_seed_center, sizeof(slpi_mag_state.center));
 	}
 	lck_mtx_unlock(&slpi_mag_lock);
@@ -4376,15 +4415,23 @@ slpi_thread(__unused void *parameter, __unused wait_result_t result)
 				hakios_tl("slpi: sns: serving the magnetometer to iOS until the session ends\n");
 				for (uint32_t minute = 1; !slpi_glink.broken; minute++) {
 					struct hakios_mag_state state;
+					uint64_t loop_path;
+					int64_t loop_area;
+					bool loop_departed, center_valid;
 
 					(void)hakios_qmi_poll(&slpi_sns_qmi, 60000);
 					lck_mtx_lock(&slpi_mag_lock);
 					state = slpi_mag_state;
+					loop_path = slpi_mag_loop_path;
+					loop_area = slpi_mag_loop_area;
+					loop_departed = slpi_mag_loop_departed;
+					center_valid = slpi_mag_center_valid;
 					lck_mtx_unlock(&slpi_mag_lock);
-					hakios_tl("slpi: sns: minute %u: %llu mag samples, raw %d %d %d, center %d %d %d, span %d %d %d nT, calibration %d; %llu orientation samples, heading %d.%03d, status %d; %u glitches\n",
+					hakios_tl("slpi: sns: minute %u: %llu mag samples, raw %d %d %d, center %d %d %d, span %d %d %d nT, calibration %d; loop path %llu, area %lld, departed %u, center valid %u; %llu orientation samples, heading %d.%03d, status %d; %u glitches\n",
 					    minute, state.samples, state.raw[0], state.raw[1], state.raw[2], state.center[0],
 					    state.center[1], state.center[2], state.span[0], state.span[1], state.span[2],
-					    state.calibration, state.orientation_samples, state.heading_millidegrees / 1000,
+					    state.calibration, loop_path, loop_area, loop_departed, center_valid,
+					    state.orientation_samples, state.heading_millidegrees / 1000,
 					    state.heading_millidegrees % 1000, state.orientation_status, slpi_mag_glitches);
 				}
 				hakios_tl("slpi: sns: GLINK broke; the magnetometer is no longer served\n");

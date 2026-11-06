@@ -7,6 +7,9 @@ python3 "$DEVICE_DIR/prepare.py" kernel
 python3 "$DEVICE_DIR/tools/embed-firmware.py" \
   --patch "$ROOT/fw-bluetooth/htbtfw20.tlv" --nvm "$ROOT/fw-bluetooth/htnv20.bin" \
   --output "$XNU_SRC/bsd/dev/umi_bt_firmware.inc"
+python3 "$DEVICE_DIR/tools/embed-sensor-registry.py" \
+  --registry "$ROOT/fw-sensors/registry.tar" \
+  --output "$XNU_SRC/bsd/dev/umi_sensor_registry.inc"
 mkdir -p "$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT"
 [ ! -f "$ROOT/xnu-deps/build/ath11k/src/ath11k/qmi.c" ] || "$ROOT/tools/mk-wlfw.sh"
 exec "$ROOT/xnu-build.sh" "${@:--j8}"
