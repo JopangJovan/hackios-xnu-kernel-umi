@@ -1599,11 +1599,23 @@ static bool
 umi_cs35l41_update(uint8_t a, uint32_t reg, uint32_t mask, uint32_t value)
 {
 	uint32_t old = 0, check = 0;
-	bool ok = umi_cs35l41_read(a, reg, &old) && umi_cs35l41_write(a, reg, (old & ~mask) | (value & mask)) &&
-	    umi_cs35l41_read(a, reg, &check) && (check & mask) == (value & mask);
-	if (!ok) say("umi-audio: amp %#x register update failed at %#x: old %#x, readback %#x, mask %#x, wanted %#x\n",
+	/* The active volume ramp can see a transient NACK on the bit-banged bus.
+	 * Repeat only that idempotent register transaction. A completed transfer
+	 * with a wrong value still fails immediately and the caller resets the amps. */
+	unsigned attempts = reg == 0x6000 ? 3 : 1;
+	for (unsigned attempt = 0; attempt < attempts; attempt++) {
+		if (umi_cs35l41_read(a, reg, &old) &&
+		    umi_cs35l41_write(a, reg, (old & ~mask) | (value & mask)) &&
+		    umi_cs35l41_read(a, reg, &check)) {
+			if ((check & mask) != (value & mask)) break;
+			if (attempt) say("umi-audio: amp %#x recovered volume update after %u retries\n", a, attempt);
+			return true;
+		}
+		if (attempt + 1 < attempts) wait_ms(2);
+	}
+	say("umi-audio: amp %#x register update failed at %#x: old %#x, readback %#x, mask %#x, wanted %#x\n",
 	    a, reg, old, check, mask, value);
-	return ok;
+	return false;
 }
 
 #include "umi_cs35l41_otp.h"

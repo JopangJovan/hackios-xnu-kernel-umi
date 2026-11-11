@@ -93,3 +93,12 @@ iOS images booted on UMI; touch initialized, the GPU rendered apps at its
 587 MHz setting, and the audio DSP and Wi-Fi interface initialized. The user
 confirmed that the build works, while scrolling skips/freezes remain. This
 source migration does not claim to resolve that remaining performance issue.
+
+## Known issue: Translate voice input
+
+On UMI running iOS 16.5 (20F66), Translate starts capturing microphone samples
+but does not produce a transcript. Camera audio recording, recording playback,
+and ringtone previews were confirmed on the device. Translate's MobileAsset
+configuration download reached HTTP 200. StreamingUnzipService then aborted
+installation when the RAM filesystem returned `ENOTSUP` for the file protection
+class query. The role of Apple's online recognition service remains unverified.
