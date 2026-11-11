@@ -21,8 +21,11 @@ pre=r'''
 #include <errno.h>
 typedef uintptr_t vm_offset_t;
 typedef size_t vm_size_t;
+typedef int kern_return_t;
 typedef int lck_mtx_t;
+#ifndef __printflike
 #define __printflike(a,b)
+#endif
 #define PAGE_MASK 16383
 #define KMA_KOBJECT 0
 #define KMA_ZERO 0
@@ -33,7 +36,7 @@ typedef int lck_mtx_t;
 #define round_page(v) (((v)+16383)&~16383ul)
 static int kernel_map;
 static unsigned lock_depth, allocations, fail_alloc, mapping_fail, ticks, fail_slot;
-static bool no_frame, device_fault, tlb_stuck, route_fail, ttbr_fail, guard_damage;
+static bool no_frame, device_fault, tlb_stuck, route_fail, ttbr_fail, guard_damage, fail_contiguous;
 static uint32_t smmu_regs[0x100000/4], ife_regs[0x4000/4];
 static uint32_t saved_cbar, saved_cba2r, saved_cb[9];
 static uintptr_t allocated[8];
@@ -44,13 +47,16 @@ static void delay(unsigned n){(void)n;}
 static void delay_for_interval(unsigned n,unsigned u){(void)n;(void)u;mock_tick();}
 static void lck_mtx_lock(lck_mtx_t *p){(void)p;assert(!lock_depth);lock_depth=1;}
 static void lck_mtx_unlock(lck_mtx_t *p){(void)p;assert(lock_depth==1);lock_depth=0;}
-static size_t strlcpy(char *d,const char *s,size_t n){size_t l=strlen(s);if(n){size_t c=l<n-1?l:n-1;memcpy(d,s,c);d[c]=0;}return l;}
+#undef strlcpy
+#define strlcpy mock_strlcpy
+static size_t mock_strlcpy(char *d,const char *s,size_t n){size_t l=strlen(s);if(n){size_t c=l<n-1?l:n-1;memcpy(d,s,c);d[c]=0;}return l;}
 static int kmem_alloc(int m,vm_offset_t *p,vm_size_t n,unsigned f,unsigned t){
  (void)m;(void)f;(void)t;++allocations;if(allocations==fail_alloc)return 1;
  void *v=aligned_alloc(16384,round_page(n));assert(v);memset(v,0,round_page(n));*p=(uintptr_t)v;
  assert(allocations<8);allocated[allocations]=(uintptr_t)v;return 0;
 }
 static int kmem_alloc_contig(int m,vm_offset_t *p,vm_size_t n,unsigned mask,unsigned a,unsigned b,unsigned f,unsigned t){
+ if(fail_contiguous)return 1;
  (void)mask;(void)a;(void)b;return kmem_alloc(m,p,n,f,t);
 }
 '''
@@ -103,7 +109,7 @@ static void reset(void){
  memset(smmu_regs,0,sizeof(smmu_regs));memset(ife_regs,0,sizeof(ife_regs));
  memset(loader_recording,0,sizeof(loader_recording));
  lock_depth=allocations=fail_alloc=mapping_fail=ticks=fail_slot=0;
- no_frame=device_fault=tlb_stuck=route_fail=ttbr_fail=guard_damage=false;
+ no_frame=device_fault=tlb_stuck=route_fail=ttbr_fail=guard_damage=fail_contiguous=false;
  smmu_regs[0x20/4]=(1u<<27)|8;smmu_regs[0x24/4]=0xa0000004; /* 64K pages, 8+8 banks, 4 CBs */
  saved_cbar=0x1200;saved_cba2r=0;
  smmu_regs[0x10000/4]=saved_cbar;smmu_regs[0x10800/4]=saved_cba2r;
@@ -152,6 +158,17 @@ int main(void){
  assert(ud.capacity>=round_page(4096+3008*2256*5/4));unsigned reused=allocations;
  assert(umi_camera_sensor_frame(0xacd9000,0xacd9200,sensor_stream)==0);clean();assert(allocations==reused&&ud.width==3008);
  assert(umi_camera_front_frame(0xacd9000,0xacd9200,sensor_stream)==0);clean();assert(allocations==reused&&ud.width==2592);
+ reset();stream_calls=0;
+ umi_camera_dma_reserve();assert(ud.memory&&ud.capacity==UD_SENSOR_CAPACITY&&allocations==1);
+ umi_camera_dma_reserve();assert(allocations==1);
+ fail_contiguous=true;
+ assert(umi_camera_front_frame(0xacd9000,0xacd9200,sensor_stream)==0);clean();
+ assert(umi_camera_sensor_frame(0xacd9000,0xacd9200,sensor_stream)==0);clean();
+ assert(allocations==2&&stream_calls==4&&!stream_live&&loader_recording[0]==kvtophys(ud.memory));
+ reset();fail_contiguous=true;
+ umi_camera_dma_reserve();assert(!ud.memory&&!ud.capacity);
+ fail_contiguous=false;
+ assert(umi_camera_sensor_frame(0xacd9000,0xacd9200,sensor_stream)==0);clean();
  reset();stream_calls=0;stream_fail=false;stop_fail=true;
  assert(umi_camera_sensor_frame(0xacd9000,0xacd9200,sensor_stream)==EIO);clean();
  assert(stream_calls==2&&stream_live&&((struct ud_header *)ud.memory)->frames==0);

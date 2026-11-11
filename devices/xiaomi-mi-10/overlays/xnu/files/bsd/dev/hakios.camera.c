@@ -4242,6 +4242,7 @@ extern int umi_camera_isp_probe(void);
 extern int umi_camera_capture_tpg(void);
 extern int umi_camera_phy_probe(void);
 extern int umi_camera_capture_sensor(void);
+extern void umi_camera_dma_reserve(void);
 extern void umi_camera_serve_ios(void);
 extern void umi_camera_probe_quiesce(void);
 
@@ -4451,6 +4452,8 @@ hakios_camera_init(void)
 			keep = 0;
 			keep_bytes = 0;
 		}
+	} else if (level == 5) {
+		umi_camera_dma_reserve();
 	}
 	if (kernel_thread_start(camera_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

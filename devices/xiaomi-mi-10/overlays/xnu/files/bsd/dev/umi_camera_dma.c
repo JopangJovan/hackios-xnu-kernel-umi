@@ -19,6 +19,7 @@ extern void hakios_tl(const char *, ...) __printflike(1, 2);
 int umi_camera_tpg(vm_offset_t, vm_offset_t);
 int umi_camera_sensor_frame(vm_offset_t, vm_offset_t, int (*)(bool));
 int umi_camera_front_frame(vm_offset_t, vm_offset_t, int (*)(bool));
+void umi_camera_dma_reserve(void);
 void umi_camera_dma_quiesce(bool);
 
 #define UD_IOVA 0x40000000ull
@@ -29,6 +30,7 @@ void umi_camera_dma_quiesce(bool);
 #define UD_HEIGHT 240u
 #define UD_STRIDE 400u
 #define UD_BYTES (UD_STRIDE*UD_HEIGHT)
+#define UD_SENSOR_CAPACITY round_page(4096 + 3008u * 2256u * 5u / 4u)
 static struct {
 	vm_offset_t ife, csid, smmu, gr1, cb, memory, tables, cb_physical;
 	vm_size_t size,capacity;
@@ -218,6 +220,34 @@ umi_camera_dma_quiesce(bool panic)
 }
 
 static int
+umi_camera_dma_alloc(vm_size_t capacity, bool physical)
+{
+	vm_offset_t memory;
+	kern_return_t kr = kmem_alloc_contig(kernel_map, &memory, capacity, PAGE_MASK, 0, 0,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT);
+	if (kr != KERN_SUCCESS) {
+		hakios_tl("UMI camera DMA: contiguous frame allocation of %lu bytes failed: %d\n",
+		    (unsigned long)capacity, kr);
+		return ENOMEM;
+	}
+	ud.memory = memory;
+	ud.capacity = capacity;
+	ud.physical_buffer = physical;
+	return 0;
+}
+
+void
+umi_camera_dma_reserve(void)
+{
+	/* The loader exports the last raw frame as one physical span. Reserve it
+	 * before userland and the modem fragment memory. Both sensors reuse it.
+	 */
+	if (!ud.memory && !umi_camera_dma_alloc(UD_SENSOR_CAPACITY, true)) {
+		hakios_tl("UMI camera DMA: reserved %lu frame bytes at boot\n", (unsigned long)ud.capacity);
+	}
+}
+
+static int
 umi_camera_frame(vm_offset_t ife,vm_offset_t csid,bool physical,int (*stream)(bool),unsigned sensor)
 {
 	if(physical && sensor!=1 && sensor!=2)return EINVAL;
@@ -225,13 +255,15 @@ umi_camera_frame(vm_offset_t ife,vm_offset_t csid,bool physical,int (*stream)(bo
 	ud.ife=ife;ud.csid=csid;ud.sensor_stream=stream;ud.sensor_stop_error=0;
 	ud.width=physical?(sensor==2?2592:3008):UD_WIDTH;ud.height=physical?(sensor==2?1940:2256):UD_HEIGHT;
 	ud.stride=(ud.width*5/4+15u)&~15u;ud.frame_bytes=ud.stride*ud.height;ud.size=round_page(4096+ud.frame_bytes);
-	if(!ud.memory) {
-        vm_size_t capacity=physical?round_page(4096+3008u*2256u*5u/4u):ud.size;
-        if(kmem_alloc_contig(kernel_map,&ud.memory,capacity,PAGE_MASK,0,0,KMA_KOBJECT|KMA_ZERO|KMA_DATA,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
-        ud.capacity=capacity;ud.physical_buffer=physical;
-    }
-    if(ud.size>ud.capacity)return ENOMEM;
-	if(!ud.tables&&kmem_alloc(kernel_map,&ud.tables,32768,KMA_KOBJECT|KMA_ZERO|KMA_DATA,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS)return ENOMEM;
+	if (!ud.memory && umi_camera_dma_alloc(physical ? UD_SENSOR_CAPACITY : ud.size, physical)) {
+		return ENOMEM;
+	}
+	if (ud.size > ud.capacity) return ENOMEM;
+	if (!ud.tables && kmem_alloc(kernel_map, &ud.tables, 32768,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		hakios_tl("UMI camera DMA: page table allocation failed\n");
+		return ENOMEM;
+	}
 	memset((void *)ud.memory,0,ud.size);memset((void *)ud.tables,0,32768);
 	struct ud_header *h=(struct ud_header *)ud.memory;
 	memcpy(h->magic,"RWCAM001",8);h->width=ud.width;h->height=ud.height;h->stride=ud.stride;
