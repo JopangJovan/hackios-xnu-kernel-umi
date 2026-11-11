@@ -126,6 +126,16 @@ IOS_JOBS=${JOBS-"
 # AudioSession and CoreHaptics need mediaserverd; its AVAudioSession setup waits for NanoRegistry's
 # paired-device Mach service. Keep both jobs in every image so the server and its clients can start.
 IOS_JOBS="$IOS_JOBS com.apple.mediaserverd com.apple.nanoregistryd"
+GPS_APFS=()
+if [ "${UMI_GPS:-0}" = 1 ]; then
+	if [ "${DEVICE:-}" != umi ] || [ ! -s "$IOS/rootfs/usr/libexec/locationd" ]; then
+		echo "UMI_GPS=1 needs the iOS 20F66 locationd in sysimage/rootfs/usr/libexec" >&2
+		exit 1
+	fi
+	IOS_JOBS="$IOS_JOBS com.apple.locationd"
+	GPS_APFS=(--plain sdx55m)
+	SYSTEM=1
+fi
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib).
@@ -494,6 +504,14 @@ umi_firmware() {
 # Include UMI assets in the small image used before iOS's root is mounted. They remain local
 # firmware inputs and are never committed to either source repository.
 umi_firmware root/fw
+if [ "${UMI_GPS:-0}" = 1 ]; then
+	mkdir -p root/sdx55m
+	for f in devcfg.mbn hyp.mbn tz.mbn aop.mbn acdb.mbn apps.mbn multi_image_qti.mbn multi_image.mbn xbl_cfg.elf sec.elf 514_0_0.mbn mbn_hw.dig mbn_sw.dig; do
+		install -m 0644 "../fw-sdx55/$f" root/sdx55m/ || exit 1
+	done
+	bash ../devices/xiaomi-mi-10/tools/build-sdx55-settings.sh "$PWD/root/lib/umi-gps-ui.dylib" || exit 1
+	printf '%s\n' '/redwood/lib/umi-gps-ui.dylib Preferences' >> root/etc/inject.conf
+fi
 
 # Segment names are device-specific. UMI's signed MDT references adsp.b00 through adsp.b18,
 # including b00 and b01; Redwood's image starts at b02 and keeps its existing selection.
@@ -593,7 +611,7 @@ done
 [ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (drivers/storage/hakios.image.c)
-python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
+python3 ../tools/apfs/mkapfs.py -z --plain fw "${GPS_APFS[@]}" -o root.apfs redwood=root | tail -1
 [ -z "$CHECK" ] || ../tools/apfs/check-image.sh root.apfs redwood=root
 
 # --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.apfs --------------------------------
@@ -778,7 +796,13 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		ln -sfn ../../Cryptexes/OS/System/Library/Caches/com.apple.dyld \
 			sysroot/System/Library/Caches/com.apple.dyld
 	fi
-	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	if [ "${UMI_GPS:-0}" = 1 ]; then
+		install -d -m 0700 sysroot/sdx55m
+		for f in mdm1m9kefs1.bin mdm1m9kefs2.bin mdm1m9kefs3.bin qdsp6sw.mbn; do
+			install -m 0600 "../fw-sdx55/$f" sysroot/sdx55m/ || exit 1
+		done
+	fi
+	python3 ../tools/apfs/mkapfs.py -z "${GPS_APFS[@]}" -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=$IOS/system.manifest
 	rm -rf sysroot
 fi

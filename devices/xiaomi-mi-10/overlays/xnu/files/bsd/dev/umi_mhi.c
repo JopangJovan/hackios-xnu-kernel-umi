@@ -22,6 +22,21 @@
 #define IPCR_BUFFER_SIZE 8192u
 #define QRTR_HELLO_SIZE 52u
 #define MHI_COMMAND_POLLS 5000u
+#define SAHARA_TX_CHANNEL 2u
+#define SAHARA_RX_CHANNEL 3u
+#define SAHARA_EVENT_RING 1u
+#define SAHARA_RING_ELEMENTS 128u
+#define SAHARA_RX_BUFFERS 4u
+#define SAHARA_BUFFER_SIZE 0x8000u
+#define CELL_TX_CHANNEL 100u
+#define CELL_RX_CHANNEL 101u
+#define CELL_TX_EVENT 7u
+#define CELL_RX_EVENT 8u
+#define CELL_TR_ELEMENTS 512u
+#define SDX55_CHANNEL_CONTEXTS 111u
+#define SDX55_EVENT_OFFLOAD_MASK ((1u << 4) | (1u << 5) | (1u << 9) | \
+	(1u << 11) | (1u << 12) | (1u << 13) | (1u << 14))
+#define SDX55_HW_EVENT_RINGS 10u
 
 static void
 dma_write_barrier(void)
@@ -42,6 +57,32 @@ dma_read_barrier(void)
 #else
 	__atomic_thread_fence(__ATOMIC_ACQUIRE);
 #endif
+}
+
+static void
+sync_for_cpu(struct umi_mhi *host, const struct umi_mhi_dma *dma)
+{
+	if (host->io->sync_for_cpu) {
+		host->io->sync_for_cpu(host->io->context, dma);
+		return;
+	}
+	dma_read_barrier();
+}
+
+static void
+sahara_consume(struct umi_mhi *host)
+{
+	if (!host->sahara_queue_count) {
+		host->sahara_received = false;
+		return;
+	}
+	unsigned slot = host->sahara_queue_head;
+	memcpy(host->sahara_rx_words, host->sahara_queued[slot],
+	    sizeof(host->sahara_rx_words));
+	host->sahara_rx_bytes = host->sahara_queued_bytes[slot];
+	host->sahara_queue_head = (slot + 1) % 4;
+	--host->sahara_queue_count;
+	host->sahara_received = true;
 }
 
 static bool
@@ -121,9 +162,12 @@ umi_mhi_probe(struct umi_mhi *host, const struct umi_mhi_io *io)
 	uint32_t channels = io->read32(io->context, 0x18);
 	uint32_t events = io->read32(io->context, 0x20);
 	/* Check every aperture before a caller can issue any firmware transfer. */
-	if (bhi < length || bhie < length || channels < length || events < length ||
-	    !span(bhi, 0x34, io->bar_size) || !span(bhie, 0x7c, io->bar_size) ||
-	    !span(channels, 128 * 8, io->bar_size) || !span(events, 3 * 8, io->bar_size)) return EINVAL;
+	bool no_bhie = io->profile == UMI_MHI_PROFILE_SDX55 && bhie == 0;
+	if (bhi < length || (!no_bhie && bhie < length) || channels < length ||
+	    events < length || !span(bhi, 0x34, io->bar_size) ||
+	    (!no_bhie && !span(bhie, 0x7c, io->bar_size)) ||
+	    !span(channels, 128 * 8, io->bar_size) ||
+	    !span(events, (io->profile == UMI_MHI_PROFILE_SDX55 ? SDX55_EVENT_CONTEXTS : 3) * 8, io->bar_size)) return EINVAL;
 	if (io->read32(io->context, bhi + 4) != 1) return ENODEV;
 	/* Real UMI PBL leaves MHIVER at the reserved-register sentinel. Its
 	 * complete BHI layout is readable before the mission-mode version appears. */
@@ -154,11 +198,31 @@ umi_mhi_execution_environment(const struct umi_mhi *host, uint32_t *environment)
 static int
 allocate(struct umi_mhi *host, size_t size, struct umi_mhi_dma *dma)
 {
+	uint64_t dma_start = host->io->dma_start ? host->io->dma_start : DMA_START;
+	uint64_t dma_end = host->io->dma_end ? host->io->dma_end : DMA_END;
 	int error = host->io->allocate(host->io->context, size, dma);
 	if (error) return error;
 	if (!dma->bytes || ((uintptr_t)dma->bytes & 7) || dma->size < size || (dma->address & 4095) ||
-	    dma->address < DMA_START || dma->address >= DMA_END ||
-	    dma->size > DMA_END - dma->address) return EINVAL;
+	    dma->address < dma_start || dma->address >= dma_end ||
+	    dma->size > dma_end - dma->address) return EINVAL;
+	return 0;
+}
+
+static int
+allocate_aligned(struct umi_mhi *host, size_t size, size_t alignment,
+	struct umi_mhi_dma *dma)
+{
+	if (!alignment || (alignment & (alignment - 1))) return EINVAL;
+	struct umi_mhi_dma allocation = {0};
+	int error = allocate(host, size + alignment - 1, &allocation);
+	if (error) return error;
+	uint64_t address = (allocation.address + alignment - 1) &
+	    ~(uint64_t)(alignment - 1);
+	size_t offset = (size_t)(address - allocation.address);
+	if (offset > allocation.size || size > allocation.size - offset) return EINVAL;
+	dma->bytes = (uint8_t *)allocation.bytes + offset;
+	dma->address = address;
+	dma->size = size;
 	return 0;
 }
 
@@ -197,16 +261,38 @@ setup_stock_channel_contexts(struct umi_mhi *host)
 	 * before the controller enters M0 and starts AMSS. Dynamic ring addresses
 	 * and ENABLED state are filled when the IPCR client starts after mission.
 	 */
-	static const struct { unsigned channel, direction; } stock_channels[] = {
-		{ 0, 1 }, { 1, 2 }, { 4, 1 }, { 5, 2 },
-		{ IPCR_TX_CHANNEL, 1 }, { IPCR_RX_CHANNEL, 2 },
+	static const struct {
+		uint8_t channel, type, event, burst;
+	} wifi_channels[] = {
+		{ 0, 1, 1, 2 }, { 1, 2, 1, 2 }, { 4, 1, 1, 2 },
+		{ 5, 2, 1, 2 }, { IPCR_TX_CHANNEL, 1, IPCR_EVENT_RING, 2 },
+		{ IPCR_RX_CHANNEL, 2, IPCR_EVENT_RING, 2 },
 	};
-	for (unsigned i = 0; i < sizeof(stock_channels) / sizeof(stock_channels[0]); i++) {
+	static const typeof(wifi_channels[0]) sdx55_channels[] = {
+		{ 0, 1, 2, 2 }, { 1, 2, 2, 2 }, { 2, 1, 1, 2 },
+		{ 3, 2, 1, 2 }, { 4, 1, 1, 2 }, { 5, 2, 3, 2 },
+		{ 8, 1, 1, 2 }, { 9, 2, 1, 2 }, { 10, 1, 1, 2 },
+		{ 11, 2, 1, 2 }, { 14, 1, 1, 2 }, { 15, 2, 2, 2 },
+		{ 16, 1, 3, 2 }, { 17, 2, 3, 2 }, { 18, 1, 1, 2 },
+		{ 19, 2, 1, 2 }, { 20, 1, 2, 2 }, { 21, 2, 2, 2 },
+		{ 22, 1, 2, 2 }, { 23, 2, 2, 2 }, { 25, 2, 1, 2 },
+		{ 26, 1, 3, 2 }, { 27, 2, 3, 2 }, { 32, 1, 3, 2 },
+		{ 33, 2, 3, 2 }, { 100, 1, 7, 3 }, { 101, 2, 8, 3 },
+		{ 103, 2, 10, 2 }, { 104, 3, 8, 3 }, { 109, 1, 15, 2 },
+		{ 110, 2, 16, 2 },
+	};
+	const void *entries = host->io->profile == UMI_MHI_PROFILE_SDX55 ?
+	    (const void *)sdx55_channels : (const void *)wifi_channels;
+	unsigned count = host->io->profile == UMI_MHI_PROFILE_SDX55 ?
+	    sizeof(sdx55_channels) / sizeof(sdx55_channels[0]) :
+	    sizeof(wifi_channels) / sizeof(wifi_channels[0]);
+	const typeof(wifi_channels[0]) *stock_channels = entries;
+	for (unsigned i = 0; i < count; i++) {
 		uint32_t *context = (uint32_t *)host->channels.bytes +
 		    stock_channels[i].channel * 11;
-		context[0] = 2u << 8; /* disabled, stock burst mode 2, pollcfg 0 */
-		context[1] = stock_channels[i].direction;
-		context[2] = IPCR_EVENT_RING;
+		context[0] = (uint32_t)stock_channels[i].burst << 8;
+		context[1] = stock_channels[i].type;
+		context[2] = stock_channels[i].event;
 	}
 }
 
@@ -241,25 +327,61 @@ umi_mhi_prepare_ready(struct umi_mhi *host)
 		report(host, "READY timeout; SBL DMA retained until endpoint reset", status);
 		return ETIMEDOUT;
 	}
+	report(host, "MHI READY status/control", (status & 0xffff) |
+	    ((control & 0xffff) << 16));
 	uint32_t config = read_reg(host, 0x10);
 	if (config == UINT32_MAX) { host->poisoned = true; return EIO; }
-	struct umi_mhi_dma *tables[] = { &host->channels, &host->events, &host->commands,
-	    &host->command_ring, &host->event_ring[0], &host->event_ring[1], &host->event_ring[2] };
-	const size_t sizes[] = { 128 * 44, 3 * 44, 44, 128 * 16, 32 * 16, 256 * 16, 32 * 16 };
-	for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
-		error = allocate(host, sizes[i], tables[i]);
+	static const struct {
+		uint16_t elements;
+		uint8_t vector;
+		uint8_t intmod;
+	} wifi_events[3] = {
+		{ 32, 1, 0 }, { 256, 2, 0 }, { 32, 0, 1 },
+	}, sdx55_events[SDX55_EVENT_CONTEXTS] = {
+		{ 32, 1, 0 }, { 256, 2, 0 }, { 256, 3, 0 }, { 256, 4, 0 },
+		{ 512, 0, 5 }, { 512, 0, 5 }, { 64, 0, 0 }, { 1024, 5, 5 },
+		{ 2048, 6, 5 }, { 0, 0, 0 }, { 1024, 7, 5 }, { 0, 0, 0 },
+		{ 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 1024, 8, 1 },
+		{ 1024, 9, 0 },
+	};
+	bool sdx55 = host->io->profile == UMI_MHI_PROFILE_SDX55;
+	unsigned event_contexts = sdx55 ? SDX55_EVENT_CONTEXTS : 3;
+	error = allocate(host, sdx55 ? SDX55_CHANNEL_CONTEXTS * 44 : 128 * 44,
+	    &host->channels);
+	if (!error) error = allocate(host, event_contexts * 44, &host->events);
+	if (!error) error = allocate(host, 44, &host->commands);
+	if (!error) error = allocate_aligned(host, 128 * 16, 128 * 16,
+	    &host->command_ring);
+	if (error) return error;
+	memset(host->channels.bytes, 0, host->channels.size);
+	memset(host->events.bytes, 0, host->events.size);
+	memset(host->commands.bytes, 0, host->commands.size);
+	memset(host->command_ring.bytes, 0, host->command_ring.size);
+	for (unsigned i = 0; i < event_contexts; i++) {
+		bool offload = sdx55 && (SDX55_EVENT_OFFLOAD_MASK & (1u << i));
+		unsigned elements = sdx55 ? sdx55_events[i].elements :
+		    wifi_events[i].elements;
+		if (offload) continue;
+		if (!elements) return EINVAL;
+		size_t length = (size_t)elements * 16;
+		error = allocate_aligned(host, length, length, &host->event_ring[i]);
 		if (error) return error;
-		memset(tables[i]->bytes, 0, tables[i]->size);
+		memset(host->event_ring[i].bytes, 0, host->event_ring[i].size);
 	}
 	setup_stock_channel_contexts(host);
-	const unsigned elements[] = { 32, 256, 32 }, vectors[] = { 1, 2, 0 };
-	for (unsigned i = 0; i < 3; i++) {
+	for (unsigned i = 0; i < event_contexts; i++) {
+		bool offload = sdx55 && (SDX55_EVENT_OFFLOAD_MASK & (1u << i));
+		if (offload) continue;
+		unsigned elements = sdx55 ? sdx55_events[i].elements :
+		    wifi_events[i].elements;
+		unsigned vector = sdx55 ? sdx55_events[i].vector : wifi_events[i].vector;
+		unsigned intmod = sdx55 ? sdx55_events[i].intmod : wifi_events[i].intmod;
 		uint32_t *context = (uint32_t *)host->events.bytes + i * 11;
 		uint64_t base = host->event_ring[i].address;
-		uint64_t length = elements[i] * 16;
-		context[0] = i == 2 ? 1u << 16 : 0; /* stock interrupt moderation */
+		uint64_t length = (uint64_t)elements * 16;
+		context[0] = intmod << 16;
 		context[1] = 1;                   /* valid software event ring */
-		context[2] = vectors[i];
+		context[2] = vector;
 		context_address(context, 3, base);
 		context_address(context, 5, length);
 		context_address(context, 7, base);
@@ -270,27 +392,46 @@ umi_mhi_prepare_ready(struct umi_mhi *host)
 	context_address(command, 5, 128 * 16);
 	context_address(command, 7, host->command_ring.address);
 	context_address(command, 9, host->command_ring.address);
-	for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); i++)
-		host->io->sync_for_device(host->io->context, tables[i]);
-	for (unsigned i = 0; i < 3; i++) {
+	host->io->sync_for_device(host->io->context, &host->channels);
+	host->io->sync_for_device(host->io->context, &host->events);
+	host->io->sync_for_device(host->io->context, &host->commands);
+	host->io->sync_for_device(host->io->context, &host->command_ring);
+	for (unsigned i = 0; i < event_contexts; i++) {
+		if (sdx55 && (SDX55_EVENT_OFFLOAD_MASK & (1u << i))) continue;
+		host->io->sync_for_device(host->io->context, &host->event_ring[i]);
 		host->event_consumer[i] = host->event_ring[i].address;
 		host->event_wp[i] = host->event_ring[i].address +
-		    sizes[4 + i] - 16;
+		    host->event_ring[i].size - 16;
 	}
 	host->command_wp = host->command_ring.address;
 	write_address(host, 0x58, host->channels.address);
 	write_address(host, 0x60, host->events.address);
 	write_address(host, 0x68, host->commands.address);
-	write_address(host, 0x80, DMA_START);
-	write_address(host, 0x88, DMA_END);
-	write_address(host, 0x98, DMA_START);
-	write_address(host, 0xa0, DMA_END);
-	write_reg(host, 0x10, (config & 0xffff) | (3u << 16));
+	uint64_t dma_start = host->io->dma_start ? host->io->dma_start : DMA_START;
+	uint64_t dma_end = host->io->dma_end ? host->io->dma_end : DMA_END;
+	write_address(host, 0x80, dma_start);
+	write_address(host, 0x88, dma_end - 1);
+	write_address(host, 0x98, dma_start);
+	write_address(host, 0xa0, dma_end - 1);
+	uint32_t programmed_config = (config & 0xffff) | (event_contexts << 16);
+	if (sdx55) programmed_config |= SDX55_HW_EVENT_RINGS << 24;
+	write_reg(host, 0x10, programmed_config);
+	report(host, "MHI channel context base low", read_reg(host, 0x58));
+	report(host, "MHI event context base low", read_reg(host, 0x60));
+	report(host, "MHI command context base low", read_reg(host, 0x68));
+	report(host, "MHI configuration after context install", read_reg(host, 0x10));
+	uint32_t *event0 = host->events.bytes;
+	report(host, "MHI event 0 type/vector", (event0[1] & 0xffff) |
+	    ((event0[2] & 0xffff) << 16));
 	dma_write_barrier();
 	/* Publish free event entries while READY, before requesting M0. */
-	for (unsigned e = 0; e < 3; e++)
+	for (unsigned e = 0; e < event_contexts; e++) {
+		if (sdx55 && (SDX55_EVENT_OFFLOAD_MASK & (1u << e))) continue;
+		unsigned elements = sdx55 ? sdx55_events[e].elements :
+		    wifi_events[e].elements;
 		write_address(host, host->event_db + e * 8,
-		    host->event_ring[e].address + elements[e] * 16 - 16);
+		    host->event_ring[e].address + (uint64_t)elements * 16 - 16);
+	}
 	write_reg(host, 0x38, (control & ~0xff00u) | 0x200); /* request M0 */
 	for (unsigned i = 0; i < POLLS; i++) {
 		status = read_reg(host, 0x48);
@@ -350,6 +491,8 @@ umi_mhi_download_sbl(struct umi_mhi *host, const void *image, size_t size)
 int
 umi_mhi_download_amss(struct umi_mhi *host, const void *image, size_t size)
 {
+	if (!host || !host->io) return EINVAL;
+	if (!host->bhie) return ENOTSUP;
 	int error = check_download(host, image, size, 1); /* SBL */
 	if (error) return error;
 	if (!host->sbl_sent || !host->contexts_ready) return EBUSY;
@@ -411,15 +554,217 @@ umi_mhi_wait_mission(struct umi_mhi *host)
 /* Recycle event entries in the same format as the Linux MHI host. Device RP
  * lives in each event context; host WP is advanced after consuming entries.
  */
+static unsigned
+ipcr_event_ring(const struct umi_mhi *host)
+{
+	return host->io->profile == UMI_MHI_PROFILE_SDX55 ? 2 : IPCR_EVENT_RING;
+}
+
+enum { EFS_HELLO, EFS_ANNOUNCE, EFS_TABLE, EFS_DATA, EFS_RESET };
+enum { EFS_SLOTS = 64, EFS_CHUNK = 4096 };
+
+/* The stock UMI ks exchange on pipe 10 announces one 52-byte memory-debug
+ * entry. Addresses in the table are remote Sahara addresses, never AP pointers.
+ * Keep the bounded session's snapshot in separate CPU memory. */
+static int
+efs_reply(struct umi_mhi *host, const void *input, unsigned bytes, uint32_t out[12], unsigned *length)
+{
+	const uint32_t *w = input;
+	*length = 0;
+	memset(out, 0, 48);
+	switch (host->efs_state) {
+	case EFS_HELLO:
+		if (bytes != 48 || w[0] != 1 || w[1] != bytes ||
+		    w[2] < 2 || w[3] > 2 || w[5] != 2) return ENOTSUP;
+		out[0] = 2; out[2] = 2; out[3] = 1; out[5] = 2;
+		out[1] = *length = 48;
+		host->efs_state = EFS_ANNOUNCE;
+		return 0;
+	case EFS_ANNOUNCE:
+		if (bytes != 16 || w[0] != 9 || w[1] != bytes || w[3] != 52 ||
+		    w[2] > UINT32_MAX - 51) return ENOTSUP;
+		out[2] = w[2]; out[3] = 52;
+		host->efs_state = EFS_TABLE;
+		break;
+	case EFS_TABLE: {
+		if (bytes != 52) return ENOTSUP;
+		const uint8_t *name = (const uint8_t *)input + 32;
+		if (memcmp(name, "m9kefs", 6) || name[6] < '1' ||
+		    name[6] > '3' || name[7] || !host->efs_shadow ||
+		    w[2] != UMI_EFS_SHADOW_BYTES || w[1] > UINT32_MAX - (w[2] - 1)) return ENOTSUP;
+		report(host, "mission EFS snapshot partition", name[6] - '0');
+		host->efs_base = w[1];
+		host->efs_offset = 0;
+		out[2] = host->efs_base; out[3] = EFS_CHUNK;
+		host->efs_state = EFS_DATA;
+		break;
+	}
+	case EFS_DATA:
+		if (bytes != EFS_CHUNK || host->efs_offset > UMI_EFS_SHADOW_BYTES - bytes) return EIO;
+		memcpy(host->efs_shadow + host->efs_offset, input, bytes);
+		host->efs_offset += bytes;
+		if (host->efs_offset == UMI_EFS_SHADOW_BYTES) {
+			report(host, "mission EFS bytes copied to RAM", host->efs_offset);
+			out[0] = 7; out[1] = *length = 8;
+			host->efs_state = EFS_RESET;
+			return 0;
+		}
+		out[2] = host->efs_base + host->efs_offset; out[3] = EFS_CHUNK;
+		break;
+	case EFS_RESET:
+		if (bytes != 8 || w[0] != 8 || w[1] != bytes) return EIO;
+		host->efs_state = EFS_HELLO;
+		report(host, "mission EFS sync completed", 1);
+		return 0;
+	default:
+		return EIO;
+	}
+	out[0] = 10; out[1] = *length = 16;
+	return 0;
+}
+
+static void
+efs_post(struct umi_mhi *host, unsigned channel, struct umi_mhi_dma *ring,
+    unsigned slot, uint64_t buffer, unsigned size)
+{
+	uint32_t *tre = (uint32_t *)ring->bytes + slot * 4;
+	words_set_address(tre, 0, buffer);
+	tre[2] = size;
+	tre[3] = (2u << 16) | (1u << 9);
+	uint64_t wp = ring->address + ((slot + 1) % EFS_SLOTS) * 16u;
+	sync_for_cpu(host, &host->channels);
+	words_set_address((uint32_t *)host->channels.bytes + channel * 11, 9, wp);
+	host->io->sync_for_device(host->io->context, ring);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	write_address(host, host->channel_db + channel * 8, wp);
+}
+
+static int
+efs_receive(struct umi_mhi *host, uint64_t pointer, unsigned bytes)
+{
+	if (pointer != host->efs_rx_ring.address + host->efs_rx_slot * 16u || bytes > EFS_CHUNK) return EIO;
+	sync_for_cpu(host, &host->efs_rx_buffer);
+	dma_read_barrier();
+	uint32_t reply[12];
+	unsigned length = 0;
+	int error = efs_reply(host, host->efs_rx_buffer.bytes, bytes, reply, &length);
+	if (error) {
+		report(host, "mission EFS unexpected state", host->efs_state);
+		report(host, "mission EFS unexpected size", bytes);
+		return error;
+	}
+	if (length && host->efs_tx_count >= EFS_SLOTS - 1) return ENOBUFS;
+	host->efs_rx_slot = (host->efs_rx_slot + 1) % EFS_SLOTS;
+	efs_post(host, 11, &host->efs_rx_ring, host->efs_rx_slot, host->efs_rx_buffer.address, EFS_CHUNK);
+	/* RESET_RESP has no UL reply. Keep DL posted for the next backup. */
+	if (!length) return 0;
+	unsigned slot = host->efs_tx_slot;
+	memcpy((uint8_t *)host->efs_tx_buffers.bytes + slot * 64, reply, length);
+	host->io->sync_for_device(host->io->context, &host->efs_tx_buffers);
+	host->efs_tx_count++;
+	host->efs_tx_slot = (slot + 1) % EFS_SLOTS;
+	efs_post(host, 10, &host->efs_tx_ring, slot, host->efs_tx_buffers.address + slot * 64, length);
+	return 0;
+}
+
+/* One buffer per direction. A descriptor keeps its buffer until a matching
+ * completion or until the PCIe owner asserts PERST and revokes DMA. */
+static void
+cell_post(struct umi_mhi *host, bool receive, bool ring_doorbell)
+{
+	struct umi_mhi_dma *ring = receive ? &host->cell_rx_ring : &host->cell_tx_ring;
+	struct umi_mhi_dma *buffer = receive ? &host->cell_rx_buffer : &host->cell_tx_buffer;
+	unsigned slot = receive ? host->cell_rx_slot : host->cell_tx_slot;
+	unsigned channel = receive ? CELL_RX_CHANNEL : CELL_TX_CHANNEL;
+	uint64_t pending = ring->address + (uint64_t)slot * 16;
+	uint64_t next = ring_next(ring->address, ring->size, pending);
+	uint32_t *tre = (uint32_t *)ring->bytes + slot * 4;
+	words_set_address(tre, 0, buffer->address);
+	tre[2] = receive ? UMI_MHI_CELL_MRU : host->cell_tx_bytes;
+	tre[3] = (2u << 16) | (1u << 9); /* transfer, interrupt on EOT */
+	host->io->sync_for_device(host->io->context, ring);
+	sync_for_cpu(host, &host->channels);
+	uint32_t *ctx = (uint32_t *)host->channels.bytes + channel * 11;
+	words_set_address(ctx, 9, next);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	if (ring_doorbell) write_address(host, host->channel_db + channel * 8, next);
+}
+
+static void
+cell_complete_rx(struct umi_mhi *host, unsigned code, size_t length)
+{
+	if (!host->io->cell_rx) return;
+	sync_for_cpu(host, &host->cell_rx_buffer);
+	bool end = code == 2;
+	if (host->cell_rx_drop || length > UMI_MHI_CELL_MRU - host->cell_rx_partial) {
+		/* A fragment exceeds the aggregate limit. Discard through the EOT
+		 * so the suffix cannot be delivered as an independent packet. */
+		host->cell_rx_drop = !end;
+		host->cell_rx_partial = 0;
+		return;
+	}
+	const void *payload = host->cell_rx_buffer.bytes;
+	if (!end || host->cell_rx_partial) {
+		uint8_t *assembly = host->cell_rx_assembly.bytes;
+		memcpy(assembly + host->cell_rx_partial, payload, length);
+		host->cell_rx_partial += length;
+		if (!end) return;
+		payload = assembly;
+		length = host->cell_rx_partial;
+		host->cell_rx_partial = 0;
+	}
+	if (length) host->io->cell_rx(host->io->context, payload, length);
+}
+
+static int
+cell_event(struct umi_mhi *host, unsigned ring, unsigned type, unsigned channel,
+    unsigned code, uint64_t pointer, unsigned length)
+{
+	bool receive = ring == CELL_RX_EVENT;
+	if (!host->cell_started || type != 0x22 ||
+	    channel != (receive ? CELL_RX_CHANNEL : CELL_TX_CHANNEL)) return EIO;
+
+	struct umi_mhi_dma *tr = receive ? &host->cell_rx_ring : &host->cell_tx_ring;
+	unsigned slot = receive ? host->cell_rx_slot : host->cell_tx_slot;
+	uint64_t posted = tr->address + (uint64_t)slot * 16;
+	if (code == 5 || code == 6) { /* OOB or DB_MODE */
+		if (!receive && !host->cell_tx_bytes) {
+			host->cell_tx_db_armed = true;
+		} else {
+			dma_write_barrier();
+			write_address(host, host->channel_db + channel * 8,
+			    ring_next(tr->address, tr->size, posted));
+		}
+		return 0;
+	}
+	if (pointer != posted) return EIO;
+	if (!receive) {
+		if (code != 2 || !host->cell_tx_bytes || length != host->cell_tx_bytes)
+			return EIO;
+		host->cell_tx_bytes = 0;
+		host->cell_tx_slot = (slot + 1) % CELL_TR_ELEMENTS;
+		return 0;
+	}
+	if ((code != 2 && code != 3 && code != 4) || length > UMI_MHI_CELL_MRU) return EIO;
+	if (!host->cell_rx_count++) report(host, "IP_HW0 first RX completion code/bytes", (code << 24) | length);
+	cell_complete_rx(host, code, length);
+	host->cell_rx_slot = (slot + 1) % CELL_TR_ELEMENTS;
+	/* The next buffer is visible in memory. OOB/DB_MODE requests the bell. */
+	cell_post(host, true, false);
+	return 0;
+}
+
 static int
 service_event_ring(struct umi_mhi *host, unsigned ring, uint64_t command,
 	int *command_cc, unsigned *received)
 {
-	if (ring >= 3 || !host->event_ring[ring].bytes) return EINVAL;
-	static const size_t ring_lengths[] = { 32u * 16u, 256u * 16u, 32u * 16u };
+	if (ring >= SDX55_EVENT_CONTEXTS || !host->event_ring[ring].bytes) return EINVAL;
 	uint32_t *context = (uint32_t *)host->events.bytes + ring * 11;
 	uint64_t base = host->event_ring[ring].address;
-	size_t length = ring_lengths[ring];
+	size_t length = host->event_ring[ring].size;
+	sync_for_cpu(host, &host->events);
 	uint64_t producer = words_address(context, 7);
 	if (!ring_pointer_valid(base, length, producer)) return EIO;
 	unsigned processed = 0;
@@ -428,11 +773,16 @@ service_event_ring(struct umi_mhi *host, unsigned ring, uint64_t command,
 		size_t offset = (size_t)(current - base);
 		volatile uint32_t *event = (volatile uint32_t *)
 		    ((volatile uint8_t *)host->event_ring[ring].bytes + offset);
-		dma_read_barrier();
+		sync_for_cpu(host, &host->event_ring[ring]);
 		uint64_t pointer = event[0] | (uint64_t)event[1] << 32;
 		uint32_t dword0 = event[2], dword1 = event[3];
 		unsigned type = (dword1 >> 16) & 0xff;
 		unsigned code = dword0 >> 24;
+		if (ring == CELL_TX_EVENT || ring == CELL_RX_EVENT) {
+			int error = cell_event(host, ring, type, dword1 >> 24, code, pointer, dword0 & 0xffff);
+			if (error) return error;
+		}
+		if (!ring && type == 0x40 && code == 2) host->mission_event_seen = true;
 		if (ring == 0 && type == 0x21 && pointer == command && command_cc)
 			*command_cc = (int)code;
 		if (type == 0x20 || type == 0x21 || type == 0x40 ||
@@ -440,7 +790,87 @@ service_event_ring(struct umi_mhi *host, unsigned ring, uint64_t command,
 			report(host, "MHI control event type/code", (type << 24) | code);
 			report(host, "MHI control event data", dword1);
 		}
-		if (ring == IPCR_EVENT_RING && type == 0x22 &&
+		if (ring == SAHARA_EVENT_RING && type == 0x22 &&
+		    ((dword1 >> 24) & 0xff) == SAHARA_TX_CHANNEL && host->sahara_started) {
+			if (code != 2 || pointer != host->sahara_tx_pending) return EIO;
+			host->sahara_tx_done = true;
+			host->sahara_tx_pending = UINT64_MAX;
+		}
+		if (ring == SAHARA_EVENT_RING && type == 0x22 &&
+		    ((dword1 >> 24) & 0xff) == SAHARA_RX_CHANNEL &&
+		    host->sahara_started) {
+			uint32_t length_done = dword0 & 0xffff;
+			if (code != 2 || pointer < host->sahara_rx_ring.address ||
+			    pointer >= host->sahara_rx_ring.address +
+			    SAHARA_RING_ELEMENTS * 16u ||
+			    ((pointer - host->sahara_rx_ring.address) & 15)) return EIO;
+			unsigned slot = (unsigned)((pointer -
+			    host->sahara_rx_ring.address) / 16u);
+			const uint32_t *completed = (const uint32_t *)
+			    host->sahara_rx_ring.bytes + slot * 4;
+			uint64_t buffer = completed[0] | (uint64_t)completed[1] << 32;
+			if (buffer < host->sahara_rx_buffers.address ||
+			    buffer >= host->sahara_rx_buffers.address +
+			    host->sahara_rx_buffers.size || length_done > SAHARA_BUFFER_SIZE ||
+			    (buffer - host->sahara_rx_buffers.address) % SAHARA_BUFFER_SIZE)
+				return EIO;
+			sync_for_cpu(host, &host->sahara_rx_buffers);
+			const uint32_t *payload = (const uint32_t *)
+			    ((const uint8_t *)host->sahara_rx_buffers.bytes +
+			    (size_t)(buffer - host->sahara_rx_buffers.address));
+			if (length_done < 8 || length_done > sizeof(host->sahara_rx_words) ||
+			    payload[1] != length_done) return EIO;
+			if (host->sahara_received) {
+				if (host->sahara_queue_count == 4) return ENOBUFS;
+				unsigned slot = (host->sahara_queue_head + host->sahara_queue_count) % 4;
+				memset(host->sahara_queued[slot], 0, sizeof(host->sahara_rx_words));
+				memcpy(host->sahara_queued[slot], payload, length_done);
+				host->sahara_queued_bytes[slot] = length_done;
+				++host->sahara_queue_count;
+			} else {
+				memset(host->sahara_rx_words, 0, sizeof(host->sahara_rx_words));
+				memcpy(host->sahara_rx_words, payload, length_done);
+				host->sahara_rx_bytes = length_done;
+			}
+			if (payload[0] != 3 && payload[0] != 0x12) {
+				report(host, "Sahara first RX command", payload[0]);
+				report(host, "Sahara RX bytes", length_done);
+			}
+			host->sahara_received = true;
+			if (received) ++*received;
+			/* Repost this payload at the producer end only after copying it.
+			 * One synchronous protocol owner consumes the saved request. */
+			uint64_t wp = host->sahara_rx_wp;
+			uint32_t *repost = (uint32_t *)host->sahara_rx_ring.bytes +
+			    (size_t)(wp - host->sahara_rx_ring.address) / 4;
+			words_set_address(repost, 0, buffer);
+			repost[2] = SAHARA_BUFFER_SIZE;
+			repost[3] = (2u << 16) | (1u << 9);
+			host->sahara_rx_wp = ring_next(host->sahara_rx_ring.address,
+			    SAHARA_RING_ELEMENTS * 16u, wp);
+			sync_for_cpu(host, &host->channels);
+			uint32_t *rx = (uint32_t *)host->channels.bytes + SAHARA_RX_CHANNEL * 11;
+			words_set_address(rx, 9, host->sahara_rx_wp);
+			host->io->sync_for_device(host->io->context, &host->sahara_rx_ring);
+			host->io->sync_for_device(host->io->context, &host->channels);
+			dma_write_barrier();
+			write_address(host, host->channel_db + SAHARA_RX_CHANNEL * 8,
+			    host->sahara_rx_wp);
+		}
+		if (ring == 1 && type == 0x22 && host->efs_rx_ring.bytes) {
+			unsigned channel = dword1 >> 24;
+			if (channel == 11) {
+				if (code != 2) return EIO;
+				int error = efs_receive(host, pointer, dword0 & 0xffff);
+				if (error) return error;
+			} else if (channel == 10) {
+				if (code != 2 || !host->efs_tx_count ||
+				    pointer != host->efs_tx_ring.address + host->efs_tx_head * 16u) return EIO;
+				host->efs_tx_count--;
+				host->efs_tx_head = (host->efs_tx_head + 1) % EFS_SLOTS;
+			}
+		}
+		if (ring == ipcr_event_ring(host) && type == 0x22 &&
 		    ((dword1 >> 24) & 0xff) == IPCR_TX_CHANNEL) {
 			if (!host->ipcr_tx_pending || pointer !=
 			    host->ipcr_tx_ring.address + (uint64_t)host->ipcr_tx_slot * 16u) {
@@ -452,7 +882,7 @@ service_event_ring(struct umi_mhi *host, unsigned ring, uint64_t command,
 			host->ipcr_tx_done = code == 2; /* transfer EOT, unlike command CC_SUCCESS=1 */
 			if (code != 2) return EIO;
 		}
-		if (ring == IPCR_EVENT_RING && type == 0x22 &&
+		if (ring == ipcr_event_ring(host) && type == 0x22 &&
 		    ((dword1 >> 24) & 0xff) == IPCR_RX_CHANNEL) {
 			uint32_t length_done = dword0 & 0xffff;
 			if (pointer < host->ipcr_rx_ring.address ||
@@ -465,7 +895,7 @@ service_event_ring(struct umi_mhi *host, unsigned ring, uint64_t command,
 			unsigned tre_slot = (unsigned)((pointer - host->ipcr_rx_ring.address) / 16);
 			const volatile uint32_t *completed_tre = (const volatile uint32_t *)
 			    ((const volatile uint8_t *)host->ipcr_rx_ring.bytes + tre_slot * 16u);
-			dma_read_barrier();
+			sync_for_cpu(host, &host->ipcr_rx_buffers);
 			uint64_t buffer = completed_tre[0] |
 			    (uint64_t)completed_tre[1] << 32;
 			if (buffer < host->ipcr_rx_buffers.address ||
@@ -499,9 +929,12 @@ service_event_ring(struct umi_mhi *host, unsigned ring, uint64_t command,
 			tre[3] = (2u << 16) | (1u << 9); /* transfer, interrupt on EOT */
 			host->ipcr_rx_wp = ring_next(host->ipcr_rx_ring.address,
 			    IPCR_RING_ELEMENTS * 16u, next);
+			sync_for_cpu(host, &host->channels);
 			uint32_t *channel = (uint32_t *)host->channels.bytes + IPCR_RX_CHANNEL * 11;
 			words_set_address(channel, 9, host->ipcr_rx_wp);
 			host->io->sync_for_device(host->io->context, &host->ipcr_rx_ring);
+			host->io->sync_for_device(host->io->context, &host->channels);
+			dma_write_barrier();
 			write_address(host, host->channel_db + IPCR_RX_CHANNEL * 8,
 			    host->ipcr_rx_wp);
 		}
@@ -514,7 +947,9 @@ service_event_ring(struct umi_mhi *host, unsigned ring, uint64_t command,
 	if (processed) {
 		words_set_address(context, 9, host->event_wp[ring]);
 		host->io->sync_for_device(host->io->context, &host->events);
-		write_address(host, host->event_db + ring * 8, host->event_wp[ring]);
+		/* ER7/8 are burst-enabled and already doorbelled on entry to AMSS. */
+		if (ring != CELL_TX_EVENT && ring != CELL_RX_EVENT)
+			write_address(host, host->event_db + ring * 8, host->event_wp[ring]);
 	}
 	return 0;
 }
@@ -532,6 +967,7 @@ send_nop(struct umi_mhi *host)
 	tre[3] = 1u << 16; /* MHI_CMD_NOP */
 	uint64_t next = ring_next(base, length, command);
 	uint32_t *context = host->commands.bytes;
+	sync_for_cpu(host, &host->commands);
 	words_set_address(context, 9, next);
 	host->io->sync_for_device(host->io->context, &host->command_ring);
 	host->io->sync_for_device(host->io->context, &host->commands);
@@ -570,6 +1006,7 @@ start_channel(struct umi_mhi *host, unsigned channel)
 	tre[3] = (channel << 24) | (18u << 16); /* START_CHAN */
 	uint64_t next = ring_next(base, length, command);
 	uint32_t *context = host->commands.bytes;
+	sync_for_cpu(host, &host->commands);
 	words_set_address(context, 9, next);
 	host->io->sync_for_device(host->io->context, &host->command_ring);
 	host->io->sync_for_device(host->io->context, &host->commands);
@@ -603,6 +1040,9 @@ start_channel(struct umi_mhi *host, unsigned channel)
 	uint32_t *command_context = host->commands.bytes;
 	uint32_t *channel_context = (uint32_t *)host->channels.bytes + channel * 11;
 	uint32_t *control_event = host->events.bytes;
+	sync_for_cpu(host, &host->commands);
+	sync_for_cpu(host, &host->channels);
+	sync_for_cpu(host, &host->events);
 	report(host, "MHI status after channel timeout", read_reg(host, 0x48));
 	report(host, "MHI control after channel timeout", read_reg(host, 0x38));
 	report(host, "MHI command RP low", command_context[7]);
@@ -633,11 +1073,347 @@ setup_ipcr_channel(struct umi_mhi *host, unsigned channel, unsigned direction,
 	memset(context, 0, 11 * sizeof(*context));
 	context[0] = 1u | (2u << 8); /* ENABLED, burst mode disabled */
 	context[1] = direction;
-	context[2] = IPCR_EVENT_RING;
+	context[2] = ipcr_event_ring(host);
 	words_set_address(context, 3, ring->address);
 	words_set_address(context, 5, IPCR_RING_ELEMENTS * 16u);
 	words_set_address(context, 7, ring->address);
 	words_set_address(context, 9, write_pointer);
+}
+
+static void
+setup_sahara_channel(struct umi_mhi *host, unsigned channel, unsigned direction,
+	const struct umi_mhi_dma *ring, uint64_t write_pointer)
+{
+	uint32_t *context = (uint32_t *)host->channels.bytes + channel * 11;
+	memset(context, 0, 11 * sizeof(*context));
+	context[0] = 1u | (2u << 8);
+	context[1] = direction;
+	context[2] = SAHARA_EVENT_RING;
+	words_set_address(context, 3, ring->address);
+	words_set_address(context, 5, SAHARA_RING_ELEMENTS * 16u);
+	words_set_address(context, 7, ring->address);
+	words_set_address(context, 9, write_pointer);
+}
+
+int
+umi_mhi_probe_sahara(struct umi_mhi *host, unsigned timeout_ms)
+{
+	if (!host || !host->io || host->io->profile != UMI_MHI_PROFILE_SDX55)
+		return EINVAL;
+	if (host->poisoned) return EIO;
+	if (!host->contexts_ready) return EBUSY;
+	if (host->sahara_started || host->sahara_tx_ring.bytes ||
+	    host->sahara_rx_ring.bytes || host->sahara_rx_buffers.bytes)
+		return EALREADY;
+	if (!timeout_ms || timeout_ms > 10000) return EINVAL;
+	uint32_t ee;
+	int error = umi_mhi_execution_environment(host, &ee);
+	if (error || ee != 1) return error ? error : EBUSY;
+	size_t ring_size = SAHARA_RING_ELEMENTS * 16u;
+	error = allocate_aligned(host, ring_size, ring_size, &host->sahara_tx_ring);
+	if (!error) error = allocate_aligned(host, ring_size, ring_size,
+	    &host->sahara_rx_ring);
+	if (!error) error = allocate(host, SAHARA_RX_BUFFERS * SAHARA_BUFFER_SIZE,
+	    &host->sahara_rx_buffers);
+	if (error) return error;
+	memset(host->sahara_tx_ring.bytes, 0, host->sahara_tx_ring.size);
+	memset(host->sahara_rx_ring.bytes, 0, host->sahara_rx_ring.size);
+	memset(host->sahara_rx_buffers.bytes, 0, host->sahara_rx_buffers.size);
+	setup_sahara_channel(host, SAHARA_TX_CHANNEL, 1, &host->sahara_tx_ring,
+	    host->sahara_tx_ring.address);
+	setup_sahara_channel(host, SAHARA_RX_CHANNEL, 2, &host->sahara_rx_ring,
+	    host->sahara_rx_ring.address);
+	host->io->sync_for_device(host->io->context, &host->sahara_tx_ring);
+	host->io->sync_for_device(host->io->context, &host->sahara_rx_ring);
+	host->io->sync_for_device(host->io->context, &host->sahara_rx_buffers);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	for (unsigned ring = 0; ring < 3; ring++) {
+		error = service_event_ring(host, ring, UINT64_MAX, NULL, NULL);
+		if (error) { host->poisoned = true; return error; }
+	}
+	error = send_nop(host);
+	if (!error) error = start_channel(host, SAHARA_TX_CHANNEL);
+	if (!error) error = start_channel(host, SAHARA_RX_CHANNEL);
+	if (error) { host->poisoned = true; return error; }
+	for (unsigned i = 0; i < SAHARA_RX_BUFFERS; i++) {
+		uint32_t *tre = (uint32_t *)host->sahara_rx_ring.bytes + i * 4;
+		uint64_t buffer = host->sahara_rx_buffers.address +
+		    (uint64_t)i * SAHARA_BUFFER_SIZE;
+		tre[0] = (uint32_t)buffer;
+		tre[1] = (uint32_t)(buffer >> 32);
+		tre[2] = SAHARA_BUFFER_SIZE;
+		tre[3] = (2u << 16) | (1u << 9);
+	}
+	uint64_t rx_wp = host->sahara_rx_ring.address + SAHARA_RX_BUFFERS * 16u;
+	sync_for_cpu(host, &host->channels);
+	uint32_t *rx_context = (uint32_t *)host->channels.bytes +
+	    SAHARA_RX_CHANNEL * 11;
+	words_set_address(rx_context, 9, rx_wp);
+	host->io->sync_for_device(host->io->context, &host->sahara_rx_ring);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	host->sahara_started = true;
+	host->sahara_rx_wp = rx_wp;
+	host->sahara_tx_wp = host->sahara_tx_ring.address;
+	host->sahara_tx_pending = UINT64_MAX;
+	write_address(host, host->channel_db + SAHARA_RX_CHANNEL * 8, rx_wp);
+	for (unsigned ms = 0; ms < timeout_ms; ms++) {
+		unsigned received = 0;
+		for (unsigned ring = 0; ring < 3; ring++) {
+			error = service_event_ring(host, ring, UINT64_MAX, NULL, &received);
+			if (error) { host->poisoned = true; return error; }
+		}
+		if (host->sahara_received) return 0;
+		host->io->delay_us(host->io->context, 1000);
+	}
+	report(host, "Sahara first RX timeout status", read_reg(host, 0x48));
+	return ETIMEDOUT;
+}
+
+static int
+sahara_send(struct umi_mhi *host, const void *bytes, size_t size,
+    unsigned timeout_ms)
+{
+	if (!size || size > SAHARA_BUFFER_SIZE ||
+	    host->sahara_tx_pending != UINT64_MAX) return EINVAL;
+	if (!host->sahara_tx_buffer.bytes) {
+		int error = allocate(host, SAHARA_BUFFER_SIZE, &host->sahara_tx_buffer);
+		if (error) return error;
+	}
+	memcpy(host->sahara_tx_buffer.bytes, bytes, size);
+	uint64_t current = host->sahara_tx_wp;
+	if (!ring_pointer_valid(host->sahara_tx_ring.address,
+	    SAHARA_RING_ELEMENTS * 16u, current)) return EIO;
+	uint32_t *tre = (uint32_t *)host->sahara_tx_ring.bytes +
+	    (size_t)(current - host->sahara_tx_ring.address) / 4;
+	words_set_address(tre, 0, host->sahara_tx_buffer.address);
+	tre[2] = (uint32_t)size; tre[3] = (2u << 16) | (1u << 9);
+	host->sahara_tx_wp = ring_next(host->sahara_tx_ring.address,
+	    SAHARA_RING_ELEMENTS * 16u, current);
+	sync_for_cpu(host, &host->channels);
+	uint32_t *channel = (uint32_t *)host->channels.bytes + SAHARA_TX_CHANNEL * 11;
+	words_set_address(channel, 9, host->sahara_tx_wp);
+	host->io->sync_for_device(host->io->context, &host->sahara_tx_buffer);
+	host->io->sync_for_device(host->io->context, &host->sahara_tx_ring);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	host->sahara_tx_done = false;
+	host->sahara_tx_pending = current;
+	dma_write_barrier();
+	write_address(host, host->channel_db + SAHARA_TX_CHANNEL * 8,
+	    host->sahara_tx_wp);
+	for (unsigned ms = 0; ms < timeout_ms; ms++) {
+		for (unsigned ring = 0; ring < 3; ring++) {
+			int error = service_event_ring(host, ring, UINT64_MAX, NULL, NULL);
+			if (error) { host->poisoned = true; return error; }
+		}
+		if (host->sahara_tx_done) return 0;
+		host->io->delay_us(host->io->context, 1000);
+	}
+	host->poisoned = true;
+	return ETIMEDOUT;
+}
+
+static int
+sahara_wait_request(struct umi_mhi *host, unsigned timeout_ms)
+{
+	for (unsigned ms = 0; ms < timeout_ms; ms++) {
+		if (host->sahara_received) return 0;
+		for (unsigned ring = 0; ring < 3; ring++) {
+			int error = service_event_ring(host, ring, UINT64_MAX, NULL, NULL);
+			if (error) { host->poisoned = true; return error; }
+		}
+		if (host->sahara_received) return 0;
+		host->io->delay_us(host->io->context, 1000);
+	}
+	return ETIMEDOUT;
+}
+
+int
+umi_mhi_sahara_handshake(struct umi_mhi *host, unsigned timeout_ms)
+{
+	if (!host || !host->io || !host->sahara_started ||
+	    !host->sahara_received || !timeout_ms || timeout_ms > 10000) return EINVAL;
+	if (host->poisoned) return EIO;
+	const uint32_t *hello = host->sahara_rx_words;
+	if (host->sahara_rx_bytes != 0x30 || hello[0] != 1) return ENOTSUP;
+	report(host, "Sahara HELLO version", hello[2]);
+	report(host, "Sahara HELLO compatible version", hello[3]);
+	report(host, "Sahara HELLO max command length", hello[4]);
+	report(host, "Sahara HELLO mode", hello[5]);
+	if (hello[2] < 2 || hello[3] > 2 || hello[5] > 3) return ENOTSUP;
+	uint32_t response[12] = {0};
+	response[0] = 2; response[1] = 0x30;
+	response[2] = 2; response[3] = 1; /* compatible with Sahara v1/v2 */
+	response[5] = hello[5];
+	/* Echo the target mode. A memory-debug announcement is reported only. */
+	sahara_consume(host);
+	int error = sahara_send(host, response, sizeof(response), timeout_ms);
+	if (error) return error;
+	report(host, "Sahara HELLO response TX completion", 2);
+	for (unsigned ms = 0; ms < timeout_ms; ms++) {
+		for (unsigned ring = 0; ring < 3; ring++) {
+			error = service_event_ring(host, ring, UINT64_MAX, NULL, NULL);
+			if (error) { host->poisoned = true; return error; }
+		}
+		if (host->sahara_received && host->sahara_tx_done) {
+			const uint32_t *request = host->sahara_rx_words;
+			report(host, "Sahara next request command", request[0]);
+			if (request[0] == 3 && host->sahara_rx_bytes == 0x14) {
+				report(host, "Sahara requested image ID", request[2]);
+				report(host, "Sahara requested image offset", request[3]);
+				report(host, "Sahara requested image bytes", request[4]);
+				return request[4] ? 0 : EIO;
+			}
+			if (request[0] == 0x12 && host->sahara_rx_bytes == 0x20) {
+				report(host, "Sahara requested image ID", request[2]);
+				report(host, "Sahara requested image offset", request[4]);
+				report(host, "Sahara requested image bytes", request[6]);
+				return request[3] || request[5] || request[7] || !request[6] ? EIO : 0;
+			}
+			return ENOTSUP;
+		}
+		host->io->delay_us(host->io->context, 1000);
+	}
+	return ETIMEDOUT;
+}
+
+int
+umi_mhi_sahara_next_image(struct umi_mhi *host, unsigned timeout_ms)
+{
+	if (!host || !host->io || !host->sahara_started ||
+	    !timeout_ms || timeout_ms > 10000) return EINVAL;
+	if (host->poisoned) return EIO;
+	int error = sahara_wait_request(host, timeout_ms);
+	if (error) return error;
+	return umi_mhi_sahara_handshake(host, timeout_ms);
+}
+
+int
+umi_mhi_sahara_serve_image(struct umi_mhi *host, uint32_t image_id,
+    const void *image, size_t size, unsigned timeout_ms)
+{
+	if (!host || !host->io || !host->sahara_started || !image || !size || size > 0x10000000u ||
+	    !timeout_ms || timeout_ms > 10000) return EINVAL;
+	if (host->poisoned) return EIO;
+	/* Limit both request count and total data, including repeated requests. */
+	uint64_t sent = 0;
+	for (unsigned request_count = 0; request_count < 256 + size / 4096; request_count++) {
+		int error = sahara_wait_request(host, timeout_ms);
+		if (error) return error;
+		uint32_t request[12];
+		memcpy(request, host->sahara_rx_words, sizeof(request));
+		uint32_t packet_size = host->sahara_rx_bytes;
+		sahara_consume(host);
+		uint64_t id, offset, length;
+		if (request[0] == 3 && packet_size == 0x14) {
+			id = request[2]; offset = request[3]; length = request[4];
+		} else if (request[0] == 0x12 && packet_size == 0x20) {
+			id = words_address(request, 2);
+			offset = words_address(request, 4);
+			length = words_address(request, 6);
+		} else if (request[0] == 4 && packet_size == 0x10) {
+			report(host, "Sahara END image ID", request[2]);
+			report(host, "Sahara END image status", request[3]);
+			if (request[2] != image_id || request[3] || !sent) return EIO;
+			const uint32_t done[2] = { 5, 8 };
+			error = sahara_send(host, done, sizeof(done), timeout_ms);
+			if (error) return error;
+			error = sahara_wait_request(host, timeout_ms);
+			if (error) return error;
+			if (host->sahara_rx_bytes != 12 || host->sahara_rx_words[0] != 6 ||
+			    host->sahara_rx_words[2] > 1) return EIO;
+			host->sahara_complete = host->sahara_rx_words[2] == 1;
+			report(host, "Sahara DONE status", host->sahara_rx_words[2]);
+			report(host, "Sahara image bytes served", (uint32_t)sent);
+			sahara_consume(host);
+			return 0;
+		} else return ENOTSUP;
+		if (request_count < 4 || request_count % 128 == 0) {
+			report(host, "Sahara image request offset", (uint32_t)offset);
+			report(host, "Sahara image request bytes", (uint32_t)length);
+		}
+		if (id != image_id) return ENOENT;
+		if (!length || offset > size || length > size - offset ||
+		    length > 8ull * size || sent > 8ull * size - length) return EINVAL;
+		for (uint64_t left = length; left;) {
+			size_t chunk = left > SAHARA_BUFFER_SIZE ? SAHARA_BUFFER_SIZE : (size_t)left;
+			error = sahara_send(host, (const uint8_t *)image + (size_t)offset,
+			    chunk, timeout_ms);
+			if (error) return error;
+			offset += chunk; left -= chunk; sent += chunk;
+		}
+	}
+	return E2BIG;
+}
+
+/* Stock ks opens the AMSS EFS pair immediately after MDM2AP_STATUS.
+ * The bounded probe services a single backup into a volatile AP snapshot. */
+int
+umi_mhi_probe_efs(struct umi_mhi *host, uint8_t *shadow)
+{
+	if (!shadow) return EINVAL;
+	if (!host || !host->io || host->io->profile != UMI_MHI_PROFILE_SDX55 ||
+	    !host->ipcr_started || host->poisoned) return EINVAL;
+	if (host->efs_rx_ring.bytes) return EALREADY;
+	static const unsigned elements = EFS_SLOTS, capacity = EFS_CHUNK;
+	host->efs_shadow = shadow;
+	int error = allocate_aligned(host, elements * 16, elements * 16, &host->efs_rx_ring);
+	if (!error) error = allocate_aligned(host, elements * 16, elements * 16, &host->efs_tx_ring);
+	if (!error) error = allocate(host, capacity, &host->efs_rx_buffer);
+	if (!error) error = allocate(host, elements * 64, &host->efs_tx_buffers);
+	if (error) return error;
+	memset(host->efs_rx_ring.bytes, 0, host->efs_rx_ring.size);
+	memset(host->efs_tx_ring.bytes, 0, host->efs_tx_ring.size);
+	memset(host->efs_rx_buffer.bytes, 0, host->efs_rx_buffer.size);
+	sync_for_cpu(host, &host->channels);
+	for (unsigned ch = 10; ch <= 11; ch++) {
+		struct umi_mhi_dma *ring = ch == 10 ? &host->efs_tx_ring : &host->efs_rx_ring;
+		uint32_t *ctx = (uint32_t *)host->channels.bytes + ch * 11;
+		memset(ctx, 0, 11 * sizeof(*ctx));
+		ctx[0] = 1u | (2u << 8);
+		ctx[1] = ch == 10 ? 1 : 2;
+		ctx[2] = 1;
+		words_set_address(ctx, 3, ring->address);
+		words_set_address(ctx, 5, elements * 16);
+		words_set_address(ctx, 7, ring->address);
+		words_set_address(ctx, 9, ring->address);
+		host->io->sync_for_device(host->io->context, ring);
+	}
+	host->io->sync_for_device(host->io->context, &host->efs_rx_buffer);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	error = start_channel(host, 10);
+	if (!error) error = start_channel(host, 11);
+	if (error) { host->poisoned = true; return error; }
+	efs_post(host, 11, &host->efs_rx_ring, 0, host->efs_rx_buffer.address, EFS_CHUNK);
+	return 0;
+}
+
+/* The Qualcomm controller forces a mission suspend/resume at the SBL
+ * handoff. Check the device transition before issuing any IPCR command. */
+static int
+sdx55_transition(struct umi_mhi *host, unsigned state)
+{
+	uint32_t control = read_reg(host, 0x38);
+	if (control == UINT32_MAX) return EIO;
+	write_reg(host, 0x38, (control & ~0xff00u) | state << 8);
+	uint32_t status = 0;
+	for (unsigned ms = 0; ms < 2000; ms++) {
+		status = read_reg(host, 0x48);
+		if (status == UINT32_MAX || (status & 4)) return EIO;
+		int error = service_event_ring(host, 0, UINT64_MAX, NULL, NULL);
+		if (error) return error;
+		if (((status >> 8) & 0xff) == state) {
+			report(host, "mission transition MHISTATUS", status);
+			return 0;
+		}
+		host->io->delay_us(host->io->context, 1000);
+	}
+	report(host, "mission transition target", state);
+	report(host, "mission transition timed out MHISTATUS", status);
+	report(host, "mission transition MHICTRL readback", read_reg(host, 0x38));
+	return ETIMEDOUT;
 }
 
 int
@@ -662,6 +1438,7 @@ umi_mhi_start_ipcr(struct umi_mhi *host)
 	memset(host->ipcr_tx_buffers.bytes, 0, host->ipcr_tx_buffers.size);
 	memset(host->ipcr_rx_ring.bytes, 0, host->ipcr_rx_ring.size);
 	memset(host->ipcr_rx_buffers.bytes, 0, host->ipcr_rx_buffers.size);
+	sync_for_cpu(host, &host->channels);
 	setup_ipcr_channel(host, IPCR_TX_CHANNEL, 1, &host->ipcr_tx_ring,
 	    host->ipcr_tx_ring.address);
 	host->ipcr_tx_wp = host->ipcr_tx_ring.address;
@@ -681,8 +1458,35 @@ umi_mhi_start_ipcr(struct umi_mhi *host)
 		error = service_event_ring(host, ring, UINT64_MAX, NULL, NULL);
 		if (error) { host->poisoned = true; return error; }
 	}
-	error = send_nop(host);
-	if (error) return error;
+	if (host->io->profile == UMI_MHI_PROFILE_SDX55) {
+		/* The downstream controller invokes its mission callback from the
+		 * EE event, which can follow BHI_EXECENV changing to AMSS. */
+		for (unsigned ms = 0; !host->mission_event_seen && ms < 15000; ms++) {
+			error = service_event_ring(host, 0, UINT64_MAX, NULL, NULL);
+			if (error) return error;
+			if (!host->mission_event_seen) host->io->delay_us(host->io->context, 1000);
+		}
+		report(host, "mission EE event received", host->mission_event_seen);
+		if (!host->mission_event_seen) return ETIMEDOUT;
+		error = sdx55_transition(host, 5);
+		if (!error) {
+			write_address(host, host->channel_db + 127 * 8, 1);
+			error = sdx55_transition(host, 2);
+		}
+		if (error) return error;
+		/* The bounded mission client owns device wake until PERST. Publish
+		 * the hardware event doorbells after the SBL-to-AMSS handoff. */
+		write_address(host, host->channel_db + 127 * 8, 1);
+		for (unsigned e = SDX55_EVENT_CONTEXTS - SDX55_HW_EVENT_RINGS;
+		    e < SDX55_EVENT_CONTEXTS; e++) {
+			if (!host->event_ring[e].bytes) continue;
+			write_address(host, host->event_db + e * 8,
+			    host->event_ring[e].address + host->event_ring[e].size - 16);
+		}
+	} else {
+		error = send_nop(host);
+		if (error) return error;
+	}
 	/* Match the stock driver: start UL first, then DL, and queue DL buffers
 	 * after START completion so the device sees an empty channel initially.
 	 */
@@ -698,6 +1502,7 @@ umi_mhi_start_ipcr(struct umi_mhi *host)
 		tre[3] = (2u << 16) | (1u << 9); /* transfer, interrupt on EOT */
 	}
 	host->ipcr_rx_wp = host->ipcr_rx_ring.address + IPCR_RX_BUFFERS * 16u;
+	sync_for_cpu(host, &host->channels);
 	uint32_t *rx_context = (uint32_t *)host->channels.bytes + IPCR_RX_CHANNEL * 11;
 	words_set_address(rx_context, 9, host->ipcr_rx_wp);
 	host->io->sync_for_device(host->io->context, &host->ipcr_rx_ring);
@@ -709,6 +1514,105 @@ umi_mhi_start_ipcr(struct umi_mhi *host)
 	return 0;
 }
 
+/* Kona's non-offload IP_HW0. Leave UL empty and post one 32 KiB DL
+ * buffer. The owner quiesces DMA with PERST before releasing the aperture. */
+int
+umi_mhi_probe_cell_data(struct umi_mhi *host)
+{
+	if (!host || !host->io || host->io->profile != UMI_MHI_PROFILE_SDX55) return EINVAL;
+	if (host->poisoned) return EIO;
+	if (!host->ipcr_started || !host->amss_sent || !host->contexts_ready) return EBUSY;
+	if (host->cell_tx_ring.bytes || host->cell_rx_ring.bytes || host->cell_rx_buffer.bytes)
+		return EALREADY;
+	uint32_t ee;
+	int error = umi_mhi_execution_environment(host, &ee);
+	if (error || ee != 2) return error ? error : EBUSY;
+	if (!host->event_ring[CELL_TX_EVENT].bytes || !host->event_ring[CELL_RX_EVENT].bytes)
+		return ENXIO;
+
+	size_t ring_size = CELL_TR_ELEMENTS * 16;
+	error = allocate_aligned(host, ring_size, ring_size, &host->cell_tx_ring);
+	if (!error) error = allocate_aligned(host, ring_size, ring_size, &host->cell_rx_ring);
+	if (!error) error = allocate(host, UMI_MHI_CELL_MRU, &host->cell_rx_buffer);
+	if (!error) error = allocate(host, UMI_MHI_CELL_MRU, &host->cell_tx_buffer);
+	/* CPU-only scratch for an aggregate split across completion events. */
+	if (!error) error = allocate(host, UMI_MHI_CELL_MRU, &host->cell_rx_assembly);
+	if (error) return error;
+	sync_for_cpu(host, &host->channels);
+	for (unsigned ch = CELL_TX_CHANNEL; ch <= CELL_RX_CHANNEL; ch++) {
+		bool receive = ch == CELL_RX_CHANNEL;
+		struct umi_mhi_dma *ring = receive ? &host->cell_rx_ring : &host->cell_tx_ring;
+		uint32_t *ctx = (uint32_t *)host->channels.bytes + ch * 11;
+		if (ctx[0] != (3u << 8) || ctx[1] != (receive ? 2u : 1u) ||
+		    ctx[2] != (receive ? CELL_RX_EVENT : CELL_TX_EVENT)) return EIO;
+		memset(ring->bytes, 0, ring_size);
+		ctx[0] |= 1; /* enabled, preserve the stock HW burst mode */
+		words_set_address(ctx, 3, ring->address);
+		words_set_address(ctx, 5, ring_size);
+		words_set_address(ctx, 7, ring->address);
+		words_set_address(ctx, 9, ring->address);
+		host->io->sync_for_device(host->io->context, ring);
+	}
+	memset(host->cell_rx_buffer.bytes, 0, UMI_MHI_CELL_MRU);
+	host->io->sync_for_device(host->io->context, &host->cell_rx_buffer);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	error = start_channel(host, CELL_TX_CHANNEL);
+	if (!error) error = start_channel(host, CELL_RX_CHANNEL);
+	if (error) { host->poisoned = true; return error; }
+	host->cell_started = true;
+	host->cell_tx_db_armed = true;
+	cell_post(host, true, true);
+	sync_for_cpu(host, &host->channels);
+	uint32_t *ctx = host->channels.bytes;
+	report(host, "IP_HW0 UL channel state", ctx[CELL_TX_CHANNEL * 11] & 0xff);
+	report(host, "IP_HW0 DL channel state", ctx[CELL_RX_CHANNEL * 11] & 0xff);
+	report(host, "IP_HW0 posted RX capacity", UMI_MHI_CELL_MRU);
+	return 0;
+}
+
+static int
+poll_mission_rings(struct umi_mhi *host, unsigned *received)
+{
+	for (unsigned ring = 0; ring < 3; ring++) {
+		int error = service_event_ring(host, ring, UINT64_MAX, NULL, received);
+		if (error) return error;
+	}
+	if (host->cell_started) {
+		int error = service_event_ring(host, CELL_TX_EVENT, UINT64_MAX, NULL, NULL);
+		if (error) return error;
+		return service_event_ring(host, CELL_RX_EVENT, UINT64_MAX, NULL, NULL);
+	}
+	return 0;
+}
+
+int
+umi_mhi_send_cell_data(struct umi_mhi *host, const void *frame, size_t length, unsigned timeout_ms)
+{
+	if (!host || !host->io || host->io->profile != UMI_MHI_PROFILE_SDX55 ||
+	    !frame || !length || !timeout_ms || timeout_ms > 5000) return EINVAL;
+	if (length > UMI_MHI_CELL_MRU) return EMSGSIZE;
+	if (host->poisoned) return EIO;
+	if (!host->cell_started || host->cell_tx_bytes) return EBUSY;
+
+	memcpy(host->cell_tx_buffer.bytes, frame, length);
+	host->io->sync_for_device(host->io->context, &host->cell_tx_buffer);
+	host->cell_tx_bytes = (uint32_t)length;
+	bool ring = host->cell_tx_db_armed;
+	host->cell_tx_db_armed = false;
+	cell_post(host, false, ring);
+	for (unsigned elapsed = 0; ; elapsed++) {
+		int error = poll_mission_rings(host, NULL);
+		if (error) { host->poisoned = true; return error; }
+		if (!host->cell_tx_bytes) return 0;
+		if (elapsed == timeout_ms) break;
+		host->io->delay_us(host->io->context, 1000);
+	}
+	/* A late completion cannot relinquish the buffer to a new send. */
+	host->poisoned = true;
+	return ETIMEDOUT;
+}
+
 int
 umi_mhi_poll_ipcr(struct umi_mhi *host, unsigned timeout_ms, unsigned *received)
 {
@@ -718,10 +1622,8 @@ umi_mhi_poll_ipcr(struct umi_mhi *host, unsigned timeout_ms, unsigned *received)
 	if (!timeout_ms || timeout_ms > 10000) return EINVAL;
 	*received = 0;
 	for (unsigned i = 0; i < timeout_ms; i++) {
-		for (unsigned ring = 0; ring < 3; ring++) {
-			int error = service_event_ring(host, ring, UINT64_MAX, NULL, received);
-			if (error) { host->poisoned = true; return error; }
-		}
+		int error = poll_mission_rings(host, received);
+		if (error) { host->poisoned = true; return error; }
 		host->io->delay_us(host->io->context, 1000);
 	}
 	if (*received) report(host, "IPCR receive events", *received);
@@ -752,6 +1654,7 @@ umi_mhi_send_qrtr_packet(struct umi_mhi *host, const void *packet,
 	tre[2] = (uint32_t)length;
 	tre[3] = (2u << 16) | (1u << 9); /* transfer, interrupt on EOT */
 	uint64_t next = ring_next(ring_base, IPCR_RING_ELEMENTS * 16u, command);
+	sync_for_cpu(host, &host->channels);
 	uint32_t *context = (uint32_t *)host->channels.bytes + IPCR_TX_CHANNEL * 11;
 	words_set_address(context, 9, next);
 	host->ipcr_tx_slot = slot;
@@ -768,10 +1671,8 @@ umi_mhi_send_qrtr_packet(struct umi_mhi *host, const void *packet,
 	write_address(host, host->channel_db + IPCR_TX_CHANNEL * 8u, next);
 	unsigned received = 0;
 	for (unsigned i = 0; i < timeout_ms; i++) {
-		for (unsigned ring = 0; ring < 3; ring++) {
-			int error = service_event_ring(host, ring, UINT64_MAX, NULL, &received);
-			if (error) { host->poisoned = true; return error; }
-		}
+		int error = poll_mission_rings(host, &received);
+		if (error) { host->poisoned = true; return error; }
 		if (host->ipcr_tx_done && host->ipcr_response_done) {
 			host->ipcr_waiting_response = false;
 			report(host, "QRTR packet transmitted", (uint32_t)buffer_address);

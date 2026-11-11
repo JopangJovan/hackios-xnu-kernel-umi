@@ -223,6 +223,7 @@ static const struct cdevsw touch_cdevsw = {
 extern void umi_touch_init(void);
 extern void umi_slpi_init(void);   /* (boot-arg slpi=1: the sensor DSP probe) */
 extern void umi_keys_init(void);
+extern void umi_sdx55_init(void);
 
 void
 hakios_input_init(void)
@@ -247,6 +248,7 @@ hakios_input_init(void)
 	hakios_wifi_init();
 	hakios_adsp_init();
 	hakios_mpss_init();
+	umi_sdx55_init();
 	/* SLPI's registry and sensor services depend on the remote-service fabric being ready. */
 	umi_slpi_init();
 }
@@ -2248,6 +2250,378 @@ slpi_sns_send_orientation_stream(void)
 	hakios_tl("slpi: sns: requested the fused orientation stream at 10 Hz (message %u, %u protobuf bytes)\n",
 	    SLPI_SNS_STD_SENSOR_CONFIG, request.payload_len);
 }
+
+/* SDX55 GNSS: QMI LOC encoding, decoding and final fix publication. */
+#define SLPI_LOC_SERVICE         0x10u
+#define SLPI_LOC_REGISTER_EVENTS 0x0021u
+#define SLPI_LOC_START           0x0022u
+#define SDX55_LOC_STOP           0x0023u
+#define SDX55_LOC_SESSION_ID     1u
+#define SLPI_LOC_POSITION_REPORT 0x0024u
+
+/* LOC_POSITION_REPORT indication — the fields this port needs */
+struct slpi_loc_position_report {
+	uint8_t latitude_present, longitude_present;
+	uint32_t session_status;    /* TLV 0x01 */
+	uint8_t  session_id;        /* TLV 0x02 */
+	uint64_t latitude_bits;     /* TLV 0x10 (double) */
+	uint64_t longitude_bits;    /* TLV 0x11 (double) */
+};
+
+static const struct qmi_elem_info slpi_loc_position_report_ei[] = {
+	{
+		.data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = sizeof(uint32_t),
+		.array_type = NO_ARRAY, .tlv_type = 1,
+		.offset = offsetof(struct slpi_loc_position_report, session_status),
+	},
+	{
+		.data_type = QMI_UNSIGNED_1_BYTE, .elem_len = 1, .elem_size = sizeof(uint8_t),
+		.array_type = NO_ARRAY, .tlv_type = 2,
+		.offset = offsetof(struct slpi_loc_position_report, session_id),
+	},
+	{
+		.data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+		.array_type = NO_ARRAY, .tlv_type = 0x10,
+		.offset = offsetof(struct slpi_loc_position_report, latitude_present),
+	},
+	{
+		.data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = sizeof(uint64_t),
+		.array_type = NO_ARRAY, .tlv_type = 0x10,
+		.offset = offsetof(struct slpi_loc_position_report, latitude_bits),
+	},
+	{
+		.data_type = QMI_OPT_FLAG, .elem_len = 1, .elem_size = sizeof(uint8_t),
+		.array_type = NO_ARRAY, .tlv_type = 0x11,
+		.offset = offsetof(struct slpi_loc_position_report, longitude_present),
+	},
+	{
+		.data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = sizeof(uint64_t),
+		.array_type = NO_ARRAY, .tlv_type = 0x11,
+		.offset = offsetof(struct slpi_loc_position_report, longitude_bits),
+	},
+	{ .data_type = QMI_EOTI },
+};
+
+/* the mandatory result TLV (type 2) of the LOC_START reply */
+static const struct qmi_elem_info slpi_loc_response_ei[] = {
+	{
+		.data_type = QMI_STRUCT, .elem_len = 1, .elem_size = sizeof(struct qmi_response_type_v01),
+		.array_type = NO_ARRAY, .tlv_type = 2, .ei_array = qmi_response_type_v01_ei,
+	},
+	{ .data_type = QMI_EOTI },
+};
+
+static LCK_GRP_DECLARE(slpi_loc_lck_grp, "hakios-loc");
+static LCK_MTX_DECLARE(slpi_loc_lock, &slpi_loc_lck_grp);
+static struct hakios_loc_state slpi_loc_state = {
+	.size = sizeof(struct hakios_loc_state), .version = HAKIOS_LOC_VERSION,
+};
+static struct hakios_sdx55_geodetic_fix sdx55_geodetic_state = {
+	.size = sizeof(struct hakios_sdx55_geodetic_fix), .version = HAKIOS_SDX55_GEODETIC_VERSION,
+	.fix = { .size = sizeof(struct hakios_sdx55_fix), .version = HAKIOS_SDX55_FIX_VERSION, .used_sv = -1 },
+};
+
+static double
+slpi_loc_bits_to_double(uint64_t bits)
+{
+	double d;
+	memcpy(&d, &bits, sizeof(d));
+	return d;
+}
+
+static bool
+slpi_loc_publish(const struct slpi_loc_position_report *report, uint8_t session, struct hakios_sdx55_geodetic_fix *sample)
+{
+	if (report->session_status != 0 || report->session_id != session ||
+	    !report->latitude_present || !report->longitude_present) return false;
+	double latitude = slpi_loc_bits_to_double(report->latitude_bits);
+	double longitude = slpi_loc_bits_to_double(report->longitude_bits);
+	if (!(latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180)) return false;
+
+	lck_mtx_lock(&slpi_loc_lock);
+	slpi_loc_state.latitude = latitude;
+	slpi_loc_state.longitude = longitude;
+	slpi_loc_state.session_status = report->session_status;
+	slpi_loc_state.fixes++;
+	slpi_loc_state.valid = 1;
+	slpi_loc_state.time = mach_absolute_time();
+	uint64_t fixes = slpi_loc_state.fixes;
+	if (sample) {
+		struct hakios_sdx55_fix *fix = &sample->fix;
+		fix->latitude = latitude;
+		fix->longitude = longitude;
+		fix->received_ticks = slpi_loc_state.time;
+		fix->fixes = sdx55_geodetic_state.fix.fixes + 1;
+		sdx55_geodetic_state = *sample;
+	}
+	lck_mtx_unlock(&slpi_loc_lock);
+
+	hakios_tl("slpi: loc: fix #%llu: %.6f, %.6f (status %u)\n",
+	    (unsigned long long)fixes, latitude, longitude, report->session_status);
+	return true;
+}
+
+int
+hakios_loc_request(uint16_t message, uint16_t txn, void *buffer, size_t capacity, uint32_t lock, const uint64_t *mask)
+{
+	/* UMI's libloc_api_v02 registers its master client and qualifies
+	 * engine-lock requests with the client selector used by setGpsLockSync. */
+	if (message == 0xbf || message == 0x37) { /* Constellation config and predicted-orbit validity. */
+		static const struct qmi_elem_info empty[] = {{ .data_type = QMI_EOTI }};
+		return hakios_qmi_encode(QMI_REQUEST, message, txn, empty, &message, buffer, capacity);
+	}
+	if (message == 0x38) {
+		struct { uint64_t utc_ms; uint32_t uncertainty_ms; } req;
+		static const struct qmi_elem_info time_ei[] = {
+			{ .data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = 8,
+			    .array_type = NO_ARRAY, .tlv_type = 1 },
+			{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = 4,
+			    .array_type = NO_ARRAY, .tlv_type = 2, .offset = 8 },
+			{ .data_type = QMI_EOTI },
+		};
+		clock_sec_t sec;
+		clock_usec_t usec;
+		clock_get_calendar_microtime(&sec, &usec);
+		if (sec < 1577836800) return -EAGAIN;
+		req.utc_ms = (uint64_t)sec * 1000 + usec / 1000;
+		req.uncertainty_ms = 5000;
+		return hakios_qmi_encode(QMI_REQUEST, message, txn, time_ei, &req, buffer, capacity);
+	}
+	if (message == 0x3b || message == 0x3a || message == 0xba || message == 0x4a) {
+		static const struct qmi_elem_info control[] = {
+			{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = 4,
+			    .array_type = NO_ARRAY, .tlv_type = 1 },
+			{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = 4,
+			    .array_type = NO_ARRAY, .tlv_type = 0x10, .offset = 4 },
+			{ .data_type = QMI_EOTI },
+		};
+		static const struct qmi_elem_info master[] = {
+			{ .data_type = QMI_UNSIGNED_4_BYTE, .elem_len = 1, .elem_size = 4,
+			    .array_type = NO_ARRAY, .tlv_type = 1 },
+			{ .data_type = QMI_EOTI },
+		};
+		if (message == 0x3a && mask) {
+			struct { uint32_t type, client; uint64_t bits; } req = {lock, 3, *mask};
+			struct qmi_elem_info mask_ei[] = {
+				control[0], control[1],
+				{ .data_type = QMI_UNSIGNED_8_BYTE, .elem_len = 1, .elem_size = 8,
+				    .array_type = NO_ARRAY, .tlv_type = 0x11, .offset = 8 },
+				{ .data_type = QMI_EOTI },
+			};
+			return hakios_qmi_encode(QMI_REQUEST, message, txn, mask_ei, &req, buffer, capacity);
+		}
+		uint32_t args[] = {message == 0xba ? 0xbaabcdef : lock, 3};
+		const struct qmi_elem_info *ei = (message == 0xba || message == 0x4a) ? master :
+		    (message == 0x3b ? control + 1 : control);
+		return hakios_qmi_encode(QMI_REQUEST, message, txn, ei, args, buffer, capacity);
+	}
+	if (message == SLPI_LOC_REGISTER_EVENTS) {
+		/* Client identity and position-engine selection from UMI's GNSS HAL. */
+		struct { uint64_t mask; uint32_t name, type; uint8_t flag; } req = {
+		    /* Position, SV, NMEA, engine and fix-session state. */
+		    0x187, 0x4c41484d, 1, 0 };
+		static const struct qmi_elem_info events[] = {
+			{ QMI_UNSIGNED_8_BYTE, 1, 8, NO_ARRAY, 1, 0, NULL },
+			{ QMI_UNSIGNED_4_BYTE, 1, 4, NO_ARRAY, 0x10, 8, NULL },
+			{ QMI_UNSIGNED_4_BYTE, 1, 4, NO_ARRAY, 0x11, 12, NULL },
+			{ QMI_UNSIGNED_1_BYTE, 1, 1, NO_ARRAY, 0x12, 16, NULL },
+			{ .data_type = QMI_EOTI },
+		};
+		return hakios_qmi_encode(QMI_REQUEST, message, txn, events, &req, buffer, capacity);
+	}
+	if (message == SDX55_LOC_STOP) {
+		uint8_t session = SDX55_LOC_SESSION_ID;
+		static const struct qmi_elem_info stop[] = {
+			{ QMI_UNSIGNED_1_BYTE, 1, 1, NO_ARRAY, 1, 0, NULL },
+			{ .data_type = QMI_EOTI },
+		};
+		return hakios_qmi_encode(QMI_REQUEST, message, txn, stop, &session, buffer, capacity);
+	}
+	if (message == SLPI_LOC_START) {
+		struct { uint32_t session, recurrence, accuracy, period, power, interval, engine, engine_period; } req =
+		    { SDX55_LOC_SESSION_ID, 1, 3, 1000, 2, 1000, 2, 1000 };
+		static const struct qmi_elem_info start[] = {
+			{ QMI_UNSIGNED_1_BYTE, 1, 1, NO_ARRAY, 1, 0, NULL },
+			{ QMI_UNSIGNED_4_BYTE, 1, 4, NO_ARRAY, 0x10, 4, NULL },
+			{ QMI_UNSIGNED_4_BYTE, 1, 4, NO_ARRAY, 0x11, 8, NULL },
+			{ QMI_UNSIGNED_4_BYTE, 1, 4, NO_ARRAY, 0x13, 12, NULL },
+			{ QMI_UNSIGNED_4_BYTE, 1, 4, NO_ARRAY, 0x15, 16, NULL },
+			{ QMI_UNSIGNED_4_BYTE, 1, 4, NO_ARRAY, 0x16, 20, NULL },
+			{ QMI_UNSIGNED_4_BYTE, 2, 4, STATIC_ARRAY, 0x1a, 24, NULL },
+			{ .data_type = QMI_EOTI },
+		};
+		return hakios_qmi_encode(QMI_REQUEST, message, txn, start, &req, buffer, capacity);
+	}
+	return -EINVAL;
+}
+
+int
+hakios_loc_result(const void *buffer, size_t size, uint16_t *service_error)
+{
+	struct qmi_response_type_v01 response = { .result = UINT16_MAX, .error = UINT16_MAX };
+	if (hakios_qmi_decode(buffer, size, slpi_loc_response_ei, &response) < 0) return EINVAL;
+	*service_error = response.error;
+	return response.result || response.error ? EIO : 0;
+}
+
+/* SDX55 LOC_POSITION_REPORT optionally identifies the technologies and
+ * the satellites used for this specific solution. */
+static void
+sdx55_loc_metric(struct hakios_sdx55_geodetic_fix *sample, uint8_t field, const uint8_t *p)
+{
+	struct hakios_sdx55_fix *fix = &sample->fix;
+	uint32_t bits;
+	float value;
+	memcpy(&bits, p, sizeof(bits));
+	if ((bits & 0x7fffffffu) >= 0x7f800000u) return;
+	memcpy(&value, p, sizeof(value));
+	if (field != 0x1a && field != 0x1b && value < 0) return;
+	switch (field) {
+	case 0x12:
+		fix->horizontal_uncertainty_m = value;
+		fix->flags |= HAKIOS_SDX55_FIX_HAS_HUNC;
+		break;
+	case 0x13:
+		fix->semi_minor_m = value;
+		fix->flags |= HAKIOS_SDX55_FIX_HAS_SEMI_MINOR;
+		break;
+	case 0x14:
+		fix->semi_major_m = value;
+		fix->flags |= HAKIOS_SDX55_FIX_HAS_SEMI_MAJOR;
+		break;
+	case 0x15:
+		if (value > 180) return;
+		fix->ellipse_azimuth_deg = value;
+		fix->flags |= HAKIOS_SDX55_FIX_HAS_ELLIPSE_AZIMUTH;
+		break;
+	case 0x1a:
+		if (value < -500 || value > 15883) return;
+		fix->altitude_ellipsoid_m = value;
+		fix->flags |= HAKIOS_SDX55_FIX_HAS_ELLIPSOID_ALTITUDE;
+		break;
+	case 0x1b:
+		sample->altitude_msl_m = value;
+		sample->flags |= HAKIOS_SDX55_GEODETIC_HAS_MSL;
+		break;
+	case 0x1c:
+		fix->vertical_uncertainty_m = value;
+		fix->flags |= HAKIOS_SDX55_FIX_HAS_VUNC;
+		break;
+	}
+}
+
+static bool
+sdx55_loc_quality(const uint8_t *p, size_t length, struct hakios_sdx55_geodetic_fix *sample)
+{
+	/* The QMI decoder skips extensions after fixed-width values. A position
+	 * must have exactly one interpretation before we publish it to userland. */
+	static const uint8_t widths[] = {
+		[0x01] = 4, [0x02] = 1, [0x10] = 8, [0x11] = 8,
+		[0x12] = 4, [0x13] = 4, [0x14] = 4, [0x15] = 4,
+		[0x17] = 4, [0x1a] = 4, [0x1b] = 4, [0x1c] = 4, [0x23] = 4, [0x25] = 8, [0x27] = 6, [0x2d] = 1,
+	};
+	uint64_t seen = 0;
+	struct hakios_sdx55_fix *fix = &sample->fix;
+	*sample = (struct hakios_sdx55_geodetic_fix){
+		.size = sizeof(*sample), .version = HAKIOS_SDX55_GEODETIC_VERSION,
+		.fix = { .size = sizeof(*fix), .version = HAKIOS_SDX55_FIX_VERSION, .used_sv = -1 },
+	};
+	while (length) {
+		if (length < 3) return false;
+		unsigned field = p[0], n = p[1] | p[2] << 8;
+		p += 3;
+		length -= 3;
+		if (n > length) return false;
+		if (field < sizeof(widths) && widths[field]) {
+			uint64_t bit = 1ull << field;
+			if (n != widths[field] || (seen & bit)) return false;
+			seen |= bit;
+		}
+		/* QMI scalars and the UMI host are little-endian. The TLVs can be unaligned. */
+		if ((field >= 0x12 && field <= 0x15) || (field >= 0x1a && field <= 0x1c)) {
+			sdx55_loc_metric(sample, field, p);
+		} else if (field == 0x17) {
+			uint32_t reliability;
+			memcpy(&reliability, p, sizeof(reliability));
+			if (reliability <= 4) {
+				sample->horizontal_reliability = reliability;
+				sample->flags |= HAKIOS_SDX55_GEODETIC_HAS_HREL;
+			}
+		} else if (field == 0x23) {
+			memcpy(&fix->technology, p, sizeof(fix->technology));
+			fix->flags |= HAKIOS_SDX55_FIX_HAS_TECHNOLOGY;
+		} else if (field == 0x25) {
+			memcpy(&fix->utc_ms, p, sizeof(fix->utc_ms));
+			fix->flags |= HAKIOS_SDX55_FIX_HAS_UTC;
+		} else if (field == 0x27) {
+			uint32_t tow_ms;
+			memcpy(&tow_ms, p + 2, sizeof(tow_ms));
+			if (tow_ms < 604800000u) {
+				memcpy(&fix->gps_week, p, sizeof(fix->gps_week));
+				fix->gps_tow_ms = tow_ms;
+				fix->flags |= HAKIOS_SDX55_FIX_HAS_GPS_TIME;
+			}
+		} else if (field == 0x2d && p[0] <= 1) {
+			fix->altitude_assumed = p[0];
+			fix->flags |= HAKIOS_SDX55_FIX_HAS_ALTITUDE_ASSUMED;
+		} else if (field == 0x2c) {
+			if (fix->used_sv >= 0 || !n || n != 1u + 2u * p[0]) return false;
+			fix->used_sv = p[0];
+		}
+		p += n;
+		length -= n;
+	}
+	return true;
+}
+
+bool
+hakios_loc_indication(const void *buffer, size_t size)
+{
+	const uint8_t *packet = buffer;
+	if (!packet || size < 7 || packet[0] != QMI_INDICATION ||
+	    (packet[3] | packet[4] << 8) != SLPI_LOC_POSITION_REPORT ||
+	    (size_t)(packet[5] | packet[6] << 8) != size - 7) return false;
+	struct slpi_loc_position_report report = { .session_status = UINT32_MAX, .session_id = UINT8_MAX };
+	struct hakios_sdx55_geodetic_fix sample;
+	const struct hakios_sdx55_fix *fix = &sample.fix;
+	if (!sdx55_loc_quality(packet + 7, size - 7, &sample) ||
+	    hakios_qmi_decode(buffer, size, slpi_loc_position_report_ei, &report) < 0) return false;
+	bool has_tech = (fix->flags & HAKIOS_SDX55_FIX_HAS_TECHNOLOGY) != 0;
+	hakios_tl("UMI SDX55: LOC position status=%u session=%u lat=%u lon=%u technology=%#x used_SV=%d\n",
+	    report.session_status, report.session_id, report.latitude_present, report.longitude_present,
+	    has_tech ? fix->technology : UINT32_MAX, fix->used_sv);
+	/* SATELLITE or HYBRID includes GNSS measurements. Without the mask use
+	 * the solution's used-SV list as independent evidence. */
+	bool satellite = has_tech ? (fix->technology & 0x81u) != 0 : fix->used_sv > 0;
+	return satellite && slpi_loc_publish(&report, SDX55_LOC_SESSION_ID, &sample);
+}
+
+static int
+sdx55_fix_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	lck_mtx_lock(&slpi_loc_lock);
+	struct hakios_sdx55_fix copy = sdx55_geodetic_state.fix;
+	lck_mtx_unlock(&slpi_loc_lock);
+	return SYSCTL_OUT(req, &copy, sizeof(copy));
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_fix, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, sdx55_fix_sysctl, "-", "last satellite-qualified SDX55 position report");
+
+static int
+sdx55_geodetic_fix_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	/* The stock system locationd job runs with UID 0. Ordinary app clients
+	 * obtain location through CoreLocation and its authorization checks. */
+	if (!req->p || proc_suser(req->p)) return EPERM;
+	lck_mtx_lock(&slpi_loc_lock);
+	struct hakios_sdx55_geodetic_fix copy = sdx55_geodetic_state;
+	lck_mtx_unlock(&slpi_loc_lock);
+	return SYSCTL_OUT(req, &copy, sizeof(copy));
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_geodetic_fix, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, sdx55_geodetic_fix_sysctl, "-", "latest SDX55 position with MSL altitude and horizontal reliability");
 
 static const struct qmi_msg_handler slpi_sns_qmi_handlers[] = {
 	{

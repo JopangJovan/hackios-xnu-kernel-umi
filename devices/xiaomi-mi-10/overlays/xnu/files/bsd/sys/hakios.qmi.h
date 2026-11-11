@@ -101,6 +101,11 @@ int hakios_qmi_encode(uint8_t type, uint16_t message, uint16_t transaction, cons
     void *buffer, size_t size);
 int hakios_qmi_decode(const void *buffer, size_t length, const struct qmi_elem_info *ei, void *structure);
 
+/* LOC v2 shared codecs for the SDX55 IPCR transport. */
+int hakios_loc_request(uint16_t message, uint16_t txn, void *buffer, size_t capacity, uint32_t lock, const uint64_t *mask);
+int hakios_loc_result(const void *buffer, size_t size, uint16_t *service_error);
+bool hakios_loc_indication(const void *buffer, size_t size);
+
 /* ---- the router's addresses -------------------------------------------------------------------- */
 
 #ifndef AF_QIPCRTR

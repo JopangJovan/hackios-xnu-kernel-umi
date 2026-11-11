@@ -2838,6 +2838,9 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=", "wifi_mac=", "wifi=1", "umi_bt_probe=", "umi_bt=",
 		"battery=1", "slpi=", "slpi_attach=1", "slpi_root=1",
+		/* SDX55 GNSS profile only. Cellular boot options remain blocked. */
+		"sdx55_step=12", "sdx55_efs=1", "sdx55_interactive=1", "sdx55_return=0",
+		"sdx55_fix_secs=600", "sdx55_xtra=1",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};

@@ -10,6 +10,13 @@ python3 "$DEVICE_DIR/tools/embed-firmware.py" \
 python3 "$DEVICE_DIR/tools/embed-sensor-registry.py" \
   --registry "$ROOT/fw-sensors/registry.tar" \
   --output "$XNU_SRC/bsd/dev/umi_sensor_registry.inc"
+python3 "$DEVICE_DIR/tools/embed-sdx55-sbl1.py" \
+  --input "$ROOT/fw-sdx55/sbl1.mbn" \
+  --output "$XNU_SRC/bsd/dev/umi_sdx55_sbl1.inc"
+python3 "$DEVICE_DIR/tools/embed-sdx55-ddr.py" \
+  --input "$ROOT/fw-sdx55/mdmddr-partition.bin" \
+  --msadp "$ROOT/fw-sdx55/msadp-partition.bin" \
+  --output "$XNU_SRC/bsd/dev/umi_sdx55_ddr.inc"
 mkdir -p "$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT"
 [ ! -f "$ROOT/xnu-deps/build/ath11k/src/ath11k/qmi.c" ] || "$ROOT/tools/mk-wlfw.sh"
 exec "$ROOT/xnu-build.sh" "${@:--j8}"
