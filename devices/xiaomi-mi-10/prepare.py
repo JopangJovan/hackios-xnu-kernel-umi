@@ -124,7 +124,8 @@ def userland():
     stage_patched_file(ROOT / 'userland/src/init.c', sandbox / 'userland/src/init.c',
                        DEVICE / 'overlays/umi-init-gps.patch')
     for name in ('xnu-env.sh', 'xnu-deps', 'tools', 'prebuilt', 'sysimage', 'devices', 'wifi',
-                 'fw-gpu', 'fw-audio', 'fw-haptic', 'fw-wifi', 'fw-bluetooth', 'fw-camera', 'fw-sensors', 'fw-sdx55'):
+                 'fw-gpu', 'fw-audio', 'fw-haptic', 'fw-wifi', 'fw-bluetooth', 'fw-camera', 'fw-slpi',
+                 'fw-sensors', 'fw-sdx55'):
         path = sandbox / name
         if not path.exists() and not path.is_symlink():
             path.symlink_to(ROOT / name, target_is_directory=(ROOT / name).is_dir())

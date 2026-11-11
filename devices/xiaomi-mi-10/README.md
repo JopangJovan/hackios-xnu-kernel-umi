@@ -37,6 +37,10 @@ extracted iOS files in `sysimage/`, and the phone's firmware in the ignored
 UMI Bluetooth needs `htbtfw20.tlv` and `htnv20.bin`; its firmware is embedded only
 in the generated kernel tree. No vendor firmware is committed here.
 
+Compass needs the phone's SLPI image (`slpi.mdt` and its split segments) in the
+ignored `fw-slpi/` directory and the sensor registry at `fw-sensors/registry.tar`.
+The UMI build stages these local inputs for the sensor DSP.
+
 ```sh
 devices/xiaomi-mi-10/build-wifi.sh
 devices/xiaomi-mi-10/build-kernel.sh -j8 -k
