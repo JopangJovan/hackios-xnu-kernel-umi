@@ -2,7 +2,8 @@
  * In 20F66 PUIPrivacyController hides its native Location Services row when
  * its carrier-availability cache is nil. An unsuccessful subscription query
  * leaves that cache nil; a successful query with no carrier override yields
- * kCFBooleanTrue. On a UMI GNSS probe the Apple cellular service is absent.
+ * kCFBooleanTrue. UMI's SDX55 data interface does not provide CoreTelephony.
+ * This library is packaged together with the native locationd job.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
@@ -51,7 +52,7 @@ gps_session(void)
     size_t n = sizeof(args);
     if (sysctlbyname("kern.bootargs", args, &n, NULL, 0) || !n || n > sizeof(args) ||
         !memchr(args, 0, n) || !has_argument(args, "sdx55_step=12") ||
-        !has_argument(args, "sdx55_efs=1") || has_argument(args, "sdx55_cell=1")) return false;
+        !has_argument(args, "sdx55_efs=1")) return false;
     struct hakios_sdx55_fix fix = {0};
     n = sizeof(fix);
     return sysctlbyname(HAKIOS_SDX55_FIX_SYSCTL, &fix, &n, NULL, 0) == 0 &&
@@ -81,7 +82,7 @@ cached_availability(id controller, SEL cmd)
     /* Preserve Apple's cache and recheck availability on the next read. */
     static char logged_key;
     if (!objc_getAssociatedObject(controller, &logged_key)) {
-        diagnostic("UMI GPS Settings: showing native Location Services row (no cellular service)\n");
+        diagnostic("UMI GPS Settings: showing native Location Services row (no CoreTelephony service)\n");
         objc_setAssociatedObject(controller, &logged_key, (id)kCFBooleanTrue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return (id)kCFBooleanTrue;

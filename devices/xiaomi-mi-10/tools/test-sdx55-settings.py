@@ -66,7 +66,7 @@ int main(void) {
     present=false;assert(!gps_session());present=true;
     version=1;assert(!gps_session());version=2;
     bootargs="not_sdx55_step=12 sdx55_efs=1";assert(!gps_session());
-    bootargs="sdx55_step=12 sdx55_efs=1 sdx55_cell=1";assert(!gps_session());
+    bootargs="sdx55_step=12 sdx55_efs=1 sdx55_cell=1";assert(gps_session());
     bootargs="sdx55_step=12 sdx55_efs=10";assert(!gps_session());
     original_refresh=refresh; original_cached=getter;
     assert(!cached_availability(&first,NULL) && !lookups);

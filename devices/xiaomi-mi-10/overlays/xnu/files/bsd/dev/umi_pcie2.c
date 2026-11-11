@@ -9,7 +9,10 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
+#include <sys/codesign.h>
+#include <sys/kauth.h>
 #include <sys/sysctl.h>
+#include <sys/ubc.h>
 #include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
@@ -34,6 +37,36 @@ extern unsigned int pmap_cache_attributes(ppnum_t);
 extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
 extern void hakios_tl(const char *, ...) __printflike(1, 2);
 #include "umi_sdx55_cell_public.inc"
+static struct umi_sdx55_radio_snapshot sdx55_radio = {
+	.size = sizeof(sdx55_radio), .version = UMI_SDX55_RADIO_VERSION, .rsrp = INT32_MIN
+};
+
+static bool
+sdx55_data_enabled(void)
+{
+	lck_mtx_lock(&cell_status_lock);
+	bool enabled = sdx55_radio.enabled;
+	lck_mtx_unlock(&cell_status_lock);
+	return enabled;
+}
+
+static void
+sdx55_data_state(enum umi_sdx55_data_state state)
+{
+	lck_mtx_lock(&cell_status_lock);
+	if (state == UMI_DATA_UNAVAILABLE) {
+		sdx55_radio.enabled = sdx55_radio.rat = 0;
+		sdx55_radio.rsrp = INT32_MIN;
+		bzero(sdx55_radio.plmn, sizeof(sdx55_radio.plmn));
+		bzero(sdx55_radio.operator_name, sizeof(sdx55_radio.operator_name));
+	}
+	if (sdx55_radio.state == UMI_DATA_UNAVAILABLE && state == UMI_DATA_CONNECTING)
+		sdx55_radio.enabled = 1;
+	sdx55_radio.state = state;
+	lck_mtx_unlock(&cell_status_lock);
+	hakios_tl("UMI SDX55: mobile data state=%u\n", state);
+}
+
 extern void loader_return(void);
 extern int umi_rpmh_wifi_power(void);
 extern int umi_rpmh_cx_vote(unsigned corner);
@@ -2304,6 +2337,8 @@ sdx55_cell_command(struct umi_mhi *host, const struct sdx55_cell_endpoint *ep,
 	else if ((ep->service == 3 && message == SDX55_NAS_BIND_SUBSCRIPTION) ||
 	    (ep->service == 1 && message == SDX55_WDS_BIND_SUBSCRIPTION))
 		len = sdx55_cell_bind_request(message, txn, argument, qmi, cap);
+	else if (ep->service == 3 && message == SDX55_NAS_GET_PLMN_NAME)
+		len = sdx55_cell_plmn_request(txn, argument, qmi, cap);
 	else if (ep->service == 26 && message == SDX55_WDA_SET_FORMAT)
 		len = sdx55_wda_set_pcie_format_request(txn, SDX55_PCIE_DATA_IFACE, format, qmi, cap);
 	else if (ep->service == 26)
@@ -2364,16 +2399,63 @@ sdx55_read_cell_service(struct umi_mhi *host, const struct sdx55_cell_endpoint *
 	return 0;
 }
 
-static int
-sdx55_move_packets(struct umi_mhi *host, unsigned seconds, const struct sdx55_data_routes *routes)
+static void
+sdx55_refresh_radio(struct umi_mhi *host, const struct sdx55_cell_endpoint *nas)
 {
-	uint64_t deadline, check_status;
-	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
+	struct sdx55_cell_status serving = {0}, system = {.nr_service = UINT8_MAX, .lte_service = UINT8_MAX};
+	if (!sdx55_cell_command(host, nas, SDX55_NAS_GET_SERVING_SYSTEM, 0, NULL))
+		serving = sdx55_query.cell;
+	if (!sdx55_cell_command(host, nas, SDX55_NAS_GET_SYSTEM_INFO, 0, NULL))
+		system = sdx55_query.cell;
+	bool nr = (system.nr_service == 2 && !system.nr_forbidden) ||
+	    (serving.registration == 1 && (serving.radio_mask & (1u << 12)));
+	bool lte = (system.lte_service == 2 && !system.lte_forbidden) ||
+	    (serving.registration == 1 && (serving.radio_mask & (1u << 8)));
+	unsigned rat = nr ? 5 : lte ? 4 : 0;
+	int32_t rsrp = INT32_MIN;
+	if (rat && !sdx55_cell_command(host, nas, SDX55_NAS_GET_SIGNAL_INFO, 0, NULL)) {
+		int16_t sample = rat == 5 ? sdx55_query.cell.nr_rsrp : sdx55_query.cell.lte_rsrp;
+		if (sample >= -156 && sample <= -31) rsrp = sample;
+	}
+	const char *plmn = serving.plmn;
+	if (rat == 4 && system.lte_plmn[0]) plmn = system.lte_plmn;
+	if (rat == 5 && system.plmn[0]) plmn = system.plmn;
+	else if (rat == 5 && !plmn[0] && lte) plmn = system.lte_plmn;
+	char name[sizeof(sdx55_radio.operator_name)] = {0};
+	if (rat && plmn[0]) {
+		if (!strcmp(plmn, serving.plmn)) strlcpy(name, serving.operator_name, sizeof(name));
+		if (!name[0] && !strcmp(plmn, sdx55_radio.plmn)) strlcpy(name, sdx55_radio.operator_name, sizeof(name));
+		if (!name[0] && strcmp(plmn, sdx55_radio.plmn)) {
+			uint32_t mcc = (plmn[0]-'0')*100 + (plmn[1]-'0')*10 + (plmn[2]-'0');
+			uint32_t mnc = (plmn[3]-'0')*10 + (plmn[4]-'0');
+			if (plmn[5]) mnc = mnc*10 + (plmn[5]-'0');
+			uint32_t argument = mcc | (mnc << 10) | ((plmn[5] != 0) << 20);
+			if (!sdx55_cell_command(host, nas, SDX55_NAS_GET_PLMN_NAME, argument, NULL))
+				strlcpy(name, sdx55_query.cell.operator_name, sizeof(name));
+		}
+	}
+	lck_mtx_lock(&cell_status_lock);
+	bool changed = sdx55_radio.rat != rat || sdx55_radio.rsrp != rsrp ||
+	    strcmp(sdx55_radio.plmn, rat ? plmn : "") || strcmp(sdx55_radio.operator_name, rat ? name : "");
+	sdx55_radio.rat = rat;
+	sdx55_radio.rsrp = rsrp;
+	strlcpy(sdx55_radio.plmn, rat ? plmn : "", sizeof(sdx55_radio.plmn));
+	strlcpy(sdx55_radio.operator_name, rat ? name : "", sizeof(sdx55_radio.operator_name));
+	lck_mtx_unlock(&cell_status_lock);
+	if (changed) hakios_tl("UMI SDX55: radio generation=%u RSRP=%d PLMN=%s description=%u (NAS NR=%u LTE=%u legacy=%u)\n",
+	    rat, rsrp, rat ? plmn : "", rat && name[0], system.nr_service, system.lte_service, serving.registration);
+}
+
+static int
+sdx55_move_packets(struct umi_mhi *host, uint64_t deadline, const struct sdx55_data_routes *routes,
+    const struct sdx55_cell_endpoint *nas)
+{
+	uint64_t check_status;
 	clock_interval_to_deadline(10, NSEC_PER_SEC, &check_status);
 	struct umi_pcie *p = host->io->context;
 	int error = 0;
 	sdx55_packets.network_ready = true;
-	while (!error && mach_absolute_time() < deadline) {
+	while (!error && sdx55_data_enabled() && mach_absolute_time() < deadline) {
 		if (!gpio_level(p, 3) || gpio_level(p, 1)) { host->poisoned = true; error = ENXIO; break; }
 		error = umi_sdx55_poll_loc(host, 5);
 		if (!error) error = sdx55_flush_flow_acks(host);
@@ -2381,6 +2463,7 @@ sdx55_move_packets(struct umi_mhi *host, unsigned seconds, const struct sdx55_da
 		if (mach_absolute_time() >= check_status) {
 			error = sdx55_read_cell_service(host, &routes->wds);
 			if (!error && sdx55_query.wan.connection_status != 2) error = ENETDOWN;
+			if (!error && sdx55_data_enabled()) sdx55_refresh_radio(host, nas);
 			clock_interval_to_deadline(10, NSEC_PER_SEC, &check_status);
 			continue;
 		}
@@ -2526,6 +2609,53 @@ sdx55_close_cell_client(struct umi_mhi *host)
 }
 
 static int
+sdx55_data_bearer(struct umi_mhi *host, uint64_t deadline, const struct sdx55_data_routes *routes,
+    const struct sdx55_cell_endpoint *nas)
+{
+	const struct sdx55_cell_endpoint *wds = &routes->wds;
+	int error = sdx55_read_cell_service(host, wds);
+	if (error) return error;
+	if (sdx55_query.wan.connection_status != 1) return EBUSY;
+	if (!sdx55_data_enabled()) return 0;
+	sdx55_data_state(UMI_DATA_CONNECTING);
+	/* Flow control can precede the START reply and IP configuration. */
+	memset(&sdx55_packets, 0, sizeof(sdx55_packets));
+	sdx55_packets.routes = routes;
+	uint32_t handle = 0;
+	error = sdx55_cell_command(host, wds, SDX55_WDS_START, 0, NULL);
+	if (!error) handle = sdx55_query.wds.handle;
+	else if (sdx55_query.wds.has_call_end || sdx55_query.wds.has_verbose) {
+		const struct sdx55_wds_result *v = &sdx55_query.wds;
+		hakios_tl("UMI SDX55: WDS call end=%d verbose_type=%d reason=%d\n",
+		    v->has_call_end ? (int)v->call_end : -1,
+		    v->has_verbose ? (int)v->verbose_type : -1, (int)v->verbose_reason);
+	}
+	if (!error && !sdx55_data_routes_current(routes)) error = ENXIO;
+	if (!error && sdx55_data_enabled()) {
+		error = sdx55_cell_command(host, wds, SDX55_WDS_SETTINGS, 0, NULL);
+		if (!error && !sdx55_data_routes_current(routes)) error = ENXIO;
+		if (!error && sdx55_data_enabled()) {
+			const struct sdx55_wds_result *v = &sdx55_query.wds;
+			error = umi_sdx55_net_up(v->address, v->netmask, v->gateway, v->dns1, v->dns2, v->mtu);
+			if (!error) {
+				sdx55_data_state(UMI_DATA_ON);
+				error = sdx55_move_packets(host, deadline, routes, nas);
+				umi_sdx55_net_down();
+			}
+		}
+	}
+	sdx55_packets.routes = NULL;
+	if (handle && !host->poisoned) {
+		sdx55_data_state(UMI_DATA_DISCONNECTING);
+		int stop = sdx55_cell_endpoint_current(wds) ?
+		    sdx55_cell_command(host, wds, SDX55_WDS_STOP, handle, NULL) : ENXIO;
+		if (stop) error = stop;
+	}
+	if (!error) sdx55_data_state(UMI_DATA_OFF);
+	return error;
+}
+
+static int
 sdx55_run_data_call(struct umi_mhi *host, unsigned seconds)
 {
 	const struct sdx55_data_routes routes = {
@@ -2543,7 +2673,9 @@ sdx55_run_data_call(struct umi_mhi *host, unsigned seconds)
 		return ENOTSUP;
 	}
 	struct sdx55_wan_status wanted = sdx55_wda_stock_format();
+	const struct sdx55_cell_endpoint nas = sdx55_services[CELL_NAS];
 	unsigned provisioned = 0;
+	sdx55_data_state(UMI_DATA_CONNECTING);
 	int ready = sdx55_wait_registration(host, &routes, &provisioned);
 	if (!ready && !sdx55_data_routes_current(&routes)) ready = ENXIO;
 	if (ready) hakios_tl("UMI SDX55: data call gated before WDS START errno=%d\n", ready);
@@ -2553,38 +2685,26 @@ sdx55_run_data_call(struct umi_mhi *host, unsigned seconds)
 	if (!error && sdx55_query.wan.connection_status != 1) error = EBUSY;
 	bool change = !error && !sdx55_wda_format_equal(&saved, &wanted);
 	if (change) error = sdx55_program_format(host, &routes.wda, &wanted);
-	uint32_t handle = 0;
 	if (!error) error = sdx55_cell_command(host, wds, SDX55_WDS_BIND_MUX, 0, NULL);
 	if (!error) error = sdx55_cell_command(host, wds, SDX55_WDS_SET_FAMILY, 0, NULL);
 	if (!error && !sdx55_data_routes_current(&routes)) error = ENXIO;
-	if (!error) {
-		/* Flow control can precede the START reply and IP configuration. */
-		sdx55_packets.routes = &routes;
-		error = sdx55_cell_command(host, wds, SDX55_WDS_START, 0, NULL);
-		if (!error) handle = sdx55_query.wds.handle;
-		else if (sdx55_query.wds.has_call_end || sdx55_query.wds.has_verbose) {
-			const struct sdx55_wds_result *v = &sdx55_query.wds;
-			hakios_tl("UMI SDX55: WDS call end=%d verbose_type=%d reason=%d\n",
-			    v->has_call_end ? (int)v->call_end : -1,
-			    v->has_verbose ? (int)v->verbose_type : -1, (int)v->verbose_reason);
+	uint64_t deadline, refresh = 0;
+	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
+	while (!error && mach_absolute_time() < deadline) {
+		if (!sdx55_data_routes_current(&routes) || !sdx55_cell_endpoint_current(&nas)) {
+			error = ENXIO;
+			break;
 		}
-	}
-	if (!error && !sdx55_data_routes_current(&routes)) error = ENXIO;
-	if (!error) error = sdx55_cell_command(host, wds, SDX55_WDS_SETTINGS, 0, NULL);
-	if (!error && !sdx55_data_routes_current(&routes)) error = ENXIO;
-	if (!error) {
-		const struct sdx55_wds_result *v = &sdx55_query.wds;
-		error = umi_sdx55_net_up(v->address, v->netmask, v->gateway, v->dns1, v->dns2, v->mtu);
-		if (!error) {
-			error = sdx55_move_packets(host, seconds, &routes);
-			umi_sdx55_net_down();
+		if (mach_absolute_time() >= refresh) {
+			sdx55_refresh_radio(host, &nas);
+			clock_interval_to_deadline(10, NSEC_PER_SEC, &refresh);
 		}
-	}
-	sdx55_packets.routes = NULL;
-	if (handle && !host->poisoned) {
-		int stop = sdx55_cell_endpoint_current(wds) ?
-		    sdx55_cell_command(host, wds, SDX55_WDS_STOP, handle, NULL) : ENXIO;
-		if (stop) error = stop;
+		if (sdx55_data_enabled())
+			error = sdx55_data_bearer(host, deadline, &routes, &nas);
+		else {
+			if (sdx55_radio.state != UMI_DATA_OFF) sdx55_data_state(UMI_DATA_OFF);
+			error = umi_sdx55_poll_loc(host, 100);
+		}
 	}
 	/* A lost START reply can leave a modem-owned session with an unknown
 	 * handle. Closing this client's QRTR port releases its resources. */
@@ -2685,7 +2805,10 @@ umi_sdx55_cell_session(struct umi_mhi *host)
 		hakios_tl("UMI SDX55: cellular IP_HW0 probe errno=%d\n", ring_error);
 		if (!first_error && ring_error) first_error = ring_error;
 	}
-	if (!first_error && call == 1) first_error = sdx55_run_data_call(host, seconds);
+	if (!first_error && call == 1) {
+		first_error = sdx55_run_data_call(host, seconds);
+		sdx55_data_state(UMI_DATA_UNAVAILABLE);
+	}
 	int restore = umi_sdx55_restore_mode(host, restore_mode);
 	return restore ? restore : first_error;
 }
@@ -3021,6 +3144,48 @@ sdx55_cell_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_cell_status,
     CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
     sdx55_cell_sysctl, "S,umi_sdx55_cell_snapshot", "Read-only QMI cellular observations");
+
+static int
+sdx55_radio_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	lck_mtx_lock(&cell_status_lock);
+	struct umi_sdx55_radio_snapshot state = sdx55_radio;
+	lck_mtx_unlock(&cell_status_lock);
+	return SYSCTL_OUT(req, &state, sizeof(state));
+}
+
+static int
+sdx55_data_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int value = sdx55_data_enabled();
+	int error = SYSCTL_OUT(req, &value, sizeof(value));
+	if (error || !req->newptr) return error;
+	if (kauth_cred_getuid(kauth_cred_get()) != 0) {
+		const char *identity = cs_identity_get(req->p);
+		if (!identity || (strcmp(identity, "com.apple.Preferences") && strcmp(identity, "com.apple.springboard")) ||
+		    !csproc_get_platform_binary(req->p))
+			return EPERM;
+	}
+	if (req->newlen != sizeof(value)) return EINVAL;
+	error = SYSCTL_IN(req, &value, sizeof(value));
+	if (error || (value != 0 && value != 1)) return error ? error : EINVAL;
+	lck_mtx_lock(&cell_status_lock);
+	if (sdx55_radio.state == UMI_DATA_UNAVAILABLE) error = ENXIO;
+	else sdx55_radio.enabled = value;
+	lck_mtx_unlock(&cell_status_lock);
+	if (!error) hakios_tl("UMI SDX55: mobile data requested=%d\n", value);
+	return error;
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_radio_status,
+    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+    sdx55_radio_sysctl, "S,umi_sdx55_radio_snapshot", "Serving radio and mobile data state");
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_mobile_data,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+    sdx55_data_sysctl, "I", "Request an SDX55 packet-data connection");
 
 SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_observe,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,

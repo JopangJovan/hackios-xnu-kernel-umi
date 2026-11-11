@@ -224,6 +224,7 @@ extern void umi_touch_init(void);
 extern void umi_slpi_init(void);   /* (boot-arg slpi=1: the sensor DSP probe) */
 extern void umi_keys_init(void);
 extern void umi_sdx55_init(void);
+static void umi_sdx55_after_sensors(void *, wait_result_t);
 
 void
 hakios_input_init(void)
@@ -248,9 +249,20 @@ hakios_input_init(void)
 	hakios_wifi_init();
 	hakios_adsp_init();
 	hakios_mpss_init();
-	umi_sdx55_init();
-	/* SLPI's registry and sensor services depend on the remote-service fabric being ready. */
-	umi_slpi_init();
+	uint32_t cellular = 0, sensors = 0;
+	if (PE_parse_boot_argn("sdx55_cell", &cellular, sizeof(cellular)) && cellular == 1 &&
+	    PE_parse_boot_argn("slpi", &sensors, sizeof(sensors)) && sensors) {
+		umi_slpi_init();
+		thread_t thread;
+		if (kernel_thread_start(umi_sdx55_after_sensors, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+			return;
+		}
+		umi_sdx55_init();
+	} else {
+		umi_sdx55_init();
+		umi_slpi_init();
+	}
 }
 
 /* ---- the sensor DSP (SLPI): a probe, boot-arg slpi=1 -------------------------------------------------- */
@@ -1794,6 +1806,26 @@ static uint64_t slpi_mag_loop_path;
 static int64_t slpi_mag_loop_area;
 static bool slpi_mag_loop_departed, slpi_mag_center_valid;
 static uint32_t slpi_mag_glitches, slpi_mag_glitch_run;
+
+static void
+umi_sdx55_after_sensors(__unused void *unused, __unused wait_result_t result)
+{
+	/* Let the sensor DSP finish its FastRPC registry exchange before starting
+	 * the external modem. Bound the wait when the magnetometer is absent. */
+	uint64_t deadline;
+	clock_interval_to_deadline(20, NSEC_PER_SEC, &deadline);
+	bool ready;
+	do {
+		lck_mtx_lock(&slpi_mag_lock);
+		ready = slpi_mag_state.samples != 0;
+		lck_mtx_unlock(&slpi_mag_lock);
+		if (ready) break;
+		delay_for_interval(50, NSEC_PER_MSEC);
+	} while (mach_absolute_time() < deadline);
+	hakios_tl("UMI SDX55: starting after SLPI, magnetometer ready=%u\n", ready);
+	umi_sdx55_init();
+	thread_terminate(current_thread());
+}
 
 static void
 slpi_mag_publish(const int64_t axis[3], uint64_t status)

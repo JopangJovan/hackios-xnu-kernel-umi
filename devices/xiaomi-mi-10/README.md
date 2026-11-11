@@ -106,3 +106,18 @@ and ringtone previews were confirmed on the device. Translate's MobileAsset
 configuration download reached HTTP 200. StreamingUnzipService then aborted
 installation when the RAM filesystem returned `ENOTSUP` for the file protection
 class query. The role of Apple's online recognition service remains unverified.
+
+## SDX55 mobile data RAM test
+
+Build the UMI images with `UMI_GPS=1` so they include the local SDX55 firmware,
+the three `fw-sdx55/mdm1m9kefs*.bin` snapshots, and the native Location Services
+job. Use current snapshots read from this phone's Android modem partitions.
+Keep the snapshots local. Select the mobile data profile for the run with
+`UMI_CELLULAR=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run`.
+
+The 600-second data test provides IPv4 via `en1`. Settings → Cellular shows the
+serving network and measured LTE or NR RSRP. Its Cellular Data switch and the
+Control Center button both stop or start the WDS packet session while leaving
+the modem registered. The iOS 16.5 (20F66) status bar derives its signal bars
+from the modem's RSRP. The cellular profile starts the external modem after
+the SLPI magnetometer produces its first sample or the startup wait expires.

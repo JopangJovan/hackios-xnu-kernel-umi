@@ -18,4 +18,18 @@ struct umi_sdx55_cell_snapshot {
 	uint32_t nr_service, nr_domain; /* domain 255 when the NR domain TLV is absent */
 	uint32_t wds_status, nas_subscription, wds_subscription;
 };
+
+#define UMI_SDX55_RADIO_SYSCTL "kern.hakios.sdx55_radio_status"
+#define UMI_SDX55_DATA_SYSCTL "kern.hakios.sdx55_mobile_data"
+#define UMI_SDX55_RADIO_VERSION 1u
+enum umi_sdx55_data_state {
+	UMI_DATA_UNAVAILABLE, UMI_DATA_OFF, UMI_DATA_CONNECTING, UMI_DATA_ON, UMI_DATA_DISCONNECTING
+};
+struct umi_sdx55_radio_snapshot {
+	uint32_t size, version, enabled, state;
+	uint32_t rat; /* 4 or 5 when registered; 0 while searching. */
+	int32_t rsrp; /* dBm, INT32_MIN when unavailable. */
+	char plmn[7];
+	char operator_name[64]; /* Serving network name as UTF-8, when available. */
+};
 #endif

@@ -5,6 +5,7 @@
 #define UMI_SDX55_CELL_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <sys/errno.h>
 
@@ -14,10 +15,12 @@
 #define SDX55_UIM_GET_CONFIGURATION  0x003au
 #define SDX55_NAS_REGISTER_AUTO      0x0022u
 #define SDX55_NAS_GET_SERVING_SYSTEM 0x0024u
+#define SDX55_NAS_GET_PLMN_NAME      0x0044u
 
 #define SDX55_NAS_BIND_SUBSCRIPTION 0x0045u
 #define SDX55_WDS_BIND_SUBSCRIPTION 0x00afu
 #define SDX55_NAS_GET_SYSTEM_INFO   0x004du
+#define SDX55_NAS_GET_SIGNAL_INFO   0x004fu
 
 struct sdx55_gw_app {
 	uint8_t slot, card_state, app_type, app_state, app_index;
@@ -40,8 +43,11 @@ struct sdx55_cell_status {
 	/* Primary and secondary 3GPP provisioning sessions, in that order. */
 	struct sdx55_gw_app gw[2];
 	uint8_t nr_service, nr_true_service, nr_domain, nr_forbidden;
+	uint8_t lte_service, lte_forbidden;
 	uint8_t registration, ps_attach;
 	uint32_t radio_mask, data_mask; /* bit indexed by the corresponding QMI enum */
+	int16_t lte_rsrp, nr_rsrp;
+	char plmn[7], lte_plmn[7], operator_name[64];
 };
 
 static inline uint16_t
@@ -83,7 +89,8 @@ sdx55_cell_request(uint16_t message, uint16_t txn, uint8_t *out, size_t capacity
 		out[11] = out[12] = out[13] = 0;
 		return 14;
 	}
-	if (message != SDX55_UIM_GET_CARD_STATUS && message != SDX55_NAS_GET_SERVING_SYSTEM && message != SDX55_NAS_GET_SYSTEM_INFO)
+	if (message != SDX55_UIM_GET_CARD_STATUS && message != SDX55_NAS_GET_SERVING_SYSTEM &&
+	    message != SDX55_NAS_GET_SYSTEM_INFO && message != SDX55_NAS_GET_SIGNAL_INFO)
 		return 0;
 	return sdx55_cell_empty_request(message, txn, out, capacity);
 }
@@ -264,12 +271,102 @@ sdx55_cell_enum_mask(const uint8_t *p, size_t n, uint32_t *mask)
 	return 0;
 }
 
+static inline void
+sdx55_cell_plmn(char out[7], unsigned mcc, unsigned mnc, unsigned digits)
+{
+	if (mcc > 999 || mnc > 999 || (digits == 2 && mnc > 99)) return;
+	out[0] = '0' + mcc / 100;
+	out[1] = '0' + mcc / 10 % 10;
+	out[2] = '0' + mcc % 10;
+	unsigned first = 3;
+	if (digits == 3) out[first++] = '0' + mnc / 100;
+	out[first++] = '0' + mnc / 10 % 10;
+	out[first++] = '0' + mnc % 10;
+	out[first] = 0;
+}
+
+static inline void
+sdx55_cell_system_plmn(char out[7], const uint8_t *p)
+{
+	if (p[19] != 1) return;
+	unsigned digits = p[25] == 0xff || !p[25] ? 5 : 6;
+	for (unsigned i = 0; i < digits; i++)
+		if (p[20+i] < '0' || p[20+i] > '9') return;
+	for (unsigned i = 0; i < digits; i++) out[i] = p[20+i];
+}
+
+/* libqmi NAS Get PLMN Name: PLMN, MNC PCS digit, always return a name. */
+static inline size_t
+sdx55_cell_plmn_request(uint16_t txn, uint32_t plmn, uint8_t *out, size_t capacity)
+{
+	if (capacity < 22 || !sdx55_cell_empty_request(SDX55_NAS_GET_PLMN_NAME, txn, out, capacity)) return 0;
+	uint8_t tlvs[] = {1,4,0,plmn, (plmn>>8)&3, plmn>>10, (plmn>>18)&3,
+	    0x11,1,0,(plmn>>20)&1, 0x12,1,0,1};
+	out[5] = sizeof(tlvs);
+	for (unsigned i = 0; i < sizeof(tlvs); i++) out[7+i] = tlvs[i];
+	return 7 + sizeof(tlvs);
+}
+
+static inline bool
+sdx55_cell_name(char name[64], unsigned encoding, unsigned spare, const uint8_t *data, size_t size)
+{
+	if (!size || (encoding == 4 && (size & 1)) || (encoding == 9 && spare > 7)) return false;
+	unsigned used = 0;
+	if (encoding == 0 || encoding == 1) {
+		if (size >= 64) return false;
+		for (; used < size && data[used]; used++) name[used] = data[used];
+	} else if (encoding == 4) {
+		for (size_t i = 0; i < size; i += 2) {
+			unsigned c = sdx55_cell_le16(data+i);
+			if (!c) break;
+			if ((c >= 0xd800 && c <= 0xdfff) || used + 3 >= 64) return false;
+			if (c >= 0x800) name[used++] = 0xe0 | c >> 12;
+			if (c >= 0x80) name[used++] = (c >= 0x800 ? 0x80 : 0xc0) | ((c >> 6) & 0x3f);
+			name[used++] = c < 0x80 ? c : 0x80 | (c & 0x3f);
+		}
+	} else if (encoding == 9) {
+		/* Decode ASCII-compatible GSM-7 names. Use the numeric PLMN if
+		 * a name needs characters outside this subset. */
+		size_t bits = size * 8 - spare;
+		for (size_t bit = 0; bit + 7 <= bits; bit += 7) {
+			unsigned c = data[bit/8] >> (bit%8);
+			if (bit%8 > 1) c |= (unsigned)data[bit/8+1] << (8-bit%8);
+			c &= 0x7f;
+			if (!c && !spare && bit + 14 > bits) break;
+			if (used == 63 || !((c >= ' ' && c <= '?') || (c >= 'A' && c <= 'Z') ||
+			    (c >= 'a' && c <= 'z'))) return false;
+			name[used++] = c;
+		}
+	}
+	name[used] = 0;
+	return used != 0;
+}
+
+static inline void
+sdx55_cell_eons(char name[64], const uint8_t *data, size_t size)
+{
+	if (size < 2 || data[1] > size - 2) return;
+	size_t offset = 2 + data[1]; /* Skip the SIM provider name, which can differ when roaming. */
+	char candidate[64];
+	for (unsigned i = 0; i < 2; i++) { /* Short and then long serving network name. */
+		if (size - offset < 4 || data[offset+3] > size-offset-4) return;
+		size_t length = data[offset+3];
+		if (sdx55_cell_name(candidate, data[offset], data[offset+2], data+offset+4, length))
+			for (unsigned j = 0; j < sizeof(candidate); j++) {
+				name[j] = candidate[j];
+				if (!candidate[j]) break;
+			}
+		offset += 4 + length;
+	}
+}
+
 static inline int
 sdx55_cell_decode(uint16_t message, uint16_t txn, const uint8_t *packet, size_t size,
     struct sdx55_cell_status *out)
 {
 	if (!out || (message != SDX55_UIM_GET_CONFIGURATION && message != SDX55_UIM_GET_CARD_STATUS &&
-	    message != SDX55_NAS_GET_SERVING_SYSTEM && message != SDX55_NAS_GET_SYSTEM_INFO))
+	    message != SDX55_NAS_GET_SERVING_SYSTEM && message != SDX55_NAS_GET_SYSTEM_INFO &&
+	    message != SDX55_NAS_GET_SIGNAL_INFO && message != SDX55_NAS_GET_PLMN_NAME))
 		return EINVAL;
 	struct sdx55_cell_status decoded = {
 		.auto_select = UINT8_MAX, .halt_subscription = UINT8_MAX,
@@ -277,6 +374,8 @@ sdx55_cell_decode(uint16_t message, uint16_t txn, const uint8_t *packet, size_t 
 		.gw = {{UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX},
 		       {UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX}},
 		.nr_service = UINT8_MAX, .nr_true_service = UINT8_MAX, .nr_domain = UINT8_MAX,
+		.lte_service = UINT8_MAX,
+		.lte_rsrp = INT16_MIN, .nr_rsrp = INT16_MIN,
 	};
 	int error = sdx55_cell_body(message, txn, packet, size, &decoded.service_error);
 	if (error) {
@@ -285,6 +384,7 @@ sdx55_cell_decode(uint16_t message, uint16_t txn, const uint8_t *packet, size_t 
 	}
 
 	int found_status = 0, found_data = 0, found_nr = 0, found_domain = 0;
+	unsigned mcc = 0, mnc = 0, pcs_mcc = 0, pcs_mnc = 0, pcs_digits = 0;
 	for (size_t off = 7; off < size; ) {
 		uint8_t tag = packet[off];
 		size_t n = sdx55_cell_le16(packet + off + 1);
@@ -306,6 +406,12 @@ sdx55_cell_decode(uint16_t message, uint16_t txn, const uint8_t *packet, size_t 
 			if (found_domain++ || n < 29 || p[0] > 1 || p[6] > 1) return EINVAL;
 			if (p[0]) decoded.nr_domain = p[1];
 			if (p[6]) decoded.nr_forbidden = p[7];
+			sdx55_cell_system_plmn(decoded.plmn, p);
+		} else if (message == SDX55_NAS_GET_SYSTEM_INFO && tag == 0x14 && n == 3) {
+			decoded.lte_service = p[0];
+		} else if (message == SDX55_NAS_GET_SYSTEM_INFO && tag == 0x19 && n >= 29) {
+			if (p[6] == 1) decoded.lte_forbidden = p[7];
+			sdx55_cell_system_plmn(decoded.lte_plmn, p);
 		} else if (message == SDX55_NAS_GET_SERVING_SYSTEM && tag == 1) {
 			if (found_status++ || n < 5 || p[0] > 4 || p[1] > 2 || p[2] > 2) return EINVAL;
 			decoded.registration = p[0];
@@ -313,9 +419,26 @@ sdx55_cell_decode(uint16_t message, uint16_t txn, const uint8_t *packet, size_t 
 			if (sdx55_cell_enum_mask(p + 4, n - 4, &decoded.radio_mask)) return EINVAL;
 		} else if (message == SDX55_NAS_GET_SERVING_SYSTEM && tag == 0x11) {
 			if (found_data++ || sdx55_cell_enum_mask(p, n, &decoded.data_mask)) return EINVAL;
+		} else if (message == SDX55_NAS_GET_SERVING_SYSTEM && tag == 0x12 && n >= 5 && p[4] == n-5) {
+			mcc = sdx55_cell_le16(p);
+			mnc = sdx55_cell_le16(p+2);
+			if (p[4] < sizeof(decoded.operator_name))
+				for (unsigned i = 0; i < p[4]; i++) decoded.operator_name[i] = p[5+i];
+		} else if (message == SDX55_NAS_GET_SERVING_SYSTEM && tag == 0x27 && n == 5 && p[4] <= 1) {
+			pcs_mcc = sdx55_cell_le16(p);
+			pcs_mnc = sdx55_cell_le16(p+2);
+			pcs_digits = 2 + p[4];
+		} else if (message == SDX55_NAS_GET_SIGNAL_INFO && tag == 0x14 && n == 6) {
+			decoded.lte_rsrp = (int16_t)sdx55_cell_le16(p+2);
+		} else if (message == SDX55_NAS_GET_SIGNAL_INFO && tag == 0x17 && n == 4) {
+			decoded.nr_rsrp = (int16_t)sdx55_cell_le16(p);
+		} else if (message == SDX55_NAS_GET_PLMN_NAME && tag == 0x10) {
+			sdx55_cell_eons(decoded.operator_name, p, n);
 		}
 	}
-	if (message != SDX55_UIM_GET_CONFIGURATION && message != SDX55_NAS_GET_SYSTEM_INFO && !found_status) return EINVAL;
+	if ((message == SDX55_UIM_GET_CARD_STATUS || message == SDX55_NAS_GET_SERVING_SYSTEM) && !found_status) return EINVAL;
+	if (mcc) sdx55_cell_plmn(decoded.plmn, mcc, mnc,
+	    mcc == pcs_mcc && mnc == pcs_mnc && pcs_digits ? pcs_digits : mnc > 99 ? 3 : 2);
 	*out = decoded;
 	return 0;
 }

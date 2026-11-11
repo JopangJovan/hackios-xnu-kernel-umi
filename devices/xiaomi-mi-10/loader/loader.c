@@ -2838,9 +2838,10 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=", "wifi_mac=", "wifi=1", "umi_bt_probe=", "umi_bt=",
 		"battery=1", "slpi=", "slpi_attach=1", "slpi_root=1",
-		/* SDX55 GNSS profile only. Cellular boot options remain blocked. */
+		/* Explicit, bounded SDX55 RAM test profiles. */
 		"sdx55_step=12", "sdx55_efs=1", "sdx55_interactive=1", "sdx55_return=0",
 		"sdx55_fix_secs=600", "sdx55_xtra=1",
+		"sdx55_cell=1", "sdx55_data_rings=1", "sdx55_data_call=1", "sdx55_data_secs=180", "sdx55_data_secs=600",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};
@@ -3692,6 +3693,15 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop(&w, "ranges", ranges, sizeof(ranges));
 	dt_prop_u32(&w, "#address-cells", 2);
 	dt_prop_u32(&w, "#size-cells", 2);
+	/* UMI's external modem exposes its data interface on PCIe2 as 17cb:0306. */
+	if (plat == &platform_umi) {
+		dt_begin(&w, "baseband");
+		dt_prop_str(&w, "compatible", "qcom,ext-sdx55m");
+		dt_prop_str(&w, "model", "Qualcomm SDX55");
+		dt_prop_u32(&w, "vendor-id", 0x17cb);
+		dt_prop_u32(&w, "device-id", 0x0306);
+		dt_end(&w);
+	}
 	/*
 	 * With cam=5, where MobileGestalt looks for the cameras (IODeviceTree:/arm-io/isp, its still-camera and
 	 * rear-facing-camera, by which SpringBoard shows Camera.app): the iPhone's ISP node, of its
