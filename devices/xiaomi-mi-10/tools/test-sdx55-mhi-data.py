@@ -16,6 +16,8 @@ static uint32_t channels[111 * 11], events[17 * 11], commands[11], cr[128 * 4];
 static uint32_t er[17][128 * 4];
 static uint8_t arena[128 * 1024] __attribute__((aligned(4096)));
 static int calls, starts, bells, fail_channel, fail_allocation;
+static unsigned satellite_opcode, satellite_commands;
+static unsigned diag_starts, diag_bells;
 static size_t allocated;
 static unsigned produced[17];
 
@@ -79,7 +81,20 @@ static void delay_model(void *unused, unsigned us)
 static void reg_write(void *unused, uint32_t reg, uint32_t value)
 {
     if (reg == 0x70) {
-        int channel = cr[(h.command_wp - h.command_ring.address) / 4 + 3] >> 24;
+        uint32_t descriptor = cr[(h.command_wp - h.command_ring.address) / 4 + 3];
+        int channel = descriptor >> 24;
+        if (channel == DIAG_TX_CHANNEL || channel == DIAG_RX_CHANNEL) {
+            assert(channel == DIAG_TX_CHANNEL + diag_starts++);
+            event(0, h.command_wp, 1u << 24, 0x21u << 16);
+            return;
+        }
+        if (channel == 50) {
+            assert((descriptor >> 16 & 0xff) == satellite_opcode);
+            assert(channels[50 * 11 + 1] == 0xa && events[4 * 11 + 1] == 0xa);
+            ++satellite_commands;
+            event(0, h.command_wp, (channel == fail_channel ? 0x11u : 1u) << 24, 0x21u << 16);
+            return;
+        }
         assert(channel == 100 + starts);
         uint32_t *ctx = channels + channel * 11;
         assert(ctx[0] == 0x301 && ctx[1] == (channel == 100 ? 1 : 2));
@@ -93,6 +108,9 @@ static void reg_write(void *unused, uint32_t reg, uint32_t value)
     } else if (reg == 0x300 + 100 * 8) {
         assert(starts == 2 && tx_mode != 0); /* no UL until a real submit */
         ++tx_bells;
+    } else if (reg == 0x300 + DIAG_RX_CHANNEL * 8) {
+        assert(diag_starts == 2);
+        ++diag_bells;
     }
 }
 static void sync_noop(void *unused, const struct umi_mhi_dma *dma) { }
@@ -101,7 +119,7 @@ static struct umi_mhi_io io = {
     .profile = UMI_MHI_PROFILE_SDX55, .bar_size = 4096,
     .dma_start = 0x20000000, .dma_end = 0x20200000,
     .read32 = reg_read, .write32 = reg_write, .allocate = alloc_model,
-    .cell_rx = deliver, .delay_us = delay_model, .sync_for_device = sync_noop, .report = report_noop
+    .cell_rx = deliver, .diag_rx = deliver, .delay_us = delay_model, .sync_for_device = sync_noop, .report = report_noop
 };
 
 static void reset(void)
@@ -109,6 +127,8 @@ static void reset(void)
     memset(&h, 0, sizeof(h)); memset(produced, 0, sizeof(produced));
     memset(channels, 0, sizeof(channels)); memset(events, 0, sizeof(events));
     starts = bells = calls = fail_channel = fail_allocation = allocated = 0;
+    satellite_opcode = satellite_commands = 0;
+    diag_starts = diag_bells = 0;
     deliveries = captured_len = tx_bells = tx_mode = fake_tx_slot = 0;
     h.io = &io; h.bhi = 0x100; h.channel_db = 0x300; h.event_db = 0x700;
     h.ipcr_started = h.contexts_ready = h.amss_sent = true;
@@ -116,7 +136,7 @@ static void reset(void)
     h.command_ring = (struct umi_mhi_dma){cr, 0x20008000, sizeof(cr)};
     h.command_wp = h.command_ring.address;
     for (unsigned i = 0; i < 9; ++i) {
-        if (i > 2 && i < 7) continue;
+        if (i > 3 && i < 7) continue;
         uint64_t base = 0x20010000u + 4096 * i;
         h.event_ring[i] = (struct umi_mhi_dma){er[i], base, sizeof(er[i])};
         h.event_consumer[i] = base;
@@ -129,6 +149,39 @@ static void reset(void)
 
 int main(void)
 {
+    reset();
+    assert(umi_mhi_sdx55_sat_context(&h, 2, true, 0x20180000, 64) == EINVAL);
+    assert(umi_mhi_sdx55_sat_context(&h, 21, false, 0x20180000, 64) == EINVAL);
+    assert(umi_mhi_sdx55_sat_context(&h, 50, false, 0x201ffffc, 64) == EINVAL);
+    assert(!umi_mhi_sdx55_sat_context(&h, 4, true, 0x20180000, 0x2c));
+    assert(!umi_mhi_sdx55_sat_context(&h, 50, false, 0x20181000, 0x2c));
+    assert(words_address(events + 4 * 11, 3) == 0x20180000 && words_address(events + 4 * 11, 5) == 0x2c);
+    assert(words_address(channels + 50 * 11, 3) == 0x20181000 && words_address(channels + 50 * 11, 5) == 0x2c);
+    satellite_opcode = 0x12;
+    assert(umi_mhi_sdx55_sat_channel(&h, 21, true) == EINVAL && satellite_commands == 0);
+    fail_channel = 50;
+    assert(umi_mhi_sdx55_sat_channel(&h, 50, true) == EIO && !h.poisoned);
+    fail_channel = 0;
+    assert(!umi_mhi_sdx55_sat_channel(&h, 50, true));
+    satellite_opcode = 0x10;
+    assert(!umi_mhi_sdx55_sat_channel(&h, 50, false) && satellite_commands == 3);
+    assert(!umi_mhi_probe_cell_data(&h) && starts == 2 && bells == 1);
+    reset();
+    assert(!umi_mhi_sdx55_diag_start(&h) && diag_starts == 2 && diag_bells == 1);
+    unsigned diag_received;
+    uint64_t diag_base = h.diag_rx_ring.address;
+    unsigned diag_event_type = (DIAG_RX_CHANNEL << 24) | (0x22u << 16);
+    memset(h.diag_rx_buffers.bytes, 0x7e, h.diag_rx_buffers.size);
+    /* The firmware can return multiple descriptors with one overflow event. */
+    event(DIAG_RX_EVENT, diag_base + 16, (3u << 24) | DIAG_BUFFER_BYTES, diag_event_type);
+    assert(!umi_mhi_poll_ipcr(&h, 1, &diag_received) && h.diag_started && !h.poisoned);
+    assert(deliveries == 2 && captured_len == DIAG_BUFFER_BYTES && diag_bells == 2);
+    event(DIAG_RX_EVENT, diag_base + 32, (4u << 24) | 96, diag_event_type);
+    assert(!umi_mhi_poll_ipcr(&h, 1, &diag_received) && h.diag_started);
+    assert(deliveries == 3 && captured_len == 96 && diag_bells == 3);
+    event(DIAG_RX_EVENT, diag_base + 16, (2u << 24) | 8, diag_event_type);
+    assert(!umi_mhi_poll_ipcr(&h, 1, &diag_received) && !h.diag_started && !h.poisoned);
+    assert(deliveries == 3);
     reset();
     io.profile = UMI_MHI_PROFILE_QCA6390;
     assert(umi_mhi_probe_cell_data(&h) != 0 && !starts && !calls);
@@ -203,7 +256,7 @@ int main(void)
         assert(deliveries == seen[slot] && captured_len == sizeof(frame));
         assert(!memcmp(captured, frame, captured_len));
     }
-    puts("PASS: SDX55 IP_HW0 startup, TX ownership, RX aggregation, ring wrap, burst mode and failure handling");
+    puts("PASS: SDX55 satellite contexts, DIAG overflow recovery and IP_HW0 startup, ownership, aggregation and ring wrap");
 }
 '''
 with tempfile.TemporaryDirectory() as directory:

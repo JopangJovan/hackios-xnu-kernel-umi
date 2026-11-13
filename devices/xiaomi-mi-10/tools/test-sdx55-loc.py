@@ -66,7 +66,7 @@ static char location_log[256];
 #define hakios_tl(...) ((void)snprintf(location_log,sizeof(location_log),__VA_ARGS__))
 '''
 fixture += pcie[pcie.index("static int\nsdx55_pdm_response("):pcie.index("static uint32_t\nsdx55_le32(")]
-fixture += pcie[pcie.index("static uint32_t\nsdx55_le32("):pcie.index("static void\numi_sdx55_qrtr_packet(void *context, const void *data, size_t size)\n{")]
+fixture += pcie[pcie.index("static uint32_t\nsdx55_le32("):pcie.index("/* ADSP protection-domain service routing")]
 fixture += pcie[pcie.index("#define SDX55_DMS_PORT"):pcie.index("} umi_sdx55_dms;") + len("} umi_sdx55_dms;")]
 fixture += r'''
 struct umi_mhi { uint8_t mode; unsigned reads, writes, refusals; uint16_t refusal_code; };

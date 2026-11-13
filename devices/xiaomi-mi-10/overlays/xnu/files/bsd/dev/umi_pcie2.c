@@ -6,6 +6,7 @@
 #include <sys/umi_pcie.h>
 #include <sys/umi_mhi.h>
 #include <sys/hakios.qmi.h>
+#include <sys/hakios.audio.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
@@ -23,10 +24,13 @@
 #include <pexpert/pexpert.h>
 #include <libkern/libkern.h>
 #include <machine/machine_routines.h>
+#include <os/atomic.h>
 #include "umi_pcie2_phy.h"
 #include "umi_sdx55_wan.h"
 #include "umi_sdx55_wds.h"
 #include "umi_sdx55_qmap.h"
+#include "umi_sdx55_ims.h"
+#include "umi_sdx55_voice_wire.h"
 #include <sys/umi_sdx55_net.h>
 #include <sys/umi_sdx55_cell_status.h>
 #include "umi_sdx55_sbl1.inc"
@@ -85,6 +89,10 @@ void umi_sdx55_init(void);
 #define BAR  0x64300000u
 #define SDX55_IOVA 0x20000000ull
 #define SDX55_DMA_SIZE 0x200000u
+#define SDX55_SAT_IOVA (SDX55_IOVA + SDX55_DMA_SIZE)
+#define SDX55_SAT_BYTES 0x51000u
+#define SDX55_SAT_TABLE 0x4000u
+#define SDX55_DMA_TABLE_BYTES 0x5000u
 #define SDX55_SID  0x1d01u
 #define SDX55_MSI_ADDRESS 0x17a10040ull
 #define SDX55_MSI_DATA 864u /* Live UMI DT: PCIe2 SPI 832, GIC number = SPI + 32. */
@@ -615,6 +623,20 @@ static struct {
 } umi_sdx55_dma;
 
 static bool
+sdx55_voice_boot_enabled(void)
+{
+	uint32_t voice = 0;
+	return PE_parse_boot_argn("sdx55_voice", &voice, sizeof(voice)) && voice == 1;
+}
+
+static bool
+sdx55_voice_diag_enabled(void)
+{
+	uint32_t diag = 0;
+	return PE_parse_boot_argn("sdx55_voice_diag", &diag, sizeof(diag)) && diag == 1;
+}
+
+static bool
 umi_sdx55_smmu_sync(void)
 {
 	umi_sdx55_direct_write(umi_sdx55_dma.cb, 0x610,
@@ -706,7 +728,7 @@ umi_sdx55_smmu_install(void)
 	    umi_sdx55_dma.memory_size > 0x200000 ||
 	    (umi_sdx55_dma.memory_size & 0xfff))
 		return EINVAL;
-	memset((void *)umi_sdx55_dma.tables, 0, 0x4000);
+	memset((void *)umi_sdx55_dma.tables, 0, SDX55_DMA_TABLE_BYTES);
 	uint64_t *l1 = (uint64_t *)umi_sdx55_dma.tables;
 	uint64_t *l2 = (uint64_t *)(umi_sdx55_dma.tables + 0x1000);
 	uint64_t *l3 = (uint64_t *)(umi_sdx55_dma.tables + 0x2000);
@@ -717,6 +739,8 @@ umi_sdx55_smmu_install(void)
 	    kvtophys((vm_offset_t)l3) | 3;
 	l2[(SDX55_MSI_ADDRESS >> 21) & 511] =
 	    kvtophys((vm_offset_t)msi_l3) | 3;
+	if (umi_sdx55_dma.memory_size == SDX55_DMA_SIZE && sdx55_voice_boot_enabled())
+		l2[(SDX55_SAT_IOVA >> 21) & 511] = kvtophys(umi_sdx55_dma.tables + SDX55_SAT_TABLE) | 3;
 	for (unsigned page_index = 0;
 	    page_index < umi_sdx55_dma.memory_size / 0x1000; page_index++)
 		l3[((SDX55_IOVA >> 12) + page_index) & 511] =
@@ -727,7 +751,7 @@ umi_sdx55_smmu_install(void)
 	msi_l3[(SDX55_MSI_ADDRESS >> 12) & 511] =
 	    (SDX55_MSI_ADDRESS & ~0xfffull) | 3ull | BIT(6) | (2ull << 2) |
 	    (2ull << 8) | BIT(10) | BIT(11) | (1ull << 53) | (1ull << 54);
-	umi_sdx55_clean(umi_sdx55_dma.tables, 0x4000);
+	umi_sdx55_clean(umi_sdx55_dma.tables, SDX55_DMA_TABLE_BYTES);
 	umi_sdx55_clean(umi_sdx55_dma.memory, umi_sdx55_dma.memory_size);
 
 	umi_sdx55_dma.context_changed = true;
@@ -849,7 +873,7 @@ umi_sdx55_smmu_proof(void)
 	umi_sdx55_dma.memory_size = 0x1000;
 	memset((void *)umi_sdx55_dma.memory, 0xa5, umi_sdx55_dma.memory_size);
 	if (!umi_sdx55_dma.tables && kmem_alloc(kernel_map, &umi_sdx55_dma.tables,
-	    0x4000, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    SDX55_DMA_TABLE_BYTES, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
 		return ENOMEM;
 	lck_mtx_lock(&hakios_smmu_lock);
@@ -885,7 +909,7 @@ umi_sdx55_bhi_boot_inner(struct umi_pcie *p, bool reserve_mhi)
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
 		return ENOMEM;
 	if (!umi_sdx55_dma.tables && kmem_alloc(kernel_map, &umi_sdx55_dma.tables,
-	    0x4000, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    SDX55_DMA_TABLE_BYTES, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
 		return ENOMEM;
 	umi_sdx55_dma.memory_size = dma_size;
@@ -972,18 +996,25 @@ umi_sdx55_mhi_write(void *context, uint32_t offset, uint32_t value)
 }
 
 static int
+umi_sdx55_mhi_allocate_aligned(size_t size, vm_size_t alignment, struct umi_mhi_dma *dma)
+{
+	vm_size_t rounded = round_page(size);
+	vm_size_t offset = (umi_sdx55_mhi_cursor + alignment - 1) & ~(alignment - 1);
+	if (!rounded || offset > umi_sdx55_dma.memory_size ||
+	    rounded > umi_sdx55_dma.memory_size - offset)
+		return ENOMEM;
+	dma->bytes = (void *)(umi_sdx55_dma.memory + offset);
+	dma->address = SDX55_IOVA + offset;
+	dma->size = rounded;
+	umi_sdx55_mhi_cursor = offset + rounded;
+	return 0;
+}
+
+static int
 umi_sdx55_mhi_allocate(void *context, size_t size, struct umi_mhi_dma *dma)
 {
 	(void)context;
-	vm_size_t rounded = round_page(size);
-	if (!rounded || umi_sdx55_mhi_cursor > umi_sdx55_dma.memory_size ||
-	    rounded > umi_sdx55_dma.memory_size - umi_sdx55_mhi_cursor)
-		return ENOMEM;
-	dma->bytes = (void *)(umi_sdx55_dma.memory + umi_sdx55_mhi_cursor);
-	dma->address = SDX55_IOVA + umi_sdx55_mhi_cursor;
-	dma->size = rounded;
-	umi_sdx55_mhi_cursor += rounded;
-	return 0;
+	return umi_sdx55_mhi_allocate_aligned(size, PAGE_SIZE, dma);
 }
 
 static void
@@ -1018,6 +1049,8 @@ umi_sdx55_mhi_delay(void *context, unsigned us)
 {
 	pause_us(context, us);
 }
+
+#include "umi_sdx55_modem_diag.inc"
 
 extern const uint8_t *hakios_image_file(const char *, const char *, uint64_t *, int *);
 
@@ -1102,6 +1135,9 @@ static struct {
 } umi_sdx55_loc;
 
 #define SDX55_CELL_PORT 0x4303u
+static void sdx55_voice_announce(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+static void sdx55_voice_receive(uint32_t, uint32_t, uint32_t, const uint8_t *, size_t);
+static void sdx55_ims_receive(uint32_t, uint32_t, uint32_t, const uint8_t *, size_t);
 /* UMI netmgr / ds_get_epid: PCIe iface 4 for rmnet_mhi0, separate from netdev GET_EPID (0). */
 #define SDX55_PCIE_DATA_IFACE 4u
 #define SDX55_CELL_MUX 1u
@@ -1705,18 +1741,113 @@ sdx55_loc_has_control_ind(uint16_t message)
 	    message == 0x4a || message == 0xba || message == 0xbf;
 }
 
+/* ADSP protection-domain service routing on the modem worker. */
+static int sdx55_voice_audio_prepare(struct umi_mhi *);
+
+static struct {
+	bool enabled, pending;
+	uint64_t advertised;
+	struct hakios_audio_pd_packet request;
+} sdx55_audio_pd;
+
+#include "umi_sdx55_mhi_adsp.inc"
+
+static bool
+sdx55_audio_pd_rx(uint32_t type, uint32_t src_node, uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
+    bool confirm, const uint8_t *payload, uint32_t length)
+{
+	if (!sdx55_audio_pd.advertised ||
+	    sdx55_audio_pd.advertised != ((uint64_t)dst_node << 32 | dst_port)) return false;
+	if ((src_node != umi_sdx55_dms_node && src_node != umi_sdx55_peer) || !src_node || !src_port || sdx55_audio_pd.pending ||
+	    length > sizeof(sdx55_audio_pd.request.data)) return true;
+	if (type == 1) {
+		if (length < 7 || payload[0] != QMI_REQUEST || sdx55_cell_le16(payload + 5) != length - 7) return true;
+		unsigned msg = sdx55_cell_le16(payload + 3);
+		if (msg != 0x20 && msg != 0x23) return true; /* register listener, acknowledge state */
+	} else if (type != 7 || length != 20) return true; /* flow-control resume */
+	sdx55_audio_pd.request = (struct hakios_audio_pd_packet){
+		type, src_node, src_port, dst_node, dst_port, confirm, length, {0}
+	};
+	memcpy(sdx55_audio_pd.request.data, payload, length);
+	sdx55_audio_pd.pending = true;
+	return true;
+}
+
+static int
+sdx55_audio_pd_poll(struct umi_mhi *host)
+{
+	if (!sdx55_audio_pd.enabled || !umi_sdx55_peer || !umi_sdx55_dms_node) return 0;
+	uint64_t endpoint = hakios_adsp_audio_pd_endpoint();
+	if (sdx55_audio_pd.advertised != endpoint) {
+		bool added = !sdx55_audio_pd.advertised;
+		uint64_t which = added ? endpoint : sdx55_audio_pd.advertised;
+		uint32_t type = added ? 4 : 5;
+		uint32_t packet[] = {1, type, 1, 0xfffffffe, 0, 20, umi_sdx55_peer, 0xfffffffe,
+		    type, HAKIOS_AUDIO_PD_SERVICE, HAKIOS_AUDIO_PD_INSTANCE, (uint32_t)(which >> 32), (uint32_t)which};
+		sdx55_audio_pd.advertised = added ? endpoint : 0;
+		int error = umi_mhi_send_qrtr_packet(host, packet, sizeof(packet), 1000, UINT16_MAX);
+		if (!error && umi_sdx55_dms_node != umi_sdx55_peer) {
+			/* The next hop consumes its control packets locally. The modem's
+			 * service registry needs its own copy of the ADSP announcement. */
+			packet[6] = umi_sdx55_dms_node;
+			error = umi_mhi_send_qrtr_packet(host, packet, sizeof(packet), 1000, UINT16_MAX);
+		}
+		if (error) return error;
+		hakios_tl("UMI SDX55: voice audio PD %s node=%u port=%u modem=%u\n",
+		    added ? "announced" : "withdrawn", packet[11], packet[12], umi_sdx55_dms_node);
+	}
+	if (sdx55_audio_pd.pending) {
+		struct hakios_audio_pd_packet request = sdx55_audio_pd.request;
+		sdx55_audio_pd.pending = false;
+		int error = hakios_adsp_audio_pd_send(&request);
+		hakios_tl("UMI SDX55: voice audio PD to DSP type=%u msg=%#x errno=%d\n",
+		    request.type, request.type == 1 ? sdx55_cell_le16(request.data + 3) : 0, error);
+	}
+	struct hakios_audio_pd_packet reply;
+	if (!hakios_adsp_audio_pd_receive(&reply) ||
+	    (reply.to_node != umi_sdx55_dms_node && reply.to_node != umi_sdx55_peer)) return 0;
+	uint16_t msg = reply.type == 1 && reply.length >= 7 ? sdx55_cell_le16(reply.data + 3) : 0;
+	if (msg == 0x20 || msg == 0x22) {
+		unsigned state_tag = msg == 0x20 ? 0x10 : 1;
+		for (unsigned at = 7; at + 3 <= reply.length;) {
+			unsigned count = sdx55_cell_le16(reply.data + at + 1);
+			if (count > reply.length - at - 3) break;
+			if (reply.data[at] == state_tag && count == 4) {
+				uint32_t state = sdx55_le32(reply.data + at + 3);
+				hakios_tl("UMI SDX55: voice audio PD state=%#x\n", state);
+				if (state == 0x1fffffffu) {
+					/* The modem can open its voice transport when it sees
+					 * Audio PD UP. Publish the mailbox before that point. */
+					int setup = sdx55_voice_audio_prepare(host);
+					hakios_tl("UMI SDX55: voice mailbox before audio PD UP errno=%d\n", setup);
+				}
+				break;
+			}
+			at += count + 3;
+		}
+	}
+	uint32_t packet[8 + sizeof(reply.data) / 4] = {
+	    1, reply.type, reply.from_node, reply.from_port, reply.confirm, reply.length, reply.to_node, reply.to_port
+	};
+	memcpy(packet + 8, reply.data, reply.length);
+	int error = umi_mhi_send_qrtr_packet(host, packet, 32 + ((reply.length + 3) & ~3u), 1000, UINT16_MAX);
+	hakios_tl("UMI SDX55: voice audio PD to modem type=%u msg=%#x errno=%d\n", reply.type, msg, error);
+	return error;
+}
+
 static void
 umi_sdx55_qrtr_packet(void *context, const void *data, size_t size)
 {
 	(void)context;
 	const uint8_t *bytes = data;
-	uint32_t type, length, dst_port, src_node, src_port;
+	uint32_t type, length, dst_node, dst_port, src_node, src_port;
 	size_t header;
 	++umi_sdx55_qrtr_frames;
 	if (size >= 16 && bytes[0] == 3) {
 		type = bytes[1];
 		src_port = bytes[10] | (uint32_t)bytes[11] << 8;
 		src_node = bytes[8] | (uint32_t)bytes[9] << 8;
+		dst_node = bytes[12] | (uint32_t)bytes[13] << 8;
 		dst_port = bytes[14] | (uint32_t)bytes[15] << 8;
 		length = sdx55_le32(bytes + 4);
 		header = 16u + bytes[3];
@@ -1724,14 +1855,16 @@ umi_sdx55_qrtr_packet(void *context, const void *data, size_t size)
 		type = sdx55_le32(bytes + 4);
 		src_port = sdx55_le32(bytes + 12);
 		src_node = sdx55_le32(bytes + 8);
+		dst_node = sdx55_le32(bytes + 24);
 		dst_port = sdx55_le32(bytes + 28);
 		length = sdx55_le32(bytes + 20);
 		header = 32;
 	} else return;
 	if (header > size || length > size - header) return;
 	const uint8_t *payload = bytes + header;
-	if (type == 1 && ((bytes[0] == 3 && (bytes[2] & 1)) ||
-	    (bytes[0] == 1 && sdx55_le32(bytes + 16))) && umi_sdx55_credits < 32) {
+	bool confirm = bytes[0] == 3 ? (bytes[2] & 1) != 0 : sdx55_le32(bytes + 16) != 0;
+	if (sdx55_audio_pd_rx(type, src_node, src_port, dst_node, dst_port, confirm, payload, length)) return;
+	if (type == 1 && confirm && umi_sdx55_credits < 32) {
 		unsigned i = umi_sdx55_credits++;
 		umi_sdx55_credit[i].node = src_node;
 		umi_sdx55_credit[i].port = src_port;
@@ -1739,6 +1872,14 @@ umi_sdx55_qrtr_packet(void *context, const void *data, size_t size)
 	}
 	if (type == 1 && dst_port == SDX55_CELL_PORT) {
 		sdx55_cell_reply(src_node, src_port, payload, length);
+		return;
+	}
+	if (type == 1 && (dst_port == SDX55_VOICE_PORT || dst_port == SDX55_IMSA_PORT || dst_port == SDX55_IMSS_PORT)) {
+		sdx55_voice_receive(dst_port, src_node, src_port, payload, length);
+		return;
+	}
+	if (type == 1 && (dst_port == SDX55_IMSDCM_PORT || dst_port == SDX55_IMS_WDS_PORT)) {
+		sdx55_ims_receive(dst_port, src_node, src_port, payload, length);
 		return;
 	}
 	if (type == 1 && dst_port == SDX55_PDM_PORT) {
@@ -1930,6 +2071,7 @@ umi_sdx55_qrtr_packet(void *context, const void *data, size_t size)
 	hakios_tl("UMI SDX55: QRTR type=%u service=%u instance/version=%#x node=%u port=%u\n",
 	    type, service, instance, node, port);
 	sdx55_cell_announce(type, service, instance, node, port);
+	sdx55_voice_announce(type, service, instance, node, port);
 	if (service == 2 && instance == 1 && port && (type == 4 ||
 	    (umi_sdx55_dms_node == node && umi_sdx55_dms_port == port))) {
 		umi_sdx55_dms_node = node;
@@ -1969,6 +2111,8 @@ umi_sdx55_poll_loc(struct umi_mhi *host, unsigned ms)
 		typeof(umi_sdx55_pdm_queue[0]) reply = umi_sdx55_pdm_queue[--umi_sdx55_pdm_count];
 		error = umi_mhi_send_qrtr_packet(host, reply.packet, reply.size, 1000, UINT16_MAX);
 	}
+	if (!error && sdx55_audio_pd.enabled) sdx55_sat_poll(host);
+	if (!error) error = sdx55_audio_pd_poll(host);
 	if (error || !umi_sdx55_credits) return error;
 	unsigned i = --umi_sdx55_credits;
 	uint32_t local = umi_sdx55_credit[i].local;
@@ -2446,6 +2590,10 @@ sdx55_refresh_radio(struct umi_mhi *host, const struct sdx55_cell_endpoint *nas)
 	    rat, rsrp, rat ? plmn : "", rat && name[0], system.nr_service, system.lte_service, serving.registration);
 }
 
+#include "umi_sdx55_ims.inc"
+#include "umi_sdx55_voice_audio.inc"
+#include "umi_sdx55_voice.inc"
+
 static int
 sdx55_move_packets(struct umi_mhi *host, uint64_t deadline, const struct sdx55_data_routes *routes,
     const struct sdx55_cell_endpoint *nas)
@@ -2460,6 +2608,7 @@ sdx55_move_packets(struct umi_mhi *host, uint64_t deadline, const struct sdx55_d
 		error = umi_sdx55_poll_loc(host, 5);
 		if (!error) error = sdx55_flush_flow_acks(host);
 		if (error) break;
+		sdx55_voice_tick(host);
 		if (mach_absolute_time() >= check_status) {
 			error = sdx55_read_cell_service(host, &routes->wds);
 			if (!error && sdx55_query.wan.connection_status != 2) error = ENETDOWN;
@@ -2690,6 +2839,7 @@ sdx55_run_data_call(struct umi_mhi *host, unsigned seconds)
 	if (!error && !sdx55_data_routes_current(&routes)) error = ENXIO;
 	uint64_t deadline, refresh = 0;
 	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
+	if (!error) sdx55_voice_begin();
 	while (!error && mach_absolute_time() < deadline) {
 		if (!sdx55_data_routes_current(&routes) || !sdx55_cell_endpoint_current(&nas)) {
 			error = ENXIO;
@@ -2703,9 +2853,11 @@ sdx55_run_data_call(struct umi_mhi *host, unsigned seconds)
 			error = sdx55_data_bearer(host, deadline, &routes, &nas);
 		else {
 			if (sdx55_radio.state != UMI_DATA_OFF) sdx55_data_state(UMI_DATA_OFF);
+			sdx55_voice_tick(host);
 			error = umi_sdx55_poll_loc(host, 100);
 		}
 	}
+	sdx55_voice_finish(host);
 	/* A lost START reply can leave a modem-owned session with an unknown
 	 * handle. Closing this client's QRTR port releases its resources. */
 	if (!host->poisoned) {
@@ -2805,6 +2957,11 @@ umi_sdx55_cell_session(struct umi_mhi *host)
 		hakios_tl("UMI SDX55: cellular IP_HW0 probe errno=%d\n", ring_error);
 		if (!first_error && ring_error) first_error = ring_error;
 	}
+	if (!first_error && sdx55_audio_pd.enabled && sdx55_voice_diag_enabled()) {
+		int diag_error = sdx55_modem_diag_start(host);
+		hakios_tl("UMI SDX55: voice modem DIAG start errno=%d DMA used=%#lx\n", diag_error,
+		    (unsigned long)umi_sdx55_mhi_cursor);
+	}
 	if (!first_error && call == 1) {
 		first_error = sdx55_run_data_call(host, seconds);
 		sdx55_data_state(UMI_DATA_UNAVAILABLE);
@@ -2848,6 +3005,9 @@ umi_sdx55_mission_session(struct umi_mhi *host, bool open_efs, bool cellular)
 	for (unsigned i = 0; i < sizeof(sdx55_services)/sizeof(sdx55_services[0]); i++)
 		sdx55_services[i].port = sdx55_services[i].node = 0;
 	umi_sdx55_pdm_count = 0;
+	bzero(&sdx55_audio_pd, sizeof(sdx55_audio_pd));
+	bzero(&sdx55_sat, sizeof(sdx55_sat));
+	sdx55_audio_pd.enabled = cellular && sdx55_voice_boot_enabled();
 	umi_sdx55_dms_node = umi_sdx55_dms_port = 0;
 	umi_sdx55_peer = umi_sdx55_loc_port = umi_sdx55_loc_node = umi_sdx55_qrtr_frames = 0;
 	struct umi_pcie *pcie = host->io->context;
@@ -2903,6 +3063,7 @@ umi_sdx55_mission_session(struct umi_mhi *host, bool open_efs, bool cellular)
 		    0xfffffffe, 4, 64, 0x101, 1, SDX55_PDM_PORT};
 		error = umi_mhi_send_qrtr_packet(host, announce, sizeof(announce), 1000, UINT16_MAX);
 	}
+	if (!error && cellular) sdx55_ims_dcm_announce(host);
 	for (unsigned i = 0; !error && i < 12000; i++) {
 		if ((!cellular || sdx55_cell_discovered()) && (!location || umi_sdx55_loc_port != 0)) break;
 		/* A HELLO asks the peer name server to send its current services.
@@ -2937,6 +3098,7 @@ umi_sdx55_prepare_mhi(struct umi_pcie *p, bool probe_sahara, bool handshake,
 	umi_sdx55_mhi_io.bar_size = 0x1000;
 	umi_sdx55_mhi_io.dma_start = SDX55_IOVA;
 	umi_sdx55_mhi_io.dma_end = SDX55_IOVA + SDX55_DMA_SIZE;
+	if (sdx55_voice_boot_enabled()) umi_sdx55_mhi_io.dma_end = SDX55_SAT_IOVA + SDX55_SAT_BYTES;
 	umi_sdx55_mhi_io.profile = UMI_MHI_PROFILE_SDX55;
 	umi_sdx55_mhi_io.read32 = umi_sdx55_mhi_read;
 	umi_sdx55_mhi_io.write32 = umi_sdx55_mhi_write;
@@ -2947,6 +3109,7 @@ umi_sdx55_prepare_mhi(struct umi_pcie *p, bool probe_sahara, bool handshake,
 	umi_sdx55_mhi_io.report = umi_sdx55_mhi_report;
 	umi_sdx55_mhi_io.qrtr_packet = umi_sdx55_qrtr_packet;
 	umi_sdx55_mhi_io.cell_rx = sdx55_receive_packets;
+	umi_sdx55_mhi_io.diag_rx = sdx55_modem_diag_receive;
 	report(p, "SBL MHI length", rd(p, BAR));
 	report(p, "SBL MHI version", rd(p, BAR + 8));
 	report(p, "SBL MHI channel doorbells", rd(p, BAR + 0x18));
@@ -3186,6 +3349,10 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_radio_status,
 SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_mobile_data,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
     sdx55_data_sysctl, "I", "Request an SDX55 packet-data connection");
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_voice,
+    CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+    sdx55_voice_sysctl, "S,umi_voice_snapshot", "SDX55 outbound voice test");
 
 SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_observe,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,

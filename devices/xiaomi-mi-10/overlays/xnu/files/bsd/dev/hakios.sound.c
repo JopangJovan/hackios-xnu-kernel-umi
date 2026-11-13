@@ -580,8 +580,14 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 #define PERIOD_FRAMES           960             /* 20 ms */
 #define PERIOD_BYTES            (PERIOD_FRAMES * 4)
 #define BUFFER_BYTES            (PERIODS * 4096)        /* a page each */
-#define MIC_BYTES               (16 * 4096)             /* the microphones' (hakios.mic.c), behind the periods */
-#define SHARED_BYTES            (BUFFER_BYTES + MIC_BYTES)
+#define MIC_BYTES               (8 * 4096)              /* the microphones' (hakios.mic.c), behind the periods */
+#define VOICE_PCM_OFFSET        (BUFFER_BYTES + MIC_BYTES)
+#define SHARED_BYTES            (VOICE_PCM_OFFSET + UMI_VOICE_PCM_BYTES)
+#define VOICE_MAILBOX_OFFSET    0x20000u
+#define VOICE_CAL_OFFSET        (VOICE_MAILBOX_OFFSET + UMI_VOICE_MAILBOX_BYTES)
+
+_Static_assert(VOICE_MAILBOX_OFFSET >= SHARED_BYTES &&
+    VOICE_CAL_OFFSET + UMI_VOICE_CAL_BYTES <= 0x200000u, "ADSP shared DMA range");
 
 static struct {
 	bool found, on, passed;         /* passed: the boot chain lets the stream through untranslated */
@@ -591,7 +597,7 @@ static struct {
 	uint32_t old_ttbr0_low, old_ttbr0_high, old_ttbr1_low, old_ttbr1_high, old_mair0, old_mair1;
 	vm_offset_t tables;             /* three of 4K: the root, one of the second level, one of the third */
 } space;
-static vm_offset_t buffer;              /* BUFFER_BYTES of ours, the periods (and MIC_BYTES behind them: the microphones') */
+static vm_offset_t buffer;              /* playback, microphone and call downlink periods */
 static uint64_t buffer_address;         /* as the DSP is to know it */
 
 static void
@@ -848,7 +854,8 @@ space_off(void)
 /*
  * The DSP's view of our memory is one: the sound's periods and the microphones' buffers behind them
  * (hakios.mic.c), through the same stream and context. Whoever comes first sets it up, whoever
- * leaves last takes it down. user: 0 the sound, 1 the microphones. With hakios_smmu_lock held.
+ * leaves last takes it down. Users 0–4 are playback, microphone, modem mailbox, call PCM and call calibration.
+ * With hakios_smmu_lock held.
  */
 static uint32_t space_users;
 
@@ -916,6 +923,113 @@ hakios_audio_dsp_memory_put(void)
 {
 	lck_mtx_lock(&hakios_smmu_lock);
 	shared_put(1);
+	lck_mtx_unlock(&hakios_smmu_lock);
+}
+
+bool
+hakios_audio_voice_pcm_memory(uintptr_t *memory, uint64_t *dsp_address)
+{
+	lck_mtx_lock(&hakios_smmu_lock);
+	bool ok = shared_get(3);
+	if (ok) {
+		*memory = buffer + VOICE_PCM_OFFSET;
+		*dsp_address = buffer_address + VOICE_PCM_OFFSET;
+	}
+	lck_mtx_unlock(&hakios_smmu_lock);
+	return ok;
+}
+
+void
+hakios_audio_voice_pcm_memory_put(void)
+{
+	lck_mtx_lock(&hakios_smmu_lock);
+	shared_put(3);
+	lck_mtx_unlock(&hakios_smmu_lock);
+}
+
+static uintptr_t voice_mailbox;
+static uint64_t voice_mailbox_address;
+
+/* Map dedicated wired pages into the live audio context with hakios_smmu_lock held. */
+static bool
+shared_map(uintptr_t memory, unsigned offset, unsigned bytes, uint64_t *dsp_address)
+{
+	if (space.passed) {
+		uint64_t phys = kvtophys(memory);
+		if (!phys) return false;
+		for (unsigned page = 4096; page < bytes; page += 4096)
+			if (kvtophys(memory + page) != phys + page) return false;
+		*dsp_address = phys | AUDIO_STREAM_BITS;
+		return true;
+	}
+	uint64_t *entries = (uint64_t *)(space.tables + 8192) + offset / 4096;
+	unsigned pages = bytes / 4096;
+	for (unsigned page = 0; page < pages; page++)
+		entries[page] = kvtophys(memory + page * 4096) | AUDIO_PTE;
+	for (unsigned entry = 0; entry < pages * sizeof(*entries); entry += 64)
+		__asm__ volatile("dc cvac, %0" :: "r" ((uintptr_t)entries + entry) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, space.context);
+	put(&apps_smmu_context, "tlbsync", SMMU_CB_TLBSYNC, 1);
+	for (unsigned ms = 0; ms < 100; ms++) {
+		if (!(rd(apps_smmu_context.base + SMMU_CB_TLBSTATUS) & 1)) {
+			*dsp_address = (AUDIO_ADDRESSES + offset) | AUDIO_STREAM_BITS;
+			return true;
+		}
+		sleep_ms(1);
+	}
+	return false;
+}
+
+bool
+hakios_audio_voice_mailbox(uintptr_t memory, uint64_t *dsp_address)
+{
+	if (!memory || (memory & 4095)) return false;
+	lck_mtx_lock(&hakios_smmu_lock);
+	bool ok = voice_mailbox == memory;
+	if (!voice_mailbox && shared_get(2)) {
+		ok = shared_map(memory, VOICE_MAILBOX_OFFSET, UMI_VOICE_MAILBOX_BYTES, &voice_mailbox_address);
+		if (ok) voice_mailbox = memory;
+		else shared_put(2);
+	}
+	if (ok) *dsp_address = voice_mailbox_address;
+	lck_mtx_unlock(&hakios_smmu_lock);
+	return ok;
+}
+
+void
+hakios_audio_voice_mailbox_put(void)
+{
+	lck_mtx_lock(&hakios_smmu_lock);
+	shared_put(2);
+	voice_mailbox = 0;
+	voice_mailbox_address = 0;
+	lck_mtx_unlock(&hakios_smmu_lock);
+}
+
+bool
+hakios_audio_voice_cal_memory(uintptr_t *memory, uint64_t *dsp_address)
+{
+	static uintptr_t calibration;
+	lck_mtx_lock(&hakios_smmu_lock);
+	bool ok = shared_get(4);
+	if (ok) {
+		if (!calibration && kmem_alloc(kernel_map, &calibration, UMI_VOICE_CAL_BYTES,
+		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
+			calibration = 0;
+		ok = calibration && shared_map(calibration, VOICE_CAL_OFFSET, UMI_VOICE_CAL_BYTES, dsp_address);
+		if (ok) *memory = calibration;
+		else shared_put(4);
+	}
+	lck_mtx_unlock(&hakios_smmu_lock);
+	return ok;
+}
+
+void
+hakios_audio_voice_cal_memory_put(void)
+{
+	lck_mtx_lock(&hakios_smmu_lock);
+	shared_put(4);
 	lck_mtx_unlock(&hakios_smmu_lock);
 }
 
@@ -1216,6 +1330,57 @@ static volatile bool feeder_runs, watcher_runs;
 static uint64_t fed_frames, silent_frames, ios_frames;
 static volatile uint32_t ios_peak;              /* the largest sample since the amplifiers last started */
 
+/* A separate mono queue allows a call to stop without discarding media from iOS. */
+#define VOICE_RING_FRAMES 4096u
+static LCK_MTX_DECLARE(voice_ring_lock, &sound_lock_group);
+static int16_t voice_ring[VOICE_RING_FRAMES];
+static uint32_t voice_ring_head, voice_ring_tail;
+
+uint32_t
+hakios_audio_voice_play(const int16_t *samples, uint32_t frames)
+{
+	if (!umi_profile || !feeder_runs || stopping) return 0;
+	lck_mtx_lock(&voice_ring_lock);
+	uint32_t room = VOICE_RING_FRAMES - (voice_ring_head - voice_ring_tail);
+	uint32_t taken = frames < room ? frames : room;
+	bool audible = false;
+	for (uint32_t i = 0; i < taken; i++) {
+		int16_t sample = samples[i] / 2;
+		voice_ring[(voice_ring_head + i) % VOICE_RING_FRAMES] = sample;
+		audible |= sample > SILENCE || sample < -SILENCE;
+	}
+	voice_ring_head += taken;
+	if (audible) last_sound_us = now_us();
+	lck_mtx_unlock(&voice_ring_lock);
+	return taken;
+}
+
+void
+hakios_audio_voice_flush(void)
+{
+	lck_mtx_lock(&voice_ring_lock);
+	voice_ring_tail = voice_ring_head;
+	lck_mtx_unlock(&voice_ring_lock);
+}
+
+static bool
+voice_mix(int16_t *samples)
+{
+	lck_mtx_lock(&voice_ring_lock);
+	uint32_t frames = voice_ring_head - voice_ring_tail;
+	if (frames > PERIOD_FRAMES) frames = PERIOD_FRAMES;
+	for (uint32_t i = 0; i < frames; i++) {
+		int16_t voice = voice_ring[(voice_ring_tail + i) % VOICE_RING_FRAMES];
+		for (unsigned ch = 0; ch < 2; ch++) {
+			int32_t sum = samples[2 * i + ch] + voice;
+			samples[2 * i + ch] = sum > INT16_MAX ? INT16_MAX : (sum < INT16_MIN ? INT16_MIN : (int16_t)sum);
+		}
+	}
+	voice_ring_tail += frames;
+	lck_mtx_unlock(&voice_ring_lock);
+	return frames != 0;
+}
+
 /* From the writer's thread, under hakios.audio.c's lock: never waits. */
 static uint32_t
 ios_sink(const int16_t *frames, uint32_t count)
@@ -1292,9 +1457,10 @@ period_fill_ios(unsigned period)
 	ring_tail = tail + n;
 	fed_frames += n;
 	silent_frames += PERIOD_FRAMES - n;
+	bool voice = voice_mix(samples);
 	/* the guard, on every period, silence too: its filter and its averages go on (hakios.guard.c) */
 	hakios_guard_process(samples, PERIOD_FRAMES);
-	if (n != 0 && hakios_audio_recording_fed()) {
+	if (!voice && n != 0 && hakios_audio_recording_fed()) {
 		hakios_audio_record_fed(samples, n);
 	}
 	guard_periods++;

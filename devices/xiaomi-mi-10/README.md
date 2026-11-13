@@ -121,3 +121,63 @@ Control Center button both stop or start the WDS packet session while leaving
 the modem registered. The iOS 16.5 (20F66) status bar derives its signal bars
 from the modem's RSRP. The cellular profile starts the external modem after
 the SLPI magnetometer produces its first sample or the startup wait expires.
+
+## SDX55 outbound call RAM test
+
+Build the UMI loader and userland with the mobile data inputs above, using
+`UMI_GPS=1` for the userland build. Set `UMI_VOICE_CAL_DIR` for the kernel
+build or place the local handset calibration in `fw-audio/voice-cal/`. The
+tested handset configuration uses four tables (`cvs-static.bin`,
+`cvp-device.bin`, `cvp-static.bin`, and `cvp-dynamic.bin`) and their
+`columns-{7,8,9}.bin` descriptors. Keep the source tables and generated images
+local.
+
+Start with `UMI_CELLULAR=1 UMI_VOICE=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run`.
+During the 600-second SDX55 session, open Phone → Keypad → Cellular Call.
+The call sheet shows the modem state and offers an End Call button. The optional
+`sdx55_voice_diag=1` boot argument enables DSP and modem diagnostics. Logs
+include call states, voice frame counts and per-second signal levels. They
+omit dialed numbers and audio samples.
+
+### Hardware validation
+
+On 2026-11-14, UMI running iOS 16.5 (20F66) registered for IMS voice, reached the
+10010 menu and completed two manual hangups acknowledged by the modem. The
+48 kHz RX0 clock and routing enable sustained downlink decoding. Both handset
+microphones (ADC1 and ADC4) supply the DSP through DEC0 and DEC1. During quiet
+downlink intervals, both microphones carried signal, the encoder produced
+uplink payloads, and the modem logged uplink frames. The same 10010 robot
+responded to speech on stock Android. The iOS tests establish the uplink as
+far as the modem. Far-end speech recognition, intelligibility, and incoming
+calls still need explicit tests.
+
+### Repeatable gaps in IVR playback
+
+On iOS, parts of the robot's prompts are interrupted at the same points across
+calls. The two test calls queued all 9,212,160 downlink PCM samples retrieved by
+the working capture path with zero read errors. The playback driver shut the
+amplifiers off after three seconds of silence and woke them 21 times across
+both calls. The amplifiers reached playback volume 194–200 ms after the first
+non-silent PCM, which had only about 160 ms of buffering. That timing can cut
+the start of a prompt after a pause. The first playback path attempted at
+connection also returned no data and delayed the working stream-end capture
+by about two seconds. Whether these delays explain every repeated gap remains
+open.
+
+1. Keep the protected UMI speaker outputs ready for the duration of a call,
+   including silent IVR pauses. Release them on hangup or teardown so the
+   normal idle timer can power them down.
+2. Start with the working CVS stream-end capture path. Measure the first
+   decoded and played samples from the moment the modem reports connection.
+3. Use the same prompt and spoken phrase on Android and iOS. Compare the
+   repeated gap against modem frame sequence and size, decoder PCM, queued
+   and consumed PCM, and amplifier state. If a gap is present in the decoder
+   output, trace the receive frames and timing at that point. If the decoder
+   output is continuous, trace the playback queue and speaker output.
+4. Confirm full prompts after silent pauses, a response to the spoken phrase,
+   and normal connect and hangup. Check a subsequent call and media playback
+   after hangup.
+
+`python3 devices/xiaomi-mi-10/tools/test-sdx55-voice.py` and
+`python3 devices/xiaomi-mi-10/tools/test-sdx55-ims.py` exercise the call
+worker and IMS data session with a simulated modem.

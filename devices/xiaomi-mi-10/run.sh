@@ -15,6 +15,9 @@ if [[ "${UMI_CELLULAR:-0}" == 1 && " $XL_CMDLINE " != *" sdx55_"* ]]; then
   XL_CMDLINE+=" sdx55_step=12 sdx55_efs=1 sdx55_interactive=1 sdx55_return=0"
   XL_CMDLINE+=" sdx55_cell=1 sdx55_data_rings=1 sdx55_data_call=1 sdx55_data_secs=600"
 fi
+if [[ "${UMI_VOICE:-0}" == 1 && " $XL_CMDLINE " == *" sdx55_data_call=1 "* && " $XL_CMDLINE " != *" sdx55_voice="* ]]; then
+  XL_CMDLINE+=" sdx55_voice=1"
+fi
 python3 "$DEVICE_DIR/tools/stage-runtime.py"
 if [[ " $XL_CMDLINE " == *" wifi=1 "* && " $XL_CMDLINE " != *" wifi_mac="* ]] && [ -f "$OUT/wifi-boot.args" ]; then
   XL_CMDLINE="$XL_CMDLINE $(cat "$OUT/wifi-boot.args")"; export XL_CMDLINE

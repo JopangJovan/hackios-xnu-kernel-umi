@@ -44,7 +44,7 @@ struct sdx55_cell_status {
 	struct sdx55_gw_app gw[2];
 	uint8_t nr_service, nr_true_service, nr_domain, nr_forbidden;
 	uint8_t lte_service, lte_forbidden;
-	uint8_t registration, ps_attach;
+	uint8_t registration, cs_attach, ps_attach;
 	uint32_t radio_mask, data_mask; /* bit indexed by the corresponding QMI enum */
 	int16_t lte_rsrp, nr_rsrp;
 	char plmn[7], lte_plmn[7], operator_name[64];
@@ -415,6 +415,7 @@ sdx55_cell_decode(uint16_t message, uint16_t txn, const uint8_t *packet, size_t 
 		} else if (message == SDX55_NAS_GET_SERVING_SYSTEM && tag == 1) {
 			if (found_status++ || n < 5 || p[0] > 4 || p[1] > 2 || p[2] > 2) return EINVAL;
 			decoded.registration = p[0];
+			decoded.cs_attach = p[1];
 			decoded.ps_attach = p[2];
 			if (sdx55_cell_enum_mask(p + 4, n - 4, &decoded.radio_mask)) return EINVAL;
 		} else if (message == SDX55_NAS_GET_SERVING_SYSTEM && tag == 0x11) {

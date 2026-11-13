@@ -1987,7 +1987,7 @@ struct glink_packet {
  * carries APR, the audio services' own protocol (below; Android's apr_tal_rpmsg.c asks for no
  * particular intents: what the DSP sends there is a few hundred bytes, up to a few kilobytes).
  */
-enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNELS };
+enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNEL_MHI_SAT, CHANNELS };
 
 struct glink_channel {
 	const char *name;
@@ -2025,6 +2025,7 @@ static struct {
 		[CHANNEL_APR] = { .name = "apr_audio_svc", .ours = 2, .intents = { { 0x200, 8 }, { 0x1000, 4 }, { 0x2000, 2 } } },
 		/* the battery manager's (battmgr below): answers of a few dozen bytes, a name of 128 */
 		[CHANNEL_PMIC] = { .name = "PMIC_RTR_ADSP_APPS", .ours = 3, .intents = { { 0x200, 6 }, { 0x1000, 2 }, { 0, 0 } } },
+		[CHANNEL_MHI_SAT] = { .name = "mhi_sat", .ours = 4, .intents = { { 0x200, 4 }, { 0, 0 }, { 0, 0 } } },
 	},
 };
 
@@ -2469,6 +2470,39 @@ glink_send(struct glink_channel *channel, const void *data, uint32_t length)
 	return 0;
 }
 
+bool
+hakios_adsp_mhi_sat_open(void)
+{
+	lck_mtx_lock(&glink_lock);
+	bool open = glink.channel[CHANNEL_MHI_SAT].open && glink.up && !glink.broken;
+	lck_mtx_unlock(&glink_lock);
+	return open;
+}
+
+int
+hakios_adsp_mhi_sat_send(const void *data, uint32_t length)
+{
+	return glink_send(&glink.channel[CHANNEL_MHI_SAT], data, length);
+}
+
+uint32_t
+hakios_adsp_mhi_sat_receive(void *data, uint32_t capacity)
+{
+	struct glink_channel *channel = &glink.channel[CHANNEL_MHI_SAT];
+	lck_mtx_lock(&glink_lock);
+	struct glink_packet *packet = channel->first;
+	if (packet) {
+		channel->first = packet->next;
+		if (!channel->first) channel->last = NULL;
+	}
+	lck_mtx_unlock(&glink_lock);
+	if (!packet) return 0;
+	uint32_t length = packet->length <= capacity ? packet->length : 0;
+	memcpy(data, packet->data, length);
+	kfree_data(packet, sizeof(*packet) + packet->length);
+	return length;
+}
+
 /* ---- QRTR: hello, and the services the DSP tells of (hakios.wifi.c, without ports of our own yet) ---- */
 
 #define QRTR_US                 1u
@@ -2489,6 +2523,89 @@ static struct {
 	bool there;
 } qrtr_servers[64];
 static uint32_t qrtr_peer, qrtr_in, qrtr_out, qrtr_hellos, qrtr_lookups;
+
+/* The modem worker relays the actual ADSP registry, preserving QRTR addresses.
+ * The GLINK thread hands replies back through this bounded queue. */
+static LCK_MTX_DECLARE(audio_pd_lock, &adsp_lock_group);
+static struct {
+	uint64_t endpoint;
+	uint32_t modem_node;
+	unsigned head, count;
+	struct hakios_audio_pd_packet rx[8];
+} audio_pd;
+
+uint64_t
+hakios_adsp_audio_pd_endpoint(void)
+{
+	lck_mtx_lock(&audio_pd_lock);
+	uint64_t endpoint = audio_pd.endpoint;
+	lck_mtx_unlock(&audio_pd_lock);
+	return endpoint;
+}
+
+static void
+audio_pd_set_endpoint(uint64_t endpoint, uint64_t only_if)
+{
+	lck_mtx_lock(&audio_pd_lock);
+	if ((!only_if || audio_pd.endpoint == only_if) && audio_pd.endpoint != endpoint) {
+		audio_pd.endpoint = endpoint;
+		audio_pd.modem_node = 0;
+		audio_pd.head = audio_pd.count = 0;
+	}
+	lck_mtx_unlock(&audio_pd_lock);
+}
+
+int
+hakios_adsp_audio_pd_send(const struct hakios_audio_pd_packet *p)
+{
+	if (!p->length || p->length > sizeof(p->data)) return EINVAL;
+	lck_mtx_lock(&audio_pd_lock);
+	bool valid = audio_pd.endpoint == ((uint64_t)p->to_node << 32 | p->to_port) &&
+	    (!audio_pd.modem_node || audio_pd.modem_node == p->from_node);
+	if (valid) audio_pd.modem_node = p->from_node;
+	lck_mtx_unlock(&audio_pd_lock);
+	if (!valid) return ENXIO;
+	struct {
+		struct qrtr_header header;
+		uint8_t data[sizeof(p->data)];
+	} packet = {
+		.header = {1, p->type, p->from_node, p->from_port, p->confirm, p->length, p->to_node, p->to_port}
+	};
+	memcpy(packet.data, p->data, p->length);
+	return glink_send(&glink.channel[CHANNEL_QRTR], &packet, sizeof(packet.header) + ((p->length + 3) & ~3u));
+}
+
+bool
+hakios_adsp_audio_pd_receive(struct hakios_audio_pd_packet *p)
+{
+	lck_mtx_lock(&audio_pd_lock);
+	bool ready = audio_pd.count != 0;
+	if (ready) {
+		*p = audio_pd.rx[audio_pd.head];
+		audio_pd.head = (audio_pd.head + 1) % (sizeof(audio_pd.rx) / sizeof(audio_pd.rx[0]));
+		audio_pd.count--;
+	}
+	lck_mtx_unlock(&audio_pd_lock);
+	return ready;
+}
+
+static bool
+audio_pd_relay(const struct qrtr_header *h, const uint8_t *data)
+{
+	if ((h->type != QRTR_DATA && h->type != QRTR_RESUME_TX) || h->to_node == QRTR_US) return false;
+	lck_mtx_lock(&audio_pd_lock);
+	bool matched = audio_pd.endpoint == ((uint64_t)h->from_node << 32 | h->from_port) &&
+	    audio_pd.modem_node == h->to_node && h->to_port && h->to_port != QRTR_CONTROL;
+	const unsigned slots = sizeof(audio_pd.rx) / sizeof(audio_pd.rx[0]);
+	if (matched && audio_pd.count < slots && h->size <= sizeof(audio_pd.rx[0].data)) {
+		struct hakios_audio_pd_packet *p = &audio_pd.rx[(audio_pd.head + audio_pd.count++) % slots];
+		*p = (struct hakios_audio_pd_packet){h->type, h->from_node, h->from_port,
+		    h->to_node, h->to_port, h->confirm, h->size, {0}};
+		memcpy(p->data, data, h->size);
+	}
+	lck_mtx_unlock(&audio_pd_lock);
+	return matched;
+}
 
 static int
 qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
@@ -2515,6 +2632,8 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
 	return error;
 }
 
+#include "umi_sdx55_adsp_diag.inc"
+
 static void
 qrtr_control(const struct qrtr_header *header, const struct qrtr_control *control)
 {
@@ -2528,8 +2647,14 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		}
 		error = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
 		printf("adsp: qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
+		if (!error) voice_diag_announce(header->from_node);
 		break;
 	case QRTR_NEW_SERVER:
+		if (control->words[0] == HAKIOS_AUDIO_PD_SERVICE && control->words[1] == HAKIOS_AUDIO_PD_INSTANCE &&
+		    control->words[2] && control->words[2] == header->from_node && control->words[3] &&
+		    control->words[3] < 0xfffe) {
+			audio_pd_set_endpoint((uint64_t)control->words[2] << 32 | control->words[3], 0);
+		}
 		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 			if (qrtr_servers[i].there && qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]) {
 				found = (int)i;
@@ -2550,6 +2675,7 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		    control->words[0], control->words[1] & 0xff, control->words[1] >> 8, control->words[2], control->words[3]);
 		break;
 	case QRTR_DEL_SERVER:
+		audio_pd_set_endpoint(0, (uint64_t)control->words[2] << 32 | control->words[3]);
 		printf("adsp: qrtr: service %u at node %u port %u has gone\n", control->words[0], control->words[2], control->words[3]);
 		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 			if (qrtr_servers[i].there && qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]) {
@@ -2565,6 +2691,7 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		}
 		break;
 	case QRTR_BYE:
+		audio_pd_set_endpoint(0, 0);
 		printf("adsp: qrtr: BYE from node %u\n", header->from_node);
 		bzero(qrtr_servers, sizeof(qrtr_servers));
 		break;
@@ -2607,6 +2734,7 @@ qrtr_input(const uint8_t *data, uint32_t length)
 	if (qrtr_peer == 0) {
 		qrtr_peer = header.from_node;
 	}
+	if (audio_pd_relay(&header, data + at)) return;
 	if (header.type == QRTR_RESUME_TX) {
 		return;
 	}
@@ -2615,6 +2743,7 @@ qrtr_input(const uint8_t *data, uint32_t length)
 
 		qrtr_out_packet(QRTR_RESUME_TX, header.to_port, header.from_node, header.from_port, &resume, sizeof(resume));
 	}
+	if (voice_diag_input(&header, data + at)) return;
 	if (header.to_port == QRTR_CONTROL || header.type == QRTR_HELLO || header.type == QRTR_BYE ||
 	    header.type == QRTR_NEW_SERVER || header.type == QRTR_DEL_SERVER || header.type == QRTR_NEW_LOOKUP) {
 		struct qrtr_control control = { 0 };
@@ -2644,6 +2773,7 @@ qrtr_input(const uint8_t *data, uint32_t length)
 #define APR_MSG_TYPE_SEQ_CMD            2
 #define APR_HDR_FIELD(type, bytes)      ((uint16_t)((type) << 8 | ((bytes) / 4) << 4))      /* version 0 */
 #define APR_BASIC_RSP_RESULT            0x000110e8u
+#define APR_RSP_ACCEPTED                0x000100beu
 #define AVCS_GET_VERSIONS               0x00012905u
 #define AVCS_GET_VERSIONS_RSP           0x00012906u
 #define AVCS_CMD_ADSP_EVENT_GET_STATE   0x0001290cu
@@ -2660,6 +2790,7 @@ struct apr_header {
 
 static struct {
 	uint32_t opcode, token, length;
+	uint16_t source_port;
 	uint32_t words[64];
 	volatile bool there;
 } apr_answer;
@@ -2668,6 +2799,7 @@ static bool audio_up;                   /* the core service has said that the au
 static uint32_t apr_waited_for;         /* the token a question waits for the answer to; 0: none */
 static hakios_apr_events_t apr_events; /* the sound's (hakios.sound.c): what nobody waits for */
 static hakios_apr_events_t apr_events_second;  /* the microphones' (hakios.mic.c) */
+static hakios_apr_events_t apr_events_voice;   /* the SDX55 call downlink */
 static LCK_MTX_DECLARE(apr_lock, &adsp_lock_group);     /* one question at a time */
 
 /* A packet from the DSP's audio services. From the link's thread. */
@@ -2698,7 +2830,10 @@ apr_input(const uint8_t *data, uint32_t length)
 	}
 	payload = (header.size < length ? header.size : length) - header_length;
 	apr_in++;
-	if (header.token != apr_waited_for || apr_waited_for == 0) {
+	uint32_t waiting = os_atomic_load(&apr_waited_for, acquire);
+	bool awaited = waiting && header.token == waiting;
+	if (header.opcode == APR_RSP_ACCEPTED && awaited) return;
+	if (!awaited) {
 		hakios_apr_events_t events = apr_events;
 		uint32_t words[64];
 
@@ -2713,6 +2848,11 @@ apr_input(const uint8_t *data, uint32_t length)
 		    payload < sizeof(words) ? payload : sizeof(words))) {
 			return;
 		}
+		events = os_atomic_load(&apr_events_voice, acquire);
+		if (events != NULL && events(header.from_service, header.from_port, header.opcode, header.token, words,
+		    payload < sizeof(words) ? payload : sizeof(words))) {
+			return;
+		}
 	}
 	if (apr_in <= 40) {
 		uint32_t w[4] = { 0, 0, 0, 0 };
@@ -2722,10 +2862,12 @@ apr_input(const uint8_t *data, uint32_t length)
 		    "%#x %#x\n", header.from_service, header.from_domain, header.from_port, header.to_service, header.to_domain,
 		    header.to_port, header.opcode, header.token, payload, w[0], w[1], w[2], w[3]);
 	}
+	if (!awaited) return;
 	bzero(apr_answer.words, sizeof(apr_answer.words));
 	memcpy(apr_answer.words, data + header_length, payload < sizeof(apr_answer.words) ? payload : sizeof(apr_answer.words));
 	apr_answer.length = payload;
 	apr_answer.opcode = header.opcode;
+	apr_answer.source_port = header.from_port;
 	apr_answer.token = header.token;
 	/* (released: the thread that waits must not see "there" before the words and the token above, as with battmgr's answers) */
 	os_atomic_store(&apr_answer.there, true, release);
@@ -2737,8 +2879,8 @@ apr_input(const uint8_t *data, uint32_t length)
  * The port is the service's own numbering of what the command is for (ASM: session << 8 | stream).
  */
 bool
-hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
-    uint32_t ms, struct hakios_apr_answer *answer)
+hakios_adsp_apr_ports(uint8_t service, uint16_t source, uint16_t destination, uint32_t token, uint32_t opcode,
+    const void *payload, uint32_t length, uint32_t ms, struct hakios_apr_answer *answer)
 {
 	uint8_t packet[sizeof(struct apr_header) + 256];
 	struct apr_header *header = (struct apr_header *)packet;
@@ -2753,10 +2895,10 @@ hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 	header->size = (uint16_t)(sizeof(*header) + length);
 	header->from_service = service;
 	header->from_domain = APR_DOMAIN_APPS;
-	header->from_port = port;
+	header->from_port = source;
 	header->to_service = service;
 	header->to_domain = APR_DOMAIN_ADSP;
-	header->to_port = port;
+	header->to_port = destination;
 	header->opcode = opcode;
 	if (length != 0) {
 		memcpy(packet + sizeof(*header), payload, length);
@@ -2776,8 +2918,8 @@ hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 		}
 	}
 	header->token = token;
-	apr_answer.there = false;
-	apr_waited_for = token;
+	os_atomic_store(&apr_answer.there, false, relaxed);
+	os_atomic_store(&apr_waited_for, token, release);
 	error = glink_send(&glink.channel[CHANNEL_APR], packet, (uint32_t)sizeof(*header) + length);
 	if (error != 0) {
 		printf("adsp: apr: > opcode %#x to service %u: NOT SENT (%d)\n", opcode, service, error);
@@ -2790,6 +2932,7 @@ hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 					answer->opcode = apr_answer.opcode;
 					answer->token = apr_answer.token;
 					answer->length = apr_answer.length;
+					answer->source_port = apr_answer.source_port;
 					memcpy(answer->words, apr_answer.words, sizeof(answer->words));
 				}
 				break;
@@ -2797,9 +2940,16 @@ hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 			sleep_ms(1);
 		}
 	}
-	apr_waited_for = 0;
+	os_atomic_store(&apr_waited_for, 0, release);
 	lck_mtx_unlock(&apr_lock);
 	return answered;
+}
+
+bool
+hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
+    uint32_t ms, struct hakios_apr_answer *answer)
+{
+	return hakios_adsp_apr_ports(service, port, port, token, opcode, payload, length, ms, answer);
 }
 
 void
@@ -2812,6 +2962,12 @@ void
 hakios_adsp_apr_events_second(hakios_apr_events_t handler)
 {
 	apr_events_second = handler;
+}
+
+void
+hakios_adsp_apr_events_voice(hakios_apr_events_t handler)
+{
+	os_atomic_store(&apr_events_voice, handler, release);
 }
 
 /* A command to one of the DSP's services, and its answer waited for: true, and the answer in apr_answer, if it came. */
@@ -3083,6 +3239,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			glink_pump();
 			packet = NULL;
 			for (unsigned c = 0; c < CHANNELS && packet == NULL; c++) {
+				if (c == CHANNEL_MHI_SAT) continue; /* Read by the modem worker. */
 				struct glink_channel *channel = &glink.channel[c];
 
 				if ((packet = channel->first) != NULL) {
@@ -3221,6 +3378,7 @@ step_link(void)
 	glink.trace = 60;
 	glink.up = true;
 	qrtr_hellos = qrtr_in = qrtr_out = qrtr_lookups = 0;
+	voice_diag.enabled = option("sdx55_voice_diag");
 	doorbell.since = began = now_us();
 	glink_say(GLINK_VERSION, GLINK_VERSION_1, glink.features, NULL, 0);
 	lck_mtx_unlock(&glink_lock);
@@ -3352,6 +3510,7 @@ hakios_adsp_stop(void)
 			services += qrtr_servers[i].there;
 		}
 		down = dsp_shutdown("the run is about to end");
+		if (down) hakios_audio_voice_mailbox_put();
 		/* (said again at the end: a long run's log keeps its beginning and its end, and the middle may be gone) */
 		tell("adsp: the audio DSP is off: it had been up%s (node %u, %u services; audio services %s), it %s, and TrustZone %s\n",
 		    node ? " and linked" : ", NOT LINKED", node, services, audio_up ? "up" : "NOT UP", stopped_by_its_word ?

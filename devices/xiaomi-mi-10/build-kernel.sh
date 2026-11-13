@@ -17,6 +17,14 @@ python3 "$DEVICE_DIR/tools/embed-sdx55-ddr.py" \
   --input "$ROOT/fw-sdx55/mdmddr-partition.bin" \
   --msadp "$ROOT/fw-sdx55/msadp-partition.bin" \
   --output "$XNU_SRC/bsd/dev/umi_sdx55_ddr.inc"
+voice_cal_args=()
+if [ -n "${UMI_VOICE_CAL_DIR:-}" ]; then
+  voice_cal_args=(--input "$UMI_VOICE_CAL_DIR")
+elif [ -d "$ROOT/fw-audio/voice-cal" ]; then
+  voice_cal_args=(--input "$ROOT/fw-audio/voice-cal")
+fi
+python3 "$DEVICE_DIR/tools/embed-sdx55-voice-cal.py" \
+  --output "$XNU_SRC/bsd/dev/umi_sdx55_voice_cal_data.inc" ${voice_cal_args[@]+"${voice_cal_args[@]}"}
 mkdir -p "$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT"
 [ ! -f "$ROOT/xnu-deps/build/ath11k/src/ath11k/qmi.c" ] || "$ROOT/tools/mk-wlfw.sh"
 exec "$ROOT/xnu-build.sh" "${@:--j8}"

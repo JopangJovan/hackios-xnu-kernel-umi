@@ -800,6 +800,7 @@ codec_look(void)
 #define WCD_ANA_BIAS                    0x3001
 #define WCD_ANA_TX_CH1                  0x300e
 #define WCD_ANA_TX_CH2                  0x300f
+#define WCD_ANA_TX_CH4                  0x3011
 #define WCD_ANA_MICB1                   0x3022
 #define WCD_ANA_MICB2                   0x3023
 #define WCD_ANA_MICB3                   0x3025
@@ -817,6 +818,7 @@ codec_look(void)
 #define WCD_HPH_REFBUFF_UHQA_CTL        0x30dd
 #define WCD_HPH_SURGE_HPHLR_SURGE_EN    0x30e2
 #define WCD_SLEEP_CTL                   0x3103
+#define WCD_TX_NEW_AMIC_MUX_CFG          0x3127
 #define WCD_LDORXTX_CONFIG              0x312a
 #define WCD_HPH_NEW_INT_RDAC_GAIN_CTL   0x3132
 #define WCD_HPH_NEW_INT_RDAC_HD2_CTL_L  0x3140
@@ -827,6 +829,7 @@ codec_look(void)
 #define WCD_CDC_ANA_CLK_CTL             0x3408
 #define WCD_CDC_DIG_CLK_CTL             0x3409
 #define WCD_CDC_TX_ANA_MODE_0_1         0x3410
+#define WCD_CDC_TX_ANA_MODE_2_3         0x3411
 #define WCD_CDC_ANA_TX_CLK_CTL          0x3417
 #define WCD_CDC_REQ_CTL                 0x3457
 #define WCD_CDC_DMIC_CTL                0x345b
@@ -962,41 +965,43 @@ static uint32_t tap;                    /* boot-arg mic_tap=1 (a test): the vibr
 static uint32_t test_bits;              /* boot-arg mic_test=N (tests): 1 no mic bias, 2 the ADC's input held (HPF init) */
 
 static bool
-port_config(uint8_t bank, bool first)
+swr_port_config(uint8_t bank, uint8_t slave, uint8_t master, uint8_t channels, uint8_t offset, uint8_t lane)
 {
-	/* umi DT: ADC1 (0x12), slave DP1 channel 1 -> master DP2 channel 1.
-	 * Kona's tx_frame_params_default[1]: interval 1, offset 1, lane 0.
-	 * The Shima port-1/lane-1 tables do not apply to this silicon. */
-	uint8_t codec_interval = 1, master_interval = 1;
-
-	/* the codec's side (swrm_apply_port_config() first: the devices' clock halved in that bank) */
-	if (first) {
-		to_all(SWRS_SCP_HOST_CLK_DIV2_CTL_BANK(bank), 0x01);
-	}
 	write_id = write_id < 14 ? write_id + 1 : 0;
-	swr_write(codec_device, SWRS_DP_CHANNEL_ENABLE_BANK(0, bank), 0x01, write_id);
+	swr_write(codec_device, SWRS_DP_CHANNEL_ENABLE_BANK(slave, bank), channels, write_id);
 	write_id = write_id < 14 ? write_id + 1 : 0;
-	swr_write(codec_device, SWRS_DP_SAMPLE_CONTROL_1_BANK(0, bank), codec_interval, write_id);
+	swr_write(codec_device, SWRS_DP_SAMPLE_CONTROL_1_BANK(slave, bank), 1, write_id);
 	write_id = write_id < 14 ? write_id + 1 : 0;
-	swr_write(codec_device, SWRS_DP_SAMPLE_CONTROL_2_BANK(0, bank), 0, write_id);
+	swr_write(codec_device, SWRS_DP_SAMPLE_CONTROL_2_BANK(slave, bank), 0, write_id);
 	write_id = write_id < 14 ? write_id + 1 : 0;
-	swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_1_BANK(0, bank), 1, write_id);
+	swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_1_BANK(slave, bank), offset, write_id);
 	write_id = write_id < 14 ? write_id + 1 : 0;
-	swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_2_BANK(0, bank), 0, write_id);
+	swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_2_BANK(slave, bank), 0, write_id);
 	write_id = write_id < 14 ? write_id + 1 : 0;
-	swr_write(codec_device, SWRS_DP_LANE_CONTROL_BANK(0, bank), 0, write_id);
-	note("mic: the codec's data port 1, bank %u: channel 1 on, sample interval %u, offsets 1 0, lane 0\n", bank, codec_interval);
-	/* Kona master port 2 receives the codec's slave port 1. */
-	return put(&tx_swr, "DP_PORT_CTRL (port 2): channel 1, offsets 1 0, interval 1", SWRM_DP_PORT_CTRL_BANK(2, bank),
-	           0x01u << 24 | 0u << 16 | 1u << 8 | master_interval, 0xffffffff) &&
-	       put(&tx_swr, "DP_SAMPLECTRL2 (port 2)", SWRM_DP_SAMPLECTRL2_BANK(2, bank), 0, 0xff) &&
-	       put(&tx_swr, "DP_PORT_CTRL_2 (port 2): lane 0", SWRM_DP_PORT_CTRL_2_BANK(2, bank), 0, 0xff) &&
+	swr_write(codec_device, SWRS_DP_LANE_CONTROL_BANK(slave, bank), lane, write_id);
+	note("mic: SoundWire bank %u slave port %u to master port %u channels %#x offset %u lane %u\n",
+	    bank, slave + 1, master, channels, offset, lane);
+	return put(&tx_swr, "DP_PORT_CTRL", SWRM_DP_PORT_CTRL_BANK(master, bank),
+	           (uint32_t)channels << 24 | (uint32_t)offset << 8 | 1u, 0xffffffff) &&
+	       put(&tx_swr, "DP_SAMPLECTRL2", SWRM_DP_SAMPLECTRL2_BANK(master, bank), 0, 0xff) &&
+	       put(&tx_swr, "DP_PORT_CTRL_2: lane", SWRM_DP_PORT_CTRL_2_BANK(master, bank), lane, 0xff) &&
 	       /* (it reads 0 back on the phone whatever is written; Android writes it and never reads it) */
-	       put(&tx_swr, "DP_PORT_HCTRL (port 2): reset horizontal control", SWRM_DP_PORT_HCTRL_BANK(2, bank), 0, 0);
+	       put(&tx_swr, "DP_PORT_HCTRL: reset horizontal control", SWRM_DP_PORT_HCTRL_BANK(master, bank), 0, 0);
 }
 
 static bool
-datapath_on(void)
+port_config(uint8_t bank, bool first, bool call)
+{
+	if (first) to_all(SWRS_SCP_HOST_CLK_DIV2_CTL_BANK(bank), 0x01);
+	/* UMI's live DT and Kona's TX1/TX2 frame tables. ADC1 is on
+	 * DP1/DP2, channel mask 1, lane 0. ADC4 is on DP2/DP3,
+	 * channel mask 2, lane 1. Slave port indices start at zero. */
+	return swr_port_config(bank, 0, 2, 1, 1, 0) &&
+	    (!call || swr_port_config(bank, 1, 3, 2, 0, 1));
+}
+
+static bool
+datapath_on(bool call)
 {
 	/* the codec's TX clock rate: "9.6 MHz" (0) in both banks; "4.8 MHz" (1) for mic_main=1 */
 	uint8_t current = 0, bank, rate = main_timing ? 1 : 0;
@@ -1012,7 +1017,7 @@ datapath_on(void)
 	}
 	/* swrm_slvdev_datapath_control() */
 	bank = (swr_rd(SWRM_MCP_STATUS) & 1) ? 0 : 1;
-	if (!put(&tx_swr, "CPU1_INTERRUPT_EN", SWRM_CPU1_INTERRUPT_EN, SWRM_INTERRUPT_STATUS_MASK, 0) || !port_config(bank, true)) {
+	if (!put(&tx_swr, "CPU1_INTERRUPT_EN", SWRM_CPU1_INTERRUPT_EN, SWRM_INTERRUPT_STATUS_MASK, 0) || !port_config(bank, true, call)) {
 		return false;
 	}
 	/*
@@ -1028,7 +1033,7 @@ datapath_on(void)
 	broadcast(SWRS_SCP_FRAME_CTRL_BANK(bank), 1u << 3 | 7u);       /* (enable_bank_switch(): the switch itself) */
 	bank_now = (swr_rd(SWRM_MCP_STATUS) & 1);
 	say("mic: the banks switched: the master is in bank %u now (asked for %u)\n", bank_now, bank);
-	if (bank_now != bank || !port_config(bank ? 0 : 1, false)) {
+	if (bank_now != bank || !port_config(bank ? 0 : 1, false, call)) {
 		return false;
 	}
 	/* and the codec's rate in the other bank */
@@ -1058,6 +1063,13 @@ datapath_on(void)
 		note("mic: the codec's SCP int status %#x, control/status %#x; DP1 int status %#x, port control %#x; the master's DP1 "
 		    "interrupt status %#x\n", status, control, dp_int, dp_ctl, swr_rd(0x1200));
 	}
+	if (call) {
+		uint8_t main = 0, second = 0;
+		if (!swr_read(codec_device, SWRS_DP_CHANNEL_ENABLE_BANK(0, bank_now), &main) ||
+		    !swr_read(codec_device, SWRS_DP_CHANNEL_ENABLE_BANK(1, bank_now), &second) ||
+		    main != 1 || second != 2) return false;
+		say("mic: call SoundWire capture bank=%u ADC1 mask=%#x ADC4 mask=%#x\n", bank_now, main, second);
+	}
 	return true;
 }
 
@@ -1077,12 +1089,30 @@ adc1_on(void)
 	       codec_bits(WCD_CDC_DIG_CLK_CTL, 0x10, 0x10) && codec_bits(WCD_ANA_TX_CH2, 0x40, (test_bits & 2) ? 0x40 : 0x00);
 }
 
+/* UMI handset endfire: AMIC5 with MIC BIAS4 feeds the codec's ADC4. */
+static bool
+voice_adc4_on(void)
+{
+	if (!codec_bits(WCD_ANA_MICB4, 0xc0, (test_bits & 1) ? 0 : 0x40)) return false;
+	sleep_ms(2);
+	return codec_bits(WCD_TX_NEW_AMIC_MUX_CFG, 0x20, 0) &&
+	    codec_bits(WCD_ANA_TX_CH4, 0x1f, 6) &&
+	    codec_bits(WCD_ANA_TX_CH4, 0x20, 0x20) &&
+	    codec_bits(WCD_CDC_TX_ANA_MODE_2_3, 0xf0, 0x30) &&
+	    codec_bits(WCD_CDC_DIG_CLK_CTL, 0x80, 0x80) &&
+	    codec_bits(WCD_ANA_TX_CH4, 0x20, 0);
+}
+
 /* ---- the TX macro's decimator 1 ------------------------------------------------------------------------- */
 
 #define TX_TOP_CSR_SWR_CTRL             0x088
 #define TX_SWR_MIC0_CTL                 0x0d0
 #define TX_SWR_MIC1_CTL                 0x0d4
 #define TX_SWR_MIC2_CTL                 0x0c0
+#define TX0_PATH_CTL                    0x400
+#define TX0_PATH_CFG0                   0x404
+#define TX0_VOL_CTL                     0x40c
+#define TX0_PATH_SEC2                   0x418
 #define TX_ADC_MUX1_CFG0                0x108
 #define TX_ADC_MUX1_CFG1                0x10c
 #define TX1_PATH_CTL                    0x480
@@ -1106,6 +1136,62 @@ static const uint32_t dec_regs[] = {
 	TX_TOP_CSR_SWR_CTRL, TX_SWR_MIC0_CTL, TX_SWR_MIC1_CTL, TX_SWR_MIC2_CTL, TX_SWR_MIC2_CTL + 4, TX_SWR_MIC2_CTL + 8,
 	TX_SWR_MIC2_CTL + 12, TX_ADC_MUX1_CFG0, TX_ADC_MUX1_CFG1, TX1_PATH_CTL,
 };
+
+/* The normal recording path uses ADC1 on DEC1. VoiceMMode2 instead
+ * routes ADC1 to DEC0 (the primary channel) and ADC4 to DEC1. */
+enum { VOICE_DEC0_MUX0, VOICE_DEC0_MUX1, VOICE_DEC0_CFG0, VOICE_DEC0_CTL, VOICE_DEC0_SEC2, VOICE_DEC0_GAIN };
+static const struct {
+	const char *name;
+	uint32_t offset, mask, value;
+} voice_dec0_settings[] = {
+	[VOICE_DEC0_MUX0] = { "ADC_MUX0_CFG0: ADC1", 0x100, 0x0f, 1 },
+	[VOICE_DEC0_MUX1] = { "ADC_MUX0_CFG1: SWR_MIC", 0x104, 0x03, 1 },
+	[VOICE_DEC0_CFG0] = { "TX0_PATH_CFG0: analog, mode 0, 150 Hz", TX0_PATH_CFG0, 0xe6, 0x40 },
+	[VOICE_DEC0_CTL] = { "TX0_PATH_CTL: on, muted, 48 kHz", TX0_PATH_CTL, 0x3f, 0x34 },
+	[VOICE_DEC0_SEC2] = { "TX0_PATH_SEC2: open HPF gate", TX0_PATH_SEC2, 0x03, 0 },
+	[VOICE_DEC0_GAIN] = { "TX0_VOL_CTL: 0 dB", TX0_VOL_CTL, 0xff, 0 },
+};
+static uint32_t voice_dec0_saved[sizeof(voice_dec0_settings) / sizeof(voice_dec0_settings[0])];
+static unsigned voice_dec0_configured;
+
+static bool
+voice_dec0_on(void)
+{
+	for (unsigned i = 0; i < sizeof(voice_dec0_settings) / sizeof(voice_dec0_settings[0]); i++) {
+		const typeof(voice_dec0_settings[0]) *setting = &voice_dec0_settings[i];
+		uint32_t original = get(&tx_macro, setting->name, setting->offset);
+		if (original == UINT32_MAX) return false;
+		voice_dec0_saved[i] = original;
+		voice_dec0_configured++;
+		if (!put_bits(&tx_macro, setting->name, setting->offset, setting->mask, setting->value)) return false;
+	}
+	if ((voice_dec0_saved[VOICE_DEC0_CFG0] & 0x60) == 0x40) return true;
+	if (!put_bits(&tx_macro, "TX0_PATH_SEC2: latch startup HPF", TX0_PATH_SEC2, 0x03, 0x02)) return false;
+	sleep_ms(1);
+	return put_bits(&tx_macro, "TX0_PATH_SEC2: open HPF gate", TX0_PATH_SEC2, 0x03, 0);
+}
+
+static bool
+voice_dec0_settled(void)
+{
+	if ((voice_dec0_saved[VOICE_DEC0_CFG0] & 0x60) == 0x40) return true;
+	if (!put_bits(&tx_macro, "TX0_PATH_CFG0: restore HPF cutoff", TX0_PATH_CFG0, 0x60,
+	    voice_dec0_saved[VOICE_DEC0_CFG0]) ||
+	    !put_bits(&tx_macro, "TX0_PATH_SEC2: latch HPF cutoff", TX0_PATH_SEC2, 0x03, 0x02)) return false;
+	sleep_ms(1);
+	return put_bits(&tx_macro, "TX0_PATH_SEC2: HPF enabled", TX0_PATH_SEC2, 0x03, 0x01);
+}
+
+static void
+voice_dec0_off(void)
+{
+	while (voice_dec0_configured) {
+		broken = false;
+		unsigned i = --voice_dec0_configured;
+		const typeof(voice_dec0_settings[0]) *setting = &voice_dec0_settings[i];
+		(void)put_bits(&tx_macro, setting->name, setting->offset, setting->mask, voice_dec0_saved[i]);
+	}
+}
 
 /*
  * Which bolero this is: its core ID, as bolero_soc_codec_probe() reads it (01 0F: 2.0, 02 0E: 2.1),
@@ -1135,7 +1221,7 @@ bolero_look(void)
 
 /* the mixer controls' writes ("TX SMIC MUX1" SWR_MIC0, "TX DEC1 MUX" SWR_MIC), hw_params' rate, and the decimator's PMU */
 static bool
-dec1_on(void)
+dec1_on(uint32_t input)
 {
 	uint32_t cfg0;
 
@@ -1144,8 +1230,7 @@ dec1_on(void)
 	}
 	dec_taken = true;
 	if (!put_bits(&tx_macro, "TX1_TX_PATH_CFG0: an analog mic", TX1_PATH_CFG0, 0x80, 0x00) ||
-	    !put_bits(&tx_macro, smic_input == 1 ? "ADC_MUX1_CFG0: SWR_MIC0" : "ADC_MUX1_CFG0: ANOTHER INPUT (mic_input)", TX_ADC_MUX1_CFG0,
-	    0x0f, smic_input & 0x0f) ||
+	    !put_bits(&tx_macro, "ADC_MUX1_CFG0: SoundWire input", TX_ADC_MUX1_CFG0, 0x0f, input & 0x0f) ||
 	    !put_bits(&tx_macro, "ADC_MUX1_CFG1: SWR_MIC", TX_ADC_MUX1_CFG1, 0x03, 0x01) ||
 	    !put_bits(&tx_macro, "TX1_TX_PATH_CTL: 48 kHz", TX1_PATH_CTL, 0x0f, 0x04) ||
 	    /* PRE_PMU: the decimator's mode (0), its PGA muted */
@@ -1238,8 +1323,11 @@ va_mic_off(void)
 #define AFE_PORT_CMD_DEVICE_START               0x000100e5u
 #define AFE_PORT_CMD_DEVICE_STOP                0x000100e6u
 #define AFE_PORT_CMD_SET_PARAM_V2               0x000100efu
+#define AFE_PORT_CMD_SET_PARAM_V3               0x000100fau
 #define AFE_MODULE_AUDIO_DEV_INTERFACE          0x0001020cu
 #define AFE_PARAM_ID_CODEC_DMA_CONFIG           0x000102b8u
+#define AFE_PARAM_ID_DEVICE_HW_DELAY            0x00010243u
+#define AFE_PARAM_ID_SET_TOPOLOGY               0x0001025au
 #define MIC_PORT                                0xb037          /* TX_CDC_DMA_TX_3 */
 #define ADM_CMD_DEVICE_OPEN_V5                  0x00010326u
 #define ADM_CMDRSP_DEVICE_OPEN_V5               0x00010329u
@@ -1311,13 +1399,13 @@ mic_read(unsigned period)
 }
 
 static bool
-afe_port_param(uint32_t module, uint32_t param, const void *data, uint16_t size, const char *what)
+afe_port_param(uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size, const char *what)
 {
 	uint8_t packet[16 + sizeof(struct afe_param) + 64];
 	struct afe_param *p = (struct afe_param *)(packet + 16);
 
 	bzero(packet, sizeof(packet));
-	*(uint16_t *)packet = MIC_PORT;
+	*(uint16_t *)packet = port;
 	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
 	p->module = module;
 	p->param = param;
@@ -1404,21 +1492,71 @@ dsp_path_on(void)
 	           NULL);
 }
 
-/* the codec DMA port: TX_CDC_DMA_TX_3, one channel of 16 bits at 48 kHz from decimator 1 */
 static bool
-dsp_port_on(void)
+codec_dma_start(uint16_t port, uint16_t bits, uint16_t channels, uint16_t mask, const char *description, const char *starting)
 {
 	struct {
 		uint32_t version, rate;
 		uint16_t bits, format, channels, mask;
-	} __attribute__((packed)) config = { 1, MIC_RATE, 16, 0, 1, 1u << 1 };
-	uint16_t start[2] = { MIC_PORT, 0 };
+	} __attribute__((packed)) config = { 1, MIC_RATE, bits, 0, channels, mask };
+	uint16_t start[2] = { port, 0 };
 
-	if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_CODEC_DMA_CONFIG, &config, sizeof(config),
-	    "the port TX_CDC_DMA_TX_3 (0xb037): 1 channel of 16 bits at 48 kHz, decimator 1")) {
+	if (!afe_port_param(port, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_CODEC_DMA_CONFIG, &config, sizeof(config),
+	    description)) {
 		return false;
 	}
-	mic_port_on = command("the port 0xb037, started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+	return command(starting, APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+}
+
+static bool
+voice_afe_param(uint16_t port, uint32_t param, const void *data, unsigned size, const char *description)
+{
+	const struct {
+		uint16_t port, reserved;
+		uint32_t mapping[3], payload_size, module;
+		uint16_t instance, padding;
+		uint32_t parameter, parameter_size;
+	} __attribute__((packed)) header = {
+		.port = port, .payload_size = 16u + size, .module = AFE_MODULE_AUDIO_DEV_INTERFACE,
+		.parameter = param, .parameter_size = size
+	};
+	uint8_t payload[sizeof(header) + 16];
+	if (size > sizeof(payload) - sizeof(header)) return false;
+	memcpy(payload, &header, sizeof(header));
+	memcpy(payload + sizeof(header), data, size);
+	return command(description, APR_SVC_AFE, AFE_PORT_CMD_SET_PARAM_V3, payload,
+	    (uint32_t)sizeof(header) + size, 0, NULL);
+}
+
+static bool
+voice_afe_start(uint16_t port, bool receive)
+{
+	/* The stock driver sets the port topology before configuring codec DMA.
+	 * Use the handset hardware delays from the stock AFE setup. */
+	const uint32_t topology[] = {1, receive ? 0x112fcu : 0x112fbu};
+	const uint32_t delay[] = {1, receive ? 474 : 578};
+	const struct {
+		uint32_t version, rate;
+		uint16_t bits, format, channels, mask;
+	} __attribute__((packed)) config = {
+		1, receive ? UMI_VOICE_HANDSET_RX_RATE : UMI_VOICE_HANDSET_TX_RATE,
+		receive ? 24 : 16, 0, receive ? 1 : 2, receive ? 1 : 3
+	};
+	const uint16_t start[] = {port, 0};
+	return voice_afe_param(port, AFE_PARAM_ID_SET_TOPOLOGY, topology, sizeof(topology), "the call AFE topology") &&
+	    voice_afe_param(port, AFE_PARAM_ID_DEVICE_HW_DELAY, delay, sizeof(delay), "the call AFE hardware delay") &&
+	    voice_afe_param(port, AFE_PARAM_ID_CODEC_DMA_CONFIG, &config, sizeof(config), "the call codec DMA format") &&
+	    command(receive ? "the call RX AFE port, started" : "the call TX AFE port, started",
+	    APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+}
+
+/* Recordings use TX_CDC_DMA_TX_3 with one 16-bit channel from decimator 1. */
+static bool
+dsp_port_on(bool call)
+{
+	mic_port_on = call ? voice_afe_start(UMI_VOICE_HANDSET_TX_PORT, false) :
+	    codec_dma_start(MIC_PORT, 16, 1, 1u << 1,
+	    "the port TX_CDC_DMA_TX_3 (0xb037): 1 channel of 16 bits at 48 kHz, decimator 1", "the port 0xb037, started");
 	return mic_port_on;
 }
 
@@ -1690,6 +1828,7 @@ undo(void)
 {
 	dsp_off();
 	dec1_off();
+	voice_dec0_off();
 	va_mic_off();
 	master_off();
 	tx_clocks_off();
@@ -1700,7 +1839,7 @@ undo(void)
 
 /* Everything up to the stream's run, in a recording's order; false (and `broken') if any of it fails. */
 static bool
-path_up(void)
+path_up(bool capture)
 {
 	if (!clocks_on()) {
 		say("mic: the clocks were not all given: the blocks are not touched\n");
@@ -1721,9 +1860,136 @@ path_up(void)
 	if (level < 3) {
 		return true;
 	}
-	/* the stream and path, the port's format and start, the codec's widgets */
-	return bolero_look() && codec_init() && dsp_path_on() && dsp_port_on() && dec1_on() && (!adc_on || adc1_on()) &&
-	       datapath_on();
+	if (!bolero_look() || !codec_init()) return false;
+	if (capture)
+		return dsp_path_on() && dsp_port_on(false) && dec1_on(smic_input) && (!adc_on || adc1_on()) && datapath_on(false);
+	/* Supply both codec slots before starting TX_CDC_DMA_TX_3 with mask 0x3.
+	 * If the capture path fails, keep the clocks available for the RX port. */
+	if (!voice_dec0_on() || !dec1_on(4) || (adc_on && (!adc1_on() || !voice_adc4_on())) ||
+	    !datapath_on(true) || !dsp_port_on(true)) {
+		say("mic: call TX capture setup failed after %s\n", last_write);
+		dec1_off();
+		voice_dec0_off();
+		broken = false;
+	}
+	return true;
+}
+
+static bool voice_owned;
+static uint64_t voice_mic_started;
+static struct block voice_rx_macro = { "the RX macro", 0x03200000, 0x1000 };
+static bool voice_rx_port;
+static unsigned voice_rx_configured;
+
+/* Bolero RX0 consumes RX_CDC_DMA_RX_0. Clock the digital path before
+ * starting the DSP port, as the stock RX macro's DAPM callbacks do.
+ * Leave the local PGA muted while the downlink plays on the iOS speaker. */
+static const struct {
+	const char *name;
+	uint32_t offset, mask, value;
+} voice_rx_settings[] = {
+	{ "MCLK_CONTROL", 0x100, 0x03, 0x03 },
+	{ "FS_CNT_CONTROL", 0x104, 0x03, 0x01 },
+	{ "RX_INT0_CFG0: MIX1 input RX0", 0x180, 0x0f, 0x05 },
+	{ "RX0_PATH_CTL: mute and 48 kHz", 0x400, 0x1f, 0x14 },
+	{ "RX0_PATH_DSM_CTL: clock", 0x440, 0x01, 0x01 },
+	{ "RX0_PATH_CFG2: interpolator", 0x40c, 0x03, 0x03 },
+	{ "RX0_PATH_CTL: enable", 0x400, 0x20, 0x20 },
+};
+static uint32_t voice_rx_saved[sizeof(voice_rx_settings) / sizeof(voice_rx_settings[0])];
+
+static void
+voice_rx_down(void)
+{
+	if (voice_rx_port) {
+		uint16_t stop[] = { UMI_VOICE_HANDSET_RX_PORT, 0 };
+		(void)command("the call RX port 0xb030, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
+		voice_rx_port = false;
+	}
+	while (voice_rx_configured) {
+		broken = false;
+		unsigned index = --voice_rx_configured;
+		const typeof(voice_rx_settings[0]) *setting = &voice_rx_settings[index];
+		(void)put_bits(&voice_rx_macro, setting->name, setting->offset, setting->mask, voice_rx_saved[index]);
+	}
+}
+
+static bool
+voice_rx_up(void)
+{
+	/* The RX macro defaults to the TX core clock voted by the microphone. */
+	for (unsigned i = 0; i < sizeof(voice_rx_settings) / sizeof(voice_rx_settings[0]); i++) {
+		const typeof(voice_rx_settings[0]) *setting = &voice_rx_settings[i];
+		uint32_t original = get(&voice_rx_macro, setting->name, setting->offset);
+		if (original == UINT32_MAX) break;
+		voice_rx_saved[i] = original;
+		voice_rx_configured++;
+		if (!put_bits(&voice_rx_macro, setting->name, setting->offset, setting->mask, setting->value)) break;
+	}
+	voice_rx_port = !broken && voice_rx_configured == sizeof(voice_rx_settings) / sizeof(voice_rx_settings[0]) &&
+	    voice_afe_start(UMI_VOICE_HANDSET_RX_PORT, true);
+	say("mic: call RX0 digital path writes=%u AFE started=%u\n", voice_rx_configured, voice_rx_port);
+	if (!voice_rx_port) {
+		voice_rx_down();
+		broken = false;
+	}
+	return voice_rx_port;
+}
+
+bool
+hakios_mic_voice_start(void)
+{
+	if (level != 4 || !running || !lck_mtx_try_lock(&mic_lock)) return false;
+	bool up = false;
+	if (!stopping && !voice_owned && !ios_wants) {
+		quiet = true;
+		broken = false;
+		up = path_up(false); /* CVP consumes the AFE port directly. */
+		if (up) {
+			voice_owned = true;
+			voice_mic_started = mach_absolute_time();
+			bool receive = voice_rx_up();
+			say("mic: call codec ports TX=%u RX=%u\n", mic_port_on, receive);
+		} else {
+			undo();
+			broken = false;
+		}
+	}
+	lck_mtx_unlock(&mic_lock);
+	return up;
+}
+
+void
+hakios_mic_voice_activate(void)
+{
+	lck_mtx_lock(&mic_lock);
+	if (voice_owned && mic_port_on && !stopping && !broken) {
+		uint64_t elapsed;
+		absolutetime_to_nanoseconds(mach_absolute_time() - voice_mic_started, &elapsed);
+		unsigned ms = (unsigned)(elapsed / NSEC_PER_MSEC);
+		if (ms < 200) sleep_ms(200 - ms);
+		if (!stopping && put_bits(&tx_macro, "TX0_PATH_CTL: unmuted", TX0_PATH_CTL, 0x10, 0) && dec1_unmute()) {
+			if (ms < 300) sleep_ms(300 - MAX(ms, 200u));
+			if (!stopping && voice_dec0_settled() && dec1_settled())
+				say("mic: call uplink DEC0=%#x DEC1=%#x gains=%#x,%#x\n",
+				    get(&tx_macro, "TX0_PATH_CTL", TX0_PATH_CTL), get(&tx_macro, "TX1_PATH_CTL", TX1_PATH_CTL),
+				    get(&tx_macro, "TX0_VOL_CTL", TX0_VOL_CTL), get(&tx_macro, "TX1_VOL_CTL", TX1_VOL_CTL));
+		}
+	}
+	lck_mtx_unlock(&mic_lock);
+}
+
+void
+hakios_mic_voice_stop(void)
+{
+	lck_mtx_lock(&mic_lock);
+	if (voice_owned) {
+		voice_rx_down();
+		undo();
+		voice_owned = false;
+		broken = false;
+	}
+	lck_mtx_unlock(&mic_lock);
 }
 
 /*
@@ -1756,6 +2022,11 @@ for_ios(void)
 			lck_mtx_unlock(&mic_lock);
 			break;
 		}
+		if (voice_owned) {
+			lck_mtx_unlock(&mic_lock);
+			sleep_ms(20);
+			continue;
+		}
 		recordings++;
 		quiet = recordings > 1;
 		ring_primed = false;
@@ -1768,7 +2039,7 @@ for_ios(void)
 		 * (a bring-up or a start that fails without setting `broken' counts as a failure too: otherwise the three-recordings
 		 * limit below never applies and, while iOS keeps the device open, the path is brought up and undone for ever)
 		 */
-		up = path_up() && listen(true);
+		up = path_up(true) && listen(true);
 		failed = broken || !up;
 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 		say("mic: iOS's recording %u %s after %llu.%llu s; last: %s; %llu frames skipped as too late, %llu reads found too little\n",
@@ -1809,7 +2080,7 @@ mic_thread(__unused void *parameter, __unused wait_result_t result)
 				say("mic: the clocks were not all given: the blocks are not touched\n");
 			}
 		} else {
-			if (path_up() && level >= 3) {
+			if (path_up(true) && level >= 3) {
 				listen(false);
 			}
 			say("mic: %s; last: %s\n", broken ? "STOPPED" : level >= 3 ? "listened" : "done", last_write);
@@ -1850,9 +2121,11 @@ void
 hakios_mic_dsp_down(void)
 {
 	stopping = true;
-	if (running) {
-		lck_mtx_lock(&mic_lock);
+	lck_mtx_lock(&mic_lock);
+	if (running || voice_owned) {
+		voice_rx_down();
 		undo();
-		lck_mtx_unlock(&mic_lock);
+		voice_owned = false;
 	}
+	lck_mtx_unlock(&mic_lock);
 }

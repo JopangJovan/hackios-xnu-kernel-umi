@@ -33,6 +33,7 @@ struct umi_mhi_io {
 	void (*qrtr_packet)(void *, const void *, size_t);
 	/* Complete IP_HW0 transfer, valid only during the callback. Do not reenter MHI. */
 	void (*cell_rx)(void *, const void *, size_t);
+	void (*diag_rx)(void *, const void *, size_t);
 };
 
 #define UMI_MHI_PROFILE_QCA6390 0u
@@ -70,6 +71,9 @@ struct umi_mhi {
 	size_t cell_rx_partial;
 	struct umi_mhi_dma cell_tx_ring, cell_rx_ring, cell_tx_buffer, cell_rx_buffer, cell_rx_assembly;
 	struct umi_mhi_dma ipcr_tx_ring, ipcr_tx_buffers, ipcr_rx_ring, ipcr_rx_buffers;
+	struct umi_mhi_dma diag_tx_ring, diag_rx_ring, diag_tx_buffer, diag_rx_buffers;
+	uint64_t diag_rx_rp, diag_rx_wp;
+	bool diag_started, diag_tx_pending;
 };
 
 /* A zero-initialized host, an enumerated endpoint, and a mapped BAR are required.
@@ -102,6 +106,11 @@ int umi_mhi_wait_mission(struct umi_mhi *);
 #define UMI_EFS_SHADOW_BYTES (2u * 1024 * 1024)
 int umi_mhi_probe_efs(struct umi_mhi *host, uint8_t *shadow);
 int umi_mhi_start_ipcr(struct umi_mhi *);
+int umi_mhi_sdx55_diag_start(struct umi_mhi *);
+int umi_mhi_sdx55_diag_send(struct umi_mhi *, const void *, size_t);
+/* Only the SDX55 ADSP satellite owns these offloaded contexts. */
+int umi_mhi_sdx55_sat_context(struct umi_mhi *, unsigned id, bool event, uint64_t base, uint32_t bytes);
+int umi_mhi_sdx55_sat_channel(struct umi_mhi *, unsigned channel, bool start);
 /* Probe non-offload IP_HW0 in AMSS. RX stays owned until the owner resets PCIe. */
 int umi_mhi_probe_cell_data(struct umi_mhi *);
 #define UMI_MHI_CELL_MRU 32768u

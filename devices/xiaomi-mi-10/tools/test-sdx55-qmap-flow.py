@@ -30,6 +30,7 @@ fixture = r'''
 struct umi_pcie { int gpios; };
 struct umi_mhi_io { void *context; };
 struct umi_mhi { bool poisoned; struct umi_mhi_io *io; };
+static void sdx55_voice_tick(struct umi_mhi *host) {(void)host;}
 static int gpio_level(struct umi_pcie *p, unsigned pin){return pin==3;}
 static unsigned now, acks, ip_sends, ip_dequeues, polls, rx_depth, qmi, instant_reply;
 static void clock_interval_to_deadline(unsigned sec, unsigned n, uint64_t *d) { *d=now+sec*10; }

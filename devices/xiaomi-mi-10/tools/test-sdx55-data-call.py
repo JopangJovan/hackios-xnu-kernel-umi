@@ -24,6 +24,12 @@ fixture = r'''
 static uint32_t umi_sdx55_dms_node = 3;
 ''' + route + r'''
 struct umi_mhi { bool poisoned; };
+static void sdx55_voice_begin(void) {}
+static void sdx55_voice_tick(struct umi_mhi *host) {(void)host;}
+static void sdx55_voice_finish(struct umi_mhi *host) {(void)host;}
+static struct { bool enabled; } sdx55_audio_pd;
+static bool sdx55_voice_diag_enabled(void) {return false;}
+static int sdx55_modem_diag_start(struct umi_mhi *host) {(void)host; return 0;}
 static int sdx55_observe_sim(struct umi_mhi *h) {(void)h; return 0;}
 static struct { const struct sdx55_data_routes *routes; } sdx55_packets;
 

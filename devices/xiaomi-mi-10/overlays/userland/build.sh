@@ -510,7 +510,7 @@ if [ "${UMI_GPS:-0}" = 1 ]; then
 		install -m 0644 "../fw-sdx55/$f" root/sdx55m/ || exit 1
 	done
 	bash ../devices/xiaomi-mi-10/tools/build-sdx55-settings.sh "$PWD/root/lib/umi-gps-ui.dylib" || exit 1
-	printf '%s\n' '/redwood/lib/umi-gps-ui.dylib Preferences SpringBoard' >> root/etc/inject.conf
+	printf '%s\n' '/redwood/lib/umi-gps-ui.dylib Preferences SpringBoard MobilePhone' >> root/etc/inject.conf
 fi
 
 # Segment names are device-specific. UMI's signed MDT references adsp.b00 through adsp.b18,

@@ -2842,6 +2842,7 @@ umi_bootargs_ok(const struct payload_info *pi)
 		"sdx55_step=12", "sdx55_efs=1", "sdx55_interactive=1", "sdx55_return=0",
 		"sdx55_fix_secs=600", "sdx55_xtra=1",
 		"sdx55_cell=1", "sdx55_data_rings=1", "sdx55_data_call=1", "sdx55_data_secs=180", "sdx55_data_secs=600",
+		"sdx55_voice=1", "sdx55_voice_diag=1",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};

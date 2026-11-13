@@ -21,8 +21,9 @@ static int starts_with(const char *s, const char *p) { return strncmp(s, p, strl
 '''
 test = r'''
 int main(void) {
- const char *good[] = { "gpu=1 metal=1", "gpu=1 metal=2", "gpu=1 metal=3", "gpu=1 metal=1 battery=1", "slpi=1 slpi_attach=1" };
- const char *bad[] = { "metal=3", "gpu=1 metal=0", "gpu=1 metal=4", "gpu=1 metal=33", "gpu=1 metal=x", "gpu=1 metal=3 metal=1", "slpi_attach=0", "slpi_attach=2" };
+ const char *good[] = { "gpu=1 metal=1", "gpu=1 metal=2", "gpu=1 metal=3", "gpu=1 metal=1 battery=1", "slpi=1 slpi_attach=1",
+     "sdx55_voice=1", "sdx55_voice=1 sdx55_voice_diag=1" };
+ const char *bad[] = { "metal=3", "gpu=1 metal=0", "gpu=1 metal=4", "gpu=1 metal=33", "gpu=1 metal=x", "gpu=1 metal=3 metal=1", "slpi_attach=0", "slpi_attach=2", "sdx55_voice_diag=2" };
  struct payload_info p = {0};
  for (unsigned i = 0; i < sizeof(good)/sizeof(*good); i++) { p.cmdline=good[i]; assert(umi_bootargs_ok(&p)); }
  for (unsigned i = 0; i < sizeof(bad)/sizeof(*bad); i++) { p.cmdline=bad[i]; assert(!umi_bootargs_ok(&p)); }
@@ -35,4 +36,4 @@ with tempfile.TemporaryDirectory() as d:
     c.write_text(shim+s[start:end]+test)
     subprocess.run(['cc','-std=c11','-Wall','-Wextra',str(c),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
-print('PASS: Metal levels 1..3; invalid/duplicate arguments, missing GPU and forced windows rejected')
+print('PASS: Metal levels 1..3; invalid/duplicate arguments, missing GPU, invalid voice diagnostics and forced windows rejected')

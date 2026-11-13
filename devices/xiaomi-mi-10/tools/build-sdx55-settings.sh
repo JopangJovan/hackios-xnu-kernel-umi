@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the UMI 20F66 Preferences-only library; this command does not edit an image.
+# Build the UMI 20F66 user interface library; this command does not edit an image.
 set -euo pipefail
 device=$(cd "$(dirname "$0")/.." && pwd)
 repo=$(cd "$device/../.." && pwd)
@@ -14,6 +14,7 @@ trap 'rm -f -- "$tmp"; rmdir -- "$tmpdir"' EXIT
     -O2 -Wall -Wextra -Werror -dynamiclib -install_name /redwood/lib/umi-gps-ui.dylib \
     -I"$device/overlays/xnu/files/bsd" -framework CoreFoundation -framework Foundation -framework UIKit -lobjc \
     -fobjc-arc "$device/overlays/userland/src/umi_cell_settings.m" \
+    "$device/overlays/userland/src/umi_voice_phone.m" \
     "$device/overlays/userland/src/umi_gps_settings.c" -o "$tmp"
 chmod 755 "$tmp"
 mv -f -- "$tmp" "$out"

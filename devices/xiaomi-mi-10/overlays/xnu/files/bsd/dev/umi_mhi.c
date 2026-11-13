@@ -33,6 +33,12 @@
 #define CELL_TX_EVENT 7u
 #define CELL_RX_EVENT 8u
 #define CELL_TR_ELEMENTS 512u
+#define DIAG_TX_CHANNEL 4u
+#define DIAG_RX_CHANNEL 5u
+#define DIAG_RX_EVENT 3u
+#define DIAG_TR_BYTES (64u * 16u)
+#define DIAG_BUFFER_BYTES 4096u
+#define DIAG_RX_BUFFERS 4u
 #define SDX55_CHANNEL_CONTEXTS 111u
 #define SDX55_EVENT_OFFLOAD_MASK ((1u << 4) | (1u << 5) | (1u << 9) | \
 	(1u << 11) | (1u << 12) | (1u << 13) | (1u << 14))
@@ -757,6 +763,52 @@ cell_event(struct umi_mhi *host, unsigned ring, unsigned type, unsigned channel,
 }
 
 static int
+diag_event(struct umi_mhi *host, unsigned channel, unsigned code, uint64_t pointer, unsigned bytes)
+{
+	if (channel == DIAG_TX_CHANNEL) {
+		if (!host->diag_tx_pending || code != 2 || pointer != host->diag_tx_ring.address) return EIO;
+		host->diag_tx_pending = false;
+		return 0;
+	}
+	struct umi_mhi_dma *ring = &host->diag_rx_ring, *buffers = &host->diag_rx_buffers;
+	if (code == 5 || code == 6) {
+		write_address(host, host->channel_db + channel * 8, host->diag_rx_wp);
+		return 0;
+	}
+	/* EOT, overflow and EOB all return ownership of the posted buffers.
+	 * The DIAG receiver checks HDLC framing and CRC across completions. */
+	if ((code != 2 && code != 3 && code != 4) || !ring_pointer_valid(ring->address, DIAG_TR_BYTES, pointer)) return EIO;
+	size_t distance = (pointer - host->diag_rx_rp) & (DIAG_TR_BYTES - 1u);
+	if (distance >= DIAG_RX_BUFFERS * 16 || (bytes > DIAG_BUFFER_BYTES && code != 3)) return EIO;
+	sync_for_cpu(host, ring);
+	sync_for_cpu(host, buffers);
+	uint64_t end = ring_next(ring->address, DIAG_TR_BYTES, pointer);
+	while (host->diag_rx_rp != end) {
+		uint64_t read = host->diag_rx_rp;
+		const uint32_t *done = (const uint32_t *)ring->bytes + (read - ring->address) / 4;
+		uint64_t address = words_address(done, 0);
+		if (address < buffers->address || address - buffers->address >= DIAG_RX_BUFFERS * DIAG_BUFFER_BYTES ||
+		    (address - buffers->address) % DIAG_BUFFER_BYTES) return EIO;
+		unsigned used = read != pointer || bytes > DIAG_BUFFER_BYTES ? DIAG_BUFFER_BYTES : bytes;
+		if (used && host->io->diag_rx)
+			host->io->diag_rx(host->io->context, (const uint8_t *)buffers->bytes + address - buffers->address, used);
+		uint32_t *next = (uint32_t *)ring->bytes + (host->diag_rx_wp - ring->address) / 4;
+		words_set_address(next, 0, address);
+		next[2] = DIAG_BUFFER_BYTES;
+		next[3] = (2u << 16) | (1u << 9);
+		host->diag_rx_rp = ring_next(ring->address, DIAG_TR_BYTES, read);
+		host->diag_rx_wp = ring_next(ring->address, DIAG_TR_BYTES, host->diag_rx_wp);
+	}
+	sync_for_cpu(host, &host->channels);
+	words_set_address((uint32_t *)host->channels.bytes + channel * 11, 9, host->diag_rx_wp);
+	host->io->sync_for_device(host->io->context, ring);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	write_address(host, host->channel_db + channel * 8, host->diag_rx_wp);
+	return 0;
+}
+
+static int
 service_event_ring(struct umi_mhi *host, unsigned ring, uint64_t command,
 	int *command_cc, unsigned *received)
 {
@@ -778,6 +830,15 @@ service_event_ring(struct umi_mhi *host, unsigned ring, uint64_t command,
 		uint32_t dword0 = event[2], dword1 = event[3];
 		unsigned type = (dword1 >> 16) & 0xff;
 		unsigned code = dword0 >> 24;
+		unsigned channel = dword1 >> 24;
+		if (host->diag_started && type == 0x22 &&
+		    ((ring == 1 && channel == DIAG_TX_CHANNEL) || (ring == DIAG_RX_EVENT && channel == DIAG_RX_CHANNEL))) {
+			int error = diag_event(host, channel, code, pointer, dword0 & 0xffff);
+			if (error) {
+				host->diag_started = false;
+				report(host, "voice modem DIAG transfer error", (channel << 16) | code);
+			}
+		}
 		if (ring == CELL_TX_EVENT || ring == CELL_RX_EVENT) {
 			int error = cell_event(host, ring, type, dword1 >> 24, code, pointer, dword0 & 0xffff);
 			if (error) return error;
@@ -994,7 +1055,7 @@ send_nop(struct umi_mhi *host)
 }
 
 static int
-start_channel(struct umi_mhi *host, unsigned channel)
+channel_command(struct umi_mhi *host, unsigned channel, unsigned opcode, bool offload)
 {
 	uint64_t base = host->command_ring.address;
 	size_t length = 128u * 16u;
@@ -1003,7 +1064,7 @@ start_channel(struct umi_mhi *host, unsigned channel)
 	volatile uint32_t *tre = (volatile uint32_t *)
 	    ((volatile uint8_t *)host->command_ring.bytes + (size_t)(command - base));
 	tre[0] = tre[1] = tre[2] = 0;
-	tre[3] = (channel << 24) | (18u << 16); /* START_CHAN */
+	tre[3] = (channel << 24) | (opcode << 16);
 	uint64_t next = ring_next(base, length, command);
 	uint32_t *context = host->commands.bytes;
 	sync_for_cpu(host, &host->commands);
@@ -1026,11 +1087,11 @@ start_channel(struct umi_mhi *host, unsigned channel)
 		if (completion >= 0) {
 			host->command_wp = next;
 			if (completion == 1) {
-				report(host, "MHI channel started", channel);
+				report(host, opcode == 18 ? "MHI channel started" : "MHI channel reset", channel);
 				return 0;
 			}
-			report(host, "MHI channel start completion code", (channel << 16) | completion);
-			host->poisoned = true;
+			report(host, "MHI channel completion code", (channel << 16) | completion);
+			if (!offload) host->poisoned = true;
 			return EIO;
 		}
 		host->io->delay_us(host->io->context, 1000);
@@ -1063,6 +1124,43 @@ start_channel(struct umi_mhi *host, unsigned channel)
 		report(host, "MHI pending command event dword1", pending[3]);
 	}
 	return ETIMEDOUT;
+}
+
+static int
+start_channel(struct umi_mhi *host, unsigned channel)
+{
+	return channel_command(host, channel, 18, false);
+}
+
+static bool
+sdx55_sat_channel_id(unsigned id)
+{
+	return id == 50 || id == 51 || id == 70 || id == 71;
+}
+
+int
+umi_mhi_sdx55_sat_context(struct umi_mhi *host, unsigned id, bool event, uint64_t base, uint32_t bytes)
+{
+	if (!host || !host->ipcr_started || host->poisoned || host->io->profile != UMI_MHI_PROFILE_SDX55 ||
+	    (event ? id != 4 : !sdx55_sat_channel_id(id)) || base < host->io->dma_start ||
+	    base >= host->io->dma_end || !bytes || bytes > host->io->dma_end - base) return EINVAL;
+	struct umi_mhi_dma *contexts = event ? &host->events : &host->channels;
+	uint32_t *context = (uint32_t *)contexts->bytes + id * 11;
+	sync_for_cpu(host, contexts);
+	memset(context, 0, 11 * sizeof(*context));
+	context[1] = 0xa; /* Generic context. Base and length are owned by the DSP. */
+	words_set_address(context, 3, base);
+	words_set_address(context, 5, bytes);
+	host->io->sync_for_device(host->io->context, contexts);
+	return 0;
+}
+
+int
+umi_mhi_sdx55_sat_channel(struct umi_mhi *host, unsigned channel, bool start)
+{
+	if (!host || !host->ipcr_started || host->poisoned || host->io->profile != UMI_MHI_PROFILE_SDX55 ||
+	    !sdx55_sat_channel_id(channel)) return EINVAL;
+	return channel_command(host, channel, start ? 18 : 16, true);
 }
 
 static void
@@ -1578,11 +1676,90 @@ poll_mission_rings(struct umi_mhi *host, unsigned *received)
 		int error = service_event_ring(host, ring, UINT64_MAX, NULL, received);
 		if (error) return error;
 	}
+	if (host->diag_started) {
+		int error = service_event_ring(host, DIAG_RX_EVENT, UINT64_MAX, NULL, NULL);
+		if (error) {
+			host->diag_started = false;
+			report(host, "voice modem DIAG event ring error", error);
+		}
+	}
 	if (host->cell_started) {
 		int error = service_event_ring(host, CELL_TX_EVENT, UINT64_MAX, NULL, NULL);
 		if (error) return error;
 		return service_event_ring(host, CELL_RX_EVENT, UINT64_MAX, NULL, NULL);
 	}
+	return 0;
+}
+
+int
+umi_mhi_sdx55_diag_start(struct umi_mhi *host)
+{
+	if (!host->ipcr_started || host->poisoned || host->io->profile != UMI_MHI_PROFILE_SDX55) return EINVAL;
+	if (host->diag_tx_ring.bytes) return EALREADY;
+	int error = allocate_aligned(host, DIAG_TR_BYTES, DIAG_TR_BYTES, &host->diag_tx_ring);
+	if (!error) error = allocate_aligned(host, DIAG_TR_BYTES, DIAG_TR_BYTES, &host->diag_rx_ring);
+	if (!error) error = allocate(host, DIAG_BUFFER_BYTES, &host->diag_tx_buffer);
+	if (!error) error = allocate(host, DIAG_RX_BUFFERS * DIAG_BUFFER_BYTES, &host->diag_rx_buffers);
+	if (error) return error;
+	sync_for_cpu(host, &host->channels);
+	for (unsigned ch = DIAG_TX_CHANNEL; ch <= DIAG_RX_CHANNEL; ch++) {
+		bool rx = ch == DIAG_RX_CHANNEL;
+		struct umi_mhi_dma *ring = rx ? &host->diag_rx_ring : &host->diag_tx_ring;
+		uint32_t *ctx = (uint32_t *)host->channels.bytes + ch * 11;
+		memset(ring->bytes, 0, ring->size);
+		ctx[0] = 1u | (2u << 8);
+		ctx[1] = rx ? 2 : 1;
+		ctx[2] = rx ? DIAG_RX_EVENT : 1;
+		words_set_address(ctx, 3, ring->address);
+		words_set_address(ctx, 5, DIAG_TR_BYTES);
+		words_set_address(ctx, 7, ring->address);
+		words_set_address(ctx, 9, ring->address);
+		host->io->sync_for_device(host->io->context, ring);
+	}
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	error = channel_command(host, DIAG_TX_CHANNEL, 18, true);
+	if (!error) error = channel_command(host, DIAG_RX_CHANNEL, 18, true);
+	if (error) return error;
+	struct umi_mhi_dma *rx = &host->diag_rx_ring;
+	for (unsigned i = 0; i < DIAG_RX_BUFFERS; i++) {
+		uint32_t *tre = (uint32_t *)rx->bytes + i * 4;
+		words_set_address(tre, 0, host->diag_rx_buffers.address + i * DIAG_BUFFER_BYTES);
+		tre[2] = DIAG_BUFFER_BYTES;
+		tre[3] = (2u << 16) | (1u << 9);
+	}
+	host->diag_rx_rp = rx->address;
+	host->diag_rx_wp = rx->address + DIAG_RX_BUFFERS * 16;
+	sync_for_cpu(host, &host->channels);
+	words_set_address((uint32_t *)host->channels.bytes + DIAG_RX_CHANNEL * 11, 9, host->diag_rx_wp);
+	host->io->sync_for_device(host->io->context, rx);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	write_address(host, host->channel_db + DIAG_RX_CHANNEL * 8, host->diag_rx_wp);
+	host->diag_started = true;
+	return 0;
+}
+
+int
+umi_mhi_sdx55_diag_send(struct umi_mhi *host, const void *payload, size_t size)
+{
+	if (!host->diag_started || host->diag_tx_pending || !size || size > DIAG_BUFFER_BYTES) return EINVAL;
+	struct umi_mhi_dma *tx = &host->diag_tx_ring;
+	memcpy(host->diag_tx_buffer.bytes, payload, size);
+	uint32_t *tre = tx->bytes;
+	words_set_address(tre, 0, host->diag_tx_buffer.address);
+	tre[2] = (uint32_t)size;
+	tre[3] = (2u << 16) | (1u << 9);
+	sync_for_cpu(host, &host->channels);
+	uint32_t *ctx = (uint32_t *)host->channels.bytes + DIAG_TX_CHANNEL * 11;
+	if (words_address(ctx, 9) != tx->address) return EALREADY; /* One bounded mask submission. */
+	words_set_address(ctx, 9, tx->address + 16);
+	host->diag_tx_pending = true;
+	host->io->sync_for_device(host->io->context, &host->diag_tx_buffer);
+	host->io->sync_for_device(host->io->context, tx);
+	host->io->sync_for_device(host->io->context, &host->channels);
+	dma_write_barrier();
+	write_address(host, host->channel_db + DIAG_TX_CHANNEL * 8, tx->address + 16);
 	return 0;
 }
 
