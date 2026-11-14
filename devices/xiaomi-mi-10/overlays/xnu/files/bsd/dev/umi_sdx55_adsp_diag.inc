@@ -21,8 +21,10 @@ struct voice_diag_pcm_level {
 static struct {
 	unsigned generation;
 	uint64_t second;
-	struct voice_diag_pcm_level mic[2], stream_tx, decoder;
+	struct voice_diag_pcm_level mic[2], stream_tx, decoder, echo_port[2], cvp_far[2];
 	unsigned tx_empty, tx_sid, tx_other;
+	unsigned rx_short, rx_speech;
+	uint64_t rx_audio_slots;
 } voice_diag_levels;
 
 static struct {
@@ -110,6 +112,17 @@ voice_diag_level_window(uint64_t clock)
 		    voice_diag_pcm_rms(tx), voice_diag_pcm_rms(rx), mic[0].samples, mic[1].samples, tx->samples,
 		    rx->samples, mic[0].clipped, mic[1].clipped, tx->clipped, voice_diag_levels.tx_empty,
 		    voice_diag_levels.tx_sid, voice_diag_levels.tx_other);
+		if (rx->samples)
+			tell("UMI SDX55: voice RX window dsp_sec=%llu short_frames=%u speech_frames=%u pcm_slots=%#llx\n",
+			    voice_diag_levels.second, voice_diag_levels.rx_short, voice_diag_levels.rx_speech,
+			    voice_diag_levels.rx_audio_slots);
+		const struct voice_diag_pcm_level *echo = voice_diag_levels.echo_port;
+		const struct voice_diag_pcm_level *cvp = voice_diag_levels.cvp_far;
+		if (echo[0].samples || cvp->samples)
+			tell("UMI SDX55: voice echo levels dsp_sec=%llu afe_rms=%u,%u cvp_far_rms=%u,%u samples=%u,%u,%u,%u\n",
+			    voice_diag_levels.second, voice_diag_pcm_rms(&echo[0]), voice_diag_pcm_rms(&echo[1]),
+			    voice_diag_pcm_rms(&cvp[0]), voice_diag_pcm_rms(&cvp[1]),
+			    echo[0].samples, echo[1].samples, cvp[0].samples, cvp[1].samples);
 	}
 	bzero(&voice_diag_levels, sizeof(voice_diag_levels));
 	voice_diag_levels.generation = generation;
@@ -343,6 +356,12 @@ voice_diag_log(const uint8_t *data, unsigned length)
 	}
 	if (code == 0x1805) {
 		unsigned index = os_atomic_inc_orig(&voice_diag.rx_frames, relaxed);
+		if (size >= 12 + 64 && voice_diag_word(data + 36) == size - 12 - 64 && voice_diag_level_window(clock)) {
+			/* The stock AMR capture uses 1-byte no-data, 6-byte SID and
+			 * longer speech payloads. Measure sizes without logging them. */
+			if (size - 12 - 64 <= 6) voice_diag_levels.rx_short++;
+			else voice_diag_levels.rx_speech++;
+		}
 		if (size >= 12 + 64 && (index < 2 || !(index % 100)))
 			tell("UMI SDX55: voice DSP RX frame index=%u clock=%#llx bytes=%u sequence=%u speech_bytes=%u media=%#x decoder_media=%#x\n",
 			    index + 1, clock, size - 12, voice_diag_word(data + 32), voice_diag_word(data + 36),
@@ -356,10 +375,15 @@ voice_diag_log(const uint8_t *data, unsigned length)
 	bool handset_rx = code == 0x1586 && tap == 0xb130;
 	bool handset_tx = code == 0x1586 && tap == 0xb137;
 	bool cvp_tx = code == 0x158a && tap == 0x10f60;
+	bool echo_port = code == 0x1586 && tap == 0x1105; /* TERT_MI2S_TX */
+	/* Stock 0x10f61 tracks the external AFE input after the speaker
+	 * switch. The mono 0x200 record tracks processed TX speech instead. */
+	bool cvp_far = code == 0x158a && tap == 0x10f61;
 	bool stream_tx = code == 0x158b && tap == 1;
 	bool decode = code == 0x158b && tap == 3;
-	if ((code == 0x158b && !stream_tx && !decode) || (code == 0x158a && !cvp_tx && tap != 0x10f61) ||
-	    (code == 0x1586 && !handset_rx && !handset_tx && tap != 0x8103)) return;
+	if ((code == 0x158b && !stream_tx && !decode) ||
+	    (code == 0x158a && !cvp_tx && !cvp_far) ||
+	    (code == 0x1586 && !handset_rx && !handset_tx && !echo_port && tap != 0x8103)) return;
 	bool audible = false;
 	unsigned width = data[50];
 	if (width != 16 && width != 32) return;
@@ -369,25 +393,32 @@ voice_diag_log(const uint8_t *data, unsigned length)
 	unsigned channels = data[48] | (unsigned)data[49] << 8;
 	unsigned samples = (size - 12 - offset) / sample_bytes;
 	struct voice_diag_pcm_level *level = NULL;
-	if (channels == (handset_tx ? 2u : 1u) && samples && samples % channels == 0 &&
+	bool stereo = handset_tx || echo_port || (cvp_far && channels == 2);
+	if (channels == (stereo ? 2u : 1u) && samples && samples % channels == 0 &&
 	    (size - 12 - offset) % sample_bytes == 0 && data[51] <= 1 &&
-	    (handset_tx || stream_tx || decode) && voice_diag_level_window(clock)) {
+	    (handset_tx || stream_tx || decode || echo_port || cvp_far) && voice_diag_level_window(clock)) {
 		if (handset_tx) level = voice_diag_levels.mic;
+		else if (echo_port) level = voice_diag_levels.echo_port;
+		else if (cvp_far) level = voice_diag_levels.cvp_far;
 		else level = stream_tx ? &voice_diag_levels.stream_tx : &voice_diag_levels.decoder;
 	}
-	unsigned frames = handset_tx ? samples / 2u : samples;
+	unsigned frames = stereo ? samples / 2u : samples;
 	for (unsigned i = 0; i < samples; i++) {
 		/* Q31 taps carry the same signal scale as the signed Q15 taps. */
 		unsigned high = offset + (i + 1) * sample_bytes - 2;
 		int16_t sample = (int16_t)(data[high] | (uint16_t)data[high + 1] << 8);
 		audible |= sample > 16 || sample < -16;
 		if (level) {
-			unsigned channel = handset_tx ? (data[51] ? i % 2u : i / frames) : 0;
+			unsigned channel = stereo ? (data[51] ? i % 2u : i / frames) : 0;
 			voice_diag_level_add(&level[channel], sample);
 		}
 	}
-	if (stream_tx) return;
+	if (stream_tx || echo_port) return;
 	if (decode) {
+		/* One bit per 20 ms on the DSP clock. This lets Android and iOS
+		 * timing be compared without keeping the decoded speech. */
+		if (audible && level)
+			voice_diag_levels.rx_audio_slots |= 1ull << (((clock >> 16) % 800u) / 16u);
 		os_atomic_inc(&voice_diag.decode_periods, relaxed);
 		if (audible) os_atomic_inc(&voice_diag.decode_audible, relaxed);
 	} else if (cvp_tx) {

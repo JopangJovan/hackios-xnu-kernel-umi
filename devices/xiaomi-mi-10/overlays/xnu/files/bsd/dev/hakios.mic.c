@@ -314,11 +314,17 @@ afe_service_param(const char *what, uint32_t module, uint32_t param, const void 
 }
 
 static bool
-afe_clock(const char *what, uint32_t id, bool on)
+afe_clock_at(const char *what, uint32_t id, uint32_t hz, bool on)
 {
-	struct afe_clock_set clock = { 1, id, CLOCK_HZ, CLOCK_COUPLE_NO, 0, on };
+	struct afe_clock_set clock = { 1, id, hz, CLOCK_COUPLE_NO, 0, on };
 
 	return afe_service_param(what, AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
+}
+
+static bool
+afe_clock(const char *what, uint32_t id, bool on)
+{
+	return afe_clock_at(what, id, CLOCK_HZ, on);
 }
 
 static uint32_t vote_handle[5];
@@ -627,20 +633,57 @@ tx_clocks_off(void)
 }
 
 static uint32_t
-swr_rd(uint32_t offset)
+swr_master_read(struct block *master, uint32_t offset)
 {
-	if (tx_swr.base == 0) {
-		tx_swr.base = ml_io_map(tx_swr.phys, tx_swr.size);
+	if (master->base == 0) {
+		master->base = ml_io_map(master->phys, master->size);
 	}
-	return rd(tx_swr.base + offset);
+	return rd(master->base + offset);
+}
+
+static uint32_t swr_rd(uint32_t offset) { return swr_master_read(&tx_swr, offset); }
+
+static bool
+swr_master_init(struct block *master)
+{
+	uint32_t ssp = SWR_BUS_HZ * 2 / (SWR_ROWS * SWR_COLUMNS * SWR_FRAME_SYNC_HZ), cfg;
+	bool linked = false;
+
+	if (!put(master, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) ||
+	    !put(master, "MCP_BUS_CTRL", SWRM_MCP_BUS_CTRL, 1, 0)) {
+		return false;
+	}
+	/* swrm_master_init() */
+	cfg = (swr_master_read(master, SWRM_MCP_CFG) & ~0x3e0000u) | 0x1fu << 17;
+	if (!put(master, "MCP_FRAME_CTRL_BANK0: 50 rows, 2 columns", SWRM_MCP_FRAME_CTRL_BANK0, 1u << 3 | 0u | (ssp - 1) << 16,
+	    0xffffffff) ||
+	    !put(master, "ENUMERATOR_CFG: auto", SWRM_ENUMERATOR_CFG, 1, 1) ||
+	    !put(master, "MCP_CFG: 31 pings", SWRM_MCP_CFG, cfg, 0x3e0000) ||
+	    !put(master, "CMD_FIFO_CFG: 3 retries", SWRM_CMD_FIFO_CFG, 3, 0xff) ||
+	    !put(master, "MCP_BUS_CTRL", SWRM_MCP_BUS_CTRL, 2, 0) ||
+	    !put(master, "COMP_CFG: interrupts as pulses", SWRM_COMP_CFG, 2, 0) ||
+	    !put(master, "INTERRUPT_CLEAR", SWRM_INTERRUPT_CLEAR, 0xffffffff, 0) ||
+	    !put(master, "INTERRUPT_EN", SWRM_INTERRUPT_EN, SWRM_INTERRUPT_STATUS_MASK, 0) ||
+	    !put(master, "CPU1_INTERRUPT_EN", SWRM_CPU1_INTERRUPT_EN, SWRM_INTERRUPT_STATUS_MASK, 0) ||
+	    !put(master, "COMP_CFG: on", SWRM_COMP_CFG, 3, 0)) {
+		return false;
+	}
+	for (int i = 0; i < 100 && !linked; i++) {
+		linked = swr_master_read(master, SWRM_COMP_STATUS) & 1;
+		if (!linked) {
+			spin_us(510);
+		}
+	}
+	say("mic: %s link=%u status=%#x\n", master->name, linked, swr_master_read(master, SWRM_COMP_STATUS));
+	if (!linked) {
+		return false;
+	}
+	return put(master, "CMD_FIFO_CFG: | 0x80000000", SWRM_CMD_FIFO_CFG, swr_master_read(master, SWRM_CMD_FIFO_CFG) | 0x80000000u, 0);
 }
 
 static bool
 master_on(void)
 {
-	uint32_t ssp = SWR_BUS_HZ * 2 / (SWR_ROWS * SWR_COLUMNS * SWR_FRAME_SYNC_HZ), cfg;
-	bool linked = false;
-
 	master_taken = true;
 	/* ("SW workaround to gate hw_ctl for SWR version >= 1.6": this master is 1.5.1, and the
 	 *  HCTL the redwood driver maps at 0x032a9000 is not at that address here -- the master
@@ -656,37 +699,7 @@ master_on(void)
 		}
 		spin_us(505);
 	}
-	/* swrm_runtime_resume() */
-	if (!put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) || !put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) ||
-	    !put(&tx_swr, "MCP_BUS_CTRL", SWRM_MCP_BUS_CTRL, 1, 0)) {
-		return false;
-	}
-	/* swrm_master_init() */
-	cfg = (swr_rd(SWRM_MCP_CFG) & ~0x3e0000u) | 0x1fu << 17;
-	if (!put(&tx_swr, "MCP_FRAME_CTRL_BANK0: 50 rows, 2 columns", SWRM_MCP_FRAME_CTRL_BANK0, 1u << 3 | 0u | (ssp - 1) << 16,
-	    0xffffffff) ||
-	    !put(&tx_swr, "ENUMERATOR_CFG: auto", SWRM_ENUMERATOR_CFG, 1, 1) ||
-	    !put(&tx_swr, "MCP_CFG: 31 pings", SWRM_MCP_CFG, cfg, 0x3e0000) ||
-	    !put(&tx_swr, "CMD_FIFO_CFG: 3 retries", SWRM_CMD_FIFO_CFG, 3, 0xff) ||
-	    !put(&tx_swr, "MCP_BUS_CTRL", SWRM_MCP_BUS_CTRL, 2, 0) ||
-	    !put(&tx_swr, "COMP_CFG: interrupts as pulses", SWRM_COMP_CFG, 2, 0) ||
-	    !put(&tx_swr, "INTERRUPT_CLEAR", SWRM_INTERRUPT_CLEAR, 0xffffffff, 0) ||
-	    !put(&tx_swr, "INTERRUPT_EN", SWRM_INTERRUPT_EN, SWRM_INTERRUPT_STATUS_MASK, 0) ||
-	    !put(&tx_swr, "CPU1_INTERRUPT_EN", SWRM_CPU1_INTERRUPT_EN, SWRM_INTERRUPT_STATUS_MASK, 0) ||
-	    !put(&tx_swr, "COMP_CFG: on", SWRM_COMP_CFG, 3, 0)) {
-		return false;
-	}
-	for (int i = 0; i < 100 && !linked; i++) {
-		linked = swr_rd(SWRM_COMP_STATUS) & 1;
-		if (!linked) {
-			spin_us(510);
-		}
-	}
-	say("mic: the SoundWire link %s (COMP_STATUS %#x)\n", linked ? "IS UP" : "DID NOT COME UP", swr_rd(SWRM_COMP_STATUS));
-	if (!linked) {
-		return false;
-	}
-	return put(&tx_swr, "CMD_FIFO_CFG: | 0x80000000", SWRM_CMD_FIFO_CFG, swr_rd(SWRM_CMD_FIFO_CFG) | 0x80000000u, 0);
+	return put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) && swr_master_init(&tx_swr);
 }
 
 static void
@@ -709,72 +722,82 @@ master_off(void)
 
 /* A command to a device on the bus (SWR_REG_VAL_PACK): a register written. */
 static bool
-swr_write(uint8_t device, uint16_t reg, uint8_t value, uint8_t id)
+swr_write_on(struct block *master, uint8_t device, uint16_t reg, uint8_t value, uint8_t id)
 {
 	uint32_t command = reg | (uint32_t)id << 16 | (uint32_t)device << 20 | (uint32_t)value << 24;
 
-	for (int i = 0; i < 20 && ((swr_rd(SWRM_CMD_FIFO_STATUS) >> 8) & 0x1f) >= 16; i++) {
+	for (int i = 0; i < 20 && ((swr_master_read(master, SWRM_CMD_FIFO_STATUS) >> 8) & 0x1f) >= 16; i++) {
 		spin_us(500);
 	}
 	snprintf(last_write, sizeof(last_write), "SoundWire: device %u register %#x <- %#x", device, reg, value);
-	wr(tx_swr.base + SWRM_CMD_FIFO_WR_CMD, command);
+	wr(master->base + SWRM_CMD_FIFO_WR_CMD, command);
 	spin_us(155);
 	return true;
 }
 
 /* ... and one read: false if the answer does not come (or is not this command's) */
 static bool
-swr_read(uint8_t device, uint16_t reg, uint8_t *value)
+swr_read_on(struct block *master, uint8_t device, uint16_t reg, uint8_t *value)
 {
 	uint32_t answer = 0;
 
 	read_id = read_id < 14 ? read_id + 1 : 0;
-	wr(tx_swr.base + SWRM_CMD_FIFO_RD_CMD, reg | (uint32_t)read_id << 16 | (uint32_t)device << 20 | 1u << 24);
+	wr(master->base + SWRM_CMD_FIFO_RD_CMD, reg | (uint32_t)read_id << 16 | (uint32_t)device << 20 | 1u << 24);
 	spin_us(255);
 	for (int tries = 0; tries < 4; tries++) {
-		for (int i = 0; i < 20 && ((swr_rd(SWRM_CMD_FIFO_STATUS) >> 16) & 0x1f) == 0; i++) {
+		for (int i = 0; i < 20 && ((swr_master_read(master, SWRM_CMD_FIFO_STATUS) >> 16) & 0x1f) == 0; i++) {
 			spin_us(500);
 		}
-		answer = swr_rd(SWRM_CMD_FIFO_RD_FIFO);
+		answer = swr_master_read(master, SWRM_CMD_FIFO_RD_FIFO);
 		if (((answer >> 8) & 0xf) == read_id) {
 			*value = (uint8_t)answer;
 			return true;
 		}
 		spin_us(505);
 	}
-	say("mic: SoundWire: device %u register %#x: no answer (fifo %#x, last %#x)\n", device, reg, swr_rd(SWRM_CMD_FIFO_STATUS),
+	say("mic: SoundWire: device %u register %#x: no answer (fifo %#x, last %#x)\n", device, reg, swr_master_read(master, SWRM_CMD_FIFO_STATUS),
 	    answer);
 	return false;
 }
 
+static bool swr_write(uint8_t device, uint16_t reg, uint8_t value, uint8_t id)
+{
+	return swr_write_on(&tx_swr, device, reg, value, id);
+}
+
+static bool swr_read(uint8_t device, uint16_t reg, uint8_t *value)
+{
+	return swr_read_on(&tx_swr, device, reg, value);
+}
+
 static uint8_t codec_device;
 
-/* the codec's TX device, enumerated: its device number, 0 if it did not show up */
+/* the codec's SoundWire device, enumerated: its device number, 0 if it did not show up */
 static uint8_t
-codec_wait(void)
+codec_wait(struct block *master, uint64_t codec_id)
 {
 	for (int waited = 0; waited < 200; waited++) {
 		for (uint8_t d = 1; d <= 11; d++) {
-			uint64_t id = (uint64_t)swr_rd(SWRM_ENUMERATOR_SLAVE_DEV_ID_2(d)) << 32 | swr_rd(SWRM_ENUMERATOR_SLAVE_DEV_ID_1(d));
-			uint32_t status = (swr_rd(SWRM_MCP_SLV_STATUS) >> (2 * d)) & 3;
+			uint64_t id = (uint64_t)swr_master_read(master, SWRM_ENUMERATOR_SLAVE_DEV_ID_2(d)) << 32 | swr_master_read(master, SWRM_ENUMERATOR_SLAVE_DEV_ID_1(d));
+			uint32_t status = (swr_master_read(master, SWRM_MCP_SLV_STATUS) >> (2 * d)) & 3;
 
-			if ((id & 0xffffffffffffull) == CODEC_TX_ID && (status == 1 || status == 2)) {
-				say("mic: the codec's TX device is device %u on the bus (ID %#llx, status %u) after %d ms\n", d,
+			if ((id & 0xffffffffffffull) == codec_id && (status == 1 || status == 2)) {
+				say("mic: %s found device %u on the bus (ID %#llx, status %u) after %d ms\n", master->name, d,
 				    id & 0xffffffffffffull, status, waited);
 				return d;
 			}
 		}
 		sleep_ms(1);
 	}
-	say("mic: the codec's TX device did not show up; the master has seen:\n");
+	say("mic: %s did not find the codec %#llx. Devices seen:\n", master->name, codec_id);
 	for (uint8_t d = 1; d <= 11; d++) {
-		uint64_t id = (uint64_t)swr_rd(SWRM_ENUMERATOR_SLAVE_DEV_ID_2(d)) << 32 | swr_rd(SWRM_ENUMERATOR_SLAVE_DEV_ID_1(d));
+		uint64_t id = (uint64_t)swr_master_read(master, SWRM_ENUMERATOR_SLAVE_DEV_ID_2(d)) << 32 | swr_master_read(master, SWRM_ENUMERATOR_SLAVE_DEV_ID_1(d));
 
 		if (id != 0) {
 			say("mic:   device %u: ID %#llx\n", d, id);
 		}
 	}
-	say("mic:   slave status %#x\n", swr_rd(SWRM_MCP_SLV_STATUS));
+	say("mic:   slave status %#x\n", swr_master_read(master, SWRM_MCP_SLV_STATUS));
 	return 0;
 }
 
@@ -1849,7 +1872,7 @@ path_up(bool capture)
 		return false;
 	}
 	sleep_ms(5);    /* ("5 ms for SoundWire's auto-enumeration", wcd938x_bind()) */
-	if ((codec_device = codec_wait()) == 0) {
+	if ((codec_device = codec_wait(&tx_swr, CODEC_TX_ID)) == 0) {
 		return false;
 	}
 	swr_write(0xf, SWRS_SCP_INT_STATUS_MASK_1, 0x04, 0xf);  /* (swrm_runtime_resume(): broadcast) */
@@ -1880,6 +1903,8 @@ static uint64_t voice_mic_started;
 static struct block voice_rx_macro = { "the RX macro", 0x03200000, 0x1000 };
 static bool voice_rx_port;
 static unsigned voice_rx_configured;
+
+#include "umi_voice_receiver.inc"
 
 /* Bolero RX0 consumes RX_CDC_DMA_RX_0. Clock the digital path before
  * starting the DSP port, as the stock RX macro's DAPM callbacks do.
@@ -1959,6 +1984,30 @@ hakios_mic_voice_start(void)
 	return up;
 }
 
+bool
+hakios_mic_voice_receiver(bool enable)
+{
+	lck_mtx_lock(&mic_lock);
+	bool ok = true;
+	if (enable && !receiver.active)
+		ok = voice_owned && voice_rx_port && !stopping && receiver_start();
+	else if (!enable && receiver.active)
+		ok = receiver_stop();
+	lck_mtx_unlock(&mic_lock);
+	return ok;
+}
+
+bool
+hakios_mic_voice_receiver_mute(bool mute)
+{
+	lck_mtx_lock(&mic_lock);
+	bool ok = receiver.active && put_bits(&voice_rx_macro, mute ? "mute earpiece" : "unmute earpiece",
+	    0x400, 0x10, mute ? 0x10 : 0);
+	if (ok) say("mic: earpiece muted=%u\n", mute);
+	lck_mtx_unlock(&mic_lock);
+	return ok;
+}
+
 void
 hakios_mic_voice_activate(void)
 {
@@ -1984,6 +2033,7 @@ hakios_mic_voice_stop(void)
 {
 	lck_mtx_lock(&mic_lock);
 	if (voice_owned) {
+		if (receiver.active) (void)receiver_stop();
 		voice_rx_down();
 		undo();
 		voice_owned = false;

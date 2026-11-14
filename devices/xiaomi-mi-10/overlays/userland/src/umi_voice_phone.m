@@ -39,7 +39,7 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
     switch (status->state) {
     case UMI_VOICE_QUEUED: case UMI_VOICE_DIALING: return voice_text(@"Dialing…", @"正在拨号…");
     case UMI_VOICE_RINGING: return voice_text(@"Ringing…", @"对方振铃中…");
-    case UMI_VOICE_ACTIVE: return voice_text(@"Connected · Audio unverified", @"已接通 · 通话音频待验证");
+    case UMI_VOICE_ACTIVE: return voice_text(@"Connected", @"已接通");
     case UMI_VOICE_ENDING: return voice_text(@"Ending…", @"正在挂断…");
     case UMI_VOICE_ENDED: return voice_text(@"Call ended", @"通话已结束");
     case UMI_VOICE_UNCERTAIN: return voice_text(@"Waiting for modem confirmation", @"等待基带确认通话状态");
@@ -57,9 +57,10 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
 @implementation UMIVoiceCallPage {
     UILabel *_stateLabel, *_detailsLabel;
     UITextField *_numberInput;
-    UIButton *_action;
+    UIButton *_action, *_speaker;
     NSTimer *_timer;
     BOOL _submitted, _callLive;
+    unsigned _audioRoute;
     int _requestError;
 }
 
@@ -89,7 +90,10 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
     _action = [UIButton buttonWithType:UIButtonTypeSystem];
     [_action addTarget:self action:@selector(endOrDismiss) forControlEvents:UIControlEventTouchUpInside];
     [_action setTitle:voice_text(@"Call", @"拨打") forState:UIControlStateNormal];
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[_numberInput, _stateLabel, _detailsLabel, _action]];
+    _speaker = [UIButton buttonWithType:UIButtonTypeSystem];
+    _speaker.hidden = YES;
+    [_speaker addTarget:self action:@selector(switchAudioRoute) forControlEvents:UIControlEventTouchUpInside];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[_numberInput, _stateLabel, _detailsLabel, _speaker, _action]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 18;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -148,9 +152,34 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
     unsigned error = _requestError ? (unsigned)_requestError : readError ? (unsigned)readError : status.error;
     _detailsLabel.text = error || status.qmi_error || status.end_reason ?
         [NSString stringWithFormat:@"errno %u · QMI %u · cause %u", error, status.qmi_error, status.end_reason] : nil;
+    struct umi_voice_route_status audio = {0};
+    size_t audioLength = sizeof(audio);
+    BOOL audioReady = !readError && status.state == UMI_VOICE_ACTIVE &&
+        !sysctlbyname(UMI_VOICE_ROUTE_SYSCTL, &audio, &audioLength, NULL, 0) &&
+        audioLength == sizeof(audio) && (audio.route == UMI_VOICE_ROUTE_RECEIVER || audio.route == UMI_VOICE_ROUTE_SPEAKER);
+    _audioRoute = audioReady ? audio.route : UMI_VOICE_ROUTE_NONE;
+    _speaker.hidden = !audioReady;
+    _speaker.enabled = audioReady && !audio.pending;
+    _speaker.selected = audio.route == UMI_VOICE_ROUTE_SPEAKER;
+    [_speaker setTitle:audio.pending ? voice_text(@"Switching audio…", @"正在切换音频…") :
+        _speaker.selected ? voice_text(@"Speaker On", @"扬声器已开") : voice_text(@"Speaker Off", @"扬声器已关")
+        forState:UIControlStateNormal];
+    _speaker.accessibilityLabel = voice_text(@"Speaker", @"扬声器");
+    _speaker.accessibilityValue = _speaker.selected ? voice_text(@"On", @"打开") : voice_text(@"Off", @"关闭");
+    if (audioReady && audio.error)
+        _detailsLabel.text = voice_text(@"Could not switch audio output.", @"无法切换音频输出。");
     [_action setTitle:_callLive ? voice_text(@"End Call", @"挂断") : voice_text(@"Done", @"完成") forState:UIControlStateNormal];
     _action.enabled = status.state != UMI_VOICE_ENDING;
     _action.tintColor = _callLive ? UIColor.systemRedColor : UIColor.systemBlueColor;
+}
+
+- (void)switchAudioRoute
+{
+    if (!_speaker.enabled || _audioRoute == UMI_VOICE_ROUTE_NONE) return;
+    uint32_t route = _audioRoute == UMI_VOICE_ROUTE_SPEAKER ? UMI_VOICE_ROUTE_RECEIVER : UMI_VOICE_ROUTE_SPEAKER;
+    int error = sysctlbyname(UMI_VOICE_ROUTE_SYSCTL, NULL, NULL, &route, sizeof(route)) ? errno : 0;
+    [self refreshCall];
+    if (error) _detailsLabel.text = voice_text(@"Could not switch audio output.", @"无法切换音频输出。");
 }
 
 - (void)endOrDismiss

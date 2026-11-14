@@ -23,6 +23,9 @@ if [ -n "${UMI_VOICE_CAL_DIR:-}" ]; then
 elif [ -d "$ROOT/fw-audio/voice-cal" ]; then
   voice_cal_args=(--input "$ROOT/fw-audio/voice-cal")
 fi
+if [ -n "${UMI_VOICE_SPEAKER_CAL_DIR:-}" ]; then
+  voice_cal_args+=(--speaker-input "$UMI_VOICE_SPEAKER_CAL_DIR")
+fi
 python3 "$DEVICE_DIR/tools/embed-sdx55-voice-cal.py" \
   --output "$XNU_SRC/bsd/dev/umi_sdx55_voice_cal_data.inc" ${voice_cal_args[@]+"${voice_cal_args[@]}"}
 mkdir -p "$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT"

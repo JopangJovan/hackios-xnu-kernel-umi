@@ -78,6 +78,7 @@
 #include <libkern/OSAtomic.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
+#include <os/atomic_private.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/hakios.audio.h>
@@ -342,6 +343,8 @@ command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const
 #define AFE_SVC_CMD_SET_PARAM                   0x000100f3u
 #define AFE_MODULE_AUDIO_DEV_INTERFACE          0x0001020cu
 #define AFE_PARAM_ID_I2S_CONFIG                 0x0001020du
+#define AFE_PARAM_ID_DEVICE_HW_DELAY            0x00010243u
+#define AFE_PARAM_ID_SET_TOPOLOGY               0x0001025au
 #define AFE_PARAM_ID_TDM_CONFIG                 0x0001029du
 #define AFE_MODULE_TDM                          0x0001028au
 #define AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG   0x00010297u
@@ -425,13 +428,13 @@ afe_service_param(const char *what, uint32_t module, uint32_t param, const void 
 
 /* A parameter of the port. */
 static bool
-afe_port_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
+afe_port_param(const char *what, uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size)
 {
 	uint8_t packet[16 + sizeof(struct afe_param) + 64];
 	struct afe_param *p = (struct afe_param *)(packet + 16);
 
 	bzero(packet, sizeof(packet));
-	*(uint16_t *)packet = active_port;
+	*(uint16_t *)packet = port;
 	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
 	p->module = module;
 	p->param = param;
@@ -441,6 +444,31 @@ afe_port_param(const char *what, uint32_t module, uint32_t param, const void *da
 }
 
 static bool clock_on, group_on, port_on;
+static bool voice_echo_requested, voice_echo_port_on;
+static uint32_t voice_echo_pin_cfg;
+#define UMI_VOICE_ECHO_PIN 134u
+
+/* Tertiary MI2S TX shares the clocks already driven by the playback port. */
+static void
+afe_voice_echo_off(void)
+{
+	if (!voice_echo_port_on) return;
+	os_atomic_store(&voice_echo_requested, false, release);
+	const uint16_t stop[] = { UMI_VOICE_ECHO_PORT, 0 };
+	if (command("UMI call echo reference port, stopped", APR_SVC_AFE, 0,
+	    AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL)) {
+		put(&tlmm, "gpio134 (MI2S2 SD0)", GPIO_CFG(UMI_VOICE_ECHO_PIN), voice_echo_pin_cfg);
+		voice_echo_port_on = false;
+	}
+}
+
+void
+hakios_audio_voice_echo_stop(void)
+{
+	lck_mtx_lock(&sound_lock);
+	afe_voice_echo_off();
+	lck_mtx_unlock(&sound_lock);
+}
 
 static bool
 afe_clock(bool on)
@@ -479,7 +507,7 @@ afe_on(void)
 		/* Stock UMI: TERT_MI2S_RX, SD1, stereo S16_LE, internal WS, 48 kHz. */
 		struct afe_i2s i2s = { 1, 16, 2, 1, 1, RATE, 0, 0 };
 		announce("UMI tertiary MI2S port 0x1004: stereo 16-bit, SD1, 48 kHz");
-		if (!afe_port_param("UMI I2S configuration", AFE_MODULE_AUDIO_DEV_INTERFACE,
+		if (!afe_port_param("UMI I2S configuration", active_port, AFE_MODULE_AUDIO_DEV_INTERFACE,
 		    AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s))) {
 			return false;
 		}
@@ -505,8 +533,8 @@ afe_on(void)
 		return false;
 	}
 	if (!afe_port_param("the port 0x9000: 2 channels of 32 bits at 48 kHz in 2 slots, sync 0 1, inverted, delay 1",
-	    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_TDM_CONFIG, &tdm, sizeof(tdm)) ||
-	    !afe_port_param("the port's slots: channels at bytes 0 and 4", AFE_MODULE_TDM, AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG,
+	    active_port, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_TDM_CONFIG, &tdm, sizeof(tdm)) ||
+	    !afe_port_param("the port's slots: channels at bytes 0 and 4", active_port, AFE_MODULE_TDM, AFE_PARAM_ID_PORT_SLOT_MAPPING_CONFIG,
 	    &mapping, sizeof(mapping))) {
 		return false;
 	}
@@ -520,6 +548,7 @@ afe_off(void)
 	uint16_t stop[2] = { active_port, 0 };
 	struct afe_group_enable disable = { GROUP, 0 };
 
+	afe_voice_echo_off();
 	if (port_on) {
 		command(umi_profile ? "UMI port 0x1004, stopped" : "the port 0x9000, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
 		port_on = false;
@@ -1315,9 +1344,8 @@ play(uint32_t ms, bool amplifiers)
  * /dev/hakios-audio's writer (the audio server's real-time thread, hakios.audio.c) puts frames
  * into a ring and does not wait; the feeder, a thread of ours, takes them from there into each
  * period the DSP gives back (and silence when there is nothing), so the stream never stops
- * while the run lasts. The amplifiers are only on while there is sound: the watcher starts them
- * (and fades them in to sound_below) when a write is not silence, and stops them after three
- * seconds of silence or no writes.
+ * while the run lasts. The watcher fades in the amplifiers for a non-silent
+ * write or a UMI call. Outside calls it powers them down after three quiet seconds.
  */
 #define RING_FRAMES             32768           /* 0.68 s; a power of two, the indices run on and wrap */
 #define SILENCE                 8               /* samples no larger than this are silence (as hakios.audio.c's) */
@@ -1335,6 +1363,74 @@ static volatile uint32_t ios_peak;              /* the largest sample since the 
 static LCK_MTX_DECLARE(voice_ring_lock, &sound_lock_group);
 static int16_t voice_ring[VOICE_RING_FRAMES];
 static uint32_t voice_ring_head, voice_ring_tail;
+static bool voice_speaker_held;
+static volatile bool guard_on;                  /* the protected amplifier outputs are ready */
+static struct {
+	uint32_t mixed, short_periods, first_mix_ms;
+	uint32_t initial_write_errors, initial_underflows;
+} voice_playback;
+
+bool
+hakios_audio_voice_echo_start(void)
+{
+	if (!umi_profile) return false;
+	lck_mtx_lock(&sound_lock);
+	bool enabled = false;
+	if (port_on && watcher_runs && !stopping && !voice_echo_port_on) {
+		const uint32_t topology[] = {1, 0x112fb};
+		const uint32_t delay[] = {1, 578};
+		const struct afe_i2s format = {1, 16, 1, 1, 1, RATE, 0, 0};
+		const uint16_t start[] = {UMI_VOICE_ECHO_PORT, 0};
+		const char *pin = "gpio134 (MI2S2 SD0)";
+		voice_echo_pin_cfg = get(&tlmm, pin, GPIO_CFG(UMI_VOICE_ECHO_PIN));
+		put(&tlmm, pin, GPIO_CFG(UMI_VOICE_ECHO_PIN), CFG_MI2S0 | CFG_8MA);
+		enabled = afe_port_param("UMI call echo reference topology", UMI_VOICE_ECHO_PORT,
+		    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SET_TOPOLOGY, topology, sizeof(topology)) &&
+		    afe_port_param("UMI call echo reference hardware delay", UMI_VOICE_ECHO_PORT,
+		    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_DEVICE_HW_DELAY, delay, sizeof(delay)) &&
+		    afe_port_param("UMI call echo reference format", UMI_VOICE_ECHO_PORT,
+		    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, &format, sizeof(format));
+		if (enabled) {
+			/* If START times out it may still have reached the DSP. */
+			voice_echo_port_on = true;
+			enabled = command("UMI call echo reference port, started", APR_SVC_AFE, 0,
+			    AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+			if (!enabled) afe_voice_echo_off();
+		} else {
+			put(&tlmm, pin, GPIO_CFG(UMI_VOICE_ECHO_PIN), voice_echo_pin_cfg);
+		}
+		if (enabled) os_atomic_store(&voice_echo_requested, true, release);
+	}
+	lck_mtx_unlock(&sound_lock);
+	return enabled;
+}
+
+void
+hakios_audio_voice_speaker_hold(bool active)
+{
+	if (!umi_profile || os_atomic_load(&voice_speaker_held, relaxed) == active) return;
+	if (active) {
+		lck_mtx_lock(&voice_ring_lock);
+		bzero(&voice_playback, sizeof(voice_playback));
+		voice_playback.initial_write_errors = write_errors;
+		voice_playback.initial_underflows = underflows;
+		lck_mtx_unlock(&voice_ring_lock);
+	}
+	os_atomic_store(&voice_speaker_held, active, release);
+	say("sound: call speaker hold=%u amp_ready=%u uptime_ms=%llu\n", active, guard_on, now_us() / 1000);
+}
+
+void
+hakios_audio_voice_playback_report(void)
+{
+	lck_mtx_lock(&voice_ring_lock);
+	const typeof(voice_playback) snapshot = voice_playback;
+	uint32_t pending = voice_ring_head - voice_ring_tail;
+	lck_mtx_unlock(&voice_ring_lock);
+	say("sound: call playback uptime_ms=%llu first_mix_ms=%u mixed=%u pending=%u short_periods=%u amp_ready=%u write_errors=%u underflows=%u\n",
+	    now_us() / 1000, snapshot.first_mix_ms, snapshot.mixed, pending, snapshot.short_periods,
+	    guard_on, write_errors - snapshot.initial_write_errors, underflows - snapshot.initial_underflows);
+}
 
 uint32_t
 hakios_audio_voice_play(const int16_t *samples, uint32_t frames)
@@ -1369,6 +1465,13 @@ voice_mix(int16_t *samples)
 	lck_mtx_lock(&voice_ring_lock);
 	uint32_t frames = voice_ring_head - voice_ring_tail;
 	if (frames > PERIOD_FRAMES) frames = PERIOD_FRAMES;
+	if (os_atomic_load(&voice_speaker_held, relaxed)) {
+		if (frames && !voice_playback.mixed)
+			voice_playback.first_mix_ms = (uint32_t)(now_us() / 1000);
+		if (voice_playback.mixed)
+			voice_playback.short_periods += frames < PERIOD_FRAMES;
+		voice_playback.mixed += frames;
+	}
 	for (uint32_t i = 0; i < frames; i++) {
 		int16_t voice = voice_ring[(voice_ring_tail + i) % VOICE_RING_FRAMES];
 		for (unsigned ch = 0; ch < 2; ch++) {
@@ -1409,7 +1512,6 @@ ios_sink(const int16_t *frames, uint32_t count)
 }
 
 static uint32_t guard_periods;                  /* periods through the guard */
-static volatile bool guard_on;                  /* the amplifiers are on: what the guard lets through is heard */
 
 /* tenths of a dB as text: "-5.7" */
 static const char *
@@ -1566,9 +1668,8 @@ speaker_stop(void)
 }
 
 /*
- * The amplifiers are off. The guard goes on at their level all the same: what it lets through now reaches them
- * 160 ms later, behind the periods queued at the DSP, and if that is sound, they will have been started by then
- * (70 ms after it comes). While they are off nothing but silence comes, and the averages fall as a speaker cools.
+ * When the amplifiers are idle the guard keeps running at their configured
+ * level. Samples reach the outputs behind the periods already queued to the DSP.
  * Only when nothing can be heard at all -- iOS's volume at 0, the amplifiers given up on -- is the guard told so.
  */
 static void
@@ -1581,7 +1682,7 @@ guard_off(bool unheard)
 }
 
 /*
- * The amplifiers on while there is sound, at the volume iOS has set (hakios_audio_volume(): how
+ * The amplifiers on while there is sound or a UMI call, at the volume iOS has set (hakios_audio_volume(): how
  * far under the loudest, sound_below under Android's level), and off while iOS's volume is 0;
  * their status looked at every 200 ms while they are on. On the sound's thread.
  */
@@ -1589,13 +1690,15 @@ static void
 watch(void)
 {
 	bool on = false, given_up = false, muted = false;
+	bool echo = false;
 	uint64_t last_look = 0, last_monitor = 0;
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0;
 
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
 
 	while (!stopping) {
-		uint64_t now = now_us(), sounded = last_sound_us;
+		uint64_t sounded = last_sound_us, now = now_us();
+		bool call = os_atomic_load(&voice_speaker_held, acquire);
 		uint32_t extra_now, generation_now;
 		bool muted_now;
 
@@ -1621,8 +1724,8 @@ watch(void)
 				guard_level(sound_attenuation(extra));
 			}
 		}
-		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
-			say_when("iOS plays: the amplifiers are started");
+		if (!on && !given_up && !muted && (call || (sounded != 0 && now - sounded < 100000))) {
+			say_when(call ? "call: starting the amplifiers" : "iOS plays: the amplifiers are started");
 			starts++;
 			ios_peak = 0;
 			if (!speaker_start() || !speaker_set_volume(sound_attenuation(extra), 1)) {
@@ -1635,12 +1738,15 @@ watch(void)
 				last_look = now_us();
 				last_monitor = 0;
 				monitor_looks = 0;
-				/* (what is written now is heard after the periods already queued at the DSP: PERIODS x 20 ms) */
-				say("sound: the amplifiers are up %llu ms after the first write that was not silence; that write reaches "
-				    "them %u ms after it was made, behind the periods queued at the DSP\n", (last_look - sounded) / 1000,
-				    PERIODS * PERIOD_FRAMES / 48);
+				if (call)
+					say("sound: call speaker ready uptime_ms=%llu warmup_ms=%llu\n",
+					    last_look / 1000, (last_look - now) / 1000);
+				else
+					say("sound: the amplifiers are up %llu ms after the first write that was not silence; that write reaches "
+					    "them %u ms after it was made, behind the periods queued at the DSP\n", (last_look - sounded) / 1000,
+					    PERIODS * PERIOD_FRAMES / 48);
 			}
-		} else if (on && now - sounded > QUIET_BEFORE_OFF_US) {
+		} else if (on && !call && now - sounded > QUIET_BEFORE_OFF_US) {
 			say_when("three seconds of silence: the amplifiers are stopped");
 			say("sound: what iOS wrote while they were on peaked at %u%% of full scale (%u)\n", ios_peak * 100 / 32768,
 			    ios_peak);
@@ -1667,8 +1773,16 @@ watch(void)
 				}
 			}
 		}
+		bool wanted_echo = on && os_atomic_load(&voice_echo_requested, acquire);
+		if (wanted_echo != echo) {
+			echo = wanted_echo;
+			bool ok = umi_speaker_echo_reference(echo);
+			say("sound: call speaker echo reference=%u configured=%u uptime_ms=%llu\n",
+			    echo, ok, now_us() / 1000);
+		}
 		sleep_ms(5);
 	}
+	if (echo) umi_speaker_echo_reference(false);
 	guard_off(true);
 	say("sound: the watcher stops; the amplifiers were started %u times, iOS set the volume %u times%s\n", starts, changes,
 	    given_up ? ", and the amplifiers were then given up on" : "");

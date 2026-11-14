@@ -17,6 +17,7 @@
 #define SDX55_MVM_DETACH_CVP 0x0001123fu
 #define SDX55_MVM_START 0x00011190u
 #define SDX55_MVM_STOP 0x00011192u
+#define SDX55_MVM_PAUSE 0x0001137du
 #define SDX55_APR_DESTROY 0x0001003cu
 #define SDX55_CVD_VERSION 0x00011378u
 #define SDX55_CVD_VERSION_REPLY 0x00011379u
@@ -24,8 +25,16 @@
 #define SDX55_CVP_SET_PARAM_V2 0x0001133du
 #define SDX55_CVP_RX_MEDIA_INFO 0x00013254u
 #define SDX55_CVP_TX_MEDIA_INFO 0x00013253u
+#define SDX55_CVP_EC_MEDIA_INFO 0x00013255u
 #define SDX55_APR_AVCS 3u
 #define SDX55_AVCS_REGISTER_TOPOLOGIES 0x00012923u
+#define SDX55_AVCS_MAP 0x00012924u
+#define SDX55_AVCS_MAP_REPLY 0x00012925u
+#define SDX55_AVCS_UNMAP 0x00012926u
+#define SDX55_VOICE_TX_TOPOLOGY 0x1000e202u
+#define SDX55_VOICE_HANDSET_RX_TOPOLOGY 0x1000e20cu
+#define SDX55_VOICE_SPEAKER_RX_TOPOLOGY 0x1000e200u
+#define SDX55_CVP_SET_DEVICE_V3 0x0001316au
 
 struct sdx55_voice_format {
 	uint32_t port, rate;
@@ -39,12 +48,18 @@ static const struct sdx55_voice_format voice_handset_rx = {
 static const struct sdx55_voice_format voice_handset_tx = {
 	UMI_VOICE_HANDSET_TX_PORT, UMI_VOICE_HANDSET_TX_RATE, 2, 2, {1, 2}
 };
+/* The modem's topologies use 2 for the 16-bit TX format. Keep the
+ * speaker reference at 16 bits to share the existing playback clock. */
+static const struct sdx55_voice_format voice_echo_reference = {
+	UMI_VOICE_ECHO_PORT, 48000, 2, 2, {1, 0}
+};
 
 static struct umi_mhi_dma voice_mailbox;
 
 static struct {
 	uint16_t source, mvm, cvs, cvp;
-	bool attempted, attached, started, microphone;
+	bool attempted, attached, started, microphone, speaker_echo, receiver;
+	unsigned topologies;
 	uint32_t cal_handle, cal_registered;
 } voice_audio;
 
@@ -147,28 +162,33 @@ sdx55_voice_cvp_channel_info(uint32_t parameter, const struct sdx55_voice_format
 }
 
 static bool
-sdx55_voice_cvp_channels(void)
+sdx55_voice_cvp_channels(bool echo)
 {
+	struct sdx55_voice_format ec_format = echo ? voice_echo_reference : voice_handset_rx;
+	/* Stock stereo channel info uses FL/FR. Its endpoint media map only
+	 * identifies the first reference channel. */
+	if (echo) ec_format.map[1] = 2;
 	int rx = sdx55_voice_cvp_channel_info(0x1328f, &voice_handset_rx);
 	int tx = sdx55_voice_cvp_channel_info(0x1328e, &voice_handset_tx);
-	int ec = sdx55_voice_cvp_channel_info(0x13290, &voice_handset_rx);
+	int ec = sdx55_voice_cvp_channel_info(0x13290, &ec_format);
 	hakios_tl("UMI SDX55: voice CVP channel format errno RX=%d TX=%d EC=%d\n", rx, tx, ec);
 	return !rx && !tx && !ec;
 }
 
 static unsigned
-sdx55_voice_handset_topologies(void)
+sdx55_voice_handset_topologies(bool stock_tx)
 {
 	/* UMI's ACDB voice-handset RX and voice-dmic-ef TX definitions. The
 	 * firmware also provides the instance-free TX definition, which fits
 	 * in a 128-byte GLINK intent with the APR and AVCS headers. */
 	static const uint32_t topologies[][15] = {
-		{1, 2, 0x1000e20c, 8, 5, 0x10efa, 0x10000, 0x10ee8, 0x10000, 0x1000e101, 0x10000,
+		{1, 2, SDX55_VOICE_HANDSET_RX_TOPOLOGY, 8, 5, 0x10efa, 0x10000, 0x10ee8, 0x10000, 0x1000e101, 0x10000,
 		    0x10943, 0x10000, 0x10ef5, 0x10000},
-		{1, 0, 0x1000e202, 8, 10, 0x10ee7, 0x10ee9, 0x10ef0, 0x10ef1, 0x10ef3, 0x10ef4,
+		{1, 0, SDX55_VOICE_TX_TOPOLOGY, 8, 10, 0x10ee7, 0x10ee9, 0x10ef0, 0x10ef1, 0x10ef3, 0x10ef4,
 		    0x10ef7, 0x10f00, 0x1000e100, 0x10f11},
 	};
 	static unsigned registered;
+	if (stock_tx) registered |= 2u; /* The speaker pair registers the same TX topology. */
 	for (unsigned i = 0; i < sizeof(topologies) / sizeof(topologies[0]); i++) {
 		if (registered & (1u << i)) continue;
 		struct { uint32_t low, high, handle, size, topology[15]; } packet = {.size=sizeof(topologies[0])};
@@ -178,6 +198,66 @@ sdx55_voice_handset_topologies(void)
 			registered |= 1u << i;
 	}
 	return registered;
+}
+
+struct sdx55_voice_ports {
+	uint16_t tx;
+	uint32_t tx_topology;
+	uint16_t rx;
+	uint32_t rx_topology, mixing;
+	uint16_t echo_ref;
+} __attribute__((packed));
+
+static struct sdx55_voice_ports
+sdx55_voice_ports(unsigned topologies, bool echo)
+{
+	uint32_t rx = (topologies & 1u) ? SDX55_VOICE_HANDSET_RX_TOPOLOGY : 0x10f77;
+	return (struct sdx55_voice_ports){
+		.tx = UMI_VOICE_HANDSET_TX_PORT,
+		.tx_topology = (topologies & 2u) ? SDX55_VOICE_TX_TOPOLOGY : 0x10f70,
+		.rx = UMI_VOICE_HANDSET_RX_PORT,
+		.rx_topology = echo ? SDX55_VOICE_SPEAKER_RX_TOPOLOGY : rx,
+		.mixing = echo ? 0x10f7d : 0x10f7c,
+		.echo_ref = echo ? UMI_VOICE_ECHO_PORT : 0xffff,
+	};
+}
+
+static int
+sdx55_voice_cvp_format(bool modern, bool media_format, bool echo)
+{
+	int error = 0;
+	if (modern && (!media_format || !sdx55_voice_cvp_channels(echo))) {
+		if (echo) return EIO;
+		const uint16_t channels[] = {voice_handset_tx.channels, voice_handset_rx.channels};
+		error = sdx55_voice_audio_command(SDX55_APR_CVP, voice_audio.source, voice_audio.cvp,
+		    SDX55_CVP_CHANNELS, channels, sizeof(channels), NULL);
+	}
+	if (!error && media_format) error = sdx55_voice_audio_media(SDX55_CVP_RX_MEDIA_INFO, &voice_handset_rx);
+	if (!error && media_format) error = sdx55_voice_audio_media(SDX55_CVP_TX_MEDIA_INFO, &voice_handset_tx);
+	if (!error && echo) error = sdx55_voice_audio_media(SDX55_CVP_EC_MEDIA_INFO, &voice_echo_reference);
+	if (!error && modern) error = sdx55_voice_audio_command(SDX55_APR_CVP, voice_audio.source, voice_audio.cvp,
+	    SDX55_CVP_COMMIT, NULL, 0, NULL);
+	return error;
+}
+
+static int
+sdx55_voice_cvp_configure(bool modern, bool media_format, unsigned topologies, bool echo)
+{
+	const struct sdx55_voice_ports ports = sdx55_voice_ports(topologies, echo);
+	const struct {
+		uint16_t direction, tx;
+		uint32_t tx_topology;
+		uint16_t rx;
+		uint32_t rx_topology, profile, mixing;
+		uint16_t echo_ref;
+		char name[20];
+	} __attribute__((packed)) devices = {
+		.direction=2, .tx=ports.tx, .tx_topology=ports.tx_topology, .rx=ports.rx, .rx_topology=ports.rx_topology,
+		.profile=0x1135e, .mixing=ports.mixing, .echo_ref=ports.echo_ref
+	};
+	int error = sdx55_voice_audio_command(SDX55_APR_CVP, voice_audio.source, 0,
+	    modern ? SDX55_CVP_CREATE_V3 : SDX55_CVP_CREATE_V2, &devices, sizeof(devices), &voice_audio.cvp);
+	return error ? error : sdx55_voice_cvp_format(modern, media_format, echo);
 }
 
 static void
@@ -209,10 +289,94 @@ sdx55_voice_audio_observe_mailbox(const char *when)
 #include "umi_sdx55_voice_pcm.inc"
 #include "umi_sdx55_voice_cal.inc"
 
+static unsigned
+sdx55_voice_audio_route(void)
+{
+	if (!voice_audio.started) return UMI_VOICE_ROUTE_NONE;
+	return voice_audio.receiver ? UMI_VOICE_ROUTE_RECEIVER : UMI_VOICE_ROUTE_SPEAKER;
+}
+
+/* Change only the ADSP devices on the active call. The CVS session, both
+ * codec DMA ports and the modem call stay in place, as on Android. */
+static int
+sdx55_voice_audio_set_devices(bool speaker)
+{
+	sdx55_voice_cal_deregister();
+	sdx55_voice_cal_unmap();
+	voice_audio.speaker_echo = speaker;
+	const struct sdx55_voice_ports ports = sdx55_voice_ports(voice_audio.topologies, speaker);
+	int error = sdx55_voice_audio_command(SDX55_APR_CVP, voice_audio.source, voice_audio.cvp,
+	    SDX55_CVP_SET_DEVICE_V3, &ports, sizeof(ports), NULL);
+	if (!error) error = sdx55_voice_cvp_format(true, true, speaker);
+	if (!error) sdx55_voice_cal_register();
+	/* A route with the wrong calibration can send speaker audio back to the far end. */
+	if (!error && voice_audio.cal_registered != 0xf) error = EIO;
+	return error;
+}
+
+static int
+sdx55_voice_audio_resume(void)
+{
+	return sdx55_voice_audio_command(SDX55_APR_MVM, voice_audio.source, voice_audio.mvm,
+	    SDX55_MVM_START, NULL, 0, NULL);
+}
+
+static int
+sdx55_voice_audio_switch(unsigned route)
+{
+	if (route == sdx55_voice_audio_route()) return 0;
+	if (!voice_audio.started || voice_audio.topologies != 3 || (!voice_audio.receiver && !voice_audio.speaker_echo))
+		return ENXIO;
+	bool speaker = route == UMI_VOICE_ROUTE_SPEAKER;
+	if (!speaker && !hakios_mic_voice_receiver(true)) return EIO;
+	if (speaker) {
+		hakios_audio_voice_speaker_hold(true);
+		if (!hakios_audio_voice_echo_start()) {
+			hakios_audio_voice_speaker_hold(false);
+			return EIO;
+		}
+	}
+	int error = sdx55_voice_audio_command(SDX55_APR_MVM, voice_audio.source, voice_audio.mvm,
+	    SDX55_MVM_PAUSE, NULL, 0, NULL);
+	if (error) goto release_prepared;
+	sdx55_voice_pcm_stop();
+	if (speaker && !hakios_mic_voice_receiver_mute(true)) error = EIO;
+	if (!error) error = sdx55_voice_audio_set_devices(speaker);
+	if (!error && !speaker && !hakios_mic_voice_receiver_mute(false)) error = EIO;
+	if (!error) error = sdx55_voice_audio_resume();
+	if (!error) {
+		voice_audio.receiver = !speaker;
+		if (speaker) {
+			(void)hakios_mic_voice_receiver(false);
+			sdx55_voice_audio_connected();
+		} else {
+			hakios_audio_voice_echo_stop();
+			hakios_audio_voice_speaker_hold(false);
+		}
+		return 0;
+	}
+	if (!speaker) (void)hakios_mic_voice_receiver_mute(true);
+	int restored = sdx55_voice_audio_set_devices(!speaker);
+	if (speaker && !restored && !hakios_mic_voice_receiver_mute(false)) restored = EIO;
+	int resumed = sdx55_voice_audio_resume();
+	if (!speaker && !restored && !resumed) sdx55_voice_audio_connected();
+	hakios_tl("UMI SDX55: voice route=%u errno=%d restore=%d resume=%d\n", route, error, restored, resumed);
+release_prepared:
+	if (speaker) {
+		hakios_audio_voice_echo_stop();
+		hakios_audio_voice_speaker_hold(false);
+	} else {
+		(void)hakios_mic_voice_receiver(false);
+	}
+	return error;
+}
+
 static void
 sdx55_voice_audio_stop(void)
 {
 	sdx55_voice_pcm_stop();
+	hakios_audio_voice_speaker_hold(false);
+	if (voice_audio.receiver) (void)hakios_mic_voice_receiver_mute(true);
 	if (voice_audio.started) {
 		sdx55_voice_audio_observe_mailbox("end");
 		(void)sdx55_voice_audio_command(SDX55_APR_MVM, voice_audio.source, voice_audio.mvm, SDX55_MVM_STOP, NULL, 0, NULL);
@@ -223,6 +387,7 @@ sdx55_voice_audio_stop(void)
 	sdx55_voice_cal_deregister();
 	if (voice_audio.cvp)
 		(void)sdx55_voice_audio_command(SDX55_APR_CVP, voice_audio.source, voice_audio.cvp, SDX55_APR_DESTROY, NULL, 0, NULL);
+	if (voice_audio.speaker_echo) hakios_audio_voice_echo_stop();
 	if (voice_audio.cvs)
 		(void)sdx55_voice_audio_command(SDX55_APR_CVS, voice_audio.source, voice_audio.cvs, SDX55_APR_DESTROY, NULL, 0, NULL);
 	sdx55_voice_cal_unmap();
@@ -239,6 +404,8 @@ sdx55_voice_audio_start(unsigned subscription)
 	if (voice_audio.attempted || (subscription != 1 && subscription != 2)) return;
 	voice_audio.attempted = true;
 	hakios_adsp_voice_diag_call(true);
+	/* Start warming the speaker while the modem and DSP set up the call. */
+	hakios_audio_voice_speaker_hold(true);
 	uint16_t source = subscription == 2 ? 7 : 6;
 	voice_audio.source = source;
 	voice_audio.microphone = hakios_mic_voice_start();
@@ -263,29 +430,36 @@ sdx55_voice_audio_start(unsigned subscription)
 	const uint8_t dual = 1;
 	if (!error) error = sdx55_voice_audio_command(SDX55_APR_MVM, source, voice_audio.mvm, SDX55_MVM_DUAL_CONTROL,
 	    &dual, sizeof(dual), NULL);
-	unsigned topologies = !error && modern ? sdx55_voice_handset_topologies() : 0;
-	hakios_tl("UMI SDX55: voice handset CVP topologies=%#x\n", topologies);
-	const struct {
-		uint16_t direction, tx;
-		uint32_t tx_topology;
-		uint16_t rx;
-		uint32_t rx_topology, profile, mixing;
-		uint16_t echo_ref;
-		char name[20];
-	} __attribute__((packed)) handset = {
-		.direction=2, .tx=UMI_VOICE_HANDSET_TX_PORT, .tx_topology=(topologies & 2u) ? 0x1000e202 : 0x10f70,
-		.rx=UMI_VOICE_HANDSET_RX_PORT, .rx_topology=(topologies & 1u) ? 0x1000e20c : 0x10f77,
-		.profile=0x1135e, .mixing=0x10f7c, .echo_ref=0xffff
-	};
-	if (!error) error = sdx55_voice_audio_command(SDX55_APR_CVP, source, 0, modern ? SDX55_CVP_CREATE_V3 : SDX55_CVP_CREATE_V2,
-	    &handset, sizeof(handset), &voice_audio.cvp);
-	const uint16_t channels[] = {voice_handset_tx.channels, voice_handset_rx.channels};
-	bool configured_channels = !error && media_format && sdx55_voice_cvp_channels();
-	if (!error && modern && !configured_channels) error = sdx55_voice_audio_command(SDX55_APR_CVP, source, voice_audio.cvp, SDX55_CVP_CHANNELS,
-	    channels, sizeof(channels), NULL);
-	if (!error && media_format) error = sdx55_voice_audio_media(SDX55_CVP_RX_MEDIA_INFO, &voice_handset_rx);
-	if (!error && media_format) error = sdx55_voice_audio_media(SDX55_CVP_TX_MEDIA_INFO, &voice_handset_tx);
-	if (!error && modern) error = sdx55_voice_audio_command(SDX55_APR_CVP, source, voice_audio.cvp, SDX55_CVP_COMMIT, NULL, 0, NULL);
+	bool speaker_topologies = !error && media_format && sdx55_voice_register_speaker_topologies();
+	unsigned topologies = !error && modern ? sdx55_voice_handset_topologies(speaker_topologies) : 0;
+	voice_audio.topologies = speaker_topologies ? topologies : 0;
+	hakios_tl("UMI SDX55: voice CVP topologies handset=%#x speaker=%u\n", topologies, speaker_topologies);
+	if (!error) {
+		voice_audio.receiver = speaker_topologies && voice_audio.microphone && hakios_mic_voice_receiver(true);
+		if (voice_audio.receiver && !hakios_mic_voice_receiver_mute(false)) {
+			(void)hakios_mic_voice_receiver(false);
+			voice_audio.receiver = false;
+		}
+		if (voice_audio.receiver) hakios_audio_voice_speaker_hold(false);
+		voice_audio.speaker_echo = !voice_audio.receiver && speaker_topologies && voice_audio.microphone &&
+		    hakios_audio_voice_echo_start();
+		error = sdx55_voice_cvp_configure(modern, media_format, topologies, voice_audio.speaker_echo);
+		if (error && voice_audio.speaker_echo) {
+			hakios_tl("UMI SDX55: voice speaker echo reference rejected errno=%d\n", error);
+			/* Release the provisional CVP before retrying the known handset configuration. */
+			if (voice_audio.cvp) {
+				error = sdx55_voice_audio_command(SDX55_APR_CVP, source, voice_audio.cvp,
+				    SDX55_APR_DESTROY, NULL, 0, NULL);
+				if (!error) voice_audio.cvp = 0;
+			} else if (error == EIO) error = 0;
+			if (!error) {
+				hakios_audio_voice_echo_stop();
+				voice_audio.speaker_echo = false;
+				error = sdx55_voice_cvp_configure(modern, media_format, topologies, false);
+			}
+		}
+		hakios_tl("UMI SDX55: voice speaker echo reference=%u CVP errno=%d\n", voice_audio.speaker_echo, error);
+	}
 	if (!error && modern) sdx55_voice_cal_register();
 	if (!error) error = sdx55_voice_audio_command(SDX55_APR_CVP, source, voice_audio.cvp, SDX55_CVP_ENABLE, NULL, 0, NULL);
 	if (!error) {

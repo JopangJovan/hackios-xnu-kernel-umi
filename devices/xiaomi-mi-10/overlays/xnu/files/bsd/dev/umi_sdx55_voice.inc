@@ -25,7 +25,18 @@ static struct umi_voice_snapshot voice_view = {
 	.ims_voice=UMI_VOICE_IMS_UNKNOWN, .ims_technology=UMI_VOICE_IMS_UNKNOWN
 };
 static struct umi_voice_request voice_request;
+static struct umi_voice_route_status voice_route_view;
 static bool voice_accepting;
+
+static void
+sdx55_voice_publish_route(unsigned pending, unsigned error)
+{
+	unsigned route = sdx55_voice_audio_route();
+	lck_mtx_lock(&cell_status_lock);
+	voice_route_view = (struct umi_voice_route_status){route, pending, error};
+	lck_mtx_unlock(&cell_status_lock);
+	hakios_tl("UMI SDX55: voice output route=%u pending=%u errno=%u\n", route, pending, error);
+}
 
 static void
 sdx55_voice_publish(unsigned state, int error, unsigned qmi_error, const struct sdx55_voice_call *call)
@@ -194,6 +205,7 @@ static void
 sdx55_voice_clear_call(void)
 {
 	sdx55_voice_audio_stop();
+	sdx55_voice_publish_route(UMI_VOICE_ROUTE_NONE, 0);
 	voice_worker.owned = voice_worker.uncertain = voice_worker.seen = voice_worker.has_indication = false;
 	bzero(voice_worker.target, sizeof(voice_worker.target));
 }
@@ -253,7 +265,10 @@ sdx55_voice_apply(struct sdx55_voice_result *report, bool polled)
 	if (connected)
 		sdx55_voice_audio_observe_mailbox("active");
 	sdx55_voice_publish(state, 0, 0, call);
-	if (connected) sdx55_voice_audio_connected();
+	if (connected) {
+		sdx55_voice_publish_route(UMI_VOICE_ROUTE_NONE, 0);
+		sdx55_voice_audio_connected();
+	}
 }
 
 static void
@@ -387,6 +402,13 @@ sdx55_voice_tick(struct umi_mhi *host)
 	lck_mtx_unlock(&cell_status_lock);
 	if (action == UMI_VOICE_DIAL) { sdx55_voice_dial(host); return; }
 	if (action == UMI_VOICE_END) { sdx55_voice_end(host); return; }
+	if (action == UMI_VOICE_USE_RECEIVER || action == UMI_VOICE_USE_SPEAKER) {
+		unsigned route = action == UMI_VOICE_USE_SPEAKER ? UMI_VOICE_ROUTE_SPEAKER : UMI_VOICE_ROUTE_RECEIVER;
+		int error = voice_view.state == UMI_VOICE_ACTIVE && voice_worker.owned ?
+		    sdx55_voice_audio_switch(route) : ENOENT;
+		sdx55_voice_publish_route(UMI_VOICE_ROUTE_NONE, error);
+		return;
+	}
 	if (voice_worker.target[0] && now >= voice_worker.poll_after) {
 		struct sdx55_voice_result reply;
 		if (!sdx55_voice_command(host, &voice_endpoint, SDX55_VOICE_GET_ALL, 0, &reply)) sdx55_voice_apply(&reply, true);
@@ -445,5 +467,36 @@ sdx55_voice_sysctl SYSCTL_HANDLER_ARGS
 	lck_mtx_unlock(&cell_status_lock);
 out:
 	bzero(&request, sizeof(request));
+	return error;
+}
+
+static int
+sdx55_voice_route_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	if (kauth_cred_getuid(kauth_cred_get()) != 0) {
+		const char *identity = cs_identity_get(req->p);
+		if (!identity || strcmp(identity, "com.apple.mobilephone") || !csproc_get_platform_binary(req->p)) return EPERM;
+	}
+	lck_mtx_lock(&cell_status_lock);
+	struct umi_voice_route_status view = voice_route_view;
+	lck_mtx_unlock(&cell_status_lock);
+	int error = SYSCTL_OUT(req, &view, sizeof(view));
+	if (error || !req->newptr) return error;
+	uint32_t route;
+	if (req->newlen != sizeof(route)) return EINVAL;
+	error = SYSCTL_IN(req, &route, sizeof(route));
+	if (error) return error;
+	if (route != UMI_VOICE_ROUTE_RECEIVER && route != UMI_VOICE_ROUTE_SPEAKER) return EINVAL;
+
+	lck_mtx_lock(&cell_status_lock);
+	if (!voice_accepting || voice_view.state != UMI_VOICE_ACTIVE || !voice_route_view.route) error = ENXIO;
+	else if (voice_request.action || voice_route_view.pending) error = EBUSY;
+	else if (route != voice_route_view.route) {
+		voice_request.action = route == UMI_VOICE_ROUTE_SPEAKER ? UMI_VOICE_USE_SPEAKER : UMI_VOICE_USE_RECEIVER;
+		voice_route_view.pending = route;
+		voice_route_view.error = 0;
+	}
+	lck_mtx_unlock(&cell_status_lock);
 	return error;
 }

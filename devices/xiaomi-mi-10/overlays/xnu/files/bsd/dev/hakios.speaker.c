@@ -1816,6 +1816,37 @@ static bool umi_output_on, umi_reset_asserted;
 static uint32_t umi_reset_cfg, umi_reset_io;
 static uint32_t umi_volume_attenuation = 320; /* register starts at -40 dB */
 
+/* Called by the speaker watcher. The two amps share SD0. Each drives only
+ * its own I2S slot, with the same DSP output that feeds its DAC. */
+bool
+umi_speaker_echo_reference(bool enable)
+{
+	if (!umi_output_ready || umi_reset_asserted) return false;
+	if (enable) {
+		for (unsigned i = 0; i < 2; i++) {
+			uint8_t a = i ? 0x42 : 0x40;
+			if (!umi_cs35l41_update(a, 0x480c, 3, 1) ||         /* SDOUT Hi-Z outside its slot */
+			    !umi_cs35l41_update(a, 0x4808, 0xff0000, 16u << 16) ||
+			    !umi_cs35l41_update(a, 0x4830, 0x3f, 16) ||    /* ASP TX word length */
+			    !umi_cs35l41_update(a, 0x4810, 0x3f3f, 0x100) ||
+			    !umi_cs35l41_update(a, i ? 0x4c20 : 0x4c24, 0x7f, 0x32))
+				return false;
+		}
+		if (umi_cs35l41_update(0x40, 0x4800, 0xf, 2) &&
+		    umi_cs35l41_update(0x42, 0x4800, 0xf, 1))
+			return true;
+	}
+	/* Clear even after a partial enable or an unacknowledged write. */
+	bool disabled = true;
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t a = i ? 0x42 : 0x40;
+		if (!umi_cs35l41_update(a, 0x4800, 0xf, 0) &&
+		    !umi_cs35l41_update(a, 0x4800, 0xf, 0))
+			disabled = false;
+	}
+	return !enable && disabled;
+}
+
 void
 umi_speaker_quiesce(void)
 {

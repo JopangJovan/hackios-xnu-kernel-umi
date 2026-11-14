@@ -27,6 +27,8 @@ static uint8_t call_state, direction = 1;
 static unsigned sent, dials, hangups, dial_type;
 static unsigned audio_connections;
 static bool audio_connected;
+static unsigned audio_route;
+static bool reject_route;
 static uint64_t now = 1;
 static const char test_number[] = "+12025550123";
 
@@ -49,8 +51,14 @@ static void sdx55_ims_dcm_tick(struct umi_mhi *host, unsigned subscription) {}
 static void sdx55_ims_dcm_close(struct umi_mhi *host) {}
 static int sdx55_voice_audio_prepare(struct umi_mhi *host) { return 0; }
 static void sdx55_voice_audio_observe_mailbox(const char *when) {}
-static void sdx55_voice_audio_start(unsigned subscription) {}
-static void sdx55_voice_audio_stop(void) { audio_connected = false; }
+static void sdx55_voice_audio_start(unsigned subscription) { audio_route = UMI_VOICE_ROUTE_RECEIVER; }
+static void sdx55_voice_audio_stop(void) { audio_connected = false; audio_route = UMI_VOICE_ROUTE_NONE; }
+static unsigned sdx55_voice_audio_route(void) { return audio_route; }
+static int sdx55_voice_audio_switch(unsigned route) {
+    if (reject_route) return EIO;
+    audio_route = route;
+    return 0;
+}
 static void sdx55_voice_audio_connected(void) {
     assert(!audio_connected);
     audio_connected = true;
@@ -184,6 +192,11 @@ static int request(int proc, unsigned action, const char *number) {
     return sdx55_voice_sysctl(NULL, NULL, 0, &req);
 }
 
+static int request_route(int proc, uint32_t route) {
+    struct sysctl_req req = {proc, &route, sizeof(route)};
+    return sdx55_voice_route_sysctl(NULL, NULL, 0, &req);
+}
+
 int main(void) {
     struct umi_mhi host = {0};
     uint8_t wire[64];
@@ -214,6 +227,7 @@ int main(void) {
     enabled = true;
     sdx55_voice_begin(); sdx55_voice_tick(&host);
     assert(voice_view.state == UMI_VOICE_READY && voice_view.ims_registration == 2 && sent == 8);
+    assert(request_route(1, UMI_VOICE_ROUTE_SPEAKER) == ENXIO);
     assert(request(0, UMI_VOICE_DIAL, test_number) == EPERM);
     assert(request(2, UMI_VOICE_DIAL, test_number) == EPERM);
     assert(request(1, UMI_VOICE_DIAL, "112") == EINVAL);
@@ -238,10 +252,24 @@ int main(void) {
     sdx55_voice_receive(SDX55_VOICE_PORT, 3, 46, active, sizeof(active));
     sdx55_voice_tick(&host);
     assert(voice_view.state == UMI_VOICE_ACTIVE && audio_connections == 1);
+    assert(voice_route_view.route == UMI_VOICE_ROUTE_RECEIVER);
+    assert(request_route(0, UMI_VOICE_ROUTE_SPEAKER) == EPERM);
+    assert(request_route(1, UMI_VOICE_ROUTE_NONE) == EINVAL);
+    assert(!request_route(1, UMI_VOICE_ROUTE_SPEAKER));
+    assert(voice_route_view.pending == UMI_VOICE_ROUTE_SPEAKER);
+    assert(request_route(1, UMI_VOICE_ROUTE_RECEIVER) == EBUSY);
+    sdx55_voice_tick(&host);
+    assert(voice_route_view.route == UMI_VOICE_ROUTE_SPEAKER && !voice_route_view.pending);
+    reject_route = true;
+    assert(!request_route(1, UMI_VOICE_ROUTE_RECEIVER)); sdx55_voice_tick(&host);
+    assert(voice_route_view.route == UMI_VOICE_ROUTE_SPEAKER && voice_route_view.error == EIO);
+    reject_route = false;
+    assert(!request_route(1, UMI_VOICE_ROUTE_RECEIVER));
     assert(!request(1, UMI_VOICE_END, NULL)); sdx55_voice_tick(&host);
     assert(hangups == 1 && voice_view.state == UMI_VOICE_ENDING);
     now++; sdx55_voice_tick(&host);
     assert(voice_view.state == UMI_VOICE_ENDED && voice_view.end_reason == 0x19 && !audio_connected);
+    assert(voice_route_view.route == UMI_VOICE_ROUTE_NONE && !voice_route_view.pending);
 
     lost_ack = true;
     assert(!request(1, UMI_VOICE_DIAL, test_number)); sdx55_voice_tick(&host);
@@ -288,4 +316,4 @@ with tempfile.TemporaryDirectory() as directory:
     subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Wno-unused-parameter",
                     "-I", str(DEV), str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
-print("PASS: SDX55 voice binding, outbound call states, uncertain reply recovery, and hangup ownership")
+print("PASS: SDX55 call states, hangup ownership, and in-call audio route requests")

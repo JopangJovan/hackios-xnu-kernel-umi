@@ -23,6 +23,14 @@ static struct {
 } voice_pcm_worker;
 static uint32_t voice_pcm_serial, voice_pcm_period[VOICE_PCM_PERIODS];
 
+static uint64_t
+sdx55_voice_uptime_ms(void)
+{
+	uint64_t nanoseconds;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &nanoseconds);
+	return nanoseconds / NSEC_PER_MSEC;
+}
+
 struct sdx55_voice_pcm {
 	uintptr_t memory;
 	uint64_t address;
@@ -170,9 +178,15 @@ sdx55_voice_pcm_close(const struct sdx55_voice_pcm *pcm)
 static void
 sdx55_voice_pcm_feed(const struct sdx55_voice_pcm *pcm)
 {
-	for (unsigned i = 0; i < VOICE_PCM_PERIODS; i++)
-		if (!sdx55_voice_pcm_read(pcm, i)) return;
+	for (unsigned i = 0; i < VOICE_PCM_PERIODS; i++) {
+		if (!os_atomic_load(&voice_pcm_worker.wanted, acquire)) return;
+		if (!sdx55_voice_pcm_read(pcm, i)) {
+			hakios_tl("UMI SDX55: voice downlink read submit failed period=%u\n", i);
+			return;
+		}
+	}
 
+	bool diag = sdx55_voice_diag_enabled();
 	uint64_t report, timeout;
 	clock_interval_to_deadline(500, NSEC_PER_MSEC, &report);
 	clock_interval_to_deadline(2, NSEC_PER_SEC, &timeout);
@@ -180,14 +194,21 @@ sdx55_voice_pcm_feed(const struct sdx55_voice_pcm *pcm)
 	while (os_atomic_load(&voice_pcm_worker.wanted, acquire)) {
 		uint64_t now = mach_absolute_time();
 		if (now >= report) {
-			sdx55_voice_audio_observe_mailbox("during call");
+			if (diag) {
+				sdx55_voice_audio_observe_mailbox("during call");
+				hakios_audio_voice_playback_report();
+			}
 			hakios_tl("UMI SDX55: voice downlink reads=%u errors=%u nonzero_periods=%u frames=%u queued=%u\n",
 			    reads, errors, nonzero, frames, played);
 			clock_interval_to_deadline(2, NSEC_PER_SEC, &report);
 		}
 		uint32_t result = os_atomic_load(&voice_pcm_period[next], acquire);
 		if (!(result & (VOICE_PCM_DONE | VOICE_PCM_ERROR))) {
-			if (now >= timeout) break;
+			if (now >= timeout) {
+				errors++;
+				hakios_tl("UMI SDX55: voice downlink DMA timed out period=%u\n", next);
+				break;
+			}
 			delay_for_interval(2, NSEC_PER_MSEC);
 			continue;
 		}
@@ -204,33 +225,40 @@ sdx55_voice_pcm_feed(const struct sdx55_voice_pcm *pcm)
 		unsigned count = ((result & ~VOICE_PCM_DONE) >> 12) / sizeof(*samples);
 		bool audible = false;
 		for (unsigned i = 0; i < count; i++) audible |= samples[i] > 16 || samples[i] < -16;
+		if (!reads || (audible && !nonzero))
+			hakios_tl("UMI SDX55: voice downlink %s uptime_ms=%llu frames=%u\n",
+			    audible ? "first audible PCM" : "first PCM", sdx55_voice_uptime_ms(), count);
 		nonzero += audible;
 		frames += count;
 		played += hakios_audio_voice_play(samples, count);
 		reads++;
-		if (!sdx55_voice_pcm_read(pcm, next)) break;
+		if (!sdx55_voice_pcm_read(pcm, next)) {
+			errors++;
+			hakios_tl("UMI SDX55: voice downlink read resubmit failed period=%u\n", next);
+			break;
+		}
 		next = (next + 1) % VOICE_PCM_PERIODS;
 		clock_interval_to_deadline(2, NSEC_PER_SEC, &timeout);
 	}
 	hakios_tl("UMI SDX55: voice downlink stopped reads=%u errors=%u nonzero_periods=%u frames=%u queued=%u\n",
 	    reads, errors, nonzero, frames, played);
+	if (diag) hakios_audio_voice_playback_report();
 }
-
-#include "umi_sdx55_voice_cvp.inc"
 
 static void
 sdx55_voice_pcm_thread(__unused void *arg, __unused wait_result_t wait_result)
 {
 	if (voice_audio.microphone && os_atomic_load(&voice_pcm_worker.wanted, acquire))
 		hakios_mic_voice_activate();
-	if (!sdx55_voice_cvp_pcm() && os_atomic_load(&voice_pcm_worker.wanted, acquire)) {
+	if (os_atomic_load(&voice_pcm_worker.wanted, acquire)) {
 		struct sdx55_voice_pcm pcm = {0};
 		hakios_adsp_apr_events_voice(sdx55_voice_pcm_event);
 		bool ready = sdx55_voice_pcm_setup(&pcm);
-		hakios_tl("UMI SDX55: voice downlink ready=%u\n", ready);
+		hakios_tl("UMI SDX55: voice downlink ready=%u path=CVS uptime_ms=%llu\n", ready, sdx55_voice_uptime_ms());
 		if (ready && os_atomic_load(&voice_pcm_worker.wanted, acquire))
 			sdx55_voice_pcm_feed(&pcm);
 		sdx55_voice_pcm_close(&pcm);
+		hakios_adsp_apr_events_voice(NULL);
 	}
 	os_atomic_store(&voice_pcm_worker.running, false, release);
 	thread_terminate(current_thread());
@@ -240,6 +268,11 @@ static void
 sdx55_voice_audio_connected(void)
 {
 	if (!voice_audio.started || os_atomic_load(&voice_pcm_worker.running, acquire)) return;
+	hakios_tl("UMI SDX55: voice downlink connected uptime_ms=%llu\n", sdx55_voice_uptime_ms());
+	if (voice_audio.receiver) {
+		hakios_mic_voice_activate();
+		return;
+	}
 	voice_pcm_worker.source = voice_audio.source;
 	voice_pcm_worker.cvs = voice_audio.cvs;
 	os_atomic_store(&voice_pcm_worker.wanted, true, release);

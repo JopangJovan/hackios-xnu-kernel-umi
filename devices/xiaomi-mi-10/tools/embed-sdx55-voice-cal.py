@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Embed locally extracted UMI handset voice calibration from stock Android."""
+"""Embed locally extracted UMI voice calibration from stock Android."""
 
 import argparse
 import struct
@@ -40,10 +40,7 @@ def compact_volume_table(data, columns):
     return table, struct.pack("<I", 7) + columns[4:16] + columns[28:]
 
 
-def make_include(source):
-    yield "/* Generated from local UMI firmware. */\n"
-    if source is None:
-        return
+def calibration_tables(source):
     inputs = (
         ("cvs", "cvs-static.bin", "columns-9.bin", 7),
         ("device", "cvp-device.bin", None, 0),
@@ -67,24 +64,43 @@ def make_include(source):
         total_bytes += (len(data) + 127) & ~127
         tables.append((name, data))
     if total_bytes > 11 * 4096:
-        raise ValueError("Voice calibration exceeds the handset DSP buffer")
-    yield "#define UMI_SDX55_VOICE_CAL_AVAILABLE 1\n"
+        raise ValueError("Voice calibration exceeds the DSP buffer")
+    return tables
+
+
+def embed_tables(tables, prefix):
     for name, data in tables:
-        yield f"static const uint8_t voice_cal_{name}[] = {{\n"
+        yield f"static const uint8_t voice_cal_{prefix}{name}[] = {{\n"
         for offset in range(0, len(data), 16):
             values = ", ".join(f"0x{byte:02x}" for byte in data[offset:offset + 16])
             yield f"\t{values},\n"
         yield "};\n"
 
 
+def make_include(source, speaker_source=None):
+    yield "/* Generated from local UMI firmware. */\n"
+    if source is None:
+        if speaker_source is not None:
+            raise ValueError("Speaker voice calibration requires handset calibration for fallback")
+        return
+    handset = calibration_tables(source)
+    yield "#define UMI_SDX55_VOICE_CAL_AVAILABLE 1\n"
+    yield from embed_tables(handset, "")
+    if speaker_source is not None:
+        speaker = calibration_tables(speaker_source)
+        yield "#define UMI_SDX55_VOICE_SPEAKER_CAL_AVAILABLE 1\n"
+        yield from embed_tables(speaker, "speaker_")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path)
+    parser.add_argument("--speaker-input", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     try:
-        data = "".join(make_include(args.input))
-    except (OSError, ValueError) as exc:
+        data = "".join(make_include(args.input, args.speaker_input))
+    except (OSError, ValueError, struct.error) as exc:
         parser.exit(1, f"{exc}\n")
     if not args.output.exists() or args.output.read_text() != data:
         args.output.write_text(data)

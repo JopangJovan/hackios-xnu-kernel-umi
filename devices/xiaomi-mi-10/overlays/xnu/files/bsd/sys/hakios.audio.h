@@ -47,6 +47,7 @@ bool umi_speaker_calibrated(void);
 bool umi_speaker_start(void);
 bool umi_speaker_volume(uint32_t below, uint32_t step_ms);
 bool umi_speaker_healthy(void);
+bool umi_speaker_echo_reference(bool enable);
 void umi_speaker_stop(void);
 void umi_speaker_shutdown(void);
 void umi_speaker_quiesce(void);
@@ -149,6 +150,11 @@ bool hakios_audio_voice_cal_memory(uintptr_t *memory, uint64_t *dsp_address);
 void hakios_audio_voice_cal_memory_put(void);
 uint32_t hakios_audio_voice_play(const int16_t *samples, uint32_t frames);
 void hakios_audio_voice_flush(void);
+void hakios_audio_voice_speaker_hold(bool active);
+void hakios_audio_voice_playback_report(void);
+#define UMI_VOICE_ECHO_PORT 0x1005u
+bool hakios_audio_voice_echo_start(void);
+void hakios_audio_voice_echo_stop(void);
 /* UMI stock DT mailbox_region, shared with SDX55 and kept wired for the ADSP's lifetime. */
 #define UMI_VOICE_MAILBOX_BYTES 0x20000u
 bool hakios_audio_voice_mailbox(uintptr_t memory, uint64_t *dsp_address);
@@ -180,6 +186,8 @@ bool hakios_audio_recording_mic(void);
 #define UMI_VOICE_HANDSET_RX_RATE 48000u
 #define UMI_VOICE_HANDSET_TX_RATE 48000u
 bool hakios_mic_voice_start(void);
+bool hakios_mic_voice_receiver(bool enable);
+bool hakios_mic_voice_receiver_mute(bool mute);
 void hakios_mic_voice_activate(void);
 void hakios_mic_voice_stop(void);
 void hakios_mic_dsp_up(void);          /* the DSP's audio services are up (adsp=1): boot-arg mic=N begins */
