@@ -296,6 +296,15 @@ sdx55_voice_audio_route(void)
 	return voice_audio.receiver ? UMI_VOICE_ROUTE_RECEIVER : UMI_VOICE_ROUTE_SPEAKER;
 }
 
+static int
+sdx55_voice_audio_mute(bool muted)
+{
+	if (!voice_audio.started || !voice_audio.microphone || !voice_audio.cvs) return ENXIO;
+	const uint16_t volume[] = {0, muted, 20};
+	return sdx55_voice_audio_command(SDX55_APR_CVS, voice_audio.source, voice_audio.cvs,
+	    0x1138b, volume, sizeof(volume), NULL);
+}
+
 /* Change only the ADSP devices on the active call. The CVS session, both
  * codec DMA ports and the modem call stay in place, as on Android. */
 static int

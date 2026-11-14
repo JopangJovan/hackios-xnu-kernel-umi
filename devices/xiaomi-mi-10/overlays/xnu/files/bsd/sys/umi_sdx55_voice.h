@@ -5,6 +5,7 @@
 
 #define UMI_VOICE_SYSCTL "kern.hakios.sdx55_voice"
 #define UMI_VOICE_ROUTE_SYSCTL "kern.hakios.sdx55_voice_route"
+#define UMI_VOICE_MUTE_SYSCTL "kern.hakios.sdx55_voice_mute"
 #define UMI_VOICE_VERSION 1u
 #define UMI_VOICE_NUMBER_SIZE 17u
 #define UMI_VOICE_IMS_UNKNOWN UINT32_MAX
@@ -15,11 +16,18 @@ enum umi_voice_state {
 	UMI_VOICE_FAILED, UMI_VOICE_UNCERTAIN
 };
 
-enum umi_voice_action { UMI_VOICE_DIAL = 1, UMI_VOICE_END, UMI_VOICE_USE_RECEIVER, UMI_VOICE_USE_SPEAKER };
+enum umi_voice_action {
+	UMI_VOICE_DIAL = 1, UMI_VOICE_END, UMI_VOICE_USE_RECEIVER, UMI_VOICE_USE_SPEAKER,
+	UMI_VOICE_MUTE, UMI_VOICE_UNMUTE
+};
 enum umi_voice_route { UMI_VOICE_ROUTE_NONE, UMI_VOICE_ROUTE_RECEIVER, UMI_VOICE_ROUTE_SPEAKER };
 
 struct umi_voice_route_status {
 	uint32_t route, pending, error;
+};
+
+struct umi_voice_mute_status {
+	uint32_t muted, pending, error;
 };
 
 struct umi_voice_snapshot {

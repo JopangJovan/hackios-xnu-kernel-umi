@@ -32,8 +32,8 @@ Its status follows.
 
 ## Xiaomi Mi 10 (UMI, Snapdragon 865): status
 
-As of **2026-11-07**. Everything below was checked in RAM sessions on the phone (`fastboot boot`; nothing is flashed, and
-a reboot returns the phone to its own Android). The default boot arguments are
+These features were checked in RAM sessions on the phone (`fastboot boot`). A reboot returns
+the phone to Android. The latest cellular call check was on **2026-11-15**. The default boot arguments are
 [`devices/xiaomi-mi-10/boot.args`](devices/xiaomi-mi-10/boot.args); building and running are described in
 [devices/xiaomi-mi-10/README.md](devices/xiaomi-mi-10/README.md).
 
@@ -52,6 +52,7 @@ a reboot returns the phone to its own Android). The default boot arguments are
 | Flashlight | `torch=3` | channel 0 only, 125 mA at most, off after 30 s or at 45 °C ([FLASHLIGHT.md](devices/xiaomi-mi-10/FLASHLIGHT.md)) |
 | **Wi-Fi** (QCA6390 over PCIe/MHI): scanning, joining, browsing | `wifi=1` | **fixed 2026-11-07**, see below |
 | **Compass** (ak0991x magnetometer behind the sensor DSP, SLPI) | `slpi=1 slpi_attach=1` | **working 2026-11-07**; limits below |
+| **SDX55 cellular data** | `UMI_CELLULAR=1` | Mobile data, network name, signal bars, and cellular data controls verified in RAM sessions. [Build and run](devices/xiaomi-mi-10/README.md#sdx55-mobile-data-ram-test) |
 | Models with up to 8 GiB of memory | — | |
 
 ### Partly working or experimental
@@ -62,12 +63,12 @@ a reboot returns the phone to its own Android). The default boot arguments are
 | Metal (`metal=1`) | native buffers, command queues and blits verified; an AIR shader executed on the Adreno 650 in an isolated test | a render pipeline and a Metal compositor: the home screen stays on OpenGL ES ([METAL.md](devices/xiaomi-mi-10/METAL.md)) |
 | Bluetooth (QCA6390 over H4, `umi_bt=1`) | the controller's firmware loads, the H4 endpoint is ready, iOS's bluetoothd scans | pairing and audio are not verified |
 | Compass accuracy | the dial follows the phone; hard iron is calibrated by one closed flat turn | the mapping of the sensor's X/Y axes to the phone's frame still needs correcting; without the SLPI fused orientation the heading assumes the phone lies flat |
+| SDX55 cellular calls | Outgoing calls from the Phone keypad and Recents, the system call screen, speaker switching, and hangup verified on iOS 16.5 | In-call keypad (DTMF) is pending. Incoming calls and microphone mute still need hardware verification. [Call setup and validation](devices/xiaomi-mi-10/README.md#sdx55-outbound-call-ram-test) |
 
 ### Not yet
 
 - The other sensors behind the sensor DSP (accelerometer, gyroscope, light, proximity, pressure): the DSP reads their registry,
   but nothing is given to iOS yet, so there is no auto-rotation and no level.
-- Cellular on UMI (the modem work in [docs/cellular.md](docs/cellular.md) is the POCO X5 Pro's).
 - Apple's services: not supported and not a goal.
 
 ### Fixed recently

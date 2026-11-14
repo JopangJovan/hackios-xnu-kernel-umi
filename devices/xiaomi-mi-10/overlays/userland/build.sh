@@ -53,6 +53,8 @@
 #                                   the kernel. adsp=1 needs none of it: the system image has the firmware in /fw.
 #                      MODEM=1      stage checked local MPSS firmware from ../fw-modem in system.apfs /fw.
 #                                   This does not start the modem; the XNU MPSS driver is still required.
+#                      UMI_CALLSERVICESD=FILE stages the iOS 20F66 callservicesd for UMI's RAM boot.
+#                                   UMI_GPS=1 includes the SDX55 user interface and firmware inputs.
 #   system.apfs      the system image, the root filesystem (the resident RAM disk, /dev/md0), an
 #                    APFS container: the part of iOS 16.5 chosen by ../sysimage/select-system.py at
 #                    its real paths, the dyld shared cache, and src/stage0.c as /sbin/launchd (the
@@ -511,6 +513,27 @@ if [ "${UMI_GPS:-0}" = 1 ]; then
 	done
 	bash ../devices/xiaomi-mi-10/tools/build-sdx55-settings.sh "$PWD/root/lib/umi-gps-ui.dylib" || exit 1
 	printf '%s\n' '/redwood/lib/umi-gps-ui.dylib Preferences SpringBoard MobilePhone' >> root/etc/inject.conf
+	# This executable is over the extractor's default framework size limit.
+	# Use the original binary from the same 20F66 root volume.
+	if [ -n "${UMI_CALLSERVICESD:-}" ]; then
+		install -m 0755 "$UMI_CALLSERVICESD" root/bin/callservicesd
+		printf '%s\n' '/redwood/lib/umi-gps-ui.dylib InCallService' >> root/etc/inject.conf
+		python3 - "$IOS/rootfs" <<'PY'
+import pathlib
+import plistlib
+import sys
+
+name = 'com.apple.telephonyutilities.callservicesd.plist'
+source = pathlib.Path(sys.argv[1]) / 'System/Library/LaunchDaemons' / name
+target = pathlib.Path('root/LaunchDaemons') / name
+with source.open('rb') as f:
+    job = plistlib.load(f)
+job['ProgramArguments'][0] = '/redwood/bin/callservicesd'
+job['StandardErrorPath'] = '/dev/console'
+with target.open('wb') as f:
+    plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
+PY
+	fi
 fi
 
 # Segment names are device-specific. UMI's signed MDT references adsp.b00 through adsp.b18,
@@ -717,6 +740,28 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		# (a merge: an app that the system image already has would stop a plain mv)
 		cp -a sysroot/private/var/staged_system_apps/. sysroot/Applications/ 2>/dev/null || true
 		rm -rf sysroot/private/var
+	fi
+	if [ "${UMI_GPS:-0}" = 1 ] && [ -n "${UMI_CALLSERVICESD:-}" ]; then
+		# CallKit's public transaction API requires the Phone app to declare VoIP background mode.
+		# Replace the file in the staged image to preserve the source on hard-link builds.
+		python3 - sysroot/Applications/MobilePhone.app/Info.plist <<'PY'
+import pathlib
+import plistlib
+import stat
+import sys
+
+target = pathlib.Path(sys.argv[1])
+with target.open('rb') as f:
+    info = plistlib.load(f)
+modes = info.setdefault('UIBackgroundModes', [])
+if 'voip' not in modes:
+    modes.append('voip')
+    temp = target.with_suffix('.new')
+    with temp.open('xb') as f:
+        plistlib.dump(info, f, fmt=plistlib.FMT_BINARY, sort_keys=False)
+    temp.chmod(stat.S_IMODE(target.stat().st_mode))
+    temp.replace(target)
+PY
 	fi
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.ios
 	cp obj/stage0 sysroot/sbin/launchd

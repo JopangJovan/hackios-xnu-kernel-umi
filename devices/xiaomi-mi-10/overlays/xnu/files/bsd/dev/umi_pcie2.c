@@ -3358,6 +3358,10 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_voice_route,
     CTLTYPE_STRUCT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
     sdx55_voice_route_sysctl, "S,umi_voice_route_status", "SDX55 in-call audio output");
 
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_voice_mute,
+    CTLTYPE_STRUCT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+    sdx55_voice_mute_sysctl, "S,umi_voice_mute_status", "SDX55 in-call microphone mute");
+
 SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_observe,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
     umi_sdx55_observe_sysctl, "I",

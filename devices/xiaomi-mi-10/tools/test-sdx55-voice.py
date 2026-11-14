@@ -59,6 +59,12 @@ static int sdx55_voice_audio_switch(unsigned route) {
     audio_route = route;
     return 0;
 }
+static bool microphone_muted;
+static int sdx55_voice_audio_mute(bool muted) {
+    assert(audio_connected);
+    microphone_muted = muted;
+    return 0;
+}
 static void sdx55_voice_audio_connected(void) {
     assert(!audio_connected);
     audio_connected = true;
@@ -80,9 +86,10 @@ static unsigned kauth_cred_get(void) { return 501; }
 static unsigned kauth_cred_getuid(unsigned uid) { return uid; }
 static const char *cs_identity_get(int proc) {
     if (proc == 3 || proc == 4) return "com.apple.Preferences";
+    if (proc == 5) return "com.apple.InCallService";
     return proc ? "com.apple.mobilephone" : "com.example.other";
 }
-static bool csproc_get_platform_binary(int proc) { return proc == 1 || proc == 3; }
+static bool csproc_get_platform_binary(int proc) { return proc == 1 || proc == 3 || proc == 5; }
 #include "umi_sdx55_voice.inc"
 
 static size_t put_tlv(uint8_t *reply, size_t off, uint8_t tag, const void *bytes, uint8_t len) {
@@ -200,6 +207,11 @@ static int request_route(int proc, uint32_t route) {
     return sdx55_voice_route_sysctl(NULL, NULL, 0, &req);
 }
 
+static int request_mute(int proc, uint32_t mute) {
+    struct sysctl_req req = {proc, &mute, sizeof(mute)};
+    return sdx55_voice_mute_sysctl(NULL, NULL, 0, &req);
+}
+
 int main(void) {
     struct umi_mhi host = {0};
     uint8_t wire[64];
@@ -231,6 +243,7 @@ int main(void) {
     sdx55_voice_begin(); sdx55_voice_tick(&host);
     assert(voice_view.state == UMI_VOICE_READY && voice_view.ims_registration == 2 && sent == 8);
     assert(request_route(1, UMI_VOICE_ROUTE_SPEAKER) == ENXIO);
+    assert(request_mute(1, 1) == ENXIO);
     assert(request(0, UMI_VOICE_DIAL, test_number) == EPERM);
     assert(request(2, UMI_VOICE_DIAL, test_number) == EPERM);
     struct sysctl_req prefs = {.p=3};
@@ -239,6 +252,7 @@ int main(void) {
     assert(sdx55_voice_sysctl(NULL, NULL, 0, &prefs) == EPERM);
     assert(request(3, UMI_VOICE_DIAL, test_number) == EPERM);
     assert(request(3, UMI_VOICE_END, NULL) == EPERM);
+    assert(request(5, UMI_VOICE_DIAL, test_number) == EPERM);
     assert(request(1, UMI_VOICE_DIAL, "112") == EINVAL);
     assert(!request(1, UMI_VOICE_DIAL, test_number));
     assert(request(1, UMI_VOICE_DIAL, test_number) == EBUSY);
@@ -264,7 +278,16 @@ int main(void) {
     assert(voice_route_view.route == UMI_VOICE_ROUTE_RECEIVER);
     assert(request_route(0, UMI_VOICE_ROUTE_SPEAKER) == EPERM);
     assert(request_route(1, UMI_VOICE_ROUTE_NONE) == EINVAL);
-    assert(!request_route(1, UMI_VOICE_ROUTE_SPEAKER));
+    assert(request_mute(5, 1) == EPERM);
+    assert(request_mute(1, 2) == EINVAL);
+    assert(!request_mute(1, 1));
+    assert(request_route(5, UMI_VOICE_ROUTE_SPEAKER) == EBUSY);
+    sdx55_voice_tick(&host);
+    assert(voice_mute_view.muted && microphone_muted && !voice_mute_view.pending);
+    assert(!request_mute(1, 0));
+    sdx55_voice_tick(&host);
+    assert(!voice_mute_view.muted && !microphone_muted && !voice_mute_view.pending);
+    assert(!request_route(5, UMI_VOICE_ROUTE_SPEAKER));
     assert(voice_route_view.pending == UMI_VOICE_ROUTE_SPEAKER);
     assert(request_route(1, UMI_VOICE_ROUTE_RECEIVER) == EBUSY);
     sdx55_voice_tick(&host);

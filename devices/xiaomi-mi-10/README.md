@@ -133,12 +133,23 @@ tested handset configuration uses four tables (`cvs-static.bin`,
 same set of files extracted for the stock speaker calibration pair (TX 43,
 RX 15). Keep the source tables and generated images local.
 
+For the system call screen and Recents, pass `UMI_CALLSERVICESD=/absolute/path/to/callservicesd`
+along with `UMI_GPS=1` to `devices/xiaomi-mi-10/build-userland.sh`. Use the
+signed `System/Library/PrivateFrameworks/TelephonyUtilities.framework/callservicesd`
+from the same iOS 16.5 (20F66) root volume. The RAM image enables Phone's
+CallKit background mode and marks Visual Voicemail unavailable on SDX55.
+The local Apple binary and generated images stay outside Git.
+
 Start with `UMI_CELLULAR=1 UMI_VOICE=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run`.
 During the 600-second SDX55 session, open Phone → Keypad, enter a number, and
-tap the green call button. A compatibility call sheet shows the modem state
-and offers speaker and hangup controls. Settings → Cellular → Voice Service displays
-the IMS registration and voice availability reported by the baseband. The
-optional `sdx55_voice_diag=1` boot argument enables DSP and modem diagnostics.
+tap the green call button. With the call service installed, Phone reports
+the baseband's call state to CallKit and opens the system call screen.
+Tap a single-number cellular voice entry in Recents to redial. Use the system
+speaker button to switch between the receiver and speaker. The compatibility
+sheet provides audio and hangup controls if native presentation fails.
+Settings → Cellular → Voice Service displays the baseband's IMS registration
+and voice availability. The optional `sdx55_voice_diag=1` boot argument enables
+DSP and modem diagnostics.
 Logs include call states, voice frame counts and per-second signal levels.
 They omit dialed numbers and audio samples.
 
@@ -154,7 +165,20 @@ remain the two voice microphones.
 The WCD9380 earpiece is the default output. The user confirmed the call
 could switch to speakerphone and back to the earpiece, the remote system
 responded to speech, and a manual hangup completed. The handset profile
-uses its own voice calibration. Incoming calls still need testing.
+uses its own voice calibration.
+
+On 2026-11-15, Phone reached the keypad without the startup black screen.
+The green keypad button and a 10010 entry in Recents both placed a call
+into the full-screen system call UI. The system speaker button switched the
+audio output, and the modem acknowledged hangups from the system red button.
+
+### Pending call features
+
+The in-call keypad is disabled. DTMF digits are not sent to the SDX55 yet,
+so numeric options in an automated phone menu are unavailable. A future
+change needs to forward CallKit's in-call digit actions to the active modem
+call and verify that the far end recognizes them. Incoming calls and the
+system microphone mute button still need hardware validation.
 
 ### Repeatable gaps in IVR playback
 

@@ -1,4 +1,4 @@
-/* Route the iOS 16.5 Phone keypad to the SDX55 outbound call worker. */
+/* Route iOS 16.5 Phone calls from Keypad and Recents to SDX55. */
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #include <errno.h>
@@ -6,13 +6,14 @@
 #include <sys/sysctl.h>
 #include <sys/umi_sdx55_voice.h>
 #include <unistd.h>
+#include "umi_voice_system.h"
 
 static NSString *voice_text(NSString *english, NSString *chinese)
 {
     return [NSLocale.preferredLanguages.firstObject hasPrefix:@"zh"] ? chinese : english;
 }
 
-static void umi_voice_diagnostic(const char *message)
+void umi_voice_diagnostic(const char *message)
 {
     int fd = open("/dev/console", O_WRONLY);
     if (fd < 0) return;
@@ -20,7 +21,7 @@ static void umi_voice_diagnostic(const char *message)
     close(fd);
 }
 
-static int umi_voice_submit(unsigned action, NSString *number)
+int umi_voice_submit(unsigned action, NSString *number)
 {
     struct umi_voice_request request = {.size=sizeof(request), .version=UMI_VOICE_VERSION, .action=action};
     if (number && ![number getCString:request.number maxLength:sizeof(request.number) encoding:NSASCIIStringEncoding]) return EINVAL;
@@ -32,7 +33,7 @@ static int umi_voice_submit(unsigned action, NSString *number)
     return error;
 }
 
-static int umi_voice_read_status(struct umi_voice_snapshot *status)
+int umi_voice_read_status(struct umi_voice_snapshot *status)
 {
     size_t length = sizeof(*status);
     if (sysctlbyname(UMI_VOICE_SYSCTL, status, &length, NULL, 0)) return errno;
@@ -57,6 +58,7 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
 
 @interface UMIVoiceCallPage : UIViewController
 @property(nonatomic, copy) NSString *number;
+@property(nonatomic) BOOL alreadyDialed;
 @end
 
 @implementation UMIVoiceCallPage {
@@ -114,6 +116,7 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
 - (void)viewDidAppear:(BOOL)animated
 {
     [super viewDidAppear:animated];
+    if (self.alreadyDialed) _submitted = YES;
     if (!_submitted && self.number) [self submitCall];
     [self refreshCall];
     __weak UMIVoiceCallPage *weak = self;
@@ -193,8 +196,26 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
 - (NSString *)text;
 @end
 
+@interface CHRecentCall : NSObject
+- (NSString *)serviceProvider;
+- (NSInteger)mediaType;
+- (NSInteger)handleType;
+- (NSSet *)validRemoteParticipantHandles;
+- (NSString *)callerId;
+@end
+
 static void (*original_dial)(UIViewController *, SEL, UIControl *);
 static void (*original_update)(UIViewController *, SEL, id);
+static void (*original_redial)(id, SEL, CHRecentCall *);
+
+/* CallHistory's values for a voice call and a phone-number handle in 20F66. */
+static const NSInteger history_audio = 1;
+static const NSInteger history_phone_number = 2;
+
+static BOOL phone_has_visual_voicemail(__unused id phone, __unused SEL command)
+{
+    return NO;
+}
 
 static NSString *dialable_number(NSString *text)
 {
@@ -205,6 +226,22 @@ static NSString *dialable_number(NSString *text)
     char wire[UMI_VOICE_NUMBER_SIZE] = {0};
     return [number getCString:wire maxLength:sizeof(wire) encoding:NSASCIIStringEncoding] &&
         umi_voice_number_length(wire) ? number : nil;
+}
+
+static void start_phone_call(UIViewController *controller, NSString *number)
+{
+    if (controller.presentedViewController) return;
+    __weak UIViewController *weakController = controller;
+    void (^fallback)(BOOL) = ^(BOOL alreadyDialed) {
+        UIViewController *presenter = weakController;
+        if (!presenter.viewIfLoaded.window || presenter.presentedViewController) return;
+        UMIVoiceCallPage *page = [[UMIVoiceCallPage alloc] init];
+        page.number = number;
+        page.alreadyDialed = alreadyDialed;
+        page.modalInPresentation = YES;
+        [presenter presentViewController:page animated:YES completion:nil];
+    };
+    if (!umi_voice_start_system_call(number, fallback)) fallback(NO);
 }
 
 static void keypad_dial(UIViewController *controller, SEL cmd, UIControl *sender)
@@ -221,12 +258,41 @@ static void keypad_dial(UIViewController *controller, SEL cmd, UIControl *sender
         original_dial(controller, cmd, sender);
         return;
     }
-    if (controller.presentedViewController) return;
     umi_voice_diagnostic("UMI Phone: native call button tapped\n");
-    UMIVoiceCallPage *page = [[UMIVoiceCallPage alloc] init];
-    page.number = number;
-    page.modalInPresentation = YES;
-    [controller presentViewController:page animated:YES completion:nil];
+    start_phone_call(controller, number);
+}
+
+static UIViewController *recents_presenter(void)
+{
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class] ||
+            scene.activationState != UISceneActivationStateForegroundActive) continue;
+        UIWindow *window = ((UIWindowScene *)scene).keyWindow;
+        if (window && !window.hidden && window.rootViewController.viewIfLoaded.window)
+            return window.rootViewController;
+    }
+    return nil;
+}
+
+static void redial_recent_call(id controller, SEL command, CHRecentCall *call)
+{
+    if (NSThread.isMainThread &&
+        [call isKindOfClass:NSClassFromString(@"CHRecentCall")] &&
+        call.mediaType == history_audio && call.handleType == history_phone_number &&
+        call.validRemoteParticipantHandles.count <= 1) {
+        NSString *provider = call.serviceProvider;
+        if ([provider isEqualToString:@"com.apple.mobilephone"] ||
+            [provider isEqualToString:@"com.apple.Telephony"]) {
+            NSString *number = dialable_number(call.callerId);
+            UIViewController *presenter = number ? recents_presenter() : nil;
+            if (presenter) {
+                umi_voice_diagnostic("UMI Phone: recent cellular call selected\n");
+                start_phone_call(presenter, number);
+                return;
+            }
+        }
+    }
+    original_redial(controller, command, call);
 }
 
 static void keypad_update(UIViewController *controller, SEL cmd, id event)
@@ -240,16 +306,49 @@ static void keypad_update(UIViewController *controller, SEL cmd, id event)
     }
 }
 
+static BOOL voice_keypad_enabled(void)
+{
+    char args[1024];
+    size_t length = sizeof(args);
+    if (sysctlbyname("kern.bootargs", args, &length, NULL, 0) || length > sizeof(args) ||
+        !memchr(args, 0, length)) return NO;
+    const char *word = args;
+    const char *spaces = " \t\r\n\v\f";
+    while (*word) {
+        word += strspn(word, spaces);
+        size_t size = strcspn(word, spaces);
+        if (size == sizeof("sdx55_voice=1") - 1 && !memcmp(word, "sdx55_voice=1", size)) return YES;
+        word += size;
+    }
+    return NO;
+}
+
 __attribute__((constructor)) static void install_voice_keypad(void)
 {
-    if (strcmp(getprogname(), "MobilePhone")) return;
+    if (strcmp(getprogname(), "MobilePhone") || !voice_keypad_enabled()) return;
+    if (access("/redwood/bin/callservicesd", X_OK) == 0) {
+        /* Install before UIApplicationMain can ask Visual Voicemail to query
+         * CommCenter while constructing the first tab bar. */
+        Class phone = objc_lookUpClass("MobilePhoneApplication");
+        SEL showsVoicemail = sel_registerName("showsPhoneVoicemail");
+        Method method = phone ? class_getInstanceMethod(phone, showsVoicemail) : NULL;
+        if (method && method_getNumberOfArguments(method) == 2) {
+            class_replaceMethod(phone, showsVoicemail, (IMP)phone_has_visual_voicemail,
+                method_getTypeEncoding(method));
+            umi_voice_diagnostic("UMI Phone: visual voicemail unavailable on SDX55\n");
+        }
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
-        char args[1024];
-        size_t length = sizeof(args);
-        if (sysctlbyname("kern.bootargs", args, &length, NULL, 0) || length > sizeof(args) || !memchr(args, 0, length)) return;
-        NSArray *words = [[NSString stringWithUTF8String:args]
-            componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-        if (![words containsObject:@"sdx55_voice=1"]) return;
+        if (access("/redwood/bin/callservicesd", X_OK) == 0) {
+            Class recents = NSClassFromString(@"PHRecentsController");
+            SEL redial = sel_registerName("performDialRequestForRecentCall:");
+            Method method = recents ? class_getInstanceMethod(recents, redial) : NULL;
+            if (method && method_getNumberOfArguments(method) == 3) {
+                original_redial = (void *)method_getImplementation(method);
+                class_replaceMethod(recents, redial, (IMP)redial_recent_call, method_getTypeEncoding(method));
+                umi_voice_diagnostic("UMI Phone: Recents callback installed\n");
+            }
+        }
         Class dialer = NSClassFromString(@"DialerController");
         SEL call = sel_registerName("_callButtonPressed:");
         SEL update = sel_registerName("_updateCallButtonEnabledState:");
