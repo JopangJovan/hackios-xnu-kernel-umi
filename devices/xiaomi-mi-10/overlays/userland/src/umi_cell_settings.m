@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <sys/sysctl.h>
 #include <sys/umi_sdx55_cell_status.h>
+#include <sys/umi_sdx55_voice.h>
 #include <unistd.h>
 
 static NSString *localized(NSString *english, NSString *chinese)
@@ -41,6 +42,27 @@ static NSString *data_state(unsigned state)
     }
 }
 
+static NSString *voice_service(void)
+{
+    struct umi_voice_snapshot voice;
+    size_t length = sizeof(voice);
+    if (sysctlbyname(UMI_VOICE_SYSCTL, &voice, &length, NULL, 0) ||
+        length != sizeof(voice) || voice.size != length || voice.version != UMI_VOICE_VERSION ||
+        voice.state == UMI_VOICE_UNAVAILABLE)
+        return localized(@"Unavailable", @"不可用");
+    switch (voice.ims_registration) {
+    case 0: return localized(@"Not registered", @"未注册");
+    case 1: return localized(@"Registering…", @"注册中…");
+    case 2:
+        if (voice.ims_voice == 2) return localized(@"Registered (IMS)", @"已注册（IMS）");
+        if (voice.ims_voice == 1) return localized(@"Limited service", @"服务受限");
+        if (!voice.ims_voice) return localized(@"Voice unavailable", @"语音不可用");
+        break;
+    }
+    return localized(@"Checking…", @"正在查询…");
+}
+
+static BOOL showVoiceService;
 @interface UMICellularPage : UITableViewController
 @end
 
@@ -58,6 +80,7 @@ static NSString *data_state(unsigned state)
     [_dataSwitch addTarget:self action:@selector(dataChanged:) forControlEvents:UIControlEventValueChanged];
     NSArray<NSString *> *labels = @[localized(@"Cellular Data", @"蜂窝数据"), localized(@"Data Connection", @"数据连接"),
         localized(@"Carrier", @"运营商"), localized(@"Signal", @"信号")];
+    if (showVoiceService) labels = [labels arrayByAddingObject:localized(@"Voice Service", @"语音服务")];
     NSMutableArray *rows = [NSMutableArray arrayWithCapacity:labels.count];
     for (NSString *label in labels) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
@@ -97,6 +120,15 @@ static NSString *data_state(unsigned state)
     _rows[2].detailTextLabel.text = carrier.length ? carrier : @"—";
     _rows[3].detailTextLabel.text = radio.rsrp == INT32_MIN ? @"—" :
         [NSString stringWithFormat:@"%uG · %d dBm", radio.rat, radio.rsrp];
+    if (showVoiceService) {
+        NSString *status = voice_service();
+        if (![_rows[4].detailTextLabel.text isEqualToString:status]) {
+            _rows[4].detailTextLabel.text = status;
+            char message[112];
+            snprintf(message, sizeof(message), "UMI Cellular Settings: voice service status=%s\n", status.UTF8String);
+            diagnostic(message);
+        }
+    }
     for (UITableViewCell *cell in _rows) [cell setNeedsLayout];
 }
 
@@ -119,7 +151,10 @@ static NSString *data_state(unsigned state)
 }
 
 - (NSInteger)numberOfSectionsInTableView:(__unused UITableView *)table { return 2; }
-- (NSInteger)tableView:(__unused UITableView *)table numberOfRowsInSection:(__unused NSInteger)section { return 2; }
+- (NSInteger)tableView:(__unused UITableView *)table numberOfRowsInSection:(NSInteger)section
+{
+    return section == 0 ? 2 : _rows.count - 2;
+}
 - (UITableViewCell *)tableView:(__unused UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)indexPath
 {
     return _rows[2 * indexPath.section + indexPath.row];
@@ -303,6 +338,7 @@ __attribute__((constructor)) static void start_cellular_settings(void)
             install_control_center();
             return;
         }
+        showVoiceService = [words containsObject:@"sdx55_voice=1"];
         Class root = NSClassFromString(@"PSUIPrefsListController");
         SEL select = @selector(tableView:didSelectRowAtIndexPath:);
         Method method = class_getInstanceMethod(root, select);

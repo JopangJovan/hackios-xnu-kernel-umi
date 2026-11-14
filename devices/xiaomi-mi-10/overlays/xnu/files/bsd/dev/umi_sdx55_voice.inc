@@ -438,7 +438,9 @@ sdx55_voice_sysctl SYSCTL_HANDLER_ARGS
 #pragma unused(oidp, arg1, arg2)
 	if (kauth_cred_getuid(kauth_cred_get()) != 0) {
 		const char *identity = cs_identity_get(req->p);
-		if (!identity || strcmp(identity, "com.apple.mobilephone") || !csproc_get_platform_binary(req->p)) return EPERM;
+		if (!identity || !csproc_get_platform_binary(req->p) ||
+		    (strcmp(identity, "com.apple.mobilephone") &&
+		    (req->newptr || strcmp(identity, "com.apple.Preferences")))) return EPERM;
 	}
 	lck_mtx_lock(&cell_status_lock);
 	struct umi_voice_snapshot view = voice_view;

@@ -134,11 +134,13 @@ same set of files extracted for the stock speaker calibration pair (TX 43,
 RX 15). Keep the source tables and generated images local.
 
 Start with `UMI_CELLULAR=1 UMI_VOICE=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run`.
-During the 600-second SDX55 session, open Phone → Keypad → Cellular Call.
-The call sheet shows the modem state and offers an End Call button. The optional
-`sdx55_voice_diag=1` boot argument enables DSP and modem diagnostics. Logs
-include call states, voice frame counts and per-second signal levels. They
-omit dialed numbers and audio samples.
+During the 600-second SDX55 session, open Phone → Keypad, enter a number, and
+tap the green call button. A compatibility call sheet shows the modem state
+and offers speaker and hangup controls. Settings → Cellular → Voice Service displays
+the IMS registration and voice availability reported by the baseband. The
+optional `sdx55_voice_diag=1` boot argument enables DSP and modem diagnostics.
+Logs include call states, voice frame counts and per-second signal levels.
+They omit dialed numbers and audio samples.
 
 ### Hardware validation
 

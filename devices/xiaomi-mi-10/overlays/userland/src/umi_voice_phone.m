@@ -1,4 +1,4 @@
-/* iOS 16.5 Phone keypad entry for the UMI SDX55 outbound call test. */
+/* Route the iOS 16.5 Phone keypad to the SDX55 outbound call worker. */
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #include <errno.h>
@@ -12,9 +12,7 @@ static NSString *voice_text(NSString *english, NSString *chinese)
     return [NSLocale.preferredLanguages.firstObject hasPrefix:@"zh"] ? chinese : english;
 }
 
-static NSString *test_number(NSString *text);
-
-static void voice_diagnostic(const char *message)
+static void umi_voice_diagnostic(const char *message)
 {
     int fd = open("/dev/console", O_WRONLY);
     if (fd < 0) return;
@@ -22,7 +20,7 @@ static void voice_diagnostic(const char *message)
     close(fd);
 }
 
-static int voice_submit(unsigned action, NSString *number)
+static int umi_voice_submit(unsigned action, NSString *number)
 {
     struct umi_voice_request request = {.size=sizeof(request), .version=UMI_VOICE_VERSION, .action=action};
     if (number && ![number getCString:request.number maxLength:sizeof(request.number) encoding:NSASCIIStringEncoding]) return EINVAL;
@@ -30,8 +28,15 @@ static int voice_submit(unsigned action, NSString *number)
     int error = sysctlbyname(UMI_VOICE_SYSCTL, NULL, NULL, &request, sizeof(request)) ? errno : 0;
     char message[80];
     snprintf(message, sizeof(message), "UMI Phone: voice request=%u errno=%d\n", action, error);
-    voice_diagnostic(message);
+    umi_voice_diagnostic(message);
     return error;
+}
+
+static int umi_voice_read_status(struct umi_voice_snapshot *status)
+{
+    size_t length = sizeof(*status);
+    if (sysctlbyname(UMI_VOICE_SYSCTL, status, &length, NULL, 0)) return errno;
+    return length == sizeof(*status) && status->size == length && status->version == UMI_VOICE_VERSION ? 0 : EPROTO;
 }
 
 static NSString *voice_state(const struct umi_voice_snapshot *status)
@@ -55,8 +60,7 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
 @end
 
 @implementation UMIVoiceCallPage {
-    UILabel *_stateLabel, *_detailsLabel;
-    UITextField *_numberInput;
+    UILabel *_stateLabel;
     UIButton *_action, *_speaker;
     NSTimer *_timer;
     BOOL _submitted, _callLive;
@@ -69,31 +73,24 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.title = voice_text(@"Cellular Call", @"蜂窝通话");
-    _numberInput = [[UITextField alloc] init];
-    _numberInput.text = self.number;
-    _numberInput.placeholder = voice_text(@"Phone number or 10010", @"测试号码或 10010");
-    _numberInput.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
-    _numberInput.keyboardType = UIKeyboardTypePhonePad;
-    _numberInput.textAlignment = NSTextAlignmentCenter;
-    _numberInput.borderStyle = UITextBorderStyleRoundedRect;
-    _numberInput.enabled = !self.number;
+    UILabel *number = [[UILabel alloc] init];
+    number.text = self.number;
+    number.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle1];
     _stateLabel = [[UILabel alloc] init];
     _stateLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
-    _detailsLabel = [[UILabel alloc] init];
-    _detailsLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
-    _detailsLabel.textColor = UIColor.secondaryLabelColor;
-    for (UILabel *label in @[_stateLabel, _detailsLabel]) {
+    _stateLabel.textColor = UIColor.secondaryLabelColor;
+    for (UILabel *label in @[number, _stateLabel]) {
         label.textAlignment = NSTextAlignmentCenter;
         label.numberOfLines = 0;
         label.adjustsFontForContentSizeCategory = YES;
     }
     _action = [UIButton buttonWithType:UIButtonTypeSystem];
     [_action addTarget:self action:@selector(endOrDismiss) forControlEvents:UIControlEventTouchUpInside];
-    [_action setTitle:voice_text(@"Call", @"拨打") forState:UIControlStateNormal];
+    [_action setTitle:voice_text(@"End Call", @"挂断") forState:UIControlStateNormal];
     _speaker = [UIButton buttonWithType:UIButtonTypeSystem];
     _speaker.hidden = YES;
     [_speaker addTarget:self action:@selector(switchAudioRoute) forControlEvents:UIControlEventTouchUpInside];
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[_numberInput, _stateLabel, _detailsLabel, _speaker, _action]];
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[number, _stateLabel, _speaker, _action]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 18;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -110,10 +107,7 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
 - (void)submitCall
 {
     _submitted = YES;
-    _numberInput.enabled = NO;
-    [_numberInput resignFirstResponder];
-    _numberInput.text = self.number;
-    _requestError = voice_submit(UMI_VOICE_DIAL, self.number);
+    _requestError = umi_voice_submit(UMI_VOICE_DIAL, self.number);
     [self refreshCall];
 }
 
@@ -141,17 +135,12 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
 {
     if (!_submitted) return;
     struct umi_voice_snapshot status = {0};
-    size_t length = sizeof(status);
-    int readError = sysctlbyname(UMI_VOICE_SYSCTL, &status, &length, NULL, 0) ? errno : 0;
-    if (!readError && (length != sizeof(status) || status.size != sizeof(status) || status.version != UMI_VOICE_VERSION)) readError = EPROTO;
+    int readError = umi_voice_read_status(&status);
     if (!readError && !_requestError)
         _callLive = (status.state >= UMI_VOICE_QUEUED && status.state <= UMI_VOICE_ENDING) || status.state == UMI_VOICE_UNCERTAIN;
     self.modalInPresentation = _callLive;
     _stateLabel.text = _requestError ? voice_text(@"Dial request unavailable", @"拨号请求未受理") :
         readError ? voice_text(@"Modem status unavailable", @"无法读取基带状态") : voice_state(&status);
-    unsigned error = _requestError ? (unsigned)_requestError : readError ? (unsigned)readError : status.error;
-    _detailsLabel.text = error || status.qmi_error || status.end_reason ?
-        [NSString stringWithFormat:@"errno %u · QMI %u · cause %u", error, status.qmi_error, status.end_reason] : nil;
     struct umi_voice_route_status audio = {0};
     size_t audioLength = sizeof(audio);
     BOOL audioReady = !readError && status.state == UMI_VOICE_ACTIVE &&
@@ -162,12 +151,12 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
     _speaker.enabled = audioReady && !audio.pending;
     _speaker.selected = audio.route == UMI_VOICE_ROUTE_SPEAKER;
     [_speaker setTitle:audio.pending ? voice_text(@"Switching audio…", @"正在切换音频…") :
-        _speaker.selected ? voice_text(@"Speaker On", @"扬声器已开") : voice_text(@"Speaker Off", @"扬声器已关")
-        forState:UIControlStateNormal];
+        voice_text(@"Speaker", @"扬声器") forState:UIControlStateNormal];
+    _speaker.tintColor = _speaker.selected ? UIColor.systemBlueColor : UIColor.labelColor;
     _speaker.accessibilityLabel = voice_text(@"Speaker", @"扬声器");
     _speaker.accessibilityValue = _speaker.selected ? voice_text(@"On", @"打开") : voice_text(@"Off", @"关闭");
     if (audioReady && audio.error)
-        _detailsLabel.text = voice_text(@"Could not switch audio output.", @"无法切换音频输出。");
+        _stateLabel.text = voice_text(@"Could not switch audio output.", @"无法切换音频输出。");
     [_action setTitle:_callLive ? voice_text(@"End Call", @"挂断") : voice_text(@"Done", @"完成") forState:UIControlStateNormal];
     _action.enabled = status.state != UMI_VOICE_ENDING;
     _action.tintColor = _callLive ? UIColor.systemRedColor : UIColor.systemBlueColor;
@@ -179,22 +168,17 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
     uint32_t route = _audioRoute == UMI_VOICE_ROUTE_SPEAKER ? UMI_VOICE_ROUTE_RECEIVER : UMI_VOICE_ROUTE_SPEAKER;
     int error = sysctlbyname(UMI_VOICE_ROUTE_SYSCTL, NULL, NULL, &route, sizeof(route)) ? errno : 0;
     [self refreshCall];
-    if (error) _detailsLabel.text = voice_text(@"Could not switch audio output.", @"无法切换音频输出。");
+    if (error) _stateLabel.text = voice_text(@"Could not switch audio output.", @"无法切换音频输出。");
 }
 
 - (void)endOrDismiss
 {
-    if (!_submitted) {
-        self.number = test_number(_numberInput.text);
-        if (self.number) [self submitCall];
-        else _stateLabel.text = voice_text(@"Enter a test number.", @"请输入有效的测试号码。");
-        return;
-    }
+    if (!_submitted) return;
     if (!_callLive) { [self dismissViewControllerAnimated:YES completion:nil]; return; }
-    int error = voice_submit(UMI_VOICE_END, nil);
+    int error = umi_voice_submit(UMI_VOICE_END, nil);
     if (!error) { [self refreshCall]; return; }
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:voice_text(@"End Call", @"挂断")
-        message:[NSString stringWithFormat:@"errno %d", error] preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:
+        voice_text(@"Couldn’t end the call", @"无法挂断通话") message:nil preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:voice_text(@"OK", @"好") style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
@@ -209,11 +193,10 @@ static NSString *voice_state(const struct umi_voice_snapshot *status)
 - (NSString *)text;
 @end
 
-static void (*original_appear)(UIViewController *, SEL, BOOL);
-static Class keypad_class;
-static char voice_button_key;
+static void (*original_dial)(UIViewController *, SEL, UIControl *);
+static void (*original_update)(UIViewController *, SEL, id);
 
-static NSString *test_number(NSString *text)
+static NSString *dialable_number(NSString *text)
 {
     if (![text isKindOfClass:NSString.class]) return nil;
     NSCharacterSet *formatting = [NSCharacterSet characterSetWithCharactersInString:
@@ -224,42 +207,37 @@ static NSString *test_number(NSString *text)
         umi_voice_number_length(wire) ? number : nil;
 }
 
-static void keypad_call(UIViewController *controller, __unused SEL cmd, __unused id sender)
+static void keypad_dial(UIViewController *controller, SEL cmd, UIControl *sender)
 {
-    voice_diagnostic("UMI Phone: voice keypad tapped\n");
+    id dialer = [controller dialerView];
+    if (!sender || sender != [dialer callButton] || !controller.viewIfLoaded.window) {
+        original_dial(controller, cmd, sender);
+        return;
+    }
+    UIView *lcd = [dialer lcdView];
+    NSString *text = [lcd respondsToSelector:@selector(text)] ? [lcd text] : nil;
+    NSString *number = dialable_number(text);
+    if (!number) {
+        original_dial(controller, cmd, sender);
+        return;
+    }
     if (controller.presentedViewController) return;
-    UIView *lcd = [[controller dialerView] lcdView];
-    NSString *number = [lcd respondsToSelector:@selector(text)] ? test_number([lcd text]) : nil;
-    if (!number) voice_diagnostic("UMI Phone: voice keypad needs number input\n");
+    umi_voice_diagnostic("UMI Phone: native call button tapped\n");
     UMIVoiceCallPage *page = [[UMIVoiceCallPage alloc] init];
     page.number = number;
-    page.modalInPresentation = number != nil;
+    page.modalInPresentation = YES;
     [controller presentViewController:page animated:YES completion:nil];
 }
 
-static void keypad_appear(UIViewController *controller, SEL cmd, BOOL animated)
+static void keypad_update(UIViewController *controller, SEL cmd, id event)
 {
-    original_appear(controller, cmd, animated);
-    if (objc_getAssociatedObject(controller, &voice_button_key)) return;
-    UIControl *native = [[controller dialerView] callButton];
-    UIView *container = controller.view;
-    if (!native.superview || ![native isDescendantOfView:container]) return;
-    UIButtonConfiguration *appearance = UIButtonConfiguration.filledButtonConfiguration;
-    appearance.baseBackgroundColor = UIColor.systemGreenColor;
-    appearance.baseForegroundColor = UIColor.whiteColor;
-    appearance.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-    appearance.title = voice_text(@"Cellular Call", @"蜂窝拨号");
-    UIButton *button = [UIButton buttonWithConfiguration:appearance primaryAction:nil];
-    button.translatesAutoresizingMaskIntoConstraints = NO;
-    [button addTarget:controller action:sel_registerName("umi_sdx55PlaceCall:") forControlEvents:UIControlEventTouchUpInside];
-    [container addSubview:button];
-    [NSLayoutConstraint activateConstraints:@[
-        [button.trailingAnchor constraintEqualToAnchor:container.safeAreaLayoutGuide.trailingAnchor constant:-12],
-        [button.centerYAnchor constraintEqualToAnchor:native.centerYAnchor],
-        [button.heightAnchor constraintGreaterThanOrEqualToConstant:44],
-    ]];
-    objc_setAssociatedObject(controller, &voice_button_key, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    voice_diagnostic("UMI Phone: voice keypad button installed\n");
+    original_update(controller, cmd, event);
+    id dialer = [controller dialerView];
+    UIView *lcd = [dialer lcdView];
+    if ([lcd respondsToSelector:@selector(text)] && dialable_number([lcd text])) {
+        UIControl *button = [dialer callButton];
+        button.enabled = YES;
+    }
 }
 
 __attribute__((constructor)) static void install_voice_keypad(void)
@@ -272,17 +250,20 @@ __attribute__((constructor)) static void install_voice_keypad(void)
         NSArray *words = [[NSString stringWithUTF8String:args]
             componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         if (![words containsObject:@"sdx55_voice=1"]) return;
-        keypad_class = NSClassFromString(@"MPKeypadViewController");
         Class dialer = NSClassFromString(@"DialerController");
-        Method appear = class_getInstanceMethod(keypad_class, @selector(viewWillAppear:));
-        if (!keypad_class || !class_getInstanceMethod(dialer, @selector(dialerView)) || !appear ||
-            method_getNumberOfArguments(appear) != 3 ||
-            !class_addMethod(keypad_class, sel_registerName("umi_sdx55PlaceCall:"), (IMP)keypad_call, "v@:@")) {
-            voice_diagnostic("UMI Phone: voice keypad selectors unavailable\n");
+        SEL call = sel_registerName("_callButtonPressed:");
+        SEL update = sel_registerName("_updateCallButtonEnabledState:");
+        Method callMethod = dialer ? class_getInstanceMethod(dialer, call) : NULL;
+        Method updateMethod = dialer ? class_getInstanceMethod(dialer, update) : NULL;
+        if (!callMethod || !updateMethod || method_getNumberOfArguments(callMethod) != 3 ||
+            method_getNumberOfArguments(updateMethod) != 3) {
+            umi_voice_diagnostic("UMI Phone: native call button selectors unavailable\n");
             return;
         }
-        original_appear = (void *)method_getImplementation(appear);
-        method_setImplementation(appear, (IMP)keypad_appear);
-        voice_diagnostic("UMI Phone: voice keypad active\n");
+        original_dial = (void *)method_getImplementation(callMethod);
+        original_update = (void *)method_getImplementation(updateMethod);
+        class_replaceMethod(dialer, call, (IMP)keypad_dial, method_getTypeEncoding(callMethod));
+        class_replaceMethod(dialer, update, (IMP)keypad_update, method_getTypeEncoding(updateMethod));
+        umi_voice_diagnostic("UMI Phone: native call button installed\n");
     });
 }

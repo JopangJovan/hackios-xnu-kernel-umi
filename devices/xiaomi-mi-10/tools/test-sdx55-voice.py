@@ -78,8 +78,11 @@ struct sysctl_req { int p; const void *newptr; size_t newlen; };
 #define SYSCTL_IN(req, request, len) (memcpy(request, (req)->newptr, len), 0)
 static unsigned kauth_cred_get(void) { return 501; }
 static unsigned kauth_cred_getuid(unsigned uid) { return uid; }
-static const char *cs_identity_get(int proc) { return proc ? "com.apple.mobilephone" : "com.example.other"; }
-static bool csproc_get_platform_binary(int proc) { return proc == 1; }
+static const char *cs_identity_get(int proc) {
+    if (proc == 3 || proc == 4) return "com.apple.Preferences";
+    return proc ? "com.apple.mobilephone" : "com.example.other";
+}
+static bool csproc_get_platform_binary(int proc) { return proc == 1 || proc == 3; }
 #include "umi_sdx55_voice.inc"
 
 static size_t put_tlv(uint8_t *reply, size_t off, uint8_t tag, const void *bytes, uint8_t len) {
@@ -230,6 +233,12 @@ int main(void) {
     assert(request_route(1, UMI_VOICE_ROUTE_SPEAKER) == ENXIO);
     assert(request(0, UMI_VOICE_DIAL, test_number) == EPERM);
     assert(request(2, UMI_VOICE_DIAL, test_number) == EPERM);
+    struct sysctl_req prefs = {.p=3};
+    assert(!sdx55_voice_sysctl(NULL, NULL, 0, &prefs));
+    prefs.p = 4;
+    assert(sdx55_voice_sysctl(NULL, NULL, 0, &prefs) == EPERM);
+    assert(request(3, UMI_VOICE_DIAL, test_number) == EPERM);
+    assert(request(3, UMI_VOICE_END, NULL) == EPERM);
     assert(request(1, UMI_VOICE_DIAL, "112") == EINVAL);
     assert(!request(1, UMI_VOICE_DIAL, test_number));
     assert(request(1, UMI_VOICE_DIAL, test_number) == EBUSY);
