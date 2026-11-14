@@ -9,6 +9,7 @@ driver UMI
     file bsd/dev/hakios.umi_bluetooth.c
     file bsd/dev/hakios.umi_mhi.c
     file bsd/dev/hakios.umi_pcie.c
+    file bsd/dev/hakios.umi_pcie2.c
     file bsd/dev/hakios.umi_camera.c
     file bsd/dev/hakios.umi_camera_dma.c
     file bsd/dev/hakios.board.c

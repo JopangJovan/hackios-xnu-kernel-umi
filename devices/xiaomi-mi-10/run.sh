@@ -5,10 +5,19 @@ ROOT=$(cd "$DEVICE_DIR/../.." && pwd)
 OUT="$ROOT/out/xiaomi-mi-10"
 export XL_KERNEL="$OUT/xnu/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837"
 export XL_LOADER="$OUT/loader.efi"
+# This port must never pick another Android device when several are connected.
+export ANDROID_SERIAL="${ANDROID_SERIAL:-ef040a59}"
 export UEFI_TARGET=umi FD_BASE=0x9FC00000 FD_SIZE=0x300000 PAYLOAD_BASE=0xF0000000
 export DTB="${DTB:-$DEVICE_DIR/prebuilt/device-tree.dtb}"
 export UEFI_FD="${UEFI_FD:-$OUT/Mu-Silicium/Build/umiPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd}"
 export XL_CMDLINE="${XL_CMDLINE-$(cat "$DEVICE_DIR/boot.args")}"
+if [[ "${UMI_CELLULAR:-0}" == 1 && " $XL_CMDLINE " != *" sdx55_"* ]]; then
+  XL_CMDLINE+=" sdx55_step=12 sdx55_efs=1 sdx55_interactive=1 sdx55_return=0"
+  XL_CMDLINE+=" sdx55_cell=1 sdx55_data_rings=1 sdx55_data_call=1 sdx55_data_secs=600"
+fi
+if [[ "${UMI_VOICE:-0}" == 1 && " $XL_CMDLINE " == *" sdx55_data_call=1 "* && " $XL_CMDLINE " != *" sdx55_voice="* ]]; then
+  XL_CMDLINE+=" sdx55_voice=1"
+fi
 python3 "$DEVICE_DIR/tools/stage-runtime.py"
 if [[ " $XL_CMDLINE " == *" wifi=1 "* && " $XL_CMDLINE " != *" wifi_mac="* ]] && [ -f "$OUT/wifi-boot.args" ]; then
   XL_CMDLINE="$XL_CMDLINE $(cat "$OUT/wifi-boot.args")"; export XL_CMDLINE

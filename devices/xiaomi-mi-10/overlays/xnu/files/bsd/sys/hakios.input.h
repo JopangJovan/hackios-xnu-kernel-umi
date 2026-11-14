@@ -35,6 +35,103 @@ struct hakios_touch {
 	uint32_t x, y;                  /* position on the display, 0 = left/top edge, 65535 = right/bottom edge */
 };
 
+/*
+ * sysctl kern.hakios.mag: the magnetometer as it stands (UMI: the ak0991x behind the sensor DSP,
+ * drivers in bsd/dev/hakios.input.c), for the code of ours inside the Compass application
+ * (userland/src/inject_compass.c). Device frame, as iOS's: x to the right, y toward the top of
+ * the screen, z out of the screen. raw is what the sensor says; center is the kernel's estimate
+ * of the phone's own constant field (hard iron: the middle of what each axis has spanned since
+ * the stream began), so that the earth's field is raw - center.
+ */
+#define HAKIOS_MAG_SYSCTL      "kern.hakios.mag"
+#define HAKIOS_MAG_VERSION     2
+
+#define HAKIOS_LOC_VERSION 1
+struct hakios_loc_state {
+	uint32_t size;                  /* sizeof(struct hakios_loc_state) */
+	uint32_t version;               /* internal record version */
+	uint64_t fixes;                 /* position reports received */
+	uint64_t time;                  /* mach_absolute_time() of the last fix */
+	double   latitude;              /* WGS84 degrees */
+	double   longitude;             /* WGS84 degrees */
+	uint32_t valid;                 /* 1 once a fix has arrived */
+	uint32_t session_status;        /* the last report's session status */
+};
+
+/* The latest final, satellite-qualified SDX55 fix. fixes is zero until one arrives.
+ * Test flags before reading optional measurements. received_ticks is host receipt
+ * time; utc_ms comes from the modem's position report. */
+#define HAKIOS_SDX55_FIX_SYSCTL   "kern.hakios.sdx55_fix"
+#define HAKIOS_SDX55_FIX_VERSION  2
+#define HAKIOS_SDX55_FIX_HAS_UTC  (1u << 0)
+#define HAKIOS_SDX55_FIX_HAS_HUNC (1u << 1)
+#define HAKIOS_SDX55_FIX_HAS_TECHNOLOGY (1u << 2)
+#define HAKIOS_SDX55_FIX_HAS_SEMI_MINOR (1u << 3)
+#define HAKIOS_SDX55_FIX_HAS_SEMI_MAJOR (1u << 4)
+#define HAKIOS_SDX55_FIX_HAS_ELLIPSE_AZIMUTH (1u << 5)
+#define HAKIOS_SDX55_FIX_HAS_ELLIPSOID_ALTITUDE (1u << 6)
+#define HAKIOS_SDX55_FIX_HAS_VUNC (1u << 7)
+#define HAKIOS_SDX55_FIX_HAS_GPS_TIME (1u << 8)
+#define HAKIOS_SDX55_FIX_HAS_ALTITUDE_ASSUMED (1u << 9)
+
+struct hakios_sdx55_fix {
+	uint32_t size;
+	uint32_t version;
+	uint64_t fixes;
+	uint64_t received_ticks;         /* mach_absolute_time() */
+	uint64_t utc_ms;                 /* UTC milliseconds since 1970 */
+	double latitude;                 /* WGS84 degrees */
+	double longitude;
+	float horizontal_uncertainty_m;  /* circular radius reported by the modem */
+	uint32_t flags;
+	uint32_t technology;             /* QMI LOC technology mask, zero if absent */
+	int32_t used_sv;                 /* used-SV count, -1 if absent */
+	float semi_minor_m;              /* horizontal uncertainty ellipse */
+	float semi_major_m;
+	float ellipse_azimuth_deg;       /* modem's orientation, 0 to 180 degrees */
+	float altitude_ellipsoid_m;      /* height relative to the WGS84 ellipsoid */
+	float vertical_uncertainty_m;
+	uint32_t gps_tow_ms;             /* milliseconds into the GPS week */
+	uint16_t gps_week;               /* weeks since 1980-01-06 */
+	uint8_t altitude_assumed;        /* 0 = calculated, 1 = assumed, when present */
+	uint8_t reserved[5];
+};
+
+/* Root-only extended SDX55 sample. All optional fields and the embedded v2 record belong
+ * to the same final position report. Geoid undulation is ellipsoid minus MSL
+ * altitude when both are present. */
+#define HAKIOS_SDX55_GEODETIC_SYSCTL "kern.hakios.sdx55_geodetic_fix"
+#define HAKIOS_SDX55_GEODETIC_VERSION 1
+#define HAKIOS_SDX55_GEODETIC_HAS_MSL (1u << 0)
+#define HAKIOS_SDX55_GEODETIC_HAS_HREL (1u << 1)
+struct hakios_sdx55_geodetic_fix {
+	uint32_t size;
+	uint32_t version;
+	struct hakios_sdx55_fix fix;
+	uint32_t flags;
+	float altitude_msl_m;
+	uint32_t horizontal_reliability;  /* QMI 0=not set, 1=very low through 4=high */
+	uint32_t reserved;
+};
+
+struct hakios_mag_state {
+	uint32_t size;                  /* sizeof(struct hakios_mag_state) */
+	uint32_t version;               /* HAKIOS_MAG_VERSION */
+	uint64_t samples;               /* samples so far; 0: there is no magnetometer (yet) */
+	uint64_t time;                  /* mach_absolute_time() when the last one arrived */
+	int32_t raw[3];                 /* the last sample, nanotesla */
+	int32_t center[3];              /* the hard-iron estimate, nanotesla */
+	int32_t span[3];                /* how far each axis has ranged so far, nanotesla */
+	int32_t calibration;            /* 0 not yet (turn the phone around), 1 low, 2 high */
+	int32_t status;                 /* the sensor's own accuracy, 0 (unreliable) .. 3 (high) */
+	uint64_t orientation_samples;   /* SLPI's fused orientation events; 0 until its stream is live */
+	uint64_t orientation_time;      /* mach_absolute_time() when the last fused event arrived */
+	int32_t heading_millidegrees;   /* fused magnetic heading, clockwise from north */
+	int32_t pitch_millidegrees;
+	int32_t roll_millidegrees;
+	int32_t orientation_status;     /* the fusion sensor's accuracy */
+};
+
 #ifdef KERNEL
 /* For drivers; not from interrupt context. */
 void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);

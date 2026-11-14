@@ -17,6 +17,14 @@ def copy_changed(source, target):
             (source.stat().st_mode & 0o777) != (target.stat().st_mode & 0o777)):
         shutil.copy2(source, target)
 
+def stage_patched_file(source, target, patch):
+    # Patch verified upstream bytes in memory so repeated builds retain mtimes.
+    data = subprocess.check_output(['patch', '-s', '-f', '-F', '0', '-o', '-',
+                                    '-r', '-', str(source), str(patch)])
+    if not target.is_file() or target.read_bytes() != data:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
 def copy_overlay(source, target):
     for path in source.rglob('*'):
         if path.is_file() and '__pycache__' not in path.parts:
@@ -60,7 +68,11 @@ def kernel():
         words = line.split()
         if len(words) >= 2 and not words[0].startswith('#'):
             sub, target = words[:2]
-            copy_changed(ROOT / 'drivers' / sub / Path(target).name, KERNEL / target)
+            source = ROOT / 'drivers' / sub / Path(target).name
+            if target == "bsd/dev/hakios.cell.c":
+                stage_patched_file(source, KERNEL / target, DEVICE / 'overlays/xnu/hakios.cell.patch')
+            else:
+                copy_changed(source, KERNEL / target)
     external = subprocess.check_output(['python3', str(ROOT / 'tools/hakios-config.py'),
                                         'external-files'], text=True)
     for line in external.splitlines():
@@ -109,8 +121,11 @@ def userland():
     shutil.copytree(ROOT / 'userland', sandbox / 'userland', dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns('obj', 'root', 'sysroot', '*.apfs', '__pycache__'))
     copy_overlay(DEVICE / 'overlays/userland', sandbox / 'userland')
+    stage_patched_file(ROOT / 'userland/src/init.c', sandbox / 'userland/src/init.c',
+                       DEVICE / 'overlays/umi-init-gps.patch')
     for name in ('xnu-env.sh', 'xnu-deps', 'tools', 'prebuilt', 'sysimage', 'devices', 'wifi',
-                 'fw-gpu', 'fw-audio', 'fw-haptic', 'fw-wifi', 'fw-bluetooth', 'fw-camera'):
+                 'fw-gpu', 'fw-audio', 'fw-haptic', 'fw-wifi', 'fw-bluetooth', 'fw-camera', 'fw-slpi',
+                 'fw-sensors', 'fw-sdx55'):
         path = sandbox / name
         if not path.exists() and not path.is_symlink():
             path.symlink_to(ROOT / name, target_is_directory=(ROOT / name).is_dir())

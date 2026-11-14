@@ -126,6 +126,16 @@ IOS_JOBS=${JOBS-"
 # AudioSession and CoreHaptics need mediaserverd; its AVAudioSession setup waits for NanoRegistry's
 # paired-device Mach service. Keep both jobs in every image so the server and its clients can start.
 IOS_JOBS="$IOS_JOBS com.apple.mediaserverd com.apple.nanoregistryd"
+GPS_APFS=()
+if [ "${UMI_GPS:-0}" = 1 ]; then
+	if [ "${DEVICE:-}" != umi ] || [ ! -s "$IOS/rootfs/usr/libexec/locationd" ]; then
+		echo "UMI_GPS=1 needs the iOS 20F66 locationd in sysimage/rootfs/usr/libexec" >&2
+		exit 1
+	fi
+	IOS_JOBS="$IOS_JOBS com.apple.locationd"
+	GPS_APFS=(--plain sdx55m)
+	SYSTEM=1
+fi
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib).
@@ -139,7 +149,8 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
-/redwood/lib/libhakios.tweaks.dylib Preferences"}
+/redwood/lib/libhakios.tweaks.dylib Preferences
+/redwood/lib/libhakios.compass.dylib Compass"}
 [ "${BLUETOOTH-0}" != 1 ] || INJECT="$INJECT
 /redwood/lib/libhakios.bluetooth.dylib bluetoothd"
 # STOREFRONT=1: and a library of ours inside appstored as well (src/inject_store.c). It is not in the
@@ -251,6 +262,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# ... and inside an application, to say what killed it (src/inject_app.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
+		# ... and inside Compass, the magnetometer (kern.hakios.mag) as CoreMotion's device motion (src/inject_compass.c)
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.compass.dylib -lobjc \
+			-o obj/libhakios.compass.dylib src/inject_compass.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -320,6 +334,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ "${BLUETOOTH-0}" != 1 ] || cp obj/libhakios.bluetooth.dylib root/lib/
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
+	[ -f obj/libhakios.compass.dylib ] && cp obj/libhakios.compass.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
@@ -414,6 +429,21 @@ if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
 fi
+# ... and the sensor DSP's image (SLPI), from /vendor/firmware_mnt/image of the same Android into
+# ../fw-slpi (8.2 MB): the kernel's probe (boot-arg slpi=1) hands it to TrustZone and loads it.
+if [ -d ../fw-slpi ]; then
+	mkdir -p root/fw
+	cp ../fw-slpi/slpi.* root/fw/
+fi
+# The Qualcomm sensor DSP requests its persistent registry back from APSS
+# through FastRPC.  Keep the registry pulled from this UMI's Android install
+# as a read-only archive: it is copied into the small image and never written
+# back to Android.  The SLPI listener will unpack only the registry paths it
+# serves once its RPC endpoint is registered.
+if [ -f ../fw-sensors/registry.tar ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-sensors/registry.tar root/fw/sensors-registry.tar
+fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (drivers/wifi/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
@@ -474,6 +504,14 @@ umi_firmware() {
 # Include UMI assets in the small image used before iOS's root is mounted. They remain local
 # firmware inputs and are never committed to either source repository.
 umi_firmware root/fw
+if [ "${UMI_GPS:-0}" = 1 ]; then
+	mkdir -p root/sdx55m
+	for f in devcfg.mbn hyp.mbn tz.mbn aop.mbn acdb.mbn apps.mbn multi_image_qti.mbn multi_image.mbn xbl_cfg.elf sec.elf 514_0_0.mbn mbn_hw.dig mbn_sw.dig; do
+		install -m 0644 "../fw-sdx55/$f" root/sdx55m/ || exit 1
+	done
+	bash ../devices/xiaomi-mi-10/tools/build-sdx55-settings.sh "$PWD/root/lib/umi-gps-ui.dylib" || exit 1
+	printf '%s\n' '/redwood/lib/umi-gps-ui.dylib Preferences SpringBoard MobilePhone' >> root/etc/inject.conf
+fi
 
 # Segment names are device-specific. UMI's signed MDT references adsp.b00 through adsp.b18,
 # including b00 and b01; Redwood's image starts at b02 and keeps its existing selection.
@@ -512,6 +550,12 @@ if [ "${DEVICE:-}" = umi ]; then
 				--sensor-version "$version" --output "root/fw/camera-s5khmx-v$version.tab" >/dev/null
 		done
 	fi
+front_module=../fw-camera/com.qti.sensormodule.umi_sunny_s5k3t2.bin
+if [ -f "$front_module" ]; then
+    mkdir -p root/fw
+    python3 ../devices/xiaomi-mi-10/tools/umi-camsensor-v2.py "$front_module" \
+        --sensor-version 0 --output root/fw/camera-s5k3t2.tab >/dev/null
+fi
 else
 for module in ../fw-camera/com.qti.sensormodule.hakios_*.bin; do
 	[ -f "$module" ] || continue
@@ -567,7 +611,7 @@ done
 [ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (drivers/storage/hakios.image.c)
-python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
+python3 ../tools/apfs/mkapfs.py -z --plain fw "${GPS_APFS[@]}" -o root.apfs redwood=root | tail -1
 [ -z "$CHECK" ] || ../tools/apfs/check-image.sh root.apfs redwood=root
 
 # --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.apfs --------------------------------
@@ -670,7 +714,8 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	mkdir -p sysroot/System/Volumes/iOS
 	# the applications iOS installs on its first boot are system applications here (see select-system.py)
 	if [ -d sysroot/private/var/staged_system_apps ]; then
-		mv sysroot/private/var/staged_system_apps/* sysroot/Applications/
+		# (a merge: an app that the system image already has would stop a plain mv)
+		cp -a sysroot/private/var/staged_system_apps/. sysroot/Applications/ 2>/dev/null || true
 		rm -rf sysroot/private/var
 	fi
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.ios
@@ -744,7 +789,20 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	done
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
-	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	# dyld's standard path for the shared cache: a boot whose root IS this volume has no
+	# cryptex graft, and dyld looks in /System/Library/Caches, not under Cryptexes.
+	if [ -d sysroot/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld ]; then
+		mkdir -p sysroot/System/Library/Caches
+		ln -sfn ../../Cryptexes/OS/System/Library/Caches/com.apple.dyld \
+			sysroot/System/Library/Caches/com.apple.dyld
+	fi
+	if [ "${UMI_GPS:-0}" = 1 ]; then
+		install -d -m 0700 sysroot/sdx55m
+		for f in mdm1m9kefs1.bin mdm1m9kefs2.bin mdm1m9kefs3.bin qdsp6sw.mbn; do
+			install -m 0600 "../fw-sdx55/$f" sysroot/sdx55m/ || exit 1
+		done
+	fi
+	python3 ../tools/apfs/mkapfs.py -z "${GPS_APFS[@]}" -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=$IOS/system.manifest
 	rm -rf sysroot
 fi

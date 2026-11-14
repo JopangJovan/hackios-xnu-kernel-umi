@@ -83,7 +83,7 @@ BIG_CATALOGS = ('System/Library/PrivateFrameworks/SFSymbols.framework/',)
 # (/Library is the wallpapers and a few tables of regional settings, apart from the sounds)
 HEALTH = 'System/Library/Health/'
 SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra/',
-               'usr/standalone/', 'Library/Audio/', 'Library/Ringtones/',
+               'usr/standalone/', 'Library/Audio/',
                HEALTH + 'Assets/FitnessUIAssets.bundle/') + \
     tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
@@ -93,7 +93,11 @@ BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, .
 AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
          'System/Library/Audio/UISounds/')
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
-KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
+KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB', 'zh_CN')
+# (the input methods' dictionaries: the Chinese and English ones only; the other languages' are
+#  another 800 MB, and the keyboards for them are not on the phone's list)
+LINGUISTIC_KEEP = ('System/Library/LinguisticData/RequiredAssets_zh-Hans.bundle/',
+                   'System/Library/LinguisticData/RequiredAssets_en.bundle/')
 
 
 def entries(listing):
@@ -133,6 +137,8 @@ def mode_bits(text):
 
 
 def wanted_file(path, size):
+    if path.startswith('System/Library/LinguisticData/'):
+        return path.startswith(LINGUISTIC_KEEP)
     lproj = re.search(r'/([^/]+)\.lproj/', path)
     if lproj and lproj.group(1) not in KEEP_LANG:
         return False

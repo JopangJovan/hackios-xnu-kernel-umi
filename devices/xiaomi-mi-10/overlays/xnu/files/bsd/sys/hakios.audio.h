@@ -47,6 +47,7 @@ bool umi_speaker_calibrated(void);
 bool umi_speaker_start(void);
 bool umi_speaker_volume(uint32_t below, uint32_t step_ms);
 bool umi_speaker_healthy(void);
+bool umi_speaker_echo_reference(bool enable);
 void umi_speaker_stop(void);
 void umi_speaker_shutdown(void);
 void umi_speaker_quiesce(void);
@@ -120,6 +121,7 @@ void hakios_audio_record_fed(const int16_t *frames, uint32_t count);
  */
 struct hakios_apr_answer {
 	uint32_t opcode, token, length;         /* length: of the payload, in bytes */
+	uint16_t source_port;
 	uint32_t words[64];
 };
 typedef bool (*hakios_apr_events_t)(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload,
@@ -127,6 +129,8 @@ typedef bool (*hakios_apr_events_t)(uint8_t service, uint16_t port, uint32_t opc
 
 bool hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
     uint32_t wait_ms, struct hakios_apr_answer *answer);
+bool hakios_adsp_apr_ports(uint8_t service, uint16_t source, uint16_t destination, uint32_t token, uint32_t opcode,
+    const void *payload, uint32_t length, uint32_t wait_ms, struct hakios_apr_answer *answer);
 void hakios_adsp_apr_events(hakios_apr_events_t handler);
 const uint8_t *hakios_adsp_fw_file(const char *name, uint64_t *size);        /* /fw/name, read whole; give back with: */
 void hakios_adsp_fw_free(const uint8_t *data, uint64_t size);
@@ -137,10 +141,55 @@ void hakios_sound_quiesce(void);       /* on a panic's way out: the amplifiers o
 /* the microphones' part of the memory the DSP sees (hakios.sound.c): false if it cannot be had; given back with _put() */
 bool hakios_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *bytes);
 void hakios_audio_dsp_memory_put(void);
+/* The call downlink has its own DSP buffers and uses the protected speaker path. */
+#define UMI_VOICE_PCM_BYTES (4u * 4096u)
+bool hakios_audio_voice_pcm_memory(uintptr_t *memory, uint64_t *dsp_address);
+void hakios_audio_voice_pcm_memory_put(void);
+#define UMI_VOICE_CAL_BYTES (12u * 4096u)
+bool hakios_audio_voice_cal_memory(uintptr_t *memory, uint64_t *dsp_address);
+void hakios_audio_voice_cal_memory_put(void);
+uint32_t hakios_audio_voice_play(const int16_t *samples, uint32_t frames);
+void hakios_audio_voice_flush(void);
+void hakios_audio_voice_speaker_hold(bool active);
+void hakios_audio_voice_playback_report(void);
+#define UMI_VOICE_ECHO_PORT 0x1005u
+bool hakios_audio_voice_echo_start(void);
+void hakios_audio_voice_echo_stop(void);
+/* UMI stock DT mailbox_region, shared with SDX55 and kept wired for the ADSP's lifetime. */
+#define UMI_VOICE_MAILBOX_BYTES 0x20000u
+bool hakios_audio_voice_mailbox(uintptr_t memory, uint64_t *dsp_address);
+void hakios_audio_voice_mailbox_put(void);
+void hakios_adsp_voice_diag_call(bool active);
+void hakios_adsp_voice_diag_report(void);
+
+/* QRTR service registry for the UMI audio protection domain. */
+#define HAKIOS_AUDIO_PD_SERVICE 66u
+#define HAKIOS_AUDIO_PD_INSTANCE 0x4a01u
+struct hakios_audio_pd_packet {
+	uint32_t type, from_node, from_port, to_node, to_port, confirm, length;
+	uint8_t data[128];
+};
+uint64_t hakios_adsp_audio_pd_endpoint(void);
+int hakios_adsp_audio_pd_send(const struct hakios_audio_pd_packet *);
+bool hakios_adsp_audio_pd_receive(struct hakios_audio_pd_packet *);
+bool hakios_adsp_mhi_sat_open(void);
+int hakios_adsp_mhi_sat_send(const void *data, uint32_t length);
+uint32_t hakios_adsp_mhi_sat_receive(void *data, uint32_t capacity);
 /* a second handler of the DSP's events (the microphones'), asked when the first does not take one */
 void hakios_adsp_apr_events_second(hakios_apr_events_t handler);
+void hakios_adsp_apr_events_voice(hakios_apr_events_t handler);
 /* boot-arg rec_sound_mic=1: the recording (rec_sound=N) has what the microphone hears (given with hakios_audio_record_fed()) */
 bool hakios_audio_recording_mic(void);
+/* The stock UMI handset AFE ports and rates used by VoiceMMode2. */
+#define UMI_VOICE_HANDSET_RX_PORT 0xb030u
+#define UMI_VOICE_HANDSET_TX_PORT 0xb037u
+#define UMI_VOICE_HANDSET_RX_RATE 48000u
+#define UMI_VOICE_HANDSET_TX_RATE 48000u
+bool hakios_mic_voice_start(void);
+bool hakios_mic_voice_receiver(bool enable);
+bool hakios_mic_voice_receiver_mute(bool mute);
+void hakios_mic_voice_activate(void);
+void hakios_mic_voice_stop(void);
 void hakios_mic_dsp_up(void);          /* the DSP's audio services are up (adsp=1): boot-arg mic=N begins */
 void hakios_mic_dsp_down(void);        /* before the DSP is shut down at the run's end: what the microphones' path asked for given back */
 #endif

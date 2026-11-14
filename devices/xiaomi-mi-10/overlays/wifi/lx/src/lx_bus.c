@@ -839,7 +839,10 @@ lx_start(void)
 	if (bus.umi) {
 		unsigned long long address;
 		unsigned data;
-		if (!lx_os_irq_msi(&address, &data)) return ENXIO;
+		int msi = lx_os_irq_msi(&address, &data);
+
+		lx_tell("lx: umi: radio start: msi %s (%#llx + %#x)\n", msi ? "given" : "NOT GIVEN", address, data);
+		if (!msi) return ENXIO;
 		ab->pci.msi.addr_lo = (u32)address;
 		ab->pci.msi.addr_hi = (u32)(address >> 32);
 		ab->pci.msi.ep_base_data = data;
@@ -848,14 +851,23 @@ lx_start(void)
 		ab->mem = lx_os_map_registers(0x60300000, 0x100000);
 		ab->mem_len = 0x100000;
 		ab->mem_ce = ab->mem;
+		lx_tell("lx: umi: register window %p (%u bytes)\n", ab->mem, ab->mem_len);
 		if (!ab->mem) return ENOMEM;
 	}
 	ab->hw_rev = bus.umi ? ATH11K_HW_QCA6390_HW20 : ATH11K_HW_WCN6750_HW10;
 	ab->fw_mode = ATH11K_FIRMWARE_MODE_NORMAL;
 	ret = ath11k_core_pre_init(ab);
+	lx_tell("lx: umi: ath11k_core_pre_init -> %d\n", ret);
 	if (!ret && bus.umi) {
 		ab->hw_params.supports_regdb = true;
 		ab->hw_params.coldboot_cal_mm = true;
+		/* The firmware must be restarted between cold boot calibration (mode 7) and mission
+		 * mode (mode 0). ath11k does that only with cbcal_restart_fw: its power_down is
+		 * lx_os_rproc_shutdown() -> umi_wifi_radio_reset(), the endpoint reset and the
+		 * post-calibration reboot of the firmware; its power_up then finds it up again.
+		 * With false (5 Nov, 5aa9b33) none of that ran, the firmware was asked for mode 0
+		 * straight out of calibration, MHI failed (EIO) and the driver gave up 15 s in --
+		 * every session since; every session before, with true, came up. */
 		ab->hw_params.cbcal_restart_fw = true;
 	}
 	if (ret || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {

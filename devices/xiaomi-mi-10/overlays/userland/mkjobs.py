@@ -267,7 +267,7 @@ os.makedirs(dest, exist_ok=True)
 for label in labels:
     with open(f'{src}/{label}.plist', 'rb') as f:
         job = plistlib.load(f)
-    job['StandardErrorPath'] = '/dev/console'
+    job['StandardErrorPath'] = '/dev/null' if os.environ.get('CONSOLE_ERR') == '0' else '/dev/console'
     # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
     # device tree, which the loader's tree does not have yet
     job.pop('_LimitLoadToDeviceTree', None)
@@ -308,7 +308,7 @@ if rest:
         for key in ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
                     'QueueDirectories', 'StartOnMount', 'LaunchEvents'):
             job.pop(key, None)
-        job['StandardErrorPath'] = '/dev/console'
+        job['StandardErrorPath'] = '/dev/null' if os.environ.get('CONSOLE_ERR') == '0' else '/dev/console'
         if label in oslog:
             job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
         with open(f'{dest}/{name}', 'wb') as f:

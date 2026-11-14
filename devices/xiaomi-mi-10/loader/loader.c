@@ -26,7 +26,7 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define KERNEL_VIRT_BASE    0xFFFFFFF004000000ULL /* boot_args.virtBase */
 #define KERNEL_LINK_OFFSET  0x03000000ULL         /* kernel text sits 48 MB above the base */
 #define BASE_ALIGN          0x02000000ULL         /* 32 MB: L2 block size with 16K pages */
-#define MAX_MEM_SIZE        0x180000000ULL        /* 6 GB; the kernel's bootstrap page tables cover 8 */
+#define MAX_MEM_SIZE        0x200000000ULL        /* 8 GB; the kernel's bootstrap page tables cover 8 (the phone has 12) */
 /*
  * A root image too big for the payload area is placed here, at a fixed
  * offset inside the kernel's memory window, once; it then survives any
@@ -1008,6 +1008,8 @@ static const struct kernel_live *running_live;
  * running_live is NULL for a kernel without one, so it cannot say that a kernel is running.
  */
 static int run_active;
+/* Set only after usb_start() owns the peripheral controller for this boot. */
+static int usb_runtime_active;
 static uint64_t running_slide;
 static void usb_poll_command(void);
 
@@ -2400,7 +2402,15 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * After that this core only watches: no interrupts (the kernel reprograms the interrupt
 		 * controller's shared half; UEFI's handlers had better not run on top of that for long).
 		 */
-		if (!watching_only && seconds_since(started) >= NOTE_SECONDS) {
+		/*
+		 * A USB-started session has an active fastboot channel while XNU runs.
+		 * UsbDeviceProtocol delivers its completions through the watcher core's
+		 * UEFI events, so masking that core here made the iOS UI survive while
+		 * live log/stop requests disappeared after NOTE_SECONDS.  Keep its
+		 * interrupts available for the USB event pump; non-USB boots retain the
+		 * old GIC isolation once the early diagnostics have elapsed.
+		 */
+		if (!watching_only && usb_runtime_active == 0 && seconds_since(started) >= NOTE_SECONDS) {
 			watching_only = 1;
 			daif = READ_SYSREG(DAIF);
 			__asm__ volatile ("msr daifset, #0xf");
@@ -2797,19 +2807,42 @@ static int starts_with(const char *s, const char *prefix);
 
 /* UMI boot-argument gate: keep device-specific tests explicit and protect
  * the unchanged prebuilt kernel from Redwood MMIO. */
+static int apfs_ubc = 0;
+/* An explicitly opted-in USB session returns to Android on this device even if its USB link vanished. */
+#define REBOOT_AFTER_KERNEL_GRACE_MS 60000u
+static int reboot_after_kernel_return;
+static uint64_t reboot_after_kernel_deadline;
+
+static int
+payload_reboots_after_kernel_return(const char *cmdline)
+{
+	for (const char *c = cmdline; *c; c++) {
+		if (starts_with(c, "loader_reboot_after=1") && (c == cmdline || c[-1] == ' ') &&
+		    (c[21] == 0 || c[21] == ' ')) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int
 umi_bootargs_ok(const struct payload_info *pi)
 {
 	static const char *const allowed[] = {
 		"-v", "debug=", "keepsyms=", "serial=", "cpus=", "bootcpu=",
-		"loader_return_after=", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
+		"loader_return_after=", "loader_reboot_after=1", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
 		/* Narrowly allow the existing frame-latency diagnostics on UMI. */
 		"touch_lat=1", "cpuload=1000", "thermal=2",
-		"torch=1", "torch=2", "torch=3", "cam=1", "cam=2", "cam=3", "cam=4", "cam=5", "cam=6", "cam=7", "cam_fake=1",
-		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
+		"torch=1", "torch=2", "torch=3", "cam=1", "cam=2", "cam=3", "cam=4", "cam=5", "cam=6", "cam=7", "cam=8", "cam=9", "cam=10", "cam=11", "cam=12", "cam_fake=1",
+		"umi_haptic=", "haptic_effect=", "haptic_gain=", "adsp=", "sound=", "sound_below=", "sound_gain=", "mic=", "mic_adc=", "mic_input=", "mic_secs=", "mic_main=", "mic_test=", "mic_tap=", "adsp_umi=", "adsp_step=", "adsp_return=", "umi_amp_probe=",
 		"gpu=", "metal=", "cpufreq=", "fb_scan=", "fb_filter=", "fb_threads=", "fbscale=", "adreno=", "adreno_pause=", "adreno_fine=", "adreno_return=",
 		"umi_wifi_step=", "umi_wifi_return=", "wifi_mac=", "wifi=1", "umi_bt_probe=", "umi_bt=",
-		"battery=1",
+		"battery=1", "slpi=", "slpi_attach=1", "slpi_root=1",
+		/* Explicit, bounded SDX55 RAM test profiles. */
+		"sdx55_step=12", "sdx55_efs=1", "sdx55_interactive=1", "sdx55_return=0",
+		"sdx55_fix_secs=600", "sdx55_xtra=1",
+		"sdx55_cell=1", "sdx55_data_rings=1", "sdx55_data_call=1", "sdx55_data_secs=180", "sdx55_data_secs=600",
+		"sdx55_voice=1", "sdx55_voice_diag=1",
 		"glcopy=1",
 		"gltargetcopy=1",
 	};
@@ -2944,6 +2977,10 @@ umi_bootargs_ok(const struct payload_info *pi)
 		} else if (starts_with(c, "adreno_return=")) {
 			if (adreno_return || end - c != 15 || c[14] != '1') ok = 0;
 			adreno_return = 1;
+		} else if (starts_with(c, "apfs_ubc_read=")) {
+			/* passed to the APFS port: read(2) through the UBC (1, default) or past it (0) */
+			if (end - c != 15 || (c[14] != '0' && c[14] != '1')) ok = 0;
+			apfs_ubc = 1;
 		}
 		if (!ok) {
 			print("UMI: unsupported boot argument at: %s\n", c);
@@ -3053,6 +3090,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("no kernel in payload\n");
 		return 0;
 	}
+	reboot_after_kernel_return = payload_reboots_after_kernel_return(pi.cmdline);
 	if (!have_checkpoint) {
 		checkpoint = pi.checkpoint;
 	}
@@ -3216,7 +3254,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (drivers/camera/hakios.torch.c) */
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (drivers/camera/hakios.camera.c) */
+#ifdef LOADER_UMI
+	/* UMI has a verified physical rear S5KHMX. Publish its presence even
+	 * during staged driver diagnostics so SpringBoard keeps Camera.app. */
+	int camera_requested = 1;
+#else
 	int camera_requested = 0;
+#endif
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
@@ -3650,6 +3694,15 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop(&w, "ranges", ranges, sizeof(ranges));
 	dt_prop_u32(&w, "#address-cells", 2);
 	dt_prop_u32(&w, "#size-cells", 2);
+	/* UMI's external modem exposes its data interface on PCIe2 as 17cb:0306. */
+	if (plat == &platform_umi) {
+		dt_begin(&w, "baseband");
+		dt_prop_str(&w, "compatible", "qcom,ext-sdx55m");
+		dt_prop_str(&w, "model", "Qualcomm SDX55");
+		dt_prop_u32(&w, "vendor-id", 0x17cb);
+		dt_prop_u32(&w, "device-id", 0x0306);
+		dt_end(&w);
+	}
 	/*
 	 * With cam=5, where MobileGestalt looks for the cameras (IODeviceTree:/arm-io/isp, its still-camera and
 	 * rear-facing-camera, by which SpringBoard shows Camera.app): the iPhone's ISP node, of its
@@ -3760,6 +3813,17 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* --- the kernel came back ------------------------------------------- */
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */
+	/* The panel still holds the kernel's last frame (iOS's, if the session ended in it): take it
+	 * back before the log is written over it. */
+	if (SCREEN.base != 0) {
+		screen_quiet = 0;
+		memset((void *)(uintptr_t)SCREEN.base, 0, (size_t)SCREEN.stride * SCREEN.height);
+		print("\n\n   the session is over; the phone is in the loader.\n");
+		print("   run again from the host (xl run), or let it go back to Android (xl reboot).\n");
+		/* (the kernel's log is fetched over USB; echoing its 1.4 MB here would scroll the
+		 * panel for a minute through put_char) */
+		screen_quiet = 1;
+	}
 	if (hc_known) {
 		flush_dcache((uint64_t)(uintptr_t)&block_shared.kernel_native,
 		    (uint64_t)(uintptr_t)&block_shared.kernel_native + sizeof(block_shared.kernel_native));
@@ -3873,7 +3937,12 @@ static const uint8_t usb_bos[42] = {
 static const uint8_t usb_str0[4] = { 4, 3, 0x09, 0x04 };
 static const uint8_t usb_str_mfr[8] = { 8, 3, 'X', 0, 'N', 0, 'U', 0 };
 static const uint8_t usb_str_prod[20] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0, 'o', 0, 'a', 0, 'd', 0, 'e', 0, 'r', 0 };
-static const uint8_t usb_str_serial[20] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0, 'o', 0, 'a', 0, 'd', 0, 'e', 0, 'r', 0 };
+/*
+ * Keep the phone's physical USB serial stable.  Windows associates the
+ * WinUSB binding with VID/PID/serial; the generic "xnuloader" value made
+ * every RAM-loader boot a new unbound device, despite using the same port.
+ */
+static const uint8_t usb_str_serial[18] = { 18, 3, 'E', 0, 'F', 0, '0', 0, '4', 0, '0', 0, 'A', 0, '5', 0, '9', 0 };
 static const uint8_t usb_str_iface[18] = { 18, 3, 'f', 0, 'a', 0, 's', 0, 't', 0, 'b', 0, 'o', 0, 'o', 0, 't', 0 };
 
 static void EFIAPI
@@ -3881,22 +3950,65 @@ usb_dummy_notify(void *event, void *ctx)
 {
 }
 
-static int
-usb_start(void)
+static void
+usb_signal_peripheral_init(void)
 {
-	static const efi_guid usb_guid = QCOM_USB_DEVICE_GUID;
 	static const efi_guid init_guid = QCOM_USB_INIT_EVENT_GUID;
-	static const void *cfg = usb_cfg_desc, *ss_cfg = usb_ss_cfg_desc;
-	static const void *strings[5] = { usb_str0, usb_str_mfr, usb_str_prod, usb_str_serial, usb_str_iface };
-	static usb_device_descriptor_set set;
 	void *event;
 
-	/* Ask the platform to bring the controller up in peripheral mode (as the stock fastboot does). */
 	if (!EFI_ERROR(BS->create_event_ex(0x200 /* EVT_NOTIFY_SIGNAL */, 8 /* TPL_CALLBACK */, usb_dummy_notify, NULL,
 	    &init_guid, &event))) {
 		BS->signal_event(event);
 		BS->close_event(event);
 	}
+}
+
+/*
+ * start_ex() means the peripheral controller accepted its descriptors, not
+ * that the host has enumerated it.  Learn the initial link state from the
+ * protocol before queuing endpoint traffic: queuing an OUT transfer before
+ * the host configured the device made a missing enumeration indistinguishable
+ * from a stuck fastboot command.
+ */
+static void
+usb_wait_for_link(void)
+{
+	uint64_t deadline = READ_SYSREG(CNTVCT_EL0) + 5 * READ_SYSREG(CNTFRQ_EL0);
+
+	usb_connected = 0;
+	while (READ_SYSREG(CNTVCT_EL0) < deadline) {
+		uint32_t msg = UsbDeviceEventNoEvent;
+		uint64_t size = 0;
+		usb_device_event_data data;
+
+		if (EFI_ERROR(USB->handle_event(&msg, &size, &data))) {
+			print("usb: cannot poll the initial link state\n");
+			break;
+		}
+		if (msg == UsbDeviceEventDeviceStateChange) {
+			usb_connected = data.device_state == UsbDeviceStateConnected;
+			print("usb: host link is %s\n", usb_connected ? "connected" : "disconnected");
+			if (usb_connected) {
+				return;
+			}
+		}
+		BS->stall(1000);
+	}
+	if (!usb_connected) {
+		print("usb: no host connection event after 5 s\n");
+	}
+}
+
+static int
+usb_start(void)
+{
+	static const efi_guid usb_guid = QCOM_USB_DEVICE_GUID;
+	static const void *cfg = usb_cfg_desc, *ss_cfg = usb_ss_cfg_desc;
+	static const void *strings[5] = { usb_str0, usb_str_mfr, usb_str_prod, usb_str_serial, usb_str_iface };
+	static usb_device_descriptor_set set;
+
+	/* Ask the platform to bring the controller up in peripheral mode (as the stock fastboot does). */
+	usb_signal_peripheral_init();
 	if (EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&USB))) {
 		print("usb: device protocol not found\n");
 		return 0;
@@ -3914,11 +4026,14 @@ usb_start(void)
 		print("usb: start failed %x\n", s);
 		return 0;
 	}
+	usb_signal_peripheral_init();       /* Descriptors are live: make the UMI controller re-evaluate VBUS. */
 	if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
 	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
 		print("usb: no transfer buffers\n");
 		return 0;
 	}
+	usb_runtime_active = 1;
+	usb_wait_for_link();
 	print("usb: started\n");
 	return 1;
 }
@@ -3940,6 +4055,11 @@ usb_wait(uint8_t endpoint)
 		uint64_t size = 0;
 		usb_device_event_data data;
 
+		if (reboot_after_kernel_deadline != 0 && READ_SYSREG(CNTVCT_EL0) >= reboot_after_kernel_deadline) {
+			print("session log grace elapsed: rebooting locally to Android\n");
+			flush_log();
+			reboot();
+		}
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
@@ -3952,7 +4072,11 @@ usb_wait(uint8_t endpoint)
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
 			return data.transfer.status == UsbDeviceTransferStatusCompleteOK ? (int64_t)data.transfer.bytes_completed : -1;
 		}
-		if (READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {
+		/* Once autonomous recovery is armed, the hardware watchdog is the
+		 * USB-independent backstop.  Do not pet it here: handle_event() can
+		 * stop returning after XNU hands the controller back, which is exactly
+		 * the failure this recovery path must survive. */
+		if (reboot_after_kernel_deadline == 0 && READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 			wdt_pet();
 		}
@@ -4192,12 +4316,23 @@ fb_command(char *cmd)
 
 			set_result("running", cp, 0);
 			completed_log_len = 0;
+			reboot_after_kernel_deadline = 0;
 			fb_reply("OKAY", "");
 			log_len = 0;
 			print("== XNULOADER run (usb) ==\n");
-			if (!run_kernel(have_cp, cp)) {
+			int ran = run_kernel(have_cp, cp);
+			if (!ran) {
 				set_result("not-started", 0, 0);
 				compose_logs(NULL, 0);
+			} else if (reboot_after_kernel_return) {
+				reboot_after_kernel_deadline = READ_SYSREG(CNTVCT_EL0) +
+				    REBOOT_AFTER_KERNEL_GRACE_MS * READ_SYSREG(CNTFRQ_EL0) / 1000u;
+				/* The software deadline above gives a clean reset while USB still
+				 * pumps.  This independent watchdog bite also fires if the UEFI USB
+				 * protocol itself stops returning, as observed after long probes. */
+				wdt_set_ms(REBOOT_AFTER_KERNEL_GRACE_MS);
+				print("session completed: final log available for 60 s, then rebooting locally to Android\n");
+				flush_log();
 			}
 		} else if (starts_with(cmd, "oem hang")) {
 			fb_reply("OKAY", "watchdog test: not petting any more");
@@ -4593,9 +4728,15 @@ efi_main(efi_handle image, efi_system_table *st)
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);
-	if (have_payload && pi.usb_mode && usb_start()) {
+	if (have_payload && pi.usb_mode) {
+		if (!usb_start()) {
+			print("usb: cannot start the command channel; rebooting to Android\n");
+			flush_log();
+			reboot();
+		}
 		flush_log();
 		usb_command_loop();
+		reboot();
 	}
 
 	/*

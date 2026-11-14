@@ -1,0 +1,60 @@
+--- init.c
++++ init.c
+@@ -87,6 +87,28 @@
+ 		}
+ 	}
+ 	return NULL;
++}
++
++/* The SDX55 BHI transfer happens before process 1.  Kernel and process-1 timer
++ * waits do not resume reliably this early, so process 1 itself is the later
++ * lifecycle boundary: it asks a no-wait worker to observe SBL and perform the
++ * normal safe rollback as soon as the root filesystem is available. */
++static void
++trigger_sdx55_sbl_observation(const char *phase, int final)
++{
++	const char *step = boot_arg("sdx55_step");
++
++	if (step == NULL || strcmp(step, "12") != 0) return;
++	printf("init: SDX55 SBL observation at %s%s\n", phase,
++	    final ? " (final)" : "");
++	int trigger = final ? 2 : 1;
++	if (sysctlbyname("kern.hakios.sdx55_observe", NULL, NULL,
++	    &trigger, sizeof(trigger)) == 0) {
++		printf("init: SDX55 SBL observation worker triggered\n");
++	} else {
++		printf("init: SDX55 SBL observation trigger failed: %s\n",
++		    strerror(errno));
++	}
+ }
+ 
+ /* A directory of this image (or anything else) shown in place of one of the volume's: bindfs. */
+@@ -324,6 +346,7 @@
+ static int
+ list_tree(const char *path, int depth)
+ {
++	static unsigned sdx55_progress_entries;
+ 	static char buf[8192];          /* one directory at a time: the contents are copied out before recursing */
+ 	char names[32][64];
+ 	int count = 0, subdirs = 0, total = 0;
+@@ -365,6 +388,9 @@
+ 			}
+ 			printf("\n");
+ 			count++;
++			if (++sdx55_progress_entries == 32) {
++				trigger_sdx55_sbl_observation("filesystem-walk boundary", 1);
++			}
+ 			if (de->d_type == DT_DIR && depth > 0 && subdirs < 32 && strlen(full) < 64) {
+ 				strcpy(names[subdirs++], full);
+ 			}
+@@ -1440,8 +1466,10 @@
+ 		}
+ 	}
+ 
++	trigger_sdx55_sbl_observation("process-1 boundary", 0);
+ 	show_system();
+ 	mount_writable();
++	trigger_sdx55_sbl_observation("writable-filesystem boundary", 0);
+ 	restore_var();
+ 	test_files();
+ 	test_writable();

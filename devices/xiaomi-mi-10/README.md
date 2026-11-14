@@ -37,6 +37,10 @@ extracted iOS files in `sysimage/`, and the phone's firmware in the ignored
 UMI Bluetooth needs `htbtfw20.tlv` and `htnv20.bin`; its firmware is embedded only
 in the generated kernel tree. No vendor firmware is committed here.
 
+Compass needs the phone's SLPI image (`slpi.mdt` and its split segments) in the
+ignored `fw-slpi/` directory and the sensor registry at `fw-sensors/registry.tar`.
+The UMI build stages these local inputs for the sensor DSP.
+
 ```sh
 devices/xiaomi-mi-10/build-wifi.sh
 devices/xiaomi-mi-10/build-kernel.sh -j8 -k
@@ -93,3 +97,76 @@ iOS images booted on UMI; touch initialized, the GPU rendered apps at its
 587 MHz setting, and the audio DSP and Wi-Fi interface initialized. The user
 confirmed that the build works, while scrolling skips/freezes remain. This
 source migration does not claim to resolve that remaining performance issue.
+
+## Known issue: Translate voice input
+
+On UMI running iOS 16.5 (20F66), Translate starts capturing microphone samples
+but does not produce a transcript. Camera audio recording, recording playback,
+and ringtone previews were confirmed on the device. Translate's MobileAsset
+configuration download reached HTTP 200. StreamingUnzipService then aborted
+installation when the RAM filesystem returned `ENOTSUP` for the file protection
+class query. The role of Apple's online recognition service remains unverified.
+
+## SDX55 mobile data RAM test
+
+Build the UMI images with `UMI_GPS=1` so they include the local SDX55 firmware,
+the three `fw-sdx55/mdm1m9kefs*.bin` snapshots, and the native Location Services
+job. Use current snapshots read from this phone's Android modem partitions.
+Keep the snapshots local. Select the mobile data profile for the run with
+`UMI_CELLULAR=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run`.
+
+The 600-second data test provides IPv4 via `en1`. Settings → Cellular shows the
+serving network and measured LTE or NR RSRP. Its Cellular Data switch and the
+Control Center button both stop or start the WDS packet session while leaving
+the modem registered. The iOS 16.5 (20F66) status bar derives its signal bars
+from the modem's RSRP. The cellular profile starts the external modem after
+the SLPI magnetometer produces its first sample or the startup wait expires.
+
+## SDX55 outbound call RAM test
+
+Build the UMI loader and userland with the mobile data inputs above, using
+`UMI_GPS=1` for the userland build. Set `UMI_VOICE_CAL_DIR` for the kernel
+build or place the local handset calibration in `fw-audio/voice-cal/`. The
+tested handset configuration uses four tables (`cvs-static.bin`,
+`cvp-device.bin`, `cvp-static.bin`, and `cvp-dynamic.bin`) and their
+`columns-{7,8,9}.bin` descriptors. Set `UMI_VOICE_SPEAKER_CAL_DIR` to the
+same set of files extracted for the stock speaker calibration pair (TX 43,
+RX 15). Keep the source tables and generated images local.
+
+Start with `UMI_CELLULAR=1 UMI_VOICE=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run`.
+During the 600-second SDX55 session, open Phone → Keypad, enter a number, and
+tap the green call button. A compatibility call sheet shows the modem state
+and offers speaker and hangup controls. Settings → Cellular → Voice Service displays
+the IMS registration and voice availability reported by the baseband. The
+optional `sdx55_voice_diag=1` boot argument enables DSP and modem diagnostics.
+Logs include call states, voice frame counts and per-second signal levels.
+They omit dialed numbers and audio samples.
+
+### Hardware validation
+
+On 2026-11-14, UMI running iOS 16.5 (20F66) registered for IMS voice, reached the
+10010 menu, and completed manual hangups acknowledged by the modem. With the
+stock speaker calibration and a reference from both Cirrus outputs, the user
+could talk to the 10010 system and receive the expected spoken response. The
+remote side ended that call and the modem reported cause 390. ADC1 and ADC4
+remain the two voice microphones.
+
+The WCD9380 earpiece is the default output. The user confirmed the call
+could switch to speakerphone and back to the earpiece, the remote system
+responded to speech, and a manual hangup completed. The handset profile
+uses its own voice calibration. Incoming calls still need testing.
+
+### Repeatable gaps in IVR playback
+
+The protected amplifiers stay ready through pauses. Speaker playback reads
+directly from the CVS stream-end tap. In an iOS speaker call with the previous
+calibration, the far-end prompt went back up the call while the caller stayed
+silent. Repetition was already present in the decoder with increasing frame
+sequences. With the original speaker calibration and the corresponding DSP
+topology, the median number of speech-sized uplink frames during strong prompts
+fell from 44 to 0 per second. The user then confirmed a two-way conversation
+with the 10010 system.
+
+`python3 devices/xiaomi-mi-10/tools/test-sdx55-voice.py` and
+`python3 devices/xiaomi-mi-10/tools/test-sdx55-ims.py` exercise the call
+worker and IMS data session with a simulated modem.
