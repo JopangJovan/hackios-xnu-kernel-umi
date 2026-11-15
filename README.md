@@ -88,7 +88,9 @@ On stock Android, the vendor `FBE_ICE` tag let Keymaster export a temporary
 wrapped form of a TEE-generated test key without rollback resistance. Read-only
 UFS mappings reproduced all 256 sampled sectors with the same key and gave
 different results in all 256 sectors with a different key. The known-key
-AES-XTS comparison is pending. See the
+import and export also worked through the vendor HAL. The software AES-XTS
+control matched all 256 sectors, while the UFS inline result matched zero.
+See the
 [wrapped-key test results](devices/xiaomi-mi-10/README.md#hardware-wrapped-keys).
 
 ### Not yet

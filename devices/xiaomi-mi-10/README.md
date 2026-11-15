@@ -136,7 +136,7 @@ It uses synthetic AES-256 keys in Keystore2's `BLOB` domain.
 |---|---|
 | TEE-generated key with `STORAGE_KEY` alone | Ephemeral export returned `-17` (`UNSUPPORTED_KEY_FORMAT`). |
 | TEE-generated key with both tags | Two ephemeral exports succeeded. |
-| Known 32-byte seed imported with `FBE_ICE`, with or without `STORAGE_KEY` | Import succeeded. Ephemeral export returned `-17` in both cases. |
+| Known 32-byte seed imported via Keystore2 with `FBE_ICE`, with or without `STORAGE_KEY` | Import succeeded. Ephemeral export returned `-17` in both cases. |
 | Two mappings with separate exports of the same generated key | All 256 sectors matched. |
 | Mapping with a second generated key | All 256 sectors differed from the first key's output. |
 | Mapped output compared with raw UFS | All 256 sectors differed. The raw UFS sample was unchanged across the test. |
@@ -148,13 +148,41 @@ the mappings, kept keys and samples in process memory, and logged only
 statuses and counts. Android stayed booted with `/data` mounted.
 
 These results verify repeatable hardware decryption with generated test
-keys. The [Android 13 VTS reference](https://android.googlesource.com/platform/test/vts-testcase/kernel/+/refs/heads/android13-release/encryption/utils.cpp)
-derives AES-XTS from a known seed and compares it with direct UFS reads
-through the temporary mapping. The import/export failure blocks that
-comparison on this firmware. Recovery after F2FS shrink with hardware-wrapped
-keys remains unverified. That requires a dedicated native UFS test volume,
-restoring the fixture ciphertext at its original offsets, obtaining a fresh
-ephemeral export after reboot, and checking the filesystem and file hashes.
+keys. Recovery after F2FS shrink with hardware-wrapped keys remains
+unverified. That requires a dedicated native UFS test volume, restoring
+the fixture ciphertext at its original offsets, obtaining a fresh ephemeral
+export after reboot, and checking the filesystem and file hashes.
+
+#### Known-seed import and AES-XTS reference
+
+On stock MIUI `V14.0.4.0.TJBCNXM`, disassembly of `libkm_compat.so`
+confirmed that the KeyMint compatibility layer drops the vendor
+`FBE_ICE` tag when it filters key parameters. Xiaomi's `generateKey`
+adds it back before the HAL call. `importKey` sends only the filtered
+parameters. In a direct test against `IKeymasterDevice@4.0/default`,
+including `FBE_ICE` made both raw import and export return `0`.
+Omitting it left import working and reproduced `-17` at export.
+[AOSP compatibility code](https://android.googlesource.com/platform/system/security/+/refs/heads/android13-release/keystore2/src/km_compat/km_compat.cpp)
+
+The [Android 13 VTS reference](https://android.googlesource.com/platform/test/vts-testcase/kernel/+/refs/heads/android13-release/encryption/utils.cpp)
+derives a 64-byte AES-XTS key from a known seed using AES-CMAC. The probe
+re-encrypts the output of each read-only mapping and compares it to the raw
+UFS sample. An independent OpenSSL implementation agreed with the software
+reference on synthetic data and detected a corrupted sector.
+
+| Reference or control | Result |
+|---|---|
+| Direct HAL, two independent imports of the same seed | All 256 sectors matched each other. |
+| Direct HAL, a separate seed | All 256 sectors differed from the first seed's output. |
+| Kernel software `dm-crypt` using the reference key | 256/256 sectors matched the reference. |
+| UFS inline `dm-default-key` using the same raw reference key | 0/256 sectors matched the reference. |
+| UFS inline `dm-default-key` using the two hardware-wrapped seeds | 0/256 sectors matched the reference for each seed. |
+
+The raw-key inline result also differs, so the comparison has not isolated
+the hardware KDF from the UFS inline path. The exact mismatch remains open.
+Both probes ran on the same stock Android boot. All temporary mappings were
+removed, `/data` stayed mounted, and the 12 primary and backup GPT regions
+matched their previous hashes.
 
 #### Reproduce the read-only control
 
@@ -166,12 +194,15 @@ Tools' `d8`, and the static ARM64 helper with Zig 0.13:
 src=devices/xiaomi-mi-10/tools/ufs-wrapped-key-test
 build=$(mktemp -d)
 mkdir "$build/classes" "$build/dex"
-javac --release 8 -d "$build/classes" "$src/ReadOnlyWrappedVts.java"
+javac --release 8 -d "$build/classes" "$src"/*.java
 d8 --min-api 33 --output "$build/dex" "$build"/classes/*.class
 zig cc -target aarch64-linux-musl -static -O2 -Wall -Wextra \
     "$src/read-compare-input.c" -o "$build/read-compare-input"
 python3 "$src/run-readonly-vts.py" --serial YOUR_ADB_SERIAL \
     --helper "$build/read-compare-input" --dex "$build/dex/classes.dex"
+python3 "$src/run-readonly-vts.py" --serial YOUR_ADB_SERIAL \
+    --helper "$build/read-compare-input" --dex "$build/dex/classes.dex" \
+    --direct-keymaster
 ```
 
 `GENERATED_WRAPPED_READ_ONLY_CONTROL_PASS` confirms the generated-key
