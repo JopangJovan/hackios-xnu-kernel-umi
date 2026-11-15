@@ -89,6 +89,7 @@ static size_t umi_sdx55_net_dequeue(void *buf,size_t cap) {
 static int sdx55_read_cell_service(struct umi_mhi *h,const struct sdx55_cell_endpoint *ep){assert(0);return EIO;}
 static void sdx55_refresh_radio(struct umi_mhi *h,const struct sdx55_cell_endpoint *nas){assert(0);}
 static bool sdx55_data_enabled(void){return true;}
+static bool sdx55_stop_requested(void){return false;}
 ''' + command + move + r'''
 int main(void){
     struct umi_pcie pci={0};struct umi_mhi_io io={.context=&pci};struct umi_mhi host={.io=&io};

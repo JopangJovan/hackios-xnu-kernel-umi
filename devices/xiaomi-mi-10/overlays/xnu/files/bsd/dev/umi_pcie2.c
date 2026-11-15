@@ -80,6 +80,16 @@ extern uint64_t umi_camera_iomap_free(void);
 extern lck_mtx_t hakios_smmu_lock;
 extern kern_return_t thread_terminate(thread_t);
 void umi_sdx55_init(void);
+void hakios_external_modem_stop(void);
+void hakios_external_modem_quiesce(void);
+
+static bool sdx55_stopping;
+
+static bool
+sdx55_stop_requested(void)
+{
+	return os_atomic_load(&sdx55_stopping, acquire);
+}
 
 #define GCC  0x00100000u
 #define GPIO 0x0f500000u /* Kona SOUTH: TLMM 0x0f000000 + tile 0x00500000. */
@@ -2613,7 +2623,7 @@ sdx55_move_packets(struct umi_mhi *host, uint64_t deadline, const struct sdx55_d
 	struct umi_pcie *p = host->io->context;
 	int error = 0;
 	sdx55_packets.network_ready = true;
-	while (!error && sdx55_data_enabled() && mach_absolute_time() < deadline) {
+	while (!error && !sdx55_stop_requested() && sdx55_data_enabled() && mach_absolute_time() < deadline) {
 		if (!gpio_level(p, 3) || gpio_level(p, 1)) { host->poisoned = true; error = ENXIO; break; }
 		error = umi_sdx55_poll_loc(host, 5);
 		if (!error) error = sdx55_flush_flow_acks(host);
@@ -2660,6 +2670,7 @@ sdx55_wait_registration(struct umi_mhi *host, const struct sdx55_data_routes *ro
 	uint64_t deadline;
 	clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
 	do {
+		if (sdx55_stop_requested()) return ECANCELED;
 		if (!sdx55_data_routes_current(routes) || !sdx55_cell_endpoint_current(&nas)) return ENXIO;
 		uint8_t subscription = 0;
 		int error = sdx55_read_cell_service(host, &sdx55_services[CELL_UIM]);
@@ -2848,15 +2859,16 @@ sdx55_run_data_call(struct umi_mhi *host, unsigned seconds)
 	if (!error) error = sdx55_cell_command(host, wds, SDX55_WDS_BIND_MUX, 0, NULL);
 	if (!error) error = sdx55_cell_command(host, wds, SDX55_WDS_SET_FAMILY, 0, NULL);
 	if (!error && !sdx55_data_routes_current(&routes)) error = ENXIO;
-	uint64_t deadline, refresh = 0;
-	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
+	uint64_t deadline = UINT64_MAX, refresh = 0;
+	if (seconds) clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
+	else if (!error) hakios_tl("UMI SDX55: cellular session stays active until kernel shutdown\n");
 	if (!error) {
 		sdx55_voice_begin();
 		lck_mtx_lock(&cell_status_lock);
 		sms_worker.subscription = cell_view.nas_subscription;
 		lck_mtx_unlock(&cell_status_lock);
 	}
-	while (!error && mach_absolute_time() < deadline) {
+	while (!error && !sdx55_stop_requested() && mach_absolute_time() < deadline) {
 		if (!sdx55_data_routes_current(&routes) || !sdx55_cell_endpoint_current(&nas)) {
 			error = ENXIO;
 			break;
@@ -2939,16 +2951,18 @@ sdx55_observe_sim(struct umi_mhi *host)
 static int
 umi_sdx55_cell_session(struct umi_mhi *host)
 {
-	uint32_t rings = 0, call = 0, seconds = 120, sim_status = 0;
+	uint32_t rings = 0, call = 0, seconds = 120, sim_status = 0, interactive = 0;
 	PE_parse_boot_argn("sdx55_data_rings", &rings, sizeof(rings));
 	PE_parse_boot_argn("sdx55_data_call", &call, sizeof(call));
-	PE_parse_boot_argn("sdx55_data_secs", &seconds, sizeof(seconds));
+	bool timed = PE_parse_boot_argn("sdx55_data_secs", &seconds, sizeof(seconds));
+	PE_parse_boot_argn("sdx55_interactive", &interactive, sizeof(interactive));
 	PE_parse_boot_argn("sdx55_sim_status", &sim_status, sizeof(sim_status));
 	if (sim_status) {
 		if (sim_status != 1 || rings || call) return EINVAL;
 		return sdx55_observe_sim(host);
 	}
 	if (call && (call != 1 || rings != 1 || !seconds || seconds > 600)) return EINVAL;
+	if (!timed && interactive == 1) seconds = 0;
 	memset(&sdx55_packets, 0, sizeof(sdx55_packets));
 	int restore_mode = -1;
 	int first_error;
@@ -3194,6 +3208,30 @@ static struct {
 	unsigned observations;
 } umi_sdx55_sbl_work;
 
+/* Let the SDX55 worker tear down WDS, IMS, and DMA before the kernel hands
+ * control back. Give the return path a bound even if the modem stops replying. */
+void
+hakios_external_modem_stop(void)
+{
+	os_atomic_store(&sdx55_stopping, true, release);
+	if (!os_atomic_load(&umi_sdx55_sbl_work.worker_active, acquire)) return;
+	uint64_t deadline;
+	clock_interval_to_deadline(8, NSEC_PER_SEC, &deadline);
+	while (os_atomic_load(&umi_sdx55_sbl_work.worker_active, acquire) && mach_absolute_time() < deadline)
+		delay_for_interval(10, NSEC_PER_MSEC);
+}
+
+/* A panic or a stalled worker cannot run sleeping cleanup. PERST stops
+ * endpoint DMA without relying on the endpoint or taking a lock. */
+void
+hakios_external_modem_quiesce(void)
+{
+	struct umi_pcie *p = &umi_sdx55_host;
+	if (!p->dma_enabled) return;
+	(void)gpio_output(p, 85, false, 1);
+	pause_us(p, 1000);
+}
+
 static void
 umi_sdx55_sbl_worker(void *parameter, __unused wait_result_t result)
 {
@@ -3204,11 +3242,13 @@ umi_sdx55_sbl_worker(void *parameter, __unused wait_result_t result)
 
 	hakios_tl("UMI SDX55: SBL observation %u userland-triggered worker entered\n",
 	    observation);
-	uint32_t link = rd(p, DBI + 0x80);
+	if (sdx55_stop_requested()) error = ECANCELED;
+	uint32_t link = error ? UINT32_MAX : rd(p, DBI + 0x80);
 	report(p, "SBL observation local link", link);
-	if (link == UINT32_MAX || !(link & BIT(29))) {
+	if (!error && (link == UINT32_MAX || !(link & BIT(29)))) {
 		error = ETIMEDOUT;
-	} else {
+	}
+	if (!error) {
 		uint32_t endpoint = rd(p, CONF);
 		report(p, "SBL observation endpoint ID", endpoint);
 		if (endpoint != 0x030617cb) {
@@ -3269,8 +3309,8 @@ umi_sdx55_sbl_worker(void *parameter, __unused wait_result_t result)
 				    umi_sdx55_sbl_work.next_image, umi_sdx55_sbl_work.step);
 		}
 	}
-	if (retain) {
-		umi_sdx55_sbl_work.worker_active = false;
+	if (retain && !sdx55_stop_requested()) {
+		os_atomic_store(&umi_sdx55_sbl_work.worker_active, false, release);
 		hakios_tl("UMI SDX55: SBL still PBL after observation %u; protected ownership retained\n",
 		    observation);
 		thread_terminate(current_thread());
@@ -3282,7 +3322,7 @@ umi_sdx55_sbl_worker(void *parameter, __unused wait_result_t result)
 	umi_sdx55_smmu_restore();
 	lck_mtx_unlock(&hakios_smmu_lock);
 	umi_sdx55_sbl_work.pending = false;
-	umi_sdx55_sbl_work.worker_active = false;
+	os_atomic_store(&umi_sdx55_sbl_work.worker_active, false, release);
 	hakios_tl("UMI SDX55: asynchronous SBL observation errno=%d\n", error);
 	if (umi_sdx55_sbl_work.return_to_loader) loader_return();
 	thread_terminate(current_thread());
@@ -3297,17 +3337,19 @@ umi_sdx55_observe_sysctl SYSCTL_HANDLER_ARGS
 	error = SYSCTL_IN(req, &value, sizeof(value));
 	if (error) return error;
 	if (value != 1 && value != 2) return EINVAL;
-	if (!umi_sdx55_sbl_work.pending || umi_sdx55_sbl_work.worker_active ||
-	    !umi_sdx55_sbl_work.host)
+	if (!os_atomic_cmpxchg(&umi_sdx55_sbl_work.worker_active, false, true, acq_rel))
 		return ENXIO;
+	if (sdx55_stop_requested() || !umi_sdx55_sbl_work.pending || !umi_sdx55_sbl_work.host) {
+		os_atomic_store(&umi_sdx55_sbl_work.worker_active, false, release);
+		return ENXIO;
+	}
 	umi_sdx55_sbl_work.final_observation = value == 2;
-	umi_sdx55_sbl_work.worker_active = true;
 	thread_t thread;
 	if (kernel_thread_start(umi_sdx55_sbl_worker,
 	    umi_sdx55_sbl_work.host, &thread) != KERN_SUCCESS) {
-		umi_sdx55_sbl_work.worker_active = false;
 		umi_sdx55_sbl_work.pending = false;
 		umi_sdx55_bhi_release(umi_sdx55_sbl_work.host);
+		os_atomic_store(&umi_sdx55_sbl_work.worker_active, false, release);
 		return EAGAIN;
 	}
 	thread_deallocate(thread);

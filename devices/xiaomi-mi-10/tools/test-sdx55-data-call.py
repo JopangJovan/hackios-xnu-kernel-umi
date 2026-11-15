@@ -45,6 +45,8 @@ static struct { const struct sdx55_data_routes *routes; } sdx55_packets;
 static struct sdx55_wan_status cold, current;
 static int card, busy, fail, starts, stops, net_up, net_down, closed, sets, replaced, initial_transient;
 static uint64_t now;
+static bool stopping;
+static bool sdx55_stop_requested(void) { return stopping; }
 static struct umi_sdx55_radio_snapshot sdx55_radio;
 #define NSEC_PER_SEC 1000000000
 #define clock_interval_to_deadline(s,n,d) (*(d)=now+(s)*100)
@@ -105,7 +107,15 @@ static int sdx55_move_packets(struct umi_mhi *h,uint64_t deadline,const struct s
     assert(net_up && now < deadline && sdx55_radio.state==UMI_DATA_ON);
     if (fail==4) replace(CELL_WDS,false);
     if (fail==5) replace(CELL_WDA,true);
-    if (fail==7 && starts==1) sdx55_radio.enabled=0;
+    if (deadline == UINT64_MAX) {
+        if (starts == 1) {
+            now = 61000; /* The user can still toggle data after the old 600-second limit. */
+            sdx55_radio.enabled = 0;
+        } else {
+            assert(now > 60000);
+            stopping = true;
+        }
+    } else if (fail==7 && starts==1) sdx55_radio.enabled=0;
     else now=deadline;
     return sdx55_data_routes_current(routes) ? 0 : ENXIO;
 }
@@ -113,8 +123,11 @@ static int sdx55_close_cell_client(struct umi_mhi *h){closed++;return 0;}
 '''
 fixture += func + r'''
 static int opt_call=1;
+static bool opt_timed = true, opt_interactive;
 static int PE_parse_boot_argn(const char *arg,uint32_t *v,size_t size) {
-    *v = !strcmp(arg,"sdx55_data_secs") ? 2 : !strcmp(arg,"sdx55_data_rings") ? 1 : !strcmp(arg,"sdx55_data_call") ? opt_call : 0;
+    if (!strcmp(arg,"sdx55_data_secs") && !opt_timed) return 0;
+    *v = !strcmp(arg,"sdx55_data_secs") ? 2 : !strcmp(arg,"sdx55_data_rings") ? 1 :
+        !strcmp(arg,"sdx55_data_call") ? opt_call : !strcmp(arg,"sdx55_interactive") ? opt_interactive : 0;
     return 1;
 }
 static struct { int service_error; } umi_sdx55_dms;
@@ -129,6 +142,7 @@ static int run(int sim,int occupied,int fault) {
     for (unsigned i=0;i<4;i++) sdx55_cell_announce(4,sdx55_services[i].service,1,3,52+i);
     current=cold;replaced=0;card=sim;busy=occupied;fail=fault;
     starts=stops=sets=net_up=net_down=closed=now=0;
+    stopping = false;
     sdx55_data_state(UMI_DATA_UNAVAILABLE);
     int err=sdx55_run_data_call(&host,2);
     if (replaced != CELL_WDA+1) assert(sdx55_wda_format_equal(&current,&cold));
@@ -146,6 +160,20 @@ static void snapshot_retry(unsigned service) {
     assert(umi_sdx55_cell_session(&h)==EIO && !starts);
     assert(cc_starts==1 && cc_stops==2);
 }
+static void interactive_runtime(bool timed) {
+    struct umi_mhi host = {0};
+    assert(run(1,0,0)==0);
+    starts=stops=net_up=net_down=closed=now=0;
+    cc_starts=cc_stops=0;
+    opt_call=1;
+    opt_interactive=true;
+    opt_timed=timed;
+    assert(umi_sdx55_cell_session(&host)==0);
+    assert(stopping==!timed && cc_starts==1 && cc_stops==1 && closed==1);
+    int expected_bearers = timed ? 1 : 2;
+    assert(starts==expected_bearers && stops==expected_bearers);
+    assert(net_up==expected_bearers && net_down==expected_bearers);
+}
 int main(void) {
     assert(run(0,0,0)==ENODEV && !starts && !stops && !net_up && !sets && closed==1);
     assert(run(1,0,0)==0 && starts==1 && stops==1 && net_up==1 && net_down==1 && closed==1);
@@ -160,6 +188,8 @@ int main(void) {
     assert(run(1,0,8)==0 && starts==2 && stops==2 && net_up==1 && net_down==1);
     assert(run(1,0,0)==0);
     snapshot_retry(11); snapshot_retry(3);
+    interactive_runtime(true);
+    interactive_runtime(false);
 }
 '''
 with tempfile.TemporaryDirectory() as directory:

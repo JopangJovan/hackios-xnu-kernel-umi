@@ -178,12 +178,23 @@ job. Use current snapshots read from this phone's Android modem partitions.
 Keep the snapshots local. Select the mobile data profile for the run with
 `UMI_CELLULAR=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run`.
 
-The 600-second data test provides IPv4 via `en1`. Settings → Cellular shows the
-serving network and measured LTE or NR RSRP. Its Cellular Data switch and the
-Control Center button both stop or start the WDS packet session while leaving
-the modem registered. The iOS 16.5 (20F66) status bar derives its signal bars
-from the modem's RSRP. The cellular profile starts the external modem after
-the SLPI magnetometer produces its first sample or the startup wait expires.
+The cellular profile provides IPv4 via `en1` and keeps the modem registered
+for the iOS session. The Cellular Data switch in Settings and the Control
+Center button stop or start the WDS packet session while the radio stays
+registered. Settings shows the serving network and measured LTE or NR RSRP.
+The status bar derives its signal bars from the modem's RSRP. The external
+modem starts after the SLPI magnetometer produces its first sample or the
+startup wait expires.
+
+An explicit `sdx55_data_secs=180` or `sdx55_data_secs=600` still selects a timed
+diagnostic session. The previous `UMI_CELLULAR=1` profile set a 600-second
+limit. When it expired, the SDX55 worker closed the WDS session, removed the
+IPv4 address on `en1`, and cleared the reported radio state while iOS kept
+running. This made the status-bar signal disappear and stopped cellular data.
+The regular profile now leaves that limit unset. On a timed RAM return or
+host stop, the worker closes the WDS session and releases its DMA resources
+before the kernel returns to the loader. As a fallback, the kernel asserts
+the modem's hardware reset if DMA is still active.
 
 ## Native CommCenter RAM test
 
@@ -213,6 +224,12 @@ menu, and hung up through the native full-screen interface. Messages sent an
 ordinary SMS to 10010 and displayed the automatic reply. The phone returned
 to Android after testing.
 
+On the session-long cellular profile, all 61 samples over 15 minutes showed the
+SIM ready, NR registered, IMS voice available, and IPv4 on `en1`. TCP probes
+bound to `en1` passed at startup, 11 minutes, and 14 minutes 30 seconds into
+sampling. The host stop returned the cellular worker with `errno=0` and the
+SMMU context was restored before the phone returned to Android.
+
 ## SDX55 outbound call RAM test
 
 Build the UMI loader and userland with the mobile data inputs above, using
@@ -232,7 +249,7 @@ CallKit background mode and marks Visual Voicemail unavailable on SDX55.
 The local Apple binary and generated images stay outside Git.
 
 Start with `UMI_CELLULAR=1 UMI_VOICE=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run`.
-During the 600-second SDX55 session, open Phone → Keypad, enter a number, and
+Once SDX55 has registered, open Phone → Keypad, enter a number, and
 tap the green call button. With the call service installed, Phone reports
 the baseband's call state to CallKit and opens the system call screen.
 Tap a single-number cellular voice entry in Recents to redial. Use the system
@@ -307,7 +324,7 @@ devices/xiaomi-mi-10/run.sh ramdisk
 UMI_CELLULAR=1 UMI_VOICE=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run
 ```
 
-The SMS bridge is available during the 600-second SDX55 session. After
+The SMS bridge remains available while the SDX55 worker is running. After
 `SMS receive ready` and IMS registration appear in the loader log, open
 Messages and send an ordinary text to one number using the green Send button.
 Check for the text on the destination phone, then reply and verify that the

@@ -23,6 +23,7 @@ static unsigned scenario, round_no, nas_client, wds_client, nas_calls, nr_calls,
 #define clock_interval_to_deadline(s,n,d) (*(d)=round_no+3)
 #define mach_absolute_time() (round_no)
 static int sdx55_radio_initializing(unsigned code){ return code==74; }
+static bool sdx55_stop_requested(void){return false;}
 static int umi_sdx55_poll_loc(struct umi_mhi *host,unsigned ms){round_no++;return 0;}
 static int sdx55_read_cell_service(struct umi_mhi *host,const struct sdx55_cell_endpoint *ep){
     struct sdx55_cell_status *s=&sdx55_query.cell;
