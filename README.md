@@ -71,6 +71,11 @@ the phone to Android. The latest cellular call and SMS checks were on **2026-11-
 
 ### Storage validation
 
+The single-slot UMI menu selected iOS 16.5 from RAM and reached the home
+screen. Directly selecting Android and simulating an early iOS startup
+failure both returned to stock Android. See the
+[temporary boot menu test results](devices/xiaomi-mi-10/uefi/README.md#temporary-single-slot-menu).
+
 On 2026-11-15, a temporary UMI UEFI loaded the phone's own UFS driver and read
 the primary and backup GPT headers and entry arrays on all six logical units.
 Both sets of CRCs matched Android. SHA-256 hashes of all 12 GPT regions matched

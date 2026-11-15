@@ -997,6 +997,9 @@ static uint64_t sound_len;
 
 static void wdt_pet(void);
 static int wdt_armed;
+#ifdef LOADER_UMI
+static uint64_t umi_menu_run_deadline;
+#endif
 
 /*
  * While a kernel runs on another core and this one watches it: where it shows its signs of life,
@@ -2391,6 +2394,12 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		flush_log();
 	}
 	while (status == 0) {
+#ifdef LOADER_UMI
+		if (umi_menu_run_deadline != 0 && READ_SYSREG(CNTVCT_EL0) >= umi_menu_run_deadline) {
+			print("UMI RAM menu: iOS session limit elapsed; returning to stock Android\n");
+			reboot();
+		}
+#endif
 		/*
 		 * The first seconds are the ones in which a new arrangement goes wrong, and a machine
 		 * that resets takes this loader's memory with it: where there is storage for the log,
@@ -2622,6 +2631,9 @@ struct payload_info {
 	const uint8_t *ufs_survey_driver;
 	uint32_t ufs_survey_driver_size;
 	int usb_mode;
+#ifdef LOADER_UMI
+	int ram_menu;
+#endif
 };
 
 static uint64_t
@@ -2706,6 +2718,10 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->ufs_survey_driver_size = e->size;
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
+#ifdef LOADER_UMI
+		} else if (memcmp(e->name, "umi-ram-menu", sizeof("umi-ram-menu")) == 0) {
+			pi->ram_menu = 1;
+#endif
 		}
 		p += sizeof(*e) + ((e->size + 15) & ~15u);
 	}
@@ -3324,6 +3340,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (checkpoint == CHECKPOINT_SELFTEST) {
 		kernel_mpidr = this_mpidr;
 	}
+#ifdef LOADER_UMI
+	if (umi_menu_run_deadline != 0 && kernel_mpidr == this_mpidr) {
+		print("UMI RAM menu: iOS needs a separate core so the loader can supervise it\n");
+		return 0;
+	}
+#endif
 
 	/* where the kernel will show its signs of life, and how long it has said it will run */
 	const struct kernel_live *kernel_live = NULL;
@@ -4161,6 +4183,11 @@ starts_with(const char *s, const char *prefix)
 static const uint8_t *ufs_survey_driver;
 static uint32_t ufs_survey_driver_size;
 
+#ifdef LOADER_UMI
+static int umi_ram_menu_mode;
+#include "rammenu.c"
+#endif
+
 static void
 run_ufs_gpt_survey(void)
 {
@@ -4198,6 +4225,22 @@ run_ufs_gpt_survey(void)
 static void
 fb_command(char *cmd)
 {
+#ifdef LOADER_UMI
+	if (umi_ram_menu_mode) {
+		if (str_eq(cmd, "oem ram-menu") && !run_active && !umi_menu.deadline &&
+		    !reboot_after_kernel_deadline) {
+			fb_reply("OKAY", "");
+			umi_menu_open();
+			return;
+		}
+		if (starts_with(cmd, "oem run") || starts_with(cmd, "oem selftest") ||
+		    ((umi_menu.deadline || reboot_after_kernel_deadline) &&
+		     (starts_with(cmd, "download:") || starts_with(cmd, "oem ramdisk")))) {
+			fb_reply("FAIL", "use the physical buttons on the RAM menu");
+			return;
+		}
+	}
+#endif
 	if (ufs_survey_driver != NULL) {
 		if (str_eq(cmd, "oem survey")) {
 			static int attempted;
@@ -4476,6 +4519,18 @@ usb_command_loop(void)
 {
 	screen_quiet = 1;
 	for (;;) {
+#ifdef LOADER_UMI
+		if (umi_menu.deadline || (umi_ram_menu_mode && reboot_after_kernel_deadline)) {
+			usb_poll_command();
+			if (umi_menu.deadline) {
+				umi_menu_poll();
+			} else if (READ_SYSREG(CNTVCT_EL0) >= reboot_after_kernel_deadline) {
+				reboot();
+			}
+			BS->stall(20000);
+			continue;
+		}
+#endif
 		char cmd[128];
 		int64_t n;
 
@@ -4797,6 +4852,9 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && (pi.usb_mode || pi.ufs_survey_driver != NULL)) {
+#ifdef LOADER_UMI
+		umi_ram_menu_mode = pi.usb_mode && pi.ram_menu && pi.ufs_survey_driver == NULL;
+#endif
 		ufs_survey_driver = pi.ufs_survey_driver;
 		ufs_survey_driver_size = pi.ufs_survey_driver_size;
 		if (!usb_start()) {
