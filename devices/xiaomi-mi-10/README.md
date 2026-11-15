@@ -255,6 +255,15 @@ the baseband's call state to CallKit and opens the system call screen.
 Tap a single-number cellular voice entry in Recents to redial. Use the system
 speaker button to switch between the receiver and speaker. The compatibility
 sheet provides audio and hangup controls if native presentation fails.
+
+On an earlier first call after boot, CallKit returned `MaximumCallGroupsReached`
+(error 7) immediately after the provider became ready. Phone opened the
+compatibility sheet and the baseband completed the call. Phone now retries that
+CallKit request up to three times at 600 ms intervals using the same call UUID.
+It waits for the start action before submitting the native dial request to the
+baseband. If the full-screen scene is still inactive after a transition request,
+InCallService requests the full-screen presentation again for the same call.
+
 Settings → Cellular → Voice Service displays the baseband's IMS registration
 and voice availability. The optional `sdx55_voice_diag=1` boot argument enables
 DSP and modem diagnostics.
@@ -279,6 +288,12 @@ On 2026-11-15, Phone reached the keypad without the startup black screen.
 The green keypad button and a 10010 entry in Recents both placed a call
 into the full-screen system call UI. The system speaker button switched the
 audio output, and the modem acknowledged hangups from the system red button.
+
+In a separate cold-boot test on 2026-11-15, the first call to 10010 from the
+green keypad button stayed on the native full-screen call page. The user
+heard the carrier menu and ended the call with the red system button. The log
+confirmed the native view, connection, and hangup. The first CallKit request
+succeeded, so the retry path was not exercised in this test.
 
 ### Pending call features
 

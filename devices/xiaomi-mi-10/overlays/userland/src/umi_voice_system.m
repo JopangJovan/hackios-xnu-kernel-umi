@@ -86,6 +86,7 @@ static const NSInteger audio_route_control = 3;
     CXEndCallAction *_endAction;
     CXSetMutedCallAction *_muteAction;
     BOOL _submitted, _connected, _ready, _transactionRequested, _presentationRequested;
+    NSUInteger _startRetries;
     UIBackgroundTaskIdentifier _backgroundTask;
     int _presentationToken;
 }
@@ -126,6 +127,7 @@ static const NSInteger audio_route_control = 3;
     _endAction = nil;
     _muteAction = nil;
     _submitted = _connected = _transactionRequested = _presentationRequested = NO;
+    _startRetries = 0;
 }
 
 - (void)fallbackBeforeDial
@@ -167,6 +169,21 @@ static const NSInteger audio_route_control = 3;
             snprintf(message, sizeof(message), "UMI Phone: system call transaction rejected %s=%ld\n",
                 error.domain.UTF8String, (long)error.code);
             umi_voice_diagnostic(message);
+            if ([error.domain isEqualToString:CXErrorDomainRequestTransaction] &&
+                error.code == CXErrorCodeRequestTransactionErrorMaximumCallGroupsReached &&
+                self->_startRetries < 3) {
+                /* CallKit can reject the first transaction just after the
+                 * provider connects. Keep ownership of the same request;
+                 * the modem is only dialed if its start action arrives. */
+                self->_startRetries++;
+                umi_voice_diagnostic("UMI Phone: retrying system start after call-group limit\n");
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 600 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                    if (![self->_callID isEqual:callID] || self->_submitted) return;
+                    self->_transactionRequested = NO;
+                    [self requestStart];
+                });
+                return;
+            }
             [self fallbackBeforeDial];
         });
     }];
@@ -242,7 +259,7 @@ static const NSInteger audio_route_control = 3;
             error.domain.UTF8String ?: "accepted", (long)error.code);
         umi_voice_diagnostic(message);
     }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         if (![self->_callID isEqual:callID] || !self->_fallback) return;
         void (^fallback)(BOOL) = self->_fallback;
         self->_fallback = nil;
@@ -415,6 +432,17 @@ static BOOL present_dismissed(ICSApplicationDelegate *delegate, SEL command, TUP
     return original_present_dismissed(delegate, command, call);
 }
 
+static BOOL present_full_screen_call(ICSApplicationDelegate *delegate, TUProxyCall *call)
+{
+    SBSInCallPresentationConfiguration *configuration = [delegate configurationForCall:call];
+    if (![configuration respondsToSelector:@selector(setUserInitiated:)]) return NO;
+    [configuration setPreferredPresentationMode:fullscreen_call_mode];
+    [configuration setUserInitiated:YES];
+    [delegate performPresentationWithConfiguration:configuration forSceneType:0];
+    umi_voice_diagnostic("UMI InCallService: requested a full-screen call scene\n");
+    return YES;
+}
+
 static void request_call_presentation(ICSApplicationDelegate *delegate, SEL command, TUProxyCall *call,
     id dialRequest, BOOL tappedPill)
 {
@@ -425,17 +453,21 @@ static void request_call_presentation(ICSApplicationDelegate *delegate, SEL comm
                 scene.activationState != UISceneActivationStateForegroundActive) {
                 [scene requestTransitionToPresentationMode:fullscreen_call_mode isUserInitiated:YES];
                 umi_voice_diagnostic("UMI InCallService: requested transition to the full-screen call page\n");
+                NSString *callUUID = [call callUUID];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                    TUCallCenter *center = [NSClassFromString(@"TUCallCenter") sharedInstance];
+                    TUProxyCall *current = [center frontmostAudioOrVideoCall];
+                    SBSUIInCallWindowScene *currentScene = [delegate currentInCallScene];
+                    if ([[current callUUID] isEqualToString:callUUID] &&
+                        ([currentScene presentationMode] != fullscreen_call_mode ||
+                         currentScene.activationState != UISceneActivationStateForegroundActive)) {
+                        present_full_screen_call(delegate, current);
+                    }
+                });
             }
             return;
         }
-        SBSInCallPresentationConfiguration *configuration = [delegate configurationForCall:call];
-        if (configuration && [configuration respondsToSelector:@selector(setUserInitiated:)]) {
-            [configuration setPreferredPresentationMode:fullscreen_call_mode];
-            [configuration setUserInitiated:YES];
-            [delegate performPresentationWithConfiguration:configuration forSceneType:0];
-            umi_voice_diagnostic("UMI InCallService: requested a full-screen call scene\n");
-            return;
-        }
+        if (present_full_screen_call(delegate, call)) return;
     }
     original_request_call_presentation(delegate, command, call, dialRequest, tappedPill);
 }
@@ -473,9 +505,12 @@ static void verify_audio_call_view(UIViewController *controller)
     }
 }
 
-static void audio_call_view_appeared(id controller, SEL command, BOOL animated)
+static __weak UIViewController *audio_call_view;
+
+static void audio_call_view_appeared(UIViewController *controller, SEL command, BOOL animated)
 {
     original_audio_call_view_appeared(controller, command, animated);
+    audio_call_view = controller;
     verify_audio_call_view(controller);
 }
 
@@ -588,6 +623,13 @@ __attribute__((constructor)) static void start_incall_route(void)
         if (method && method_getNumberOfArguments(method) == 3) {
             original_audio_call_view_appeared = (void *)method_getImplementation(method);
             class_replaceMethod(cls, selector, (IMP)audio_call_view_appeared, method_getTypeEncoding(method));
+            [NSNotificationCenter.defaultCenter addObserverForName:UISceneDidActivateNotification
+                object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *notification) {
+                    UIViewController *view = audio_call_view;
+                    if (view && view.viewIfLoaded.window.windowScene == notification.object) {
+                        verify_audio_call_view(view);
+                    }
+                }];
         }
 
         cls = NSClassFromString(@"ICSApplicationDelegate");
