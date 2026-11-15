@@ -86,8 +86,11 @@ On the same device, a separate RAM-boot comparison reproduced an Android F2FS
 shrink failure when live blocks occupied the tail. The patched kernel shrank
 the 512 MiB encrypted fixture to 384 MiB, remounted it and verified all eight
 test files. Restoring the pre-shrink ciphertext image also passed its whole
-image and file hash checks. Recovery with hardware-wrapped keys remains
-unverified. See the [F2FS comparison and hardware test plan](devices/xiaomi-mi-10/README.md#f2fs-shrink-and-restore).
+image and file hash checks. On native UFS LUN 4, a separate `62 MiB → 54 MiB`
+fixture passed tail relocation, exact ciphertext restoration and a read-only
+remount after reboot using freshly exported hardware-wrapped keys. All three
+file hashes matched, and the test range returned to its original all-zero
+state. See the [native UFS F2FS test results](devices/xiaomi-mi-10/README.md#native-ufs-f2fs-shrink-and-restore).
 
 On stock Android, the vendor `FBE_ICE` tag let Keymaster export a temporary
 wrapped form of a TEE-generated test key without rollback resistance. Read-only

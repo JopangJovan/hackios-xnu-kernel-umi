@@ -147,11 +147,43 @@ first 1 MiB of UFS `userdata` as 256 sectors of 4096 bytes. It removed
 the mappings, kept keys and samples in process memory, and logged only
 statuses and counts. Android stayed booted with `/data` mounted.
 
-These results verify repeatable hardware decryption with generated test
-keys. Recovery after F2FS shrink with hardware-wrapped keys remains
-unverified. That requires a dedicated native UFS test volume, restoring
-the fixture ciphertext at its original offsets, obtaining a fresh ephemeral
-export after reboot, and checking the filesystem and file hashes.
+#### Native UFS F2FS shrink and restore
+
+On 2026-11-15, MIUI `V14.0.4.0.TJBCNXM` passed an end-to-end
+restore test on an independent 62 MiB volume on UFS LUN 4. The test
+verified both GPT copies and the SHA-256 of the entirely zero, unallocated
+range before exposing LBAs `245760`–`261631` as a temporary kernel block
+view (4 KiB LBAs). It ran the SIT-patched kernel via `fastboot boot` with
+the original Android ramdisk and device tree. Android's normal Keymaster
+service imported two independent synthetic `FBE_ICE` keys without rollback
+resistance, one for `dm-default-key` metadata encryption (`wrappedkey_v0`)
+and one for the `fscrypt` v2 `IV_INO_LBLK_64` file policy.
+
+| Stage | Result |
+|---|---|
+| Shrink `62 MiB → 54 MiB` | The protected tail file's extent end moved from byte `58,720,256` to byte `21,553,152`, below the `56,623,104`-byte boundary. Read-only `fsck.f2fs`, mount and all three file SHA-256 checks passed. |
+| Restore | The fixture's original raw ciphertext was written back at the same LBAs. The entire 62 MiB matched the pre-shrink SHA-256. |
+| Reboot and remount | Stock Android booted and Keymaster freshly exported both temporary keys. The restored raw ciphertext hash, the read-only filesystem check and all three file hashes matched. |
+| Cleanup | The temporary block view and mappings were removed. The complete unallocated range matched its original all-zero SHA-256. The 12 GPT regions and Android `boot`, `recovery` and `vbmeta` hashes matched, and `/data` was mounted on the original Android kernel. |
+
+This test covers the independent fixture. The full backup and restore of
+Android `userdata`, and the proposed 80 GiB allocation, remain pending.
+The [native test runner](tools/ufs-wrapped-key-test/native-f2fs/run.py)
+performs a read-only preflight by default. The separate write mode requires
+root ADB, UMI Fastboot, Zig 0.13, a JDK, Android SDK `d8`, and a verified
+raw copy of the connected device's `boot` partition. Its write window is
+fixed to the tested 62 MiB range and it verifies the complete gap is zero
+before proceeding.
+
+```sh
+src=devices/xiaomi-mi-10/tools/ufs-wrapped-key-test/native-f2fs
+python3 "$src/run.py" --serial YOUR_ADB_SERIAL
+
+build=$(mktemp -d)
+"$src/build.sh" "$build"
+python3 "$src/run.py" --serial YOUR_ADB_SERIAL --build-dir "$build" \
+    --stock-boot /path/to/boot.img --write-test-window
+```
 
 #### Known-seed import and AES-XTS reference
 
