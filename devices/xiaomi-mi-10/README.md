@@ -125,16 +125,58 @@ drive or RAM loop lacks access to the controller's keyslots, and the kernel
 [software fallback](https://android.googlesource.com/kernel/common/+/refs/tags/android15-6.6-2024-11_r15/Documentation/block/inline-encryption.rst)
 cannot use hardware-wrapped keys.
 
-The [AOSP metadata-encryption VTS test](https://android.googlesource.com/platform/test/vts-testcase/kernel/+/refs/heads/main/encryption/metadata_encryption_tests.cpp)
-can check decryption with an imported test key by reading through a temporary
-mapping over native storage. It does not exercise a shrink or restore. A
-separate full test can use a spare Mi 10 with dedicated native UFS test
-storage and synthetic keys generated or imported on that device. It would
-need to restore the fixture ciphertext at the original offsets, obtain a
-fresh ephemeral form of the test key after reboot, then verify the filesystem
-and file hashes. That would validate the recovery procedure on the spare
-device. The original phone's hardware-bound keys still require verification
-on that phone.
+On 2026-11-15, disassembly of the test device's stock MIUI 14 `vold`
+showed that `generateWrappedStorageKey` supplies both `STORAGE_KEY`
+(`0x700002d2`) and Qualcomm's `FBE_ICE` boolean (`0x70003f49`). The
+rollback-resistance tag is added separately by the stock helper. The test
+requests no rollback resistance and checks the returned authorizations.
+It uses synthetic AES-256 keys in Keystore2's `BLOB` domain.
+
+| Test | Result |
+|---|---|
+| TEE-generated key with `STORAGE_KEY` alone | Ephemeral export returned `-17` (`UNSUPPORTED_KEY_FORMAT`). |
+| TEE-generated key with both tags | Two ephemeral exports succeeded. |
+| Known 32-byte seed imported with `FBE_ICE`, with or without `STORAGE_KEY` | Import succeeded. Ephemeral export returned `-17` in both cases. |
+| Two mappings with separate exports of the same generated key | All 256 sectors matched. |
+| Mapping with a second generated key | All 256 sectors differed from the first key's output. |
+| Mapped output compared with raw UFS | All 256 sectors differed. The raw UFS sample was unchanged across the test. |
+
+Each temporary target used `dm-default-key` with `wrappedkey_v0` and
+`DM_READONLY_FLAG`. The test verified `BLKROGET` before reading the
+first 1 MiB of UFS `userdata` as 256 sectors of 4096 bytes. It removed
+the mappings, kept keys and samples in process memory, and logged only
+statuses and counts. Android stayed booted with `/data` mounted.
+
+These results verify repeatable hardware decryption with generated test
+keys. The [Android 13 VTS reference](https://android.googlesource.com/platform/test/vts-testcase/kernel/+/refs/heads/android13-release/encryption/utils.cpp)
+derives AES-XTS from a known seed and compares it with direct UFS reads
+through the temporary mapping. The import/export failure blocks that
+comparison on this firmware. Recovery after F2FS shrink with hardware-wrapped
+keys remains unverified. That requires a dedicated native UFS test volume,
+restoring the fixture ciphertext at its original offsets, obtaining a fresh
+ephemeral export after reboot, and checking the filesystem and file hashes.
+
+#### Reproduce the read-only control
+
+Use a booted UMI with root ADB shell access and Android 13. From the
+repository root, build the Java probe with a JDK and Android SDK Build
+Tools' `d8`, and the static ARM64 helper with Zig 0.13:
+
+```sh
+src=devices/xiaomi-mi-10/tools/ufs-wrapped-key-test
+build=$(mktemp -d)
+mkdir "$build/classes" "$build/dex"
+javac --release 8 -d "$build/classes" "$src/ReadOnlyWrappedVts.java"
+d8 --min-api 33 --output "$build/dex" "$build"/classes/*.class
+zig cc -target aarch64-linux-musl -static -O2 -Wall -Wextra \
+    "$src/read-compare-input.c" -o "$build/read-compare-input"
+python3 "$src/run-readonly-vts.py" --serial YOUR_ADB_SERIAL \
+    --helper "$build/read-compare-input" --dex "$build/dex/classes.dex"
+```
+
+`GENERATED_WRAPPED_READ_ONLY_CONTROL_PASS` confirms the generated-key
+comparison. `FULL_AOSP_REFERENCE_VERIFIED` separately reports whether
+the known-key hardware and software comparison ran and matched.
 
 ## Validation
 

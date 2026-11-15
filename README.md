@@ -84,6 +84,13 @@ test files. Restoring the pre-shrink ciphertext image also passed its whole
 image and file hash checks. Recovery with hardware-wrapped keys remains
 unverified. See the [F2FS comparison and hardware test plan](devices/xiaomi-mi-10/README.md#f2fs-shrink-and-restore).
 
+On stock Android, the vendor `FBE_ICE` tag let Keymaster export a temporary
+wrapped form of a TEE-generated test key without rollback resistance. Read-only
+UFS mappings reproduced all 256 sampled sectors with the same key and gave
+different results in all 256 sectors with a different key. The known-key
+AES-XTS comparison is pending. See the
+[wrapped-key test results](devices/xiaomi-mi-10/README.md#hardware-wrapped-keys).
+
 ### Not yet
 
 - The other sensors behind the sensor DSP (accelerometer, gyroscope, light, proximity, pressure): the DSP reads their registry,
