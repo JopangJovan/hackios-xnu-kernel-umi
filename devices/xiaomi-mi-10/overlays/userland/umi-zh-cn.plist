@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>AppleLanguages</key>
+    <array>
+        <string>zh-Hans-CN</string>
+        <string>en-US</string>
+    </array>
+    <key>AppleLocale</key>
+    <string>zh_CN</string>
+    <key>AppleKeyboards</key>
+    <array>
+        <string>zh_Hans-Pinyin@sw=Pinyin-Simplified;hw=Automatic</string>
+        <string>en_US@sw=QWERTY;hw=Automatic</string>
+        <string>emoji@sw=Emoji</string>
+    </array>
+    <key>AppleKeyboardsExpanded</key>
+    <true/>
+</dict>
+</plist>

@@ -381,15 +381,29 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		esac
 	done > root/etc/inject.conf
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
-	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
-	# points back into /var); point them at the data that ships with the system, and use this machine's zone
-	zone=$(timedatectl show -p Timezone --value 2>/dev/null || true); zone=${zone:-UTC}
+	# Use the zoneinfo shipped with iOS and seed the host's configured time zone.
+	host_os=$(uname -s)
+	zone=
+	if [ "$host_os" = Linux ]; then
+		zone=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+	fi
+	if [ -z "$zone" ]; then
+		# macOS and Linux both link localtime into a zoneinfo directory.
+		zone_link=$(readlink /etc/localtime 2>/dev/null || true)
+		case "$zone_link" in */zoneinfo/*) zone=${zone_link#*/zoneinfo/} ;; esac
+	fi
+	if [ "$host_os" = Linux ] && [ -z "$zone" ] && [ -r /etc/timezone ]; then
+		IFS= read -r zone < /etc/timezone || true
+	fi
+	case "$zone" in ''|/*|*..*|*[!A-Za-z0-9_+/-]*) zone=UTC ;; esac
+	if [ ! -f "$IOS/rootfs/usr/share/zoneinfo.default/$zone" ]; then zone=UTC; fi
 	sed -i.bak -e 's|^l\t/usr/share/zoneinfo\t/private/var/db/timezone/zoneinfo$|l\t/usr/share/zoneinfo.default\t/private/var/db/timezone/zoneinfo|' \
 		-e "s|^l\t/var/db/timezone/zoneinfo/[^\t]*\t/private/var/db/timezone/localtime\$|l\t/var/db/timezone/zoneinfo/$zone\t/private/var/db/timezone/localtime|" root/etc/var.skel
 	rm -f root/etc/var.skel.bak
 	# ... and the files of ours it puts there (var/): those under mobile/ belong to the user mobile
 	cp -r var root/var
-	(cd var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
+	install -m 644 umi-zh-cn.plist root/var/mobile/Library/Preferences/.GlobalPreferences.plist
+	(cd root/var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
 		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"
 	done >> root/etc/var.skel

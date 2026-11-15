@@ -120,6 +120,25 @@ On 2026-11-15, the updated RAM image reached the home screen, and
 covered opening the page. Wallpaper editing and saving, Screen Time
 limits, and usage history still need separate validation.
 
+## Default language, keyboard, and time zone
+
+A fresh UMI RAM boot starts in Simplified Chinese with mainland China as the
+region. The mobile user's global preferences enable the stock Simplified
+Pinyin keyboard first, followed by English and Emoji. The image uses the
+existing iOS localizations, PingFang font, and Pinyin dictionaries.
+
+The build seeds the host's time zone into the fresh iOS data volume. On macOS
+it reads the zoneinfo link at `/etc/localtime`. On Linux it tries `timedatectl`,
+then the localtime link and `/etc/timezone`. It uses UTC when the host zone
+cannot be read or is unavailable in the iOS image. On a host set to
+`Asia/Shanghai`, the initial offset is UTC+8.
+
+On 2026-11-15, a UMI RAM boot of iOS 16.5 (20F66) displayed the Simplified
+Chinese home screen labels without missing glyphs. In Notes, Simplified
+Pinyin produced a selectable `你好` candidate for `nihao`. The user confirmed
+the mainland China region and Beijing time. The build was also checked with
+the Mac's `Asia/Shanghai` and a simulated Linux `Europe/Berlin` setting.
+
 ## Home screen idle heat
 
 In the iOS 16.5 (20F66) UMI image, Visual Voicemail's `vmd` kept retrying
