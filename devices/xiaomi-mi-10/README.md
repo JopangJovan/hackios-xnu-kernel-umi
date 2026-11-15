@@ -120,6 +120,47 @@ On 2026-11-15, the updated RAM image reached the home screen, and
 covered opening the page. Wallpaper editing and saving, Screen Time
 limits, and usage history still need separate validation.
 
+## Home screen idle heat
+
+In the iOS 16.5 (20F66) UMI image, Visual Voicemail's `vmd` kept retrying
+its connection to Apple CommCenter while the home screen was idle. It used
+98–99% of one CPU core, and `launchd` used another 25–26%. The UMI build
+omits `com.apple.voicemail.vmd` in both the default and native CommCenter
+configurations. The SDX55 integration provides voice, SMS, and Internet PDP
+state, and Visual Voicemail still has no backend on this port.
+
+On 2026-11-15, Android reported a battery temperature of 38.5°C before each
+run in the table. These runs used the same USB connection, a display brightness
+setting of 500 out of 1000, and a two-minute unlocked home screen measurement.
+CPU load is the mean across the seven cores assigned to XNU. The loader's USB
+core is outside that measurement. The hotspot is the median of 13 readings,
+each taken from the hottest chip sensor at the time.
+
+| Configuration | Average XNU CPU load | Median CPU hotspot | Battery during window |
+| --- | --- | --- | --- |
+| Default `cpufreq=1`, with `vmd` | 21.6% | 70.9°C | 38 → 40°C |
+| Adaptive `cpufreq=2`, with `vmd` | 23.7% | 57.0°C | 39 → 40°C |
+| Default `cpufreq=1`, with the `vmd` fix | 2.1% | 56.2°C | 39 → 40°C |
+
+The adaptive policy lowered the requested clocks and chip temperature while
+`vmd` continued running. Omitting the job removed the dominant idle workload.
+The battery read 40°C at the end of each short run. Longer sessions and case
+temperature remain to be measured.
+
+On the fixed image with the default CommCenter configuration, the stock Phone
+app reached the carrier's voice menu and hung up through the native call
+screen. The stock Messages app sent a carrier SMS over IMS and displayed the
+multipart reply. The phone returned to Android after the test.
+
+A separate RAM boot with native CommCenter and the default `cpufreq=1`
+completed a 120-second sample with no `vmd` process. Native CommCenter reported
+the baseband booted, and the TCP probe succeeded with `en1` as the primary
+interface. During the first 40.1 seconds on the unlocked home screen, average
+XNU CPU load was 2.4%, the median CPU hotspot was 55.8°C, and the battery
+reading held at 38°C. The screen locked later in the run, so only that initial
+interval was used for the unlocked idle measurements. The phone returned to
+Android after the test.
+
 ## Known issue: Translate voice input
 
 On UMI running iOS 16.5 (20F66), Translate starts capturing microphone samples

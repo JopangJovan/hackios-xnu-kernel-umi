@@ -442,6 +442,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
+	# UMI's SDX55 integration supports voice and SMS but has no Visual Voicemail backend.
+	rm -f root/LaunchDaemons/com.apple.voicemail.vmd.plist
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
 # (it is the vendor's and never in the repository): the kernel's GPU bring-up, drivers/gpu/hakios.adreno.c, finds it in fw/
