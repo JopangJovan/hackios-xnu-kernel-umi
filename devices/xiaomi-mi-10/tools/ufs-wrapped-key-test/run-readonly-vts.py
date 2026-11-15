@@ -6,11 +6,12 @@ import shlex
 import subprocess
 
 
-def run(serial, helper, dex):
+def run(serial, helper, dex, direct_keymaster):
     adb = ["adb", "-s", serial]
     token = secrets.token_hex(4)
     root = "/dev/umi-wrapped-vts-" + token
     mapping = "umi_wrapped_vts_" + token
+    probe = "DirectStorageProbe" if direct_keymaster else "ReadOnlyWrappedVts"
 
     def shell(script, data=None, timeout=15, capture=False):
         return subprocess.run(
@@ -40,7 +41,7 @@ def run(serial, helper, dex):
             f"CLASSPATH={root}/classes.dex TMPDIR={root} /system/bin/app_process64 "
             f"-Xusejit:false -Xnoimage-dex2oat -Xhidden-api-policy:disabled "
             f"-Djava.io.tmpdir={root} /system/bin "
-            f"ReadOnlyWrappedVts {root}/read-compare-input {token}",
+            f"{probe} {root}/read-compare-input {token}",
             timeout=60,
         )
     finally:
@@ -60,8 +61,9 @@ def main():
     parser.add_argument("--serial", required=True, help="Android ADB serial")
     parser.add_argument("--helper", required=True, type=Path, help="ARM64 read-compare-input binary")
     parser.add_argument("--dex", required=True, type=Path, help="Compiled classes.dex")
+    parser.add_argument("--direct-keymaster", action="store_true", help="Run the HIDL import and AES-XTS controls")
     args = parser.parse_args()
-    run(args.serial, args.helper, args.dex)
+    run(args.serial, args.helper, args.dex, args.direct_keymaster)
 
 
 if __name__ == "__main__":

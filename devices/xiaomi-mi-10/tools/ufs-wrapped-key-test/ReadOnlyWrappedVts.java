@@ -213,9 +213,14 @@ public class ReadOnlyWrappedVts {
     }
 
     static Sample readSample(String helper, String token, byte[] hardwareKey) throws Exception {
+        return readSample(helper, token, "wrapped", hardwareKey);
+    }
+
+    static Sample readSample(String helper, String token, String mode, byte[] hardwareKey)
+            throws Exception {
         Sample sample = new Sample();
         byte[] input = (hex(hardwareKey) + "\n").getBytes("US-ASCII");
-        Process process = new ProcessBuilder(helper, token)
+        Process process = new ProcessBuilder(helper, mode, token)
             .redirectError(ProcessBuilder.Redirect.INHERIT).start();
         boolean ok = false;
         try {
@@ -225,7 +230,7 @@ public class ReadOnlyWrappedVts {
                 pipe.readFully(sample.data);
                 if (pipe.read() != -1) throw new IllegalStateException("Extra readback data");
             }
-            if (process.waitFor() != 0) throw new IllegalStateException("wrapped readback helper failed");
+            if (process.waitFor() != 0) throw new IllegalStateException(mode + " readback helper failed");
             if (Arrays.equals(sample.raw, sample.data)) throw new IllegalStateException("Readback did not decrypt data");
             ok = true;
             return sample;

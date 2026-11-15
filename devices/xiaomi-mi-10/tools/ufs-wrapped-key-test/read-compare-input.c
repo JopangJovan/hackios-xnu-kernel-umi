@@ -45,9 +45,13 @@ static int send_sample(const void *buf) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
+    if (argc != 3) return 2;
     signal(SIGPIPE, SIG_IGN);
-    const char *suffix = argv[1];
+    const char *mode = argv[1];
+    int wrapped = !strcmp(mode, "wrapped");
+    int software = !strcmp(mode, "software");
+    if (!wrapped && !software && strcmp(mode, "inline-raw")) return 2;
+    const char *suffix = argv[2];
     if (strlen(suffix) != 8 || strspn(suffix, "0123456789abcdef") != 8) return 2;
 
     char resolved[PATH_MAX];
@@ -60,7 +64,7 @@ int main(int argc, char **argv) {
     key[strcspn(key, "\n")] = '\0';
     size_t key_len = strlen(key);
     if (strspn(key, "0123456789abcdef") != key_len || key_len < 128 || key_len > 256 ||
-        (key_len % 2))
+        (key_len % 2) || (!wrapped && key_len != 128))
         return 2;
 
     int fd = open("/dev/device-mapper", O_RDWR | O_CLOEXEC);
@@ -82,15 +86,16 @@ int main(int argc, char **argv) {
     init(&table.io, sizeof(table), name);
     table.io.flags = DM_READONLY_FLAG;
     table.io.target_count = 1;
-    strcpy(table.spec.target_type, "default-key");
+    strcpy(table.spec.target_type, software ? "crypt" : "default-key");
     table.spec.length = SECTORS;
     int n = snprintf(table.params, sizeof(table.params), "aes-xts-plain64 %s 0 " RAW
-                     " 0 3 sector_size:4096 iv_large_sectors wrappedkey_v0", key);
+                     " 0 %d sector_size:4096 iv_large_sectors%s",
+                     key, wrapped ? 3 : 2, wrapped ? " wrappedkey_v0" : "");
     explicit_bzero(key, sizeof(key));
     table.spec.next = (sizeof(table.spec) + n + 1 + 7) & ~7u;
     table.io.data_size = sizeof(table.io) + table.spec.next;
     if (ioctl(fd, DM_TABLE_LOAD, &table) < 0) {
-        perror("read-only default-key DM_TABLE_LOAD");
+        perror("read-only DM_TABLE_LOAD");
         goto cleanup;
     }
     explicit_bzero(&table, sizeof(table));
@@ -114,7 +119,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Expected a verified read-only 1 MiB DM device\n");
         goto cleanup;
     }
-    fprintf(stderr, "Kernel confirmed the wrapped mapping is read-only\n");
+    fprintf(stderr, "Kernel confirmed the %s mapping is read-only\n", mode);
 
     raw = open(RAW, O_RDONLY | O_DIRECT | O_CLOEXEC);
     if (raw < 0) { perror("open native UFS read-only"); goto cleanup; }
@@ -144,7 +149,7 @@ cleanup:
     if (raw >= 0) close(raw);
     init(&io, sizeof(io), name);
     if (ioctl(fd, DM_DEV_REMOVE, &io) < 0) { perror("remove temporary mapping"); result = 1; }
-    else fprintf(stderr, "Removed wrapped test mapping\n");
+    else fprintf(stderr, "Removed %s test mapping\n", mode);
     close(fd);
     return result;
 }
