@@ -92,3 +92,35 @@ Output: `out/umi-boot.img`, containing UMI UEFI and its USB-resident EFI loader.
 Test with `fastboot boot`, never `fastboot flash`.
 The UEFI sources live in `files/`; firmware modules remain in ignored
 `Mu-Silicium/Binaries/umi`. Update `files/` after source changes in Mu-Silicium.
+
+## Read-only UFS survey
+
+The UMI loader accepts a local `umi-ufs-driver` payload entry. In this mode it
+waits at the USB command interface. `oem survey` checks the dependencies of
+the phone's own `UFSDxe.efi`, starts the driver from RAM, then reads the
+primary and backup GPT headers and entry arrays through UEFI Block I/O. The
+loader limits USB commands to the survey, log retrieval, variable queries and
+reboot. The survey reads GPT only and does not start an OS or enable the
+partition or filesystem drivers in the UEFI build.
+
+Build the UMI loader as usual. From the repository root, use the UMI FD and
+`UFSDxe.efi` extracted from your own phone's XBL as described above:
+
+```sh
+python3 xnuloader/mkpayload.py --usb -o umi-ufs-survey.payload \
+    loader.efi=out/xiaomi-mi-10/loader.efi "umi-ufs-driver=$UMI_UFS_DXE"
+UEFI_TARGET=umi FD_BASE=0x9fc00000 FD_SIZE=0x300000 PAYLOAD_BASE=0xf0000000 \
+    UEFI_FD="$UMI_UEFI_FD" DTB=devices/xiaomi-mi-10/prebuilt/device-tree.dtb \
+    python3 devices/xiaomi-mi-10/tools/mkimage.py -p umi-ufs-survey.payload -o umi-ufs-survey.img
+fastboot boot umi-ufs-survey.img
+fastboot getvar product  # wait for xnuloader
+fastboot oem survey
+fastboot oem log
+fastboot get_staged umi-ufs-survey.log
+fastboot reboot
+```
+
+The 2026-11-15 run enumerated six UFS logical units with 4 KiB blocks. Both
+GPT headers and both entry arrays on each unit passed CRC checks against
+Android's view. Android booted normally afterwards and the SHA-256 hashes of
+all 12 GPT regions were identical across the test.

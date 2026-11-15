@@ -55,7 +55,10 @@ typedef struct {
 	void *install_protocol_interface, *reinstall_protocol_interface, *uninstall_protocol_interface;
 	efi_status (EFIAPI *handle_protocol)(efi_handle h, const efi_guid *guid, void **iface);
 	void *reserved, *register_protocol_notify, *locate_handle, *locate_device_path, *install_configuration_table;
-	void *load_image, *start_image, *exit, *unload_image;
+	efi_status (EFIAPI *load_image)(uint8_t boot_policy, efi_handle parent, const void *device_path,
+	    const void *source, uint64_t size, efi_handle *image);
+	efi_status (EFIAPI *start_image)(efi_handle image, uint64_t *exit_size, char16 **exit_data);
+	void *exit, *unload_image;
 	efi_status (EFIAPI *exit_boot_services)(efi_handle image, uint64_t map_key);
 	void *get_next_monotonic_count;
 	efi_status (EFIAPI *stall)(uint64_t microseconds);

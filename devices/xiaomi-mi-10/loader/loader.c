@@ -1307,20 +1307,20 @@ ufs_crc32(const uint8_t *p, uint64_t n)
  * both come out right -- the one check here that does not depend on having the same images.
  */
 static void
-ufs_check_gpt(efi_block_io *bio, uint64_t unit)
+ufs_check_gpt(efi_block_io *bio, uint64_t unit, uint64_t lba)
 {
 	uint64_t bs = bio->media->block_size, entries_lba, count, size, bytes, read;
 	uint32_t header_size, header_crc, entries_crc, got_header, got_entries;
 	uint8_t header[512];
 
-	if (bs < 512 || bs > sizeof(ufs_buffer) ||
-	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, ufs_buffer))) {
-		print("ufs: unit %d: the GPT header could not be read\n", unit);
+	if (bs < 512 || bs > sizeof(ufs_buffer) || lba > bio->media->last_block ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, lba, bs, ufs_buffer))) {
+		print("ufs: unit %d LBA %d: the GPT header could not be read\n", unit, lba);
 		return;
 	}
 	if (ufs_buffer[0] != 'E' || ufs_buffer[1] != 'F' || ufs_buffer[2] != 'I' || ufs_buffer[3] != ' ' ||
 	    ufs_buffer[4] != 'P' || ufs_buffer[5] != 'A' || ufs_buffer[6] != 'R' || ufs_buffer[7] != 'T') {
-		print("ufs: unit %d: no GPT header in block 1\n", unit);
+		print("ufs: unit %d LBA %d: no GPT header\n", unit, lba);
 		return;
 	}
 	memcpy(header, ufs_buffer, sizeof(header));
@@ -1330,25 +1330,27 @@ ufs_check_gpt(efi_block_io *bio, uint64_t unit)
 	count = *(uint32_t *)(header + 80);
 	size = *(uint32_t *)(header + 84);
 	entries_crc = *(uint32_t *)(header + 88);
-	if (header_size < 92 || header_size > sizeof(header)) {
-		print("ufs: unit %d: GPT header size %d\n", unit, (uint64_t)header_size);
+	if (header_size < 92 || header_size > sizeof(header) || *(uint64_t *)(header + 24) != lba) {
+		print("ufs: unit %d LBA %d: invalid GPT header (size %d)\n", unit, lba, (uint64_t)header_size);
 		return;
 	}
 	*(uint32_t *)(header + 16) = 0;
 	got_header = ufs_crc32(header, header_size);
 	bytes = count * size;
 	if (bytes == 0 || bytes > sizeof(ufs_buffer)) {
-		print("ufs: unit %d: GPT header crc %s, a table of %d bytes not checked\n", unit,
+		print("ufs: unit %d LBA %d: GPT header crc %s, a table of %d bytes not checked\n", unit, lba,
 		    got_header == header_crc ? "right" : "WRONG", bytes);
 		return;
 	}
 	read = (bytes + bs - 1) / bs * bs;
-	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, entries_lba, read, ufs_buffer))) {
-		print("ufs: unit %d: the GPT table could not be read\n", unit);
+	if (read > sizeof(ufs_buffer) || entries_lba > bio->media->last_block ||
+	    read / bs - 1 > bio->media->last_block - entries_lba ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, entries_lba, read, ufs_buffer))) {
+		print("ufs: unit %d LBA %d: the GPT table could not be read\n", unit, lba);
 		return;
 	}
 	got_entries = ufs_crc32(ufs_buffer, bytes);
-	print("ufs: unit %d: GPT header crc %s (%x), table of %d entries crc %s (%x)\n", unit,
+	print("ufs: unit %d LBA %d: GPT header crc %s (%x), table of %d entries crc %s (%x)\n", unit, lba,
 	    got_header == header_crc ? "right" : "WRONG", (uint64_t)got_header, count,
 	    got_entries == entries_crc ? "right" : "WRONG", (uint64_t)got_entries);
 }
@@ -1446,7 +1448,7 @@ ufs_dump_super(efi_block_io *bio)
 }
 
 static void
-ufs_survey(void)
+ufs_survey(int gpt_only)
 {
 	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
 	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
@@ -1458,17 +1460,25 @@ ufs_survey(void)
 		for (uint64_t i = 0; i < count; i++) {
 			efi_block_io *bio;
 
-			if (EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) || bio->media->logical) {
+			if (EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) ||
+			    bio->media == NULL || bio->media->logical || !bio->media->present) {
 				continue;
 			}
 			print("ufs: unit %d: media %d, %d blocks of %d (%d MB), %s, align %d\n", units++,
 			    (uint64_t)bio->media->media_id, bio->media->last_block + 1, (uint64_t)bio->media->block_size,
 			    (bio->media->last_block + 1) * bio->media->block_size >> 20,
 			    bio->media->read_only ? "read only" : "writable", (uint64_t)bio->media->io_align);
-			ufs_check_gpt(bio, units - 1);
+			ufs_check_gpt(bio, units - 1, 1);
+			if (gpt_only) {
+				ufs_check_gpt(bio, units - 1, bio->media->last_block);
+			}
 		}
 		/* (the handle array is pool memory this function owns) */
 		BS->free_pool(handles);
+	}
+	if (gpt_only) {
+		print("ufs: %d raw units surveyed\n", units);
+		return;
 	}
 	/* the GPT partitions, with the hash of those there are images of */
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
@@ -2609,6 +2619,8 @@ struct payload_info {
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
 	const char *kernel_version;     /* kernel.ver: the version of the kernel in this payload (tools/kernel-version.py) */
+	const uint8_t *ufs_survey_driver;
+	uint32_t ufs_survey_driver_size;
 	int usb_mode;
 };
 
@@ -2689,6 +2701,9 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->kernel_version = text;                /* printed under the banner; the kernel gets it as hakios_kver */
 		} else if (str_eq(e->name, "checkpoint")) {
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
+		} else if (memcmp(e->name, "umi-ufs-driver", sizeof("umi-ufs-driver")) == 0) {
+			pi->ufs_survey_driver = p + sizeof(*e);
+			pi->ufs_survey_driver_size = e->size;
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
 		}
@@ -3301,7 +3316,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
 	}
 	if (ufs_requested >= 1) {
-		ufs_survey();
+		ufs_survey(0);
 	}
 	if (ufs_requested >= 2) {
 		block_start();
@@ -4142,6 +4157,40 @@ starts_with(const char *s, const char *prefix)
 	return 1;
 }
 
+/* The survey payload keeps the loader in USB mode, with no kernel handoff. */
+static const uint8_t *ufs_survey_driver;
+static uint32_t ufs_survey_driver_size;
+
+static void
+run_ufs_gpt_survey(void)
+{
+	/* Both protocols are listed in the UMI UFSDxe's DXE dependency expression. */
+	static const efi_guid dependencies[] = {
+		{ 0xf4e5c7d0, 0xd239, 0x47cb, { 0xaa, 0xcd, 0x7f, 0x66, 0xef, 0x76, 0x32, 0x38 } },
+		{ 0xfa5f306b, 0xf47d, 0x4ac4, { 0xa4, 0x7d, 0x88, 0x2f, 0x82, 0x04, 0xec, 0x30 } },
+	};
+	for (unsigned i = 0; i < sizeof(dependencies) / sizeof(dependencies[0]); i++) {
+		void *protocol;
+		efi_status status = BS->locate_protocol(&dependencies[i], NULL, &protocol);
+		if (EFI_ERROR(status)) {
+			print("UFSDxe dependency %d missing (%x)\n", (uint64_t)i, status);
+			return;
+		}
+	}
+
+	efi_handle driver;
+	efi_status status = BS->load_image(0, IMAGE, NULL, ufs_survey_driver, ufs_survey_driver_size, &driver);
+	print("UFSDxe LoadImage: %x\n", status);
+	if (EFI_ERROR(status)) {
+		return;
+	}
+	status = BS->start_image(driver, NULL, NULL);
+	print("UFSDxe StartImage: %x\n", status);
+	if (!EFI_ERROR(status)) {
+		ufs_survey(1);
+	}
+}
+
 /*
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
@@ -4149,6 +4198,25 @@ starts_with(const char *s, const char *prefix)
 static void
 fb_command(char *cmd)
 {
+	if (ufs_survey_driver != NULL) {
+		if (str_eq(cmd, "oem survey")) {
+			static int attempted;
+			if (attempted) {
+				fb_reply("FAIL", "survey already run");
+				return;
+			}
+			attempted = 1;
+			fb_reply("OKAY", "starting UFS survey");
+			run_ufs_gpt_survey();
+			return;
+		}
+		if (!starts_with(cmd, "getvar:") && !str_eq(cmd, "oem log") &&
+		    !str_eq(cmd, "upload") && !str_eq(cmd, "reboot")) {
+			fb_reply("FAIL", "command unavailable in GPT survey mode");
+			return;
+		}
+	}
+
 	/* a kernel runs on another core, with a live block or without one (running_live alone is NULL without) */
 	int busy = run_active;
 
@@ -4728,11 +4796,16 @@ efi_main(efi_handle image, efi_system_table *st)
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);
-	if (have_payload && pi.usb_mode) {
+	if (have_payload && (pi.usb_mode || pi.ufs_survey_driver != NULL)) {
+		ufs_survey_driver = pi.ufs_survey_driver;
+		ufs_survey_driver_size = pi.ufs_survey_driver_size;
 		if (!usb_start()) {
 			print("usb: cannot start the command channel; rebooting to Android\n");
 			flush_log();
 			reboot();
+		}
+		if (ufs_survey_driver != NULL) {
+			print("UMI UFS read-only survey ready for oem survey\n");
 		}
 		flush_log();
 		usb_command_loop();

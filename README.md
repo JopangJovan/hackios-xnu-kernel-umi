@@ -69,6 +69,14 @@ the phone to Android. The latest cellular call and SMS checks were on **2026-11-
 | SDX55 cellular calls | Outgoing calls from the Phone keypad and Recents, the system call screen, speaker switching, and hangup verified on iOS 16.5 | In-call keypad (DTMF) is pending. Incoming calls and microphone mute still need hardware verification. [Call setup and validation](devices/xiaomi-mi-10/README.md#sdx55-outbound-call-ram-test) |
 | Native CommCenter on SDX55 | Reads SIM readiness, the serving operator, and the active IPv4 Internet session as PDP 0 on `en1`. Disconnect, reconnect, calls, SMS, and browsing passed on the RAM test image. | The SDX55 driver owns session start and stop. [Scope and validation](devices/xiaomi-mi-10/README.md#native-commcenter-ram-test) |
 
+### Storage validation
+
+On 2026-11-15, a temporary UMI UEFI loaded the phone's own UFS driver and read
+the primary and backup GPT headers and entry arrays on all six logical units.
+Both sets of CRCs matched Android. SHA-256 hashes of all 12 GPT regions matched
+before and after the test, and the phone returned to Android. See the
+[read-only UFS survey](devices/xiaomi-mi-10/uefi/README.md#read-only-ufs-survey).
+
 ### Not yet
 
 - The other sensors behind the sensor DSP (accelerometer, gyroscope, light, proximity, pressure): the DSP reads their registry,
