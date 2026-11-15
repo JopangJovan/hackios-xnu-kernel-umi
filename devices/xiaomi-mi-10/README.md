@@ -87,6 +87,55 @@ The DMA completion is checked between two phase reads to reject refresh wraps.
 The wait sleeps through the known active scan interval and polls only near the
 idle boundary, rather than spinning a CPU core throughout the wait.
 
+## F2FS shrink and restore
+
+On 2026-11-15, the Mi 10 booted the stock and patched Android
+`4.19.325-20250429-73a8cedf-perf+` kernels in turn using `fastboot boot`.
+Both used the same RAM-only initramfs and test layout. An independent 512 MiB
+tmpfs-backed loop image used `dm-default-key` and `fscrypt` with synthetic raw
+keys. The final extent of an encrypted test file reached byte 411041792,
+past the proposed boundary at byte 402653184.
+
+| Kernel | After shrinking to 384 MiB | After restoring the original ciphertext image |
+|---|---|---|
+| Stock | The ioctl returned success. The SIT journal still referenced segment 184, and remount failed with `EUCLEAN`. | The full image hash and all eight file hashes matched. |
+| Patched | Read-only `fsck.f2fs` found no errors. The file extent moved inside the new boundary, the volume mounted directly, and all eight hashes matched. | The full image hash and all eight file hashes matched. |
+
+The patch drains the SIT journal during a resize checkpoint even when the
+dirty entry count is zero. The [source backport](android/f2fs-resize-sit-73a8cedf.patch)
+targets UMI Android kernel revision `73a8cedfee02256cb19a7974f0beadf95c580048`
+and follows [the upstream fix](https://kernel.googlesource.com/pub/scm/linux/kernel/git/chao/linux/+/a6ede405455106bf42164ec96fd84008c5aabdd9).
+The hardware test used equivalent ARM64 instructions in a temporary copy of
+the stock kernel image. The [image builder](tools/build-f2fs-test-boot.py)
+requires that exact stock kernel SHA-256 and a locally prepared gzip-compressed
+`newc` initramfs. It writes two host-side images for `fastboot boot`.
+
+Both temporary environments left Android partitions unmounted. After
+returning to Android, `/data` mounted normally. The primary and backup GPT
+regions of all six UFS units, the boot, recovery and vbmeta partitions, and
+four sampled Android files matched their earlier SHA-256 values. The proposed
+80 GiB allocation remains pending.
+
+### Hardware-wrapped keys
+
+A RAM loop probe returned `EOPNOTSUPP` when `dm-default-key` requested
+`wrappedkey_v0`. The Mi 10 exposes its built-in UFS controller and no
+independent block device with a compatible inline encryption path. A USB
+drive or RAM loop lacks access to the controller's keyslots, and the kernel
+[software fallback](https://android.googlesource.com/kernel/common/+/refs/tags/android15-6.6-2024-11_r15/Documentation/block/inline-encryption.rst)
+cannot use hardware-wrapped keys.
+
+The [AOSP metadata-encryption VTS test](https://android.googlesource.com/platform/test/vts-testcase/kernel/+/refs/heads/main/encryption/metadata_encryption_tests.cpp)
+can check decryption with an imported test key by reading through a temporary
+mapping over native storage. It does not exercise a shrink or restore. A
+separate full test can use a spare Mi 10 with dedicated native UFS test
+storage and synthetic keys generated or imported on that device. It would
+need to restore the fixture ciphertext at the original offsets, obtain a
+fresh ephemeral form of the test key after reboot, then verify the filesystem
+and file hashes. That would validate the recovery procedure on the spare
+device. The original phone's hardware-bound keys still require verification
+on that phone.
+
 ## Validation
 
 The kernel, Wi-Fi object, Mesa, userland images and UMI loader build. The actual

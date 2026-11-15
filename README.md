@@ -77,6 +77,13 @@ Both sets of CRCs matched Android. SHA-256 hashes of all 12 GPT regions matched
 before and after the test, and the phone returned to Android. See the
 [read-only UFS survey](devices/xiaomi-mi-10/uefi/README.md#read-only-ufs-survey).
 
+On the same device, a separate RAM-boot comparison reproduced an Android F2FS
+shrink failure when live blocks occupied the tail. The patched kernel shrank
+the 512 MiB encrypted fixture to 384 MiB, remounted it and verified all eight
+test files. Restoring the pre-shrink ciphertext image also passed its whole
+image and file hash checks. Recovery with hardware-wrapped keys remains
+unverified. See the [F2FS comparison and hardware test plan](devices/xiaomi-mi-10/README.md#f2fs-shrink-and-restore).
+
 ### Not yet
 
 - The other sensors behind the sensor DSP (accelerometer, gyroscope, light, proximity, pressure): the DSP reads their registry,
