@@ -214,6 +214,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -target arm64-apple-ios16.5 -Wall -Wextra -Werror -dynamiclib -fobjc-arc -framework Foundation \
 			-install_name /redwood/lib/umi-posterboard.dylib \
 			src/umi_posterboard.m -o obj/umi-posterboard.dylib
+		if [ "${UMI_COMMCENTER:-0}" = 1 ]; then
+			$DYN -target arm64-apple-ios16.5 -Wall -Wextra -Werror -dynamiclib -fobjc-arc \
+				-I../devices/xiaomi-mi-10/overlays/xnu/files/bsd \
+				-framework CoreFoundation -framework Foundation -framework CoreTelephony -framework IOKit \
+				-install_name /redwood/lib/umi-commcenter-boot.dylib \
+				src/umi_commcenter_boot.c src/umi_commcenter_state.m -o obj/umi-commcenter-boot.dylib
+		fi
 		if [ "${BLUETOOTH-0}" = 1 ]; then
 			$DYN -fblocks -framework CoreFoundation -framework IOKit -o obj/umi_bluetool src/umi_bluetool.c
 			$DYN -dynamiclib -install_name /redwood/lib/libhakios.bluetooth.dylib -framework CoreFoundation -framework IOKit -o obj/libhakios.bluetooth.dylib src/inject_bluetooth.c
@@ -517,6 +524,11 @@ umi_firmware() {
 # Include UMI assets in the small image used before iOS's root is mounted. They remain local
 # firmware inputs and are never committed to either source repository.
 umi_firmware root/fw
+if [ "${UMI_COMMCENTER:-0}" = 1 ]; then
+	install -m 0755 obj/umi-commcenter-boot.dylib root/lib/
+	printf '1\n' > root/etc/umi-commcenter
+	printf '%s\n' '/redwood/lib/umi-commcenter-boot.dylib CommCenter' >> root/etc/inject.conf
+fi
 if [ "${UMI_GPS:-0}" = 1 ]; then
 	mkdir -p root/sdx55m
 	for f in devcfg.mbn hyp.mbn tz.mbn aop.mbn acdb.mbn apps.mbn multi_image_qti.mbn multi_image.mbn xbl_cfg.elf sec.elf 514_0_0.mbn mbn_hw.dig mbn_sw.dig; do

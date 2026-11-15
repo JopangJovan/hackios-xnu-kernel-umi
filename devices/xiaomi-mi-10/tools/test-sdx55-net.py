@@ -18,6 +18,10 @@ with tempfile.TemporaryDirectory() as stage:
                                dev / "overlays/xnu/hakios.cell.patch")
     source = staged.read_text()
 source = "\n".join(line for line in source.splitlines() if not line.startswith("#include <"))
+# The host harness implements the narrow XNU ifnet API used by the adapter.
+net_source = (bsd / "dev/umi_sdx55_net.inc").read_text()
+source = source.replace('#include "umi_sdx55_net.inc"',
+    "\n".join(line for line in net_source.splitlines() if not line.startswith("#include <net/")))
 prefix = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -27,6 +31,7 @@ prefix = r'''
 #include <strings.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/umi_commcenter.h>
 #include <sys/umi_sdx55_net.h>
 
 #define LCK_GRP_DECLARE(name, desc) int name __attribute__((unused))
@@ -44,6 +49,21 @@ struct hakios_net_link {
 static const struct hakios_net_link *link;
 static bool linked;
 static bool allow_attach=true;
+struct if_bandwidths { uint64_t eff_bw, max_bw; };
+static struct test_ifnet { struct if_bandwidths output, input; } interface;
+typedef struct test_ifnet *ifnet_t;
+static int ifnet_find_by_name(const char *name, ifnet_t *result) {
+    if (!link || strcmp(name,"en1")) return ENXIO;
+    *result=&interface;
+    return 0;
+}
+static int ifnet_set_bandwidths(ifnet_t net, const struct if_bandwidths *out,
+    const struct if_bandwidths *in) {
+    net->output=*out;
+    net->input=*in;
+    return 0;
+}
+static void ifnet_release(ifnet_t net) {assert(net==&interface);}
 static bool hakios_net_attach(const struct hakios_net_link *l) {
     if (link || !allow_attach) return false;
     link=l;return true;
@@ -89,6 +109,15 @@ int main(int argc, char **argv)
     assert(umi_sdx55_net_dequeue(packet,2)==0);
     assert(umi_sdx55_net_dequeue(packet,sizeof(packet))==20);
     assert(!memcmp(packet,frame+14,20) && !ipa_tx);
+    struct umi_pdp_throughput rates = {65,135,25,35};
+    assert(umi_sdx55_net_report_throughput(&rates)==0);
+    assert(interface.output.max_bw==65 && interface.input.max_bw==135 &&
+           interface.output.eff_bw==25 && interface.input.eff_bw==35);
+    assert(link->transmit(frame,34));
+    umi_sdx55_net_hold_tx(true);
+    assert(!link->transmit(frame,34) && !umi_sdx55_net_dequeue(packet,sizeof(packet)));
+    umi_sdx55_net_hold_tx(false);
+    assert(link->transmit(frame,34) && umi_sdx55_net_dequeue(packet,sizeof(packet))==20);
     frame[17]=90;
     assert(!link->transmit(frame,sizeof(frame)));
     frame[17]=20;
@@ -115,6 +144,7 @@ int main(int argc, char **argv)
     for(unsigned i=0;i<16;i++) assert(link->transmit(frame,34));
     assert(!link->transmit(frame,34) && !ipa_tx); /* finite queue */
     umi_sdx55_net_down();
+    assert(umi_sdx55_net_report_throughput(&rates)==ENETDOWN);
     assert(!linked && !link->transmit(frame,34) && !umi_sdx55_net_receive(frame+14,20));
     assert(!umi_sdx55_net_dequeue(packet,sizeof(packet)));
     /* Another backend cannot hijack the unit, including while link is down. */

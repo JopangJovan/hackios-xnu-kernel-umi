@@ -66,6 +66,7 @@ the phone to Android. The latest cellular call and SMS checks were on **2026-11-
 | Bluetooth (QCA6390 over H4, `umi_bt=1`) | the controller's firmware loads, the H4 endpoint is ready, iOS's bluetoothd scans | pairing and audio are not verified |
 | Compass accuracy | the dial follows the phone; hard iron is calibrated by one closed flat turn | the mapping of the sensor's X/Y axes to the phone's frame still needs correcting; without the SLPI fused orientation the heading assumes the phone lies flat |
 | SDX55 cellular calls | Outgoing calls from the Phone keypad and Recents, the system call screen, speaker switching, and hangup verified on iOS 16.5 | In-call keypad (DTMF) is pending. Incoming calls and microphone mute still need hardware verification. [Call setup and validation](devices/xiaomi-mi-10/README.md#sdx55-outbound-call-ram-test) |
+| Native CommCenter on SDX55 | Reads SIM readiness, the serving operator, and the active IPv4 Internet session as PDP 0 on `en1`. Disconnect, reconnect, calls, SMS, and browsing passed on the RAM test image. | The SDX55 driver owns session start and stop. [Scope and validation](devices/xiaomi-mi-10/README.md#native-commcenter-ram-test) |
 
 ### Not yet
 

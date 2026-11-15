@@ -34,6 +34,7 @@
 #include "umi_sdx55_sms_wire.h"
 #include <sys/umi_sdx55_net.h>
 #include <sys/umi_sdx55_cell_status.h>
+#include <sys/umi_commcenter.h>
 #include "umi_sdx55_sbl1.inc"
 #include "umi_sdx55_ddr.inc"
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
@@ -2962,6 +2963,7 @@ umi_sdx55_cell_session(struct umi_mhi *host)
 		first_error = EAGAIN;
 	} while (mach_absolute_time() < deadline);
 	hakios_tl("UMI SDX55: cellular online errno=%d restore_mode=%d\n", first_error, restore_mode);
+	if (!first_error && call == 1) umi_commcenter_start();
 	for (unsigned i = 0; !host->poisoned && i < sizeof(sdx55_services)/sizeof(sdx55_services[0]); i++) {
 		int query_error = sdx55_read_cell_service(host, &sdx55_services[i]);
 		/* The data path repeats UIM/NAS during its registration window. */
@@ -2983,6 +2985,7 @@ umi_sdx55_cell_session(struct umi_mhi *host)
 		first_error = sdx55_run_data_call(host, seconds);
 		sdx55_data_state(UMI_DATA_UNAVAILABLE);
 	}
+	umi_commcenter_stop();
 	int restore = umi_sdx55_restore_mode(host, restore_mode);
 	return restore ? restore : first_error;
 }

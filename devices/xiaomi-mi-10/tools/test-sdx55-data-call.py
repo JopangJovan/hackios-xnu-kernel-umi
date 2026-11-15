@@ -27,6 +27,15 @@ struct umi_mhi { bool poisoned; };
 static void sdx55_voice_begin(void) {}
 static void sdx55_voice_tick(struct umi_mhi *host) {(void)host;}
 static void sdx55_voice_finish(struct umi_mhi *host) {(void)host;}
+static void sdx55_sms_tick(struct umi_mhi *host) {(void)host;}
+static void sdx55_sms_finish(struct umi_mhi *host) {(void)host;}
+static struct { unsigned subscription; } sms_worker;
+static struct { unsigned nas_subscription; } cell_view;
+#define lck_mtx_lock(lock) ((void)0)
+#define lck_mtx_unlock(lock) ((void)0)
+static unsigned cc_starts, cc_stops;
+static void umi_commcenter_start(void) { cc_starts++; }
+static void umi_commcenter_stop(void) { cc_stops++; }
 static struct { bool enabled; } sdx55_audio_pd;
 static bool sdx55_voice_diag_enabled(void) {return false;}
 static int sdx55_modem_diag_start(struct umi_mhi *host) {(void)host; return 0;}
@@ -128,11 +137,14 @@ static int run(int sim,int occupied,int fault) {
 static void snapshot_retry(unsigned service) {
     struct umi_mhi h={0};
     initial_transient=service; starts=stops=0;
+    cc_starts=cc_stops=0;
     opt_call=1;
     assert(umi_sdx55_cell_session(&h)==0 && starts==1 && stops==1);
+    assert(cc_starts==1 && cc_stops==1);
     initial_transient=service; starts=stops=0;
     opt_call=0;
     assert(umi_sdx55_cell_session(&h)==EIO && !starts);
+    assert(cc_starts==1 && cc_stops==2);
 }
 int main(void) {
     assert(run(0,0,0)==ENODEV && !starts && !stops && !net_up && !sets && closed==1);

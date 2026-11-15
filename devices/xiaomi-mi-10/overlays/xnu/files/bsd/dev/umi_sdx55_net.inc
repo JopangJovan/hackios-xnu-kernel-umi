@@ -2,7 +2,11 @@
  * Ethernet framing. No MHI addresses, DMA buffers or callbacks survive
  * inside ifnet. The mission worker is the only queue consumer. */
 #include <sys/errno.h>
+#include <sys/umi_commcenter.h>
 #include <sys/umi_sdx55_net.h>
+#include <net/if.h>
+#include <net/kpi_interface.h>
+#include <net/if_var_private.h>
 
 #define SDX55_NET_MTU (HAKIOS_NET_FRAME_MAX - 14u)
 #define SDX55_NET_QUEUE 16u
@@ -11,6 +15,7 @@ static struct {
 	uint8_t bytes[SDX55_NET_MTU];
 } sdx55_tx_queue[SDX55_NET_QUEUE];
 static unsigned sdx55_head, sdx55_count;
+static unsigned sdx55_tx_holds;
 
 static const struct hakios_net_link sdx55_link = {
 	.name = "SDX55 PCIe",
@@ -35,7 +40,7 @@ sdx55_enqueue_locked(const uint8_t *p, size_t length)
 {
 	size_t total = sdx55_ipv4_size(p, length);
 	if (!total || total > session.mtu || get32(p + 12) != session.address ||
-	    sdx55_count == SDX55_NET_QUEUE) return false;
+	    sdx55_tx_holds || sdx55_count == SDX55_NET_QUEUE) return false;
 	unsigned tail = (sdx55_head + sdx55_count) % SDX55_NET_QUEUE;
 	memcpy(sdx55_tx_queue[tail].bytes, p, total);
 	sdx55_tx_queue[tail].size = (uint16_t)total;
@@ -48,7 +53,7 @@ umi_sdx55_net_dequeue(void *out, size_t capacity)
 {
 	size_t size = 0;
 	lck_mtx_lock(&cell_lock);
-	if (sdx55_attached && session.up && sdx55_count && out &&
+	if (sdx55_attached && session.up && !sdx55_tx_holds && sdx55_count && out &&
 	    capacity >= sdx55_tx_queue[sdx55_head].size) {
 		size = sdx55_tx_queue[sdx55_head].size;
 		memcpy(out, sdx55_tx_queue[sdx55_head].bytes, size);
@@ -57,6 +62,43 @@ umi_sdx55_net_dequeue(void *out, size_t capacity)
 	}
 	lck_mtx_unlock(&cell_lock);
 	return size;
+}
+
+void
+umi_sdx55_net_hold_tx(bool hold)
+{
+	lck_mtx_lock(&cell_lock);
+	if (hold) {
+		sdx55_tx_holds++;
+		sdx55_head = sdx55_count = 0;
+	} else if (sdx55_tx_holds) {
+		sdx55_tx_holds--;
+	}
+	lck_mtx_unlock(&cell_lock);
+}
+
+int
+umi_sdx55_net_report_throughput(const struct umi_pdp_throughput *rates)
+{
+	struct if_bandwidths output = {
+		.eff_bw = rates->output_effective, .max_bw = rates->output_max
+	};
+	struct if_bandwidths input = {
+		.eff_bw = rates->input_effective, .max_bw = rates->input_max
+	};
+
+	lck_mtx_lock(&cell_attach_lock);
+	lck_mtx_lock(&cell_lock);
+	bool up = sdx55_attached && session.up;
+	lck_mtx_unlock(&cell_lock);
+	ifnet_t interface = NULL;
+	int error = up ? ifnet_find_by_name("en1", &interface) : ENETDOWN;
+	if (!error) {
+		error = ifnet_set_bandwidths(interface, &output, &input);
+		ifnet_release(interface);
+	}
+	lck_mtx_unlock(&cell_attach_lock);
+	return error;
 }
 
 bool

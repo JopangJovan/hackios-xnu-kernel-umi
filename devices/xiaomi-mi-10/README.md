@@ -144,6 +144,34 @@ the modem registered. The iOS 16.5 (20F66) status bar derives its signal bars
 from the modem's RSRP. The cellular profile starts the external modem after
 the SLPI magnetometer produces its first sample or the startup wait expires.
 
+## Native CommCenter RAM test
+
+The experimental iOS 16.5 (20F66) bridge lets Apple's CommCenter attach to the
+already started SDX55. CoreTelephony reads SIM presence and readiness from the
+modem's UIM state and the serving operator name from its NAS state. The bridge
+maps one unambiguous physical SIM to the first logical iOS line. The Internet
+query reports PDP 0 on `en1` when the selected SDX55 data session is up and
+`en1` has a usable IPv4 address.
+
+The SDX55 driver still establishes and closes the WDS session and owns modem
+power and reset. CommCenter reports the session state through its native APIs.
+The existing cellular data controls request changes through the SDX55 driver.
+`UMI_COMMCENTER=1` includes the bridge in a UMI userland build. The RAM test
+also explicitly loads the stock CommCenter job after the SDX55 comes online.
+
+On 2026-11-15, an independent CoreTelephony client reported one active
+subscription, a ready SIM, the same operator name as NAS, and an active
+IPv4 PDP 0 on `en1`. With cellular data disabled, PDP 0 became inactive.
+After re-enabling data and obtaining an IPv4 address, it became active again
+on `en1`. A default-route TCP connection also passed with native CommCenter
+running.
+
+On the same native CommCenter test image, Safari loaded a new page with Wi-Fi
+disabled. Phone called 10010 from the green keypad button, played the carrier
+menu, and hung up through the native full-screen interface. Messages sent an
+ordinary SMS to 10010 and displayed the automatic reply. The phone returned
+to Android after testing.
+
 ## SDX55 outbound call RAM test
 
 Build the UMI loader and userland with the mobile data inputs above, using
