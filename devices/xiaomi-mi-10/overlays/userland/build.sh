@@ -534,6 +534,13 @@ with target.open('wb') as f:
     plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
 PY
 	fi
+	if [ "${UMI_SMS:-0}" = 1 ]; then
+		$DYN -target arm64-apple-ios16.5 -Wall -Wextra -Werror -dynamiclib -fobjc-arc -framework Foundation \
+			-install_name /redwood/lib/umi-sms.dylib \
+			-I../devices/xiaomi-mi-10/overlays/xnu/files/bsd \
+			src/umi_sms_imagent.m -o root/lib/umi-sms.dylib
+		printf '%s\n' '/redwood/lib/umi-sms.dylib imagent' >> root/etc/inject.conf
+	fi
 fi
 
 # Segment names are device-specific. UMI's signed MDT references adsp.b00 through adsp.b18,

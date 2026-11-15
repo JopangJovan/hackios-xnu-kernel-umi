@@ -33,7 +33,7 @@ Its status follows.
 ## Xiaomi Mi 10 (UMI, Snapdragon 865): status
 
 These features were checked in RAM sessions on the phone (`fastboot boot`). A reboot returns
-the phone to Android. The latest cellular call check was on **2026-11-15**. The default boot arguments are
+the phone to Android. The latest cellular call and SMS checks were on **2026-11-15**. The default boot arguments are
 [`devices/xiaomi-mi-10/boot.args`](devices/xiaomi-mi-10/boot.args); building and running are described in
 [devices/xiaomi-mi-10/README.md](devices/xiaomi-mi-10/README.md).
 
@@ -53,6 +53,7 @@ the phone to Android. The latest cellular call check was on **2026-11-15**. The 
 | **Wi-Fi** (QCA6390 over PCIe/MHI): scanning, joining, browsing | `wifi=1` | **fixed 2026-11-07**, see below |
 | **Compass** (ak0991x magnetometer behind the sensor DSP, SLPI) | `slpi=1 slpi_attach=1` | **working 2026-11-07**; limits below |
 | **SDX55 cellular data** | `UMI_CELLULAR=1` | Mobile data, network name, signal bars, and cellular data controls verified in RAM sessions. [Build and run](devices/xiaomi-mi-10/README.md#sdx55-mobile-data-ram-test) |
+| **SDX55 carrier SMS** | `UMI_CELLULAR=1 UMI_VOICE=1`, built with `UMI_GPS=1 UMI_SMS=1` | Stock Messages sent a text over IMS and displayed the carrier's multipart reply. [Setup and validation](devices/xiaomi-mi-10/README.md#sdx55-carrier-sms-in-messages) |
 | Models with up to 8 GiB of memory | — | |
 
 ### Partly working or experimental

@@ -30,7 +30,7 @@
 
 ## 小米 10（UMI，骁龙 865）：移植状态
 
-截至 **2026-11-07**。下面每一项都是在手机上的内存会话里验证的（`fastboot boot` 进内存，不刷写任何分区，重启后手机回到它自己的
+截至 **2026-11-15**。下面每一项都是在手机上的内存会话里验证的（`fastboot boot` 进内存，不刷写任何分区，重启后手机回到它自己的
 Android）。默认启动参数在 [`devices/xiaomi-mi-10/boot.args`](devices/xiaomi-mi-10/boot.args)；构建和运行方法见
 [devices/xiaomi-mi-10/README.md](devices/xiaomi-mi-10/README.md)。
 
@@ -49,6 +49,7 @@ Android）。默认启动参数在 [`devices/xiaomi-mi-10/boot.args`](devices/xi
 | 手电筒 | `torch=3` | 只用通道 0，最大 125 mA，连续 30 秒或电池 45 °C 自动关闭（[FLASHLIGHT.md](devices/xiaomi-mi-10/FLASHLIGHT.md)） |
 | **Wi-Fi**（QCA6390，PCIe/MHI）：扫描、连接、上网 | `wifi=1` | **2026-11-07 修复**，见下文 |
 | **指南针**（传感器 DSP（SLPI）后面的 ak0991x 磁力计） | `slpi=1 slpi_attach=1` | **2026-11-07 可用**，限制见下文 |
+| **SDX55 运营商短信** | 用 `UMI_GPS=1 UMI_SMS=1` 构建，以 `UMI_CELLULAR=1 UMI_VOICE=1` 启动 | iOS 16.5 自带「信息」通过 IMS 发出普通短信，并把 10010 的两段回复合并显示为一条。[构建和验证](devices/xiaomi-mi-10/README.md#sdx55-carrier-sms-in-messages) |
 | 最大 8 GiB 内存的机型 | — | |
 
 ### 部分可用或实验性
@@ -64,7 +65,6 @@ Android）。默认启动参数在 [`devices/xiaomi-mi-10/boot.args`](devices/xi
 
 - 传感器 DSP 后面的其他传感器（加速度计、陀螺仪、光线、距离、气压）：DSP 已经读取它们的 registry，但还没有提供给 iOS，所以没有
   自动旋转，也没有水平仪。
-- UMI 上的蜂窝网络（[docs/cellular.md](docs/cellular.md) 里的调制解调器工作是 POCO X5 Pro 的）。
 - Apple 的服务：不支持，也不是目标。
 
 ### 近期修复

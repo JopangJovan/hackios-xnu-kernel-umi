@@ -31,6 +31,7 @@
 #include "umi_sdx55_qmap.h"
 #include "umi_sdx55_ims.h"
 #include "umi_sdx55_voice_wire.h"
+#include "umi_sdx55_sms_wire.h"
 #include <sys/umi_sdx55_net.h>
 #include <sys/umi_sdx55_cell_status.h>
 #include "umi_sdx55_sbl1.inc"
@@ -1138,6 +1139,8 @@ static struct {
 static void sdx55_voice_announce(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 static void sdx55_voice_receive(uint32_t, uint32_t, uint32_t, const uint8_t *, size_t);
 static void sdx55_ims_receive(uint32_t, uint32_t, uint32_t, const uint8_t *, size_t);
+static void sdx55_sms_announce(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+static void sdx55_sms_receive(uint32_t, uint32_t, const uint8_t *, size_t);
 /* UMI netmgr / ds_get_epid: PCIe iface 4 for rmnet_mhi0, separate from netdev GET_EPID (0). */
 #define SDX55_PCIE_DATA_IFACE 4u
 #define SDX55_CELL_MUX 1u
@@ -1874,6 +1877,10 @@ umi_sdx55_qrtr_packet(void *context, const void *data, size_t size)
 		sdx55_cell_reply(src_node, src_port, payload, length);
 		return;
 	}
+	if (type == 1 && dst_port == SDX55_WMS_PORT) {
+		sdx55_sms_receive(src_node, src_port, payload, length);
+		return;
+	}
 	if (type == 1 && (dst_port == SDX55_VOICE_PORT || dst_port == SDX55_IMSA_PORT || dst_port == SDX55_IMSS_PORT)) {
 		sdx55_voice_receive(dst_port, src_node, src_port, payload, length);
 		return;
@@ -2072,6 +2079,7 @@ umi_sdx55_qrtr_packet(void *context, const void *data, size_t size)
 	    type, service, instance, node, port);
 	sdx55_cell_announce(type, service, instance, node, port);
 	sdx55_voice_announce(type, service, instance, node, port);
+	sdx55_sms_announce(type, service, instance, node, port);
 	if (service == 2 && instance == 1 && port && (type == 4 ||
 	    (umi_sdx55_dms_node == node && umi_sdx55_dms_port == port))) {
 		umi_sdx55_dms_node = node;
@@ -2593,6 +2601,7 @@ sdx55_refresh_radio(struct umi_mhi *host, const struct sdx55_cell_endpoint *nas)
 #include "umi_sdx55_ims.inc"
 #include "umi_sdx55_voice_audio.inc"
 #include "umi_sdx55_voice.inc"
+#include "umi_sdx55_sms.inc"
 
 static int
 sdx55_move_packets(struct umi_mhi *host, uint64_t deadline, const struct sdx55_data_routes *routes,
@@ -2609,6 +2618,7 @@ sdx55_move_packets(struct umi_mhi *host, uint64_t deadline, const struct sdx55_d
 		if (!error) error = sdx55_flush_flow_acks(host);
 		if (error) break;
 		sdx55_voice_tick(host);
+		sdx55_sms_tick(host);
 		if (mach_absolute_time() >= check_status) {
 			error = sdx55_read_cell_service(host, &routes->wds);
 			if (!error && sdx55_query.wan.connection_status != 2) error = ENETDOWN;
@@ -2839,7 +2849,12 @@ sdx55_run_data_call(struct umi_mhi *host, unsigned seconds)
 	if (!error && !sdx55_data_routes_current(&routes)) error = ENXIO;
 	uint64_t deadline, refresh = 0;
 	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
-	if (!error) sdx55_voice_begin();
+	if (!error) {
+		sdx55_voice_begin();
+		lck_mtx_lock(&cell_status_lock);
+		sms_worker.subscription = cell_view.nas_subscription;
+		lck_mtx_unlock(&cell_status_lock);
+	}
 	while (!error && mach_absolute_time() < deadline) {
 		if (!sdx55_data_routes_current(&routes) || !sdx55_cell_endpoint_current(&nas)) {
 			error = ENXIO;
@@ -2854,10 +2869,12 @@ sdx55_run_data_call(struct umi_mhi *host, unsigned seconds)
 		else {
 			if (sdx55_radio.state != UMI_DATA_OFF) sdx55_data_state(UMI_DATA_OFF);
 			sdx55_voice_tick(host);
+			sdx55_sms_tick(host);
 			error = umi_sdx55_poll_loc(host, 100);
 		}
 	}
 	sdx55_voice_finish(host);
+	sdx55_sms_finish(host);
 	/* A lost START reply can leave a modem-owned session with an unknown
 	 * handle. Closing this client's QRTR port releases its resources. */
 	if (!host->poisoned) {
@@ -3002,6 +3019,9 @@ umi_sdx55_mission_session(struct umi_mhi *host, bool open_efs, bool cellular)
 	uint32_t fix_seconds;
 	bool location = !cellular || PE_parse_boot_argn("sdx55_fix_secs", &fix_seconds, sizeof(fix_seconds));
 	memset(&sdx55_query, 0, sizeof(sdx55_query));
+	bzero(&sms_worker, sizeof(sms_worker));
+	sms_endpoint.port = sms_endpoint.node = 0;
+	sms_worker.enabled = cellular;
 	for (unsigned i = 0; i < sizeof(sdx55_services)/sizeof(sdx55_services[0]); i++)
 		sdx55_services[i].port = sdx55_services[i].node = 0;
 	umi_sdx55_pdm_count = 0;
@@ -3361,6 +3381,14 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_voice_route,
 SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_voice_mute,
     CTLTYPE_STRUCT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
     sdx55_voice_mute_sysctl, "S,umi_voice_mute_status", "SDX55 in-call microphone mute");
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_sms,
+    CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+    sdx55_sms_sysctl, "S,umi_sms_snapshot", "SDX55 incoming SMS for imagent");
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_sms_send,
+    CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+    sdx55_sms_send_sysctl, "S,umi_sms_send_status", "SDX55 outgoing SMS for imagent");
 
 SYSCTL_PROC(_kern_hakios, OID_AUTO, sdx55_observe,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,

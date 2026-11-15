@@ -194,3 +194,76 @@ with the 10010 system.
 `python3 devices/xiaomi-mi-10/tools/test-sdx55-voice.py` and
 `python3 devices/xiaomi-mi-10/tools/test-sdx55-ims.py` exercise the call
 worker and IMS data session with a simulated modem.
+
+## SDX55 carrier SMS in Messages
+
+The stock Messages app on iOS 16.5 (20F66) sends and receives ordinary 3GPP
+text messages through the UMI's physical SIM. The bridge uses private iOS
+interfaces verified against this build.
+
+### Build and run
+
+Build the UMI kernel and loader as above. Use the same local SDX55 firmware
+and modem snapshots as the mobile data test. Build a matching userland with
+both `UMI_GPS=1` and `UMI_SMS=1` to load the SMS bridge only in `imagent`.
+When building a combined SMS and Phone image, also supply `UMI_CALLSERVICESD`
+and the handset calibration described in the outbound call section.
+
+```sh
+UMI_GPS=1 UMI_SMS=1 devices/xiaomi-mi-10/build-userland.sh
+devices/xiaomi-mi-10/run.sh reload
+devices/xiaomi-mi-10/run.sh ramdisk
+UMI_CELLULAR=1 UMI_VOICE=1 XL_SECS=3600 devices/xiaomi-mi-10/run.sh run
+```
+
+The SMS bridge is available during the 600-second SDX55 session. After
+`SMS receive ready` and IMS registration appear in the loader log, open
+Messages and send an ordinary text to one number using the green Send button.
+Check for the text on the destination phone, then reply and verify that the
+reply appears in Messages. Save the loader log, end the RAM session with
+`devices/xiaomi-mi-10/run.sh stop`, and use `devices/xiaomi-mi-10/run.sh reboot`
+if the handset is still at the loader.
+
+### SMS transport and Messages integration
+
+- **Sending.** When CommCenter has no active subscription for Messages,
+  `imagent` uses the SIM slot that the modem worker bound to Wireless
+  Messaging Service (WMS). The bridge encodes the original text as GSM
+  7-bit or Unicode, splits it at character boundaries as needed, and submits
+  each part via QMI WMS Raw Send. It selects SMS over IMS when IMS is
+  registered on that subscription. It reports the result through Messages'
+  original completion callback after all parts are accepted or a part fails.
+  Waiting for the network reply leaves the modem worker free to service calls.
+  There is no automatic retransmission after a timeout.
+- **Receiving.** The modem worker delivers validated SMS-DELIVER records to
+  the stock Messages service and restores the modem's receive routes when
+  the session ends. The bridge decodes GSM 7-bit and Unicode, rejoins
+  concatenated parts, and acknowledges a transfer after Messages accepts
+  the text or its part is stored in the reassembly queue.
+- **Logs.** `SMS send result errno=0 qmi=0` records modem acceptance.
+  Confirm delivery by checking the other device or the service's reply.
+  `Messages completion accepted= 1` records acceptance of an incoming text
+  by Messages. The SMS diagnostics omit phone numbers and message bodies.
+
+### Validation and coverage
+
+On 2026-11-15, the UMI sent a single-part text to 10010 from Messages over
+IMS. WMS returned success and Messages completed the send. The carrier's
+two-part automatic reply was reassembled and displayed as one message in
+the same conversation. Stock Android on the same SIM also sent to 10010 and
+received a reply. After the iOS test the phone returned to Android.
+
+The host tests cover WMS framing and acknowledgments, receive route restore,
+GSM 7-bit and Unicode, and multipart encoding and decoding.
+
+```sh
+python3 devices/xiaomi-mi-10/tools/test-sdx55-sms.py
+python3 devices/xiaomi-mi-10/tools/test-sdx55-voice.py
+python3 devices/xiaomi-mi-10/tools/test-sdx55-ims.py
+```
+
+The verified path is ordinary single-recipient SMS over IMS. Multipart
+sending and SMS without IMS still need hardware verification. MMS, group
+messages and iMessage are outside the bridge's scope. The SMS test included
+IMS registration and host call checks. Hardware calls were verified separately
+in the outbound call test above.
