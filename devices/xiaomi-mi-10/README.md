@@ -98,6 +98,28 @@ iOS images booted on UMI; touch initialized, the GPU rendered apps at its
 confirmed that the build works, while scrolling skips/freezes remain. This
 source migration does not claim to resolve that remaining performance issue.
 
+## Screen Time and wallpaper storage
+
+On UMI's iOS 16.5 (20F66) RAM boot, PosterBoard's lookup for the wallpaper
+store returned the shared `/var/mobile/Library/Application Support` directory.
+A filesystem trace showed a wallpaper store reset removing ScreenTimeAgent's
+`com.apple.remotemanagementd/RMAdminStore-Local.sqlite` and its companion
+files. SQLite reported an I/O error, and Settings could crash when opening
+Screen Time.
+
+The UMI userland build creates the Screen Time database's parent directory
+at boot. It changes PosterBoard's wallpaper store URL to the
+`com.apple.PosterBoard` subdirectory when the original URL resolves to the
+shared directory. A container-specific URL passes through unchanged.
+PosterBoard continues to manage and reset the contents of its own store.
+The UMI kernel accepts the full startup library list by matching init's
+4 KiB configuration buffer.
+
+On 2026-11-15, the updated RAM image reached the home screen, and
+**Settings → Screen Time** opened without crashing on UMI. This check
+covered opening the page. Wallpaper editing and saving, Screen Time
+limits, and usage history still need separate validation.
+
 ## Known issue: Translate voice input
 
 On UMI running iOS 16.5 (20F66), Translate starts capturing microphone samples

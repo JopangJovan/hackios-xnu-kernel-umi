@@ -152,7 +152,8 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
 /redwood/lib/libhakios.tweaks.dylib Preferences
-/redwood/lib/libhakios.compass.dylib Compass"}
+/redwood/lib/libhakios.compass.dylib Compass
+/redwood/lib/umi-posterboard.dylib PosterBoard"}
 [ "${BLUETOOTH-0}" != 1 ] || INJECT="$INJECT
 /redwood/lib/libhakios.bluetooth.dylib bluetoothd"
 # STOREFRONT=1: and a library of ours inside appstored as well (src/inject_store.c). It is not in the
@@ -210,6 +211,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -z "$PREBUILT" ]; then
 		# ordinary dynamically linked programs of our own, built against the iOS SDK
 		$DYN -o obj/hello_dyn src/hello_dyn.c
+		$DYN -target arm64-apple-ios16.5 -Wall -Wextra -Werror -dynamiclib -fobjc-arc -framework Foundation \
+			-install_name /redwood/lib/umi-posterboard.dylib \
+			src/umi_posterboard.m -o obj/umi-posterboard.dylib
 		if [ "${BLUETOOTH-0}" = 1 ]; then
 			$DYN -fblocks -framework CoreFoundation -framework IOKit -o obj/umi_bluetool src/umi_bluetool.c
 			$DYN -dynamiclib -install_name /redwood/lib/libhakios.bluetooth.dylib -framework CoreFoundation -framework IOKit -o obj/libhakios.bluetooth.dylib src/inject_bluetooth.c
@@ -338,6 +342,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.compass.dylib ] && cp obj/libhakios.compass.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+	[ ! -f obj/umi-posterboard.dylib ] || cp obj/umi-posterboard.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
 		cp obj/HakiosAudio root/lib/HakiosAudio.driver/
@@ -388,6 +393,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
 	# the local Files provider's root; /private/var is a fresh ramfs, so make it on every boot.
 	printf 'd\t755\t501\t501\t/private/var/mobile/Documents\n' >> root/etc/var.skel
+	# ScreenTimeAgent opens the local Remote Management store through Core Data.
+	# Its parent directory may be absent from the installed iOS data template.
+	screen_time_store_dir='/private/var/mobile/Library/Application Support/com.apple.remotemanagementd'
+	if ! awk -F '\t' -v path="$screen_time_store_dir" '$1 == "d" && $5 == path { found = 1 } END { exit !found }' root/etc/var.skel; then
+		printf 'd\t700\t501\t501\t%s\n' "$screen_time_store_dir" >> root/etc/var.skel
+	fi
 	# A key of ours for root, when there is one: ssh/authorized_keys, never in the repository (like
 	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
 	# Wi-Fi, which saves rebuilding an image for every question one wants to ask a running iOS. It

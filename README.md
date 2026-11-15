@@ -42,6 +42,7 @@ the phone to Android. The latest cellular call and SMS checks were on **2026-11-
 | Area | Boot arguments | Notes |
 |---|---|---|
 | iOS 16.5 user space: lock screen, home screen, stock apps, Simplified Chinese resources | — | layer 2, built from your own IPSW |
+| Settings → Screen Time | — | Opens on iOS 16.5 after isolating the wallpaper store. [Cause and validation](devices/xiaomi-mi-10/README.md#screen-time-and-wallpaper-storage) |
 | Touch screen (FTS), multitouch, power and volume keys | `umi_touch=1 umi_keys=1` | |
 | All eight CPU cores at their frequencies | `cpus=8 cpufreq=1` | `bootcpu=7 cpus=7` instead, to fetch live logs over USB |
 | GPU rendering on the Adreno 650 (OpenGL ES through Mesa) | `gpu=1` | at the stock maximum of 587 MHz |
