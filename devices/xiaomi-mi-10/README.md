@@ -87,6 +87,22 @@ The DMA completion is checked between two phase reads to reject refresh wraps.
 The wait sleeps through the known active scan interval and polls only near the
 idle boundary, rather than spinning a CPU core throughout the wait.
 
+## Native USB pairing
+
+A temporary UMI image reached the iOS home screen and completed the stock
+**Trust This Computer** flow on 2026-11-17. An encrypted USB session read
+iOS 16.5 and the image's `iPhone10,3` / `D22AP` identity; i4Tools identified
+the connected device as an iPhone X running 16.5 (20F66). A reboot reused
+the pairing, and native `syslog_relay` delivered 720 KiB of logs in 20 seconds.
+A follow-up AFC test exported a 280,668-byte HEIC through i4Tools File
+Management; its bytes matched an independent read-only download and the
+image decoded successfully. The i4Tools Photos page remains blocked by
+the unactivated-device dialog. Native logs were also captured for 150 seconds.
+The previous black screen came from
+a modem-disabled helper still reserving CommCenter services with a diagnostic
+that could not finish. This is an isolated USB test, pending normal-build
+integration and cellular regression tests. [Findings, limits, and next checks](USB-PAIRING.md).
+
 ## F2FS shrink and restore
 
 On 2026-11-15, the Mi 10 booted the stock and patched Android

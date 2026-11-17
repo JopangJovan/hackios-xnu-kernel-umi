@@ -1,0 +1,67 @@
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -3073,6 +3073,20 @@
+ #endif /* CONFIG_COREDUMP */
+ 
+ /* Code Signing related routines */
++extern bool miniamfi_is_active(void);
++extern void loader_log_line(const char *);
++
++static void
++csops_pair_probe(proc_t target, int op, int error, size_t length)
++{
++    if (strcmp(proc_name_address(target), "lockdownd") == 0) {
++        char line[112];
++        snprintf(line, sizeof(line), "UMI pair: lockdownd csops %d errno %d blob length %lu\n",
++            op, error, (unsigned long)length);
++        loader_log_line(line);
++    }
++}
++
+ 
+ int
+ csops(__unused proc_t p, struct csops_args *uap, __unused int32_t *retval)
+@@ -3320,6 +3334,21 @@
+ 			goto out;
+ 		}
+ 
++		/*
++		 * The stand-in does not make OSEntitlements objects. The existing
++		 * CodeDirectory slot check validates this process's embedded XML.
++		 * Use it without allocating or modifying the signature's storage.
++		 */
++		if (miniamfi_is_active()) {
++			start = NULL;
++			length = 0;
++			error = csblob_get_entitlements(blob, &start, &length);
++			csops_pair_probe(pt, ops, error, length);
++			if (error == 0) {
++				error = csops_copy_token(start, length, usize, uaddr);
++			}
++			goto out;
++		}
+ 		void* osent = csblob_os_entitlements_get(blob);
+ 		if (!osent) {
+ 			goto out;
+@@ -3356,6 +3385,7 @@
+ 		}
+ 
+ 		error = csblob_get_der_entitlements(blob, (const CS_GenericBlob **)&start, &length);
++		csops_pair_probe(pt, ops, error, length);
+ 		if (error || start == NULL) {
+ 			if (amfi && csblob_os_entitlements_get(blob)) {
+ 				void* osent = csblob_os_entitlements_get(blob);
+--- a/libkern/amfi/miniamfi.c
++++ b/libkern/amfi/miniamfi.c
+@@ -262,3 +262,11 @@
+ 	amfi_interface_register(&miniamfi);
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, miniamfi_init);
++
++/* Whether the registered AMFI provider is the redwood stand-in. */
++bool miniamfi_is_active(void);
++bool
++miniamfi_is_active(void)
++{
++    return amfi == &miniamfi;
++}

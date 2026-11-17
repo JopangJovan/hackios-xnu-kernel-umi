@@ -69,6 +69,15 @@ the phone to Android. The latest cellular call and SMS checks were on **2026-11-
 | SDX55 cellular calls | Outgoing calls from the Phone keypad and Recents, the system call screen, speaker switching, and hangup verified on iOS 16.5 | In-call keypad (DTMF) is pending. Incoming calls and microphone mute still need hardware verification. [Call setup and validation](devices/xiaomi-mi-10/README.md#sdx55-outbound-call-ram-test) |
 | Native CommCenter on SDX55 | Reads SIM readiness, the serving operator, and the active IPv4 Internet session as PDP 0 on `en1`. Disconnect, reconnect, calls, SMS, and browsing passed on the RAM test image. | The SDX55 driver owns session start and stop. [Scope and validation](devices/xiaomi-mi-10/README.md#native-commcenter-ram-test) |
 
+The 2026-11-17 native USB test completed the system trust prompt, reused
+pairing across a reboot, and captured 720 KiB of iOS logs in 20 seconds.
+i4Tools displayed iPhone X and iOS 16.5 (20F66). A follow-up exported an
+existing HEIC photo through i4Tools File Management; its bytes matched a
+read-only AFC download and ImageIO decoded it successfully. The Photos
+page still stops at the unactivated-device dialog. This temporary build
+isolates USB from the modem; normal-build integration and cellular regression
+tests remain pending. [USB pairing findings](devices/xiaomi-mi-10/USB-PAIRING.md).
+
 ### Storage validation
 
 The single-slot UMI menu selected iOS 16.5 from RAM and reached the home

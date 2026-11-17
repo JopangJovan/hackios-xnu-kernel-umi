@@ -1,0 +1,16 @@
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -106,10 +106,13 @@
+ thread_call_t corefile_open_call = NULL;
+ #endif
+ 
++#include "umi-native-usb/native-usb-load.inc"
++
+ kern_return_t
+ IOKitBSDInit( void )
+ {
+ 	IOService::publishResource("IOBSD");
++	umi_start_native_usb_probe();
+ 
+ #if IOPOLLED_COREFILE
+ 	corefile_open_call = thread_call_allocate_with_options(IOOpenPolledCoreFile, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);

@@ -1,0 +1,55 @@
+{
+  "scope": "isolated 20F66 native USB checkpoint; not enabled in normal build",
+  "device_adapter": {
+    "repo": "https://github.com/rui12366B/UniXNU-gts7xlwifi.git",
+    "revision": "88b34f97100a01aab4ea6b86dc9c748b2114c382",
+    "source": "drivers/QcomDwc3/QcomDwc3Sm8250.cpp"
+  },
+  "prelink": {
+    "repo": "https://github.com/UniXNU/XnuPrelink.git",
+    "revision": "440589b0c31625f17edf363e24b3c82c51c70bb9",
+    "original_sha256": "5575714f9bb67b7ba39bde2278b5828095d8480260ab24de55ff24206e23e6db",
+    "slide": -16531456,
+    "components": [
+      "com.apple.driver.AppleUSBXDCI",
+      "com.apple.driver.AppleUSBDeviceMux"
+    ]
+  },
+  "patches": [
+    {
+      "patch": "miniamfi-entitlements.patch",
+      "path": "bsd/kern/kern_proc.c",
+      "before_sha256": "a202868fdd945367b1d100e4846c010d9e3826338bfb237fec949ae6e553891d",
+      "after_sha256": "782cc792d0cd4a1e298ea8cc8099777a3eb17cf601a77bcf271ffd7433e74105"
+    },
+    {
+      "patch": "miniamfi-entitlements.patch",
+      "path": "libkern/amfi/miniamfi.c",
+      "before_sha256": "071c9795555e436454605cc8e2d9c85cab882325fd8352adeb3132479538fee1",
+      "after_sha256": "ffe3b912bf97097f546dd58f32ca67e7d7344e0d6b96c14c708f01b48fef29c6"
+    },
+    {
+      "patch": "xdci-return.patch",
+      "path": "osfmk/arm64/loader_return.c",
+      "before_sha256": "bfb7adeedbe2506bb2639c0d5fcd6b49b621bdc37b3055ee3815ba9b9fdc5647",
+      "after_sha256": "fca6a11902f9200ac544fef1949bd7266923ec4e1e674a726e8d5c4a3e5c1170"
+    },
+    {
+      "patch": "loader-handoff.patch",
+      "path": "loader.c",
+      "before_sha256": "6a5b839492f7688ff5c0179deb02d3b6c66c4527b9452c678e45ad0b29e61599",
+      "after_sha256": "a196f0b8fa07a06496d7205d71ae19bab49819f3df3ad3f6b9057d9241504c21"
+    },
+    {
+      "patch": "bsd-init.patch",
+      "path": "iokit/bsddev/IOKitBSDInit.cpp",
+      "before_sha256": "465132362c6719068c9f156692c0ab9f589e9bfddaedf4e5278652e9e7986d1a",
+      "after_sha256": "38a7fa3a3f2abf378696931ba77a5ae8d25c92aa2df63b558ec1a8f6c38d0e59"
+    }
+  ],
+  "verified_cases": [
+    "native-12",
+    "native-13",
+    "native-14"
+  ]
+}

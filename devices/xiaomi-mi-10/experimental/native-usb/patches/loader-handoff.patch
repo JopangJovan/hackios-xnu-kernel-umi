@@ -1,0 +1,153 @@
+--- a/loader.c
++++ b/loader.c
+@@ -1027,6 +1027,13 @@
+ static int run_active;
+ /* Set only after usb_start() owns the peripheral controller for this boot. */
+ static int usb_runtime_active;
++#ifdef LOADER_UMI
++static int umi_native_usb;
++static volatile uint32_t umi_usb_ownership __attribute__((aligned(64)));
++#define UMI_USB_RELEASED 0x58444349u
++static int umi_usb_park(void);
++static void umi_usb_recover(void);
++#endif
+ static uint64_t running_slide;
+ static void usb_poll_command(void);
+ 
+@@ -2883,7 +2890,7 @@
+ {
+ 	static const char *const allowed[] = {
+ 		"-v", "ufs_root=1", "debug=", "keepsyms=", "serial=", "cpus=", "bootcpu=",
+-		"loader_return_after=", "loader_reboot_after=1", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
++		"umixdci=", "loader_return_after=", "loader_reboot_after=1", "epoch=", "sb_delay=", "systrace=", "umi_touch=", "umi_keys=", "umifts_scan=",
+ 		/* Narrowly allow the existing frame-latency diagnostics on UMI. */
+ 		"touch_lat=1", "cpuload=1000", "thermal=2",
+ 		"torch=1", "torch=2", "torch=3", "cam=1", "cam=2", "cam=3", "cam=4", "cam=5", "cam=6", "cam=7", "cam=8", "cam=9", "cam=10", "cam=11", "cam=12", "cam_fake=1",
+@@ -3160,7 +3167,7 @@
+ 	}
+ 
+ 	/* --- kernel extent -------------------------------------------------- */
+-	uint64_t vm_lo = ~0ULL, vm_hi = 0, entry_va = 0;
++	uint64_t vm_lo = ~0ULL, vm_hi = 0, entry_va = 0, text_va = 0;
+ 	const struct load_command *lc = (const struct load_command *)(mh + 1);
+ 	for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const uint8_t *)lc + lc->cmdsize)) {
+ 		/*
+@@ -3193,6 +3200,9 @@
+ 				print("kernel: segment %d is outside the kernel or wraps\n", (uint64_t)i);
+ 				return 0;
+ 			}
++			if (str_eq(sg->segname, "__TEXT")) {
++				text_va = sg->vmaddr;
++			}
+ 			if (sg->vmaddr < vm_lo) {
+ 				vm_lo = sg->vmaddr;
+ 			}
+@@ -3206,7 +3216,7 @@
+ 	}
+ 	print("kernel va %x..%x entry %x\n", vm_lo, vm_hi, entry_va);
+ 	/* (a kernel that reaches more than the largest window past the virtual base is no kernel of this loader's) */
+-	if (vm_lo < KERNEL_VIRT_BASE + KERNEL_LINK_OFFSET || entry_va == 0 || vm_hi < vm_lo ||
++	if (vm_lo < KERNEL_VIRT_BASE || text_va < KERNEL_VIRT_BASE + KERNEL_LINK_OFFSET || entry_va == 0 || vm_hi < vm_lo ||
+ 	    vm_hi - KERNEL_VIRT_BASE > MAX_MEM_SIZE) {
+ 		print("unexpected kernel layout\n");
+ 		return 0;
+@@ -3493,6 +3503,21 @@
+ 		}
+ 		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
+ 	}
++#ifdef LOADER_UMI
++	if (umi_native_usb == 2) {
++		static const char prefix[] = "umixdci_owner_pa=0x";
++		static const char hex[] = "0123456789abcdef";
++		uint64_t address = (uint64_t)(uintptr_t)&umi_usb_ownership;
++		umi_usb_ownership = 0;
++		for (const char *cur = prefix; *cur && n < BOOT_LINE_LENGTH - 1; cur++) {
++			ba->commandLine[n++] = *cur;
++		}
++		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
++			ba->commandLine[n++] = hex[(address >> shift) & 0xf];
++		}
++		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
++	}
++#endif
+ 	if (block_enabled && df_state > 0 && df_map.magic != 0) {
+ 		/* darwin as a file: where its map is, for the kernel's own UFS driver (darwinfile.c) */
+ 		static const char prefix[] = "darwin_map_pa=0x";
+@@ -3820,6 +3845,12 @@
+ 	}
+ 	print("jumping to %x\n", entry_va + slide);
+ 	flush_log();
++#ifdef LOADER_UMI
++	if (umi_native_usb == 1 && !umi_usb_park()) {
++		print("UMI native USB: firmware could not release the controller\n");
++		return 0;
++	}
++#endif
+ 	/* From here on the kernel feeds the watchdog (boot-arg hv_wdt_pet, see loader_return.c in XNU). */
+ 	wdt_set_ms(60000);
+ 
+@@ -4178,6 +4209,33 @@
+ 	return 1;
+ }
+ 
++#ifdef LOADER_UMI
++static int
++umi_usb_park(void)
++{
++	if (USB == NULL) return 0;
++	if (usb_rx_queued) {
++		usb_abort_transfer(USB_EP_OUT);
++		usb_rx_queued = 0;
++	}
++	if (EFI_ERROR(USB->stop())) return 0;
++	usb_connected = 0;
++	USB = NULL;
++	print("UMI native USB: firmware released the controller\n");
++	return 1;
++}
++
++static void
++umi_usb_recover(void)
++{
++	wdt_set_ms(45000);
++	if (!usb_start()) {
++		USB = NULL;
++		reboot();
++	}
++}
++#endif
++
+ static int
+ usb_switch_profile(int mux)
+ {
+@@ -4415,10 +4473,12 @@
+ #ifdef LOADER_UMI
+ 	if (umi_disk_mode) {
+ 		if ((str_eq(cmd, "oem darwin-direct") || str_eq(cmd, "oem darwin-persist") ||
+-		     str_eq(cmd, "oem darwin-data")) &&
++		     str_eq(cmd, "oem darwin-data") || str_eq(cmd, "oem darwin-usb") ||
++		     str_eq(cmd, "oem darwin-usb-delay")) &&
+ 		    !run_active && !umi_menu.deadline && !reboot_after_kernel_deadline) {
+ 			umi_disk_persist = str_eq(cmd, "oem darwin-persist");
+-			umi_disk_data = str_eq(cmd, "oem darwin-data");
++			umi_native_usb = str_eq(cmd, "oem darwin-usb-delay") ? 2 : str_eq(cmd, "oem darwin-usb");
++			umi_disk_data = umi_native_usb || str_eq(cmd, "oem darwin-data");
+ 			fb_reply("OKAY", "");
+ 			umi_menu_select(1, 2);
+ 			return;
+@@ -4431,6 +4491,15 @@
+ 			umi_disk_ram = str_eq(cmd, "oem darwin-menu ram");
+ 			fb_reply("OKAY", "confirm on the phone");
+ 			umi_menu_open();
++			return;
++		}
++		if (str_eq(cmd, "oem pair-usb") && run_active && umi_native_usb == 2 && USB != NULL) {
++			fb_reply("OKAY", "transferring USB ownership to iOS");
++			if (umi_usb_park()) {
++				umi_usb_ownership = UMI_USB_RELEASED;
++				clean_dcache((uint64_t)(uintptr_t)&umi_usb_ownership,
++				    (uint64_t)(uintptr_t)&umi_usb_ownership + sizeof(umi_usb_ownership));
++			}
+ 			return;
+ 		}
+ 		if (!starts_with(cmd, "getvar:") && !str_eq(cmd, "oem log") && !str_eq(cmd, "oem screenshot") &&
