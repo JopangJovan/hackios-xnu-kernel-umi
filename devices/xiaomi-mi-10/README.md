@@ -89,6 +89,15 @@ idle boundary, rather than spinning a CPU core throughout the wait.
 
 ## Native USB pairing
 
+Lock-screen passcodes remain unsupported. The separate
+[passcode and data-protection investigation](LOCKSCREEN-PASSCODE.md)
+records the missing keybag/HFS interfaces, the loader entropy defect, and
+isolated encrypted-fixture tests. The opt-in
+[independent AppleKeyStore experiment](experimental/keybag/README.md)
+adds native create/save/load/change-secret interfaces for synthetic bags,
+without granting access to the system bag or replacing paired USB credentials.
+Passing those tests does not enable encryption for the current user data volume.
+
 A temporary UMI image reached the iOS home screen and completed the stock
 **Trust This Computer** flow on 2026-11-17. An encrypted USB session read
 iOS 16.5 and the image's `iPhone10,3` / `D22AP` identity; i4Tools identified

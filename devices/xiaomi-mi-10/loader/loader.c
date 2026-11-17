@@ -10,6 +10,9 @@
  *   - exits boot services, turns the MMU off and jumps to the kernel entry
  */
 #include "efi.h"
+#ifdef LOADER_UMI
+#include "umi_rng.h"
+#endif
 #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
 
 /* ------------------------------------------------------------------------ */
@@ -3526,9 +3529,18 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t reg2[2];
 	uint8_t seed[64];
 
+#ifdef LOADER_UMI
+	efi_status rng_status = umi_rng_seed(BS, seed);
+	if (EFI_ERROR(rng_status)) {
+		print("UMI entropy: EFI RNG failed %x; refusing counter-seeded boot\n", rng_status);
+		return 0;
+	}
+	print("UMI entropy: EFI RNG supplied 64 bytes; sanity checks passed\n");
+#else
 	for (unsigned i = 0; i < sizeof(seed); i++) {
 		seed[i] = (uint8_t)(READ_SYSREG(CNTVCT_EL0) >> (i & 7)) ^ (uint8_t)(i * 37);
 	}
+#endif
 
 	dt_begin(&w, "device-tree");
 	/*
@@ -3551,6 +3563,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	dt_begin(&w, "chosen");
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
+#ifdef LOADER_UMI
+	umi_rng_wipe(seed, sizeof(seed));
+#endif
 	dt_prop_u64(&w, "dram-base", phys_base);
 	dt_prop_u64(&w, "dram-size", win_size);
 	dt_prop_u32(&w, "debug-enabled", 1);
