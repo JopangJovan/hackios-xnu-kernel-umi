@@ -1,0 +1,14 @@
+--- a/iokit/Kernel/UmiAksLab.h
++++ b/iokit/Kernel/UmiAksLab.h
+@@ -14,9 +14,9 @@
+ extern const struct ccmode_ecb mc_aes_ecb_encrypt, mc_aes_ecb_decrypt;
+ void read_random(void *, u_int);
+ }
++#include "umi_ct_aes.h"
+ static int lab_aes(int decrypt, const uint8_t key[32], uint8_t block[16]) {
+-    const struct ccmode_ecb *mode = decrypt ? &mc_aes_ecb_decrypt : &mc_aes_ecb_encrypt;
+-    return ccecb_one_shot(mode, 32, key, 1, block, block);
++    return umi_ct_aes256(decrypt,key,block);
+ }
+ static void lab_hmac(const uint8_t *key, size_t kn, const uint8_t *data, size_t dn, uint8_t out[32]) {
+     cchmac(ccsha256_di(), kn, key, dn, data, out);

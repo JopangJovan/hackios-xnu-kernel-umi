@@ -1,0 +1,4 @@
+*.patch -whitespace
+# Preserve pinned upstream license text and its generated copy byte-for-byte.
+bearssl/*.c whitespace=-blank-at-eol
+umi_ct_aes.h whitespace=-blank-at-eol

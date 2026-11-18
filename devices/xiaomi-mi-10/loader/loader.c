@@ -2241,8 +2241,8 @@ block_poll(void)
 				    (uint64_t)(uintptr_t)block_buffer + bytes);
 				want = ufs_crc32(block_buffer, bytes);
 				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+				if (!EFI_ERROR(s)) s = bio->flush_blocks(bio);
 				if (!EFI_ERROR(s)) {
-					bio->flush_blocks(bio);
 					s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
