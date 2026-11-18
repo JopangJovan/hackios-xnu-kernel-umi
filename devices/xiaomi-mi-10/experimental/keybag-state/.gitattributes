@@ -1,0 +1,2 @@
+# Patch context retains original leading whitespace.
+*.patch -whitespace

@@ -89,7 +89,7 @@ idle boundary, rather than spinning a CPU core throughout the wait.
 
 ## Native USB pairing
 
-Lock-screen passcodes remain unsupported. The separate
+Lock-screen passcodes are not yet enabled in the normal build. The separate
 [passcode and data-protection investigation](LOCKSCREEN-PASSCODE.md)
 records the missing keybag/HFS interfaces, the loader entropy defect, and
 isolated encrypted-fixture tests. The opt-in
@@ -97,6 +97,36 @@ isolated encrypted-fixture tests. The opt-in
 adds native create/save/load/change-secret interfaces for synthetic bags,
 without granting access to the system bag or replacing paired USB credentials.
 Passing those tests does not enable encryption for the current user data volume.
+The next [encrypted-volume experiment](experimental/crypt-volume/README.md)
+adds a separate authenticated 16 MiB block device under HFS. After the
+initial snapshot tests, live encrypted file writes and authenticated redo
+recovery passed across an Android reboot (`native-26/27`), with identical
+file hashes, rejected wrong credentials, and paired USB/syslog preserved.
+This is not encryption of `/private/var` or native per-file data protection.
+The user chose native lock-screen unlock before migration and permits
+erasing iOS test data. The next [state-interface experiment](experimental/keybag-state/README.md)
+keeps system-bag access isolated while checking actual locked/unlocked state.
+The [system-bag management experiment](experimental/system-keybag/README.md)
+now preserves the original daemon's candidate/save/install ordering. Native
+tests `30/31` passed cross-reboot loading, password replacement, wrong-password
+rejection and generated-file decryption while preserving paired USB. In
+`native-34`, the original keybagd transaction, with its file paths relocated to
+an isolated test directory, also saved and installed the same encrypted bag and
+passed authentication checks. A zero API return without an installed bag is
+explicitly treated as a failure. `native-37` additionally passed the original
+`keybagd --init` isolated-file load and original MobileKeyBag lock/unlock/event
+APIs; SpringBoard observed real state changes and exactly one first unlock.
+`native-38/40` also passed entitled/unentitled UID 501 access checks. The pending
+boot variant displayed the original restart-passcode page before loading the
+saved bag. USB pairing survived, and password-protected syslog became available
+after authentication. A subsequent user-entered password survived reboot;
+`native-47` fixed the temporary image's relock authentication mismatch. The user
+confirmed repeat locks require a password and a wrong password cannot enter the
+desktop. Three complete relock/unlock cycles were verified in final telemetry, with
+unchanged saved keybag ciphertext. This round used retained firmware diagnostics
+and did not re-test native USB pairing. Production boot orchestration, retry
+policy, protection-class integration and encrypted data migration remain
+incomplete; the current HFS user-data volume is not encrypted.
 
 A temporary UMI image reached the iOS home screen and completed the stock
 **Trust This Computer** flow on 2026-11-17. An encrypted USB session read

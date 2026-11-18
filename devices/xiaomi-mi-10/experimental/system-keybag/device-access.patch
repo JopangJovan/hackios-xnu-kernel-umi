@@ -1,0 +1,32 @@
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -143,6 +143,7 @@
+ 
+ 	static IOReturn answer(IOExternalMethodArguments * args, const uint8_t * bytes, size_t length);
+ 	UmiAksLab *fLab;
++    bool fDeviceEntitled;
+ 
+ public:
+ 	virtual bool initWithTask(task_t, void *, UInt32, OSDictionary *) APPLE_KEXT_OVERRIDE;
+@@ -158,8 +159,11 @@
+ bool
+ AppleKeyStoreUserClient::initWithTask(task_t owner, void *token, UInt32 type, OSDictionary *properties)
+ {
+-    fLab = NULL;
++    fLab = NULL; fDeviceEntitled = false;
+     if (!IOUserClient::initWithTask(owner, token, type, properties)) return false;
++    OSObject *entitlement = copyClientEntitlement(owner, "com.apple.keystore.device");
++    fDeviceEntitled = entitlement == kOSBooleanTrue;
++    if (entitlement) entitlement->release();
+     fLab = umi_lab_alloc(owner);
+     return fLab != NULL;
+ }
+@@ -258,7 +262,7 @@
+     uint32_t nativeEvents=0;
+     bool nativeHandled = umi_native_method(fLab, selector, args,
+         clientHasPrivilege((void *)fLab->owner, kIOClientPrivilegeAdministrator) == kIOReturnSuccess,
+-        &nativeResult, &nativeEvents);
++        fDeviceEntitled, &nativeResult, &nativeEvents);
+     IOLockUnlock(fLab->lock);
+     if (nativeHandled) {
+         IOService *provider = getProvider();

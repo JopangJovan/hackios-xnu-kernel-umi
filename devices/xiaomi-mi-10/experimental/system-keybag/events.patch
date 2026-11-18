@@ -1,0 +1,22 @@
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -255,11 +255,17 @@
+     umi_native_aks_trace(selector, args);
+     IOLockLock(fLab->lock);
+     IOReturn nativeResult;
++    uint32_t nativeEvents=0;
+     bool nativeHandled = umi_native_method(fLab, selector, args,
+         clientHasPrivilege((void *)fLab->owner, kIOClientPrivilegeAdministrator) == kIOReturnSuccess,
+-        &nativeResult);
++        &nativeResult, &nativeEvents);
+     IOLockUnlock(fLab->lock);
+-    if (nativeHandled) return nativeResult;
++    if (nativeHandled) {
++        IOService *provider = getProvider();
++        if (provider && (nativeEvents & 1)) provider->messageClients(0xe3ffd00d);
++        if (provider && (nativeEvents & 2)) provider->messageClients(0xe3ffd00f);
++        return nativeResult;
++    }
+ 	static const uint8_t bagUUID[16] = { 0x72, 0x65, 0x64, 0x77, 0x6f, 0x6f, 0x64, 0x00, 0x6b, 0x65, 0x79, 0x62, 0x61, 0x67, 0x00, 0x01 };
+ 	uint8_t der[128];
+ 	uint64_t * out = args->scalarOutput;

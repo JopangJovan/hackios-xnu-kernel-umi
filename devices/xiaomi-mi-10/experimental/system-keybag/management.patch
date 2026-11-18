@@ -1,0 +1,32 @@
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -27,6 +27,7 @@
+ #include "MiniDrivers.h"
+ #include "UmiAksLab.h"
+ #include "UmiAksNativeTrace.h"
++#include "UmiAksNative.h"
+ 
+ enum {
+ 	kAKSOpenCheck           = 0x00,
+@@ -129,6 +130,7 @@
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++    if (!umi_native_init()) return false;
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	setName("AppleKeyStore");
+ 	registerService();
+@@ -251,6 +253,13 @@
+     }
+     IOLockUnlock(fLab->lock);
+     umi_native_aks_trace(selector, args);
++    IOLockLock(fLab->lock);
++    IOReturn nativeResult;
++    bool nativeHandled = umi_native_method(fLab, selector, args,
++        clientHasPrivilege((void *)fLab->owner, kIOClientPrivilegeAdministrator) == kIOReturnSuccess,
++        &nativeResult);
++    IOLockUnlock(fLab->lock);
++    if (nativeHandled) return nativeResult;
+ 	static const uint8_t bagUUID[16] = { 0x72, 0x65, 0x64, 0x77, 0x6f, 0x6f, 0x64, 0x00, 0x6b, 0x65, 0x79, 0x62, 0x61, 0x67, 0x00, 0x01 };
+ 	uint8_t der[128];
+ 	uint64_t * out = args->scalarOutput;

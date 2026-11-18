@@ -1,0 +1,10 @@
+--- a/loader.c
++++ b/loader.c
+@@ -3644,5 +3644,7 @@
+ 	dt_begin(&w, "defaults");
+ 	dt_prop_u32(&w, "kern.vm_compressor", 2);
++	/* Software-only keybag experiment: no Apple effaceable storage. */
++	dt_prop_u32(&w, "no-effaceable-storage", 1);
+ 	dt_end(&w);
+ 
+ 	/* the product: screen class, artwork scale, name ... as on the real phone */
