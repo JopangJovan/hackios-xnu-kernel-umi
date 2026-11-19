@@ -1,0 +1,7 @@
+{
+  "scope": "Prepared native63 USB/UFS/passcode loader; not clean repository HEAD",
+  "loader.c": {
+    "base": "8ea11fef0beedabdc80ee99aae3f5fe5f260449852b3806dd012d766c00386ee",
+    "patched": "7b0cf8c13e3e3f5d047e5b14c8c8ced820e1736d7777071d85ebc756b2bfa1e4"
+  }
+}

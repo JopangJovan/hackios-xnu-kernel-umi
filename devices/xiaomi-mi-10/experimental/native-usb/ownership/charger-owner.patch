@@ -1,0 +1,60 @@
+--- a/loader.c
++++ b/loader.c
+@@ -1030,6 +1030,8 @@
+ static int run_active;
+ /* Set only after usb_start() owns the peripheral controller for this boot. */
+ static int usb_runtime_active;
++/* Test-only ownership fence for firmware status calls. */
++static int usb_external_owner;
+ #ifdef LOADER_UMI
+ static int umi_native_usb;
+ static volatile uint32_t umi_usb_ownership __attribute__((aligned(64)));
+@@ -1166,7 +1168,7 @@
+ 			charger_shared.voltage_mv = (int32_t)voltage;
+ 		}
+ 	}
+-	if (QCOM_CHARGER != NULL) {
++	if (QCOM_CHARGER != NULL && !usb_external_owner) {
+ 		s = QCOM_CHARGER->get_charging_action(&action, &status, 0);
+ 		if (!EFI_ERROR(s)) {
+ 			charger_shared.charger_action = action;
+@@ -1197,6 +1199,14 @@
+ 			charger_shared.current_ma = status.charge_current_ma;
+ 			charger_shared.temperature_c = status.battery_temperature_c;
+ 		}
++	}
++	if (usb_external_owner) {
++		/* No fresh fuel-gauge/current/temperature sample from the policy
++		 * API: expose the existing voltage estimate and unknown values,
++		 * rather than presenting the last pre-handoff sample as current. */
++		charger_shared.current_ma = 0;
++		charger_shared.temperature_c = -273;
++		charger_shared.charger_action = 0xffffffffu;
+ 	}
+ 	if (!have_soc && have_voltage) {
+ 		charger_shared.soc_percent = soc_from_voltage((uint32_t)charger_shared.voltage_mv);
+@@ -2487,6 +2497,8 @@
+ 			last_pet = READ_SYSREG(CNTVCT_EL0);
+ 		}
+ 		/* Qualcomm's UEFI charger stack owns the PMIC/GLINK side; keep XNU's cache live. */
++		/* charger_poll fences the firmware charging-policy API once native
++		 * USB owns DWC3, while retaining the basic ChargerEx reads. */
+ 		if (charger_enabled && seconds_since(last_battery) >= 5 && hc_list_is_uefis()) {
+ 			/* (not while the kernel's own transfer list is in: Qualcomm's DXEs are not to touch the storage) */
+ 			charger_poll();
+@@ -4222,6 +4234,7 @@
+ 		return 0;
+ 	}
+ 	usb_runtime_active = 1;
++	usb_external_owner = 0;
+ 	usb_wait_for_link();
+ 	print("usb: started\n");
+ 	return 1;
+@@ -4237,6 +4250,7 @@
+ 		usb_rx_queued = 0;
+ 	}
+ 	if (EFI_ERROR(USB->stop())) return 0;
++	usb_external_owner = 1;
+ 	usb_connected = 0;
+ 	USB = NULL;
+ 	print("UMI native USB: firmware released the controller\n");

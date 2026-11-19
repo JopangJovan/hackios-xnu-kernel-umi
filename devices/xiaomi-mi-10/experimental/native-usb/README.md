@@ -5,6 +5,11 @@ This saves the implementation used for the successful `native-12` through
 checkpoint, not a switch to native USB in the normal build. See
 [USB-PAIRING.md](../../USB-PAIRING.md) for hardware results and limitations.
 
+The later [firmware charger ownership experiment](ownership/README.md) tracks
+native USB loss seen during encrypted-file testing, its old-kernel control,
+and a separately pinned loader fix. It is not included in the original
+`stage-checkpoint.py` patch set.
+
 ## Sources and prerequisites
 
 - `driver/UmiDwc3Xdci.cpp`: SM8250 DWC3 peripheral adapter, UMI HS PHY values,
@@ -72,8 +77,10 @@ remain unchanged.
 6. Assemble with the existing temporary UFS boot packer. The verified flow
    uses `fastboot boot`, `oem darwin-usb-delay`, then `oem pair-usb` after
    confirming the desktop. XNU waits up to 90 seconds for the mailbox.
-   The test's bounded return timer must remain enabled; quiesce and the
-   existing loader return path restore access for logs and stock Android.
+   The early native-12/14 tests used a bounded return timer. Later passcode
+   tests explicitly disable that countdown at the user's request; they use
+   normal diagnostics restart or Settings shutdown to return through the loader
+   and collect final logs. Quiesce and panic/watchdog recovery remain required.
 
 The optional stack/UI probes in the test helper are diagnostic artifacts,
 not prerequisites for the pairing fix. They are not included here. The

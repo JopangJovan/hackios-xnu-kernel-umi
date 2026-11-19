@@ -133,6 +133,35 @@ explicit Trust action, then successful pairing and an encrypted session.
 
 ## Remaining checks and integration
 
+### Later transport-loss control, 2026-11-20
+
+The class-A/C restart fixture in `native-62` passed file recovery but lost
+native USB shortly after enumeration. An exact rerun of the preceding v12
+kernel/helper (`native-63`) reproduced that loss, so it was not specific to
+the new class-C extension. iOS continued running after USB vanished.
+
+Two loader-only controls narrowed the issue to firmware charger-policy
+polling during native USB ownership. Suspending all charger queries
+(`native-64`) preserved pairing and a 45-second unlocked syslog capture.
+Restoring ChargerEx presence/voltage reads while omitting only
+`GetChargingAction` (`native-65`) passed 13 paired metadata queries across
+120.83 seconds and a 30-second unlocked syslog capture. Locked syslog and
+remote restart correctly returned Password protected. After unlock, the
+original diagnostics service accepted a normal restart. No pairing records
+or native authentication code changed.
+
+The [separately pinned experiment](experimental/native-usb/ownership/README.md)
+records the controls, source patch and battery-telemetry limitations. The
+exact firmware side effect is not traced. Latest-kernel reconnect and sustained
+logging checks then passed in `native-66`: the v13 A/C fixture recovered all
+three original file hashes; a 180-second log stream continued across lock and
+unlock, and physical unplug/replug restored the existing pairing plus a further
+30-second capture. Native diagnostics accepted normal restart. This is still
+an isolated no-modem image, not a normal cellular-build fix or full user-volume
+encryption.
+
+### Normal-build work
+
 1. Integrate the DWC3/native-stack changes and the entitlement fallback
    into UMI-specific build inputs, preserving shared upstream templates.
    Remove temporary syscall and thread probes from the release variant.
