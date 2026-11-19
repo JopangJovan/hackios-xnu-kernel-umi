@@ -160,6 +160,10 @@ unlock, and physical unplug/replug restored the existing pairing plus a further
 an isolated no-modem image, not a normal cellular-build fix or full user-volume
 encryption.
 
+The fix was committed separately as `5b444d9`. Current passcode/data-volume
+readiness and the remaining 80 GiB integration work are tracked in
+[ENCRYPTION-PLAN.md](ENCRYPTION-PLAN.md).
+
 ### Normal-build work
 
 1. Integrate the DWC3/native-stack changes and the entitlement fallback
