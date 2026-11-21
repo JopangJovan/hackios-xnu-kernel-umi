@@ -1,5 +1,31 @@
 # Lock-screen passcode and data protection
 
+## 当前结论（2026-11-21）
+
+锁屏密码的保存、跨重启加载、再次锁屏及错误密码拒绝已验证；独立文件保护
+已推进到 A/C 类。`native-62` 的 USB 故障随后也在旧内核复现，修正 UEFI
+充电查询与原生 USB 的交接后，`native-65/66` 的配对、连续日志和拔插检查
+通过，修复已单独提交 `5b444d9`。`native-105` 再次通过原生重锁、错码拒绝和正确
+密码解锁。`native-107` 在首次解锁后使用原有 USB 配对连续读取 60 秒系统日志。
+隔离改密、持久失败计数、认证通知和合成旧条目迁移的结果见下方进度计划。
+
+**当前 `/private/var` 尚未加密，整段 80 GiB 也不能直接加密后启动。**
+已按源码和只读容量检查整理 [当前进度、分区范围和实施计划](ENCRYPTION-PLAN.md)。
+后续先完成自动检查，再集中实机验收，减少反复输入密码的操作。
+
+## 独立改密、重试与事务恢复（2026-11-20）
+
+本轮新增 [keybag-recovery](experimental/keybag-recovery/README.md)：在合成测试袋中
+实现改密保留条目密钥、双副本加提交记录、失败计数保存与等待，以及普通条目逻辑
+A/C 类包装后端。主机 ASan/UBSan 自动检查已通过，包括 20 个保存失败/进程退出
+检查点和两次后续进程加载。真机 `native-67` 完成同一套自动检查，正常回安卓后
+`native-68` 验证同一份测试袋、计数与条目密钥均可恢复，拒绝旧口令、接受新口令；
+两轮同步成功并回原厂安卓。完整结果见该目录 `results.json`。
+
+这不是原厂系统袋的全量替换；仍须完成正式策略密钥来源、原生保存接口、
+AKS 错误码/保护类与旧钥匙串条目兼容。现有锁屏 PIN 和 USB 配对实现保持不变。
+先完成这些自动验证，再集中请用户验收，不重复要求手动输密码。
+
 ## 中文进度（2026-11-18）
 
 用户已选择接好原生锁屏密码后再加密现有 iOS，并允许抹除 iOS 测试数据。
@@ -101,6 +127,82 @@ MobileKeyBag 的锁定、解锁、事件回调。驱动此前把待加载状态�
 文件保护类与加密卷启动顺序接通。只有这些一并验证后，才初始化正式
 加密数据卷，不能把界面要求密码当作加密完成。
 
+### 2026-11-19：原生密码袋接入独立加密文件系统
+
+`native-48/49` 已把用户在手机设置的原生密码袋接到独立 16 MiB 加密
+HFS 测试卷。只增加实验用的 root 私有卷密钥接口，普通系统钥匙串和
+USB 配对包装路径保持原样；测试程序不接收、不读取、不保存用户密码。
+
+首次启动锁定时拒绝取卷密钥；用户解锁后完成文件写入和 7 次实时密文
+写盘，再卸载并清除临时密钥。再次锁屏后包装、解包和块设备访问都被拒绝，
+正确解锁后重新挂载，文件哈希一致。正常回安卓后，再次临时进入 iOS，
+同一份落盘密文和密钥封装仍可在原生认证后挂载；用户明确确认错误密码
+被拒绝、正确密码可进入。跨重启文件 SHA-256 均为
+`f92550cf2093006319c0c11d7d6afe23923c9b287aa191584ea54b62d87c8d79`。
+
+USB 继续使用原有配对，锁定时能读版本/型号、日志服务拒绝访问；解锁后
+成功读取 876,544 字节、4,928 行系统日志，原生诊断服务接受正常重启请求。
+详细接口、证据与限制见
+[`experimental/system-volume/README.md`](experimental/system-volume/README.md)。
+
+**这次验证的是卸载边界上的独立加密卷，不是现有 iOS 全部数据的加密。**
+不能把拒绝再次取密钥等同于撤销已经挂载的文件或清空所有页缓存。
+正式初始化还需要 HFS 保护类、锁屏时密钥/缓存生命周期，以及密码界面
+启动所需数据的安排；这些完成并验证前不抹除当前用户数据卷。
+
+### 2026-11-19：文件系统保持挂载时的锁屏保护
+
+`native-59` 已通过独立日志式 HFS 卷的 class-A 文件测试。首次解锁前
+不能解封卷密钥；解锁后写入 128 KiB 测试文件，保持挂载、保留打开的
+文件描述符并预热缓存，再实际按电源锁屏。锁定期间，旧描述符读取和
+新打开文件均被拒绝，内核确认该文件的缓存密钥已清除。正确解锁后
+读回哈希一致；仅去掉外层卷加密后的原始块中，也没有测试明文标记。
+用户明确确认「错误被拒绝、正确能进入、没有重启」。
+
+此前两项实机故障已修正：HFS 模块结构布局不一致导致首次建文件崩溃；
+扇区认证的大栈缓冲区导致锁屏同步写回时栈溢出。之后又补上锁定状态
+下新打开 class-A 文件的检查，避免等待脏页写回时仍接受缓存密钥。
+这次最终同步 `errno=0`，已确认回到原厂安卓。代码和逐轮结果见
+[`experimental/file-protection/README.md`](experimental/file-protection/README.md)。
+
+`native-60` 随后通过同一文件的跨重启验证：再次从安卓临时启动后，
+未解锁时仍拒绝取密钥，用户确认错误密码被拒绝、正确密码能进入。
+独立卷只读挂载后，文件 SHA-256 与上一轮一致：
+`10a90508e6050203d86bb432fc8f435efbe2359d4f6872efe97e0932539b495d`，
+原始块密文检查再次通过，测试报告 `verify PASS`。
+
+原有 USB 配对仍有效，解锁前能读取 iOS 16.5 和型号，日志服务正确拒绝
+未认证访问；解锁后采集 1,540,096 字节、9,189 行系统日志。原生诊断服务
+正常重启，日志确认测试卷与当前数据卷卸载，已回原厂安卓。
+当前只实现独立卷的 class A；完整用户卷仍需其他保护类、首次解锁前
+启动数据和正式钥匙串密钥管理。**现有 iOS 数据尚未加密，也没有抹除。**
+
+### 2026-11-19：补充 class C 与 USB 回归结果
+
+独立的 [`file-protection-classes`](experimental/file-protection-classes/README.md)
+扩展已接入 class C：首次正确认证后，只保留该类的派生密钥，锁屏仍清除
+系统主密钥；重启或替换密码袋后清除该派生密钥，不能靠改文件标签变成
+另一保护类。原有 class A 的密文格式保持兼容。
+
+`native-61` 实机验证锁屏后 class A 拒绝读/打开，class C 仍可读文件、
+新建文件；卸载再挂载以丢弃文件缓存后，锁定状态下仍可解密两份 class C
+文件，而 class A 仍被拒绝。再次解锁后三个文件哈希一致，内层密文检查
+通过。用户确认错误密码被拒绝、正确密码能进入、没有自动重启。最终同步
+`errno=0`，回原厂安卓后启动 `native-62`，同三个文件只读解密、哈希及
+密文检查再次通过。此轮没有重新得到用户对错误密码结果的明确确认，
+不能把前两轮结果冒充本轮再次验证。
+
+**`native-62` 的 USB 回归未通过。** Mac 曾短暂识别原生接口并读取版本，
+随后底层连接消失；用户确认 iOS 仍运行，拔插不能恢复，暂停主机端
+ADB/Fastboot 轮询也未恢复。未完成本轮认证配对检查，不能宣称配对保持
+正常，也不能把失联解释成密码错误。退出时 XDCI 端点命令报告
+`0xe00002bc`，根因尚未确定。用户通过设置正常关机后，加载器恢复日志
+通道，已收齐测试成功及卸载记录，并确认回到原厂安卓。
+
+现阶段是独立卷 A/C 保护通过，USB 稳定性仍需对照排查；完整用户卷的
+保护类、启动依赖和普通钥匙串接入尚未完成，**本轮没有加密或抹除现有
+iOS 数据，也没有修改安卓、GPT 或启动分区**。
+
 已定位到三个直接缺口：原厂 `keybagd` 启动任务被排除；内核
 `MiniAppleKeyStore` 固定返回“没有密码”，密钥包装只是可逆 XOR；
 当前可写 HFS 数据卷关闭了内容保护。恢复 `keybagd` 后，原厂
@@ -169,10 +271,11 @@ AES-XTS 与扇区认证。`native-24` 写入、卸载并保存密文镜像，回
 密码与数据加密的可靠完成时间。用户允许抹除 iOS，可省去旧数据迁移；
 不能省去以上启动、鉴权和真实密文恢复的验证。
 
-## Current status
+## Original baseline and earlier investigation
 
-The system passcode is **not functional**. The new independent-bag laboratory
-below does not enable Settings' passcode flow or migrate the system keybag.
+The temporary native passcode flow has since passed `native-47` (see the current
+results above); existing user data is still unencrypted. The following records
+the earlier baseline, before that repair, rather than its current status.
 On 2026-11-17 the user reproduced a
 failed passcode setup on the paired native-USB image. In test `native-15`,
 `profiled` logged "Passcode has been changed", but launchd recorded a
@@ -587,3 +690,17 @@ fields do not implement a retry delay, attempt counter or hardware security.
 After log collection, `native-28` returned to stock Android; ADB confirmed
 `sys.boot_completed=1`, product `umi` and MIUI `V14.0.4.0.TJBCNXM`. The phone
 was left in Android. No live iOS data was migrated or erased in these tests.
+
+
+## 2026-11-20 原厂保存顺序与普通条目隔离测试
+
+本轮未要求用户手动改密/解锁。详情见
+[原生事务测试说明](experimental/native-keybag-transaction/README.md)。
+原厂 keybagd 的独立副本已通过候选保存、写入失败拒绝安装和成功提交后安装的顺序；
+测试前后真实系统密码袋的加密序列化与公开状态一致。新的 A/C 条目封装在独立 IOKit
+客户端验证，未替换真实系统钥匙串。共享缓存原厂框架绕过诊断拦截的问题由只读检查
+发现后中止，后续内核隔离客户端/独立 SecItem 数据库接入仍待完成。
+
+本次保持已验证的重锁实现、内核和 USB 交接代码不变；原生 USB 配对未在这些保留固件
+日志的自动启动中重新测试。不能将独立事务/条目验证当作真实改密与 USB 的组合验收。
+不迁移现有 iOS 数据、不加密 80 GiB、不写安卓/GPT/启动分区。

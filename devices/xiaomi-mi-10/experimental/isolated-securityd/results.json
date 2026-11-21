@@ -1,0 +1,558 @@
+{
+  "scope": "Isolated original SecItem code, synthetic bags and private chroot; no live XPC securityd replacement",
+  "native_usb_pairing_retested": false,
+  "whole_data_volume_encrypted": false,
+  "rounds": [
+    {
+      "case": "native-85",
+      "firmware_log_sha256": "ccb35cf12770c84abeb1339456fd64629ab5bff73cb05908d43fb82a64f18658",
+      "firmware_log_bytes": 986592,
+      "session_log_sha256": "5440c7c0b507ef3053754f3630ee8599798b55d16ca62d91f315e3c9602385a8",
+      "final_sync_errno": [
+        "0"
+      ],
+      "returned_stock_android": true,
+      "markers": [
+        "UMI SecItem route: symbols dispatch=1 home-set=1 home-read=1",
+        "UMI SecItem route: framework user/system base paths redirected PASS",
+        "UMI SecItem route: original CRUD APIs reached four denying local callbacks PASS",
+        "UMI SecItem route: preflight PASS; no database writes or live-service requests",
+        "UMI SecItem guardian: real bag and parent framework globals unchanged PASS",
+        "UMI SecItem guardian: preflight PASS"
+      ],
+      "boot_artifact": {
+        "helper": "helper-secitem-preflight-85",
+        "boot_sha256": "e736588f4c7fcc7122f35068067620225e310f306d44d91fdcfc8d1583f21987",
+        "payload_sha256": "1e977103777b7dd642a0f80f4507fdc063bde4275ddd229fb3329fb3a17e1316",
+        "kernel_sha256": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+        "helper_sha256": "11ecb04040da918ff7dfe0edcd3fcfa7b2b1afdbd0e0068996fd72a51caba4b7"
+      },
+      "tested_source_sha256": {
+        "routing-probe.c": "2eac2d94d93c90d3dfd7a58936561faab3d5fc72bfabb71580c7968bd0553ca2",
+        "routing-guardian.c": "fbef96a68e503c5d57073ad3f3db55089b6d9c2107441a36719c2de244be1ac2",
+        "build-preflight.py": "285e41160a1eb1296eda6728a9850129a4bd06632381c3a1f00b5d61c666d867",
+        "prepare-preflight.py": "ea6584ecaeed5707ae3a51bb8cc3697d105c0383c2807c53c40eca63c59bd75f"
+      },
+      "outcome": "routing guard passed; no database use"
+    },
+    {
+      "case": "native-86",
+      "firmware_log_sha256": "a31753f02419a92aea0f00711a5cc3838f1b49fd283f13567ff8df552db92885",
+      "firmware_log_bytes": 1002870,
+      "session_log_sha256": "daf8192de9144ec045340c5d722803acf36e300aed66aac491632b59df1b9808",
+      "final_sync_errno": [
+        "0"
+      ],
+      "returned_stock_android": true,
+      "markers": [
+        "UMI SecItem backend guardian: source and reconstructed executable hashes verified PASS",
+        "UMI SecItem backend: scope status=0x0 cookie=0x554f4b31",
+        "UMI SecItem backend: default bag cannot fall back to live system bag PASS",
+        "UMI SecItem backend: private filesystem root established before database access PASS",
+        "UMI SecItem backend: original missing-item query status=-25300 output=0",
+        "UMI SecItem backend: private database exists=0 bytes=0",
+        "UMI SecItem backend: diagnostic complete; authentication and write-item tests NOT RUN",
+        "UMI SecItem backend guardian: real system bag serialization/flags unchanged PASS",
+        "UMI SecItem backend guardian: child finished=1 normal=1 status=0",
+        "UMI SecItem backend guardian: preflight complete"
+      ],
+      "boot_artifact": {
+        "helper": "helper-secitem-preflight-86",
+        "boot_sha256": "716ee6acc5a5c45322dba9ec630349d09589b1664c7648492da77554f9df971a",
+        "payload_sha256": "e18c828e2ee2b7021c78eef54c40a3b46fb93edb442f900dc6ab6a84712b73e4",
+        "kernel_sha256": "21ba8bde7a1eb9f27f282f29e5854f04587512c5e272f461e2b4f98fb1b41e44",
+        "helper_sha256": "92134041bda0303c532bf9ea976c207ef59feebc96d073c20126a90cf1d151cf"
+      },
+      "tested_source_sha256": {
+        "build-preflight.py": "285e41160a1eb1296eda6728a9850129a4bd06632381c3a1f00b5d61c666d867",
+        "backend-preflight.c": "70346a8b9c3efb2940051d7cc50ed5b5b88ae017b4121f48b2f2d57354a9afd7",
+        "prepare-backend.py": "980ea20b4ae8ecdf40eae4dbff25475645b32344cbbdaad3ddb4c244a8b0a181",
+        "prepare-preflight.py": "ea6584ecaeed5707ae3a51bb8cc3697d105c0383c2807c53c40eca63c59bd75f",
+        "routing-probe.c": "2eac2d94d93c90d3dfd7a58936561faab3d5fc72bfabb71580c7968bd0553ca2",
+        "backend-guardian.c": "9ea98eb65596e372777f817009475e11bded3cbd9026b31c26b089c094512a6b",
+        "routing-guardian.c": "fbef96a68e503c5d57073ad3f3db55089b6d9c2107441a36719c2de244be1ac2"
+      },
+      "outcome": "missing-item query passed; no added record"
+    },
+    {
+      "case": "native-87",
+      "firmware_log_sha256": "88c2f256f94e6066c6b1870a435dc9187c83d5a8085fd5fcc332ac481262d444",
+      "firmware_log_bytes": 1045495,
+      "session_log_sha256": "068846a7879109f27e187f2fa3f2d5e5f15ba53efc483969dc238918d8afb344",
+      "final_sync_errno": [
+        "0"
+      ],
+      "returned_stock_android": true,
+      "markers": [
+        "UMI SecItem backend guardian: source and reconstructed executable hashes verified PASS",
+        "UMI SecItem backend: scope status=0x0 cookie=0x554f4b31",
+        "UMI SecItem backend: default bag cannot fall back to live system bag PASS",
+        "UMI SecItem backend: private filesystem root established before database access PASS",
+        "UMI SecItem backend: original missing-item query status=-25300 output=0",
+        "UMI SecItem backend: synthetic add status=-25291",
+        "UMI SecItem backend: private database exists=0 bytes=0",
+        "UMI SecItem backend: private file Analytics bytes=170",
+        "UMI SecItem backend: synthetic add diagnostic complete; encryption NOT QUALIFIED",
+        "UMI SecItem backend guardian: real system bag serialization/flags unchanged PASS",
+        "UMI SecItem backend guardian: child finished=1 normal=1 status=0",
+        "UMI SecItem backend guardian: preflight complete"
+      ],
+      "boot_artifact": {
+        "helper": "helper-secitem-preflight-87",
+        "boot_sha256": "7306c688223b8bb4be2914ccd8de3708f1c2d640a416fe10fdf7742b0a429c67",
+        "payload_sha256": "a5a3cb1381eecd5b4bcd5aff83c506ca6e6bb61682de5943096f41780dfaff0c",
+        "kernel_sha256": "21ba8bde7a1eb9f27f282f29e5854f04587512c5e272f461e2b4f98fb1b41e44",
+        "helper_sha256": "237ed232e6309f2ad3e23d40eacac72eb2bd5265b57a73f991d575c777b5a3de"
+      },
+      "tested_source_sha256": {
+        "build-preflight.py": "285e41160a1eb1296eda6728a9850129a4bd06632381c3a1f00b5d61c666d867",
+        "backend-preflight.c": "0307b0b3e1fea3e56a1b6e69629b190753eb6c1563594328cd41da247c0dce9d",
+        "build-backend.py": "41491c43ea956276f4157394c7cdef9da8d0798dd54f42571561a0599ac5ea75",
+        "prepare-backend.py": "980ea20b4ae8ecdf40eae4dbff25475645b32344cbbdaad3ddb4c244a8b0a181",
+        "prepare-preflight.py": "ea6584ecaeed5707ae3a51bb8cc3697d105c0383c2807c53c40eca63c59bd75f",
+        "routing-probe.c": "2eac2d94d93c90d3dfd7a58936561faab3d5fc72bfabb71580c7968bd0553ca2",
+        "backend-guardian.c": "b034ef90d4f32bb5b447624ec690566dd86915cb11083c8fc95840be7f715291",
+        "routing-guardian.c": "fbef96a68e503c5d57073ad3f3db55089b6d9c2107441a36719c2de244be1ac2"
+      },
+      "outcome": "add failed; diagnostic only"
+    },
+    {
+      "case": "native-88",
+      "firmware_log_sha256": "f25176f61911251d7e467a49067685d669ccb89a93307c96bbd2ab6996e8a7a2",
+      "firmware_log_bytes": 966630,
+      "session_log_sha256": "d7b8afd68e704d97263a5231f43cc85fcef436099bd39b193cfa95eb5ae8247e",
+      "final_sync_errno": [
+        "0"
+      ],
+      "returned_stock_android": true,
+      "markers": [
+        "UMI SecItem backend guardian: source and reconstructed executable hashes verified PASS",
+        "UMI SecItem backend: scope status=0x0 cookie=0x554f4b31",
+        "UMI SecItem backend: default bag cannot fall back to live system bag PASS",
+        "UMI SecItem backend: private filesystem root established before database access PASS",
+        "UMI SecItem backend: original missing-item query status=-25300 output=0",
+        "UMI SecItem backend: original add error The operation couldn\\U2019t be completed. (NSOSStatusErrorDomain error -25291 - ks_crypt: e00002c2 failed to 'oe' item (class 6, bag: 0))",
+        "UMI SecItem backend: synthetic add status=-25291",
+        "UMI SecItem backend: private database exists=0 bytes=0",
+        "UMI SecItem backend: private file Analytics bytes=170",
+        "UMI SecItem backend: synthetic add diagnostic complete; encryption NOT QUALIFIED",
+        "UMI SecItem backend guardian: real system bag serialization/flags unchanged PASS",
+        "UMI SecItem backend guardian: child finished=1 normal=1 status=0",
+        "UMI SecItem backend guardian: preflight complete"
+      ],
+      "boot_artifact": {
+        "helper": "helper-secitem-preflight-88",
+        "boot_sha256": "a99a1e48a6c17d33f4de0ff2ee28814b4b4696f1cf5f0bf53a7e8e06eeeec98b",
+        "payload_sha256": "e5670547b832c1ef9d49f893408e48b5c33290ffd0d61b70fec212f47f2a445e",
+        "kernel_sha256": "21ba8bde7a1eb9f27f282f29e5854f04587512c5e272f461e2b4f98fb1b41e44",
+        "helper_sha256": "b4b3fa0ed46ebbeb1153e5cdfb0fa7f1ad1c09e8073614648f5b59bd45b30125"
+      },
+      "tested_source_sha256": {
+        "build-preflight.py": "285e41160a1eb1296eda6728a9850129a4bd06632381c3a1f00b5d61c666d867",
+        "backend-preflight.c": "9f4fa4b61c65ea4ff821ff2ab10b31816d1361de0287687afbe767ed2eabde62",
+        "build-backend.py": "41491c43ea956276f4157394c7cdef9da8d0798dd54f42571561a0599ac5ea75",
+        "prepare-backend.py": "980ea20b4ae8ecdf40eae4dbff25475645b32344cbbdaad3ddb4c244a8b0a181",
+        "prepare-preflight.py": "ea6584ecaeed5707ae3a51bb8cc3697d105c0383c2807c53c40eca63c59bd75f",
+        "routing-probe.c": "2eac2d94d93c90d3dfd7a58936561faab3d5fc72bfabb71580c7968bd0553ca2",
+        "backend-guardian.c": "b034ef90d4f32bb5b447624ec690566dd86915cb11083c8fc95840be7f715291",
+        "routing-guardian.c": "fbef96a68e503c5d57073ad3f3db55089b6d9c2107441a36719c2de244be1ac2",
+        "prepare-backend-helper.py": "c14e13981d6ddcb430a463bfd6c550fe23cf1e49fb88a070bdc291fc61381287"
+      },
+      "outcome": "add failed; unmapped default bag"
+    },
+    {
+      "case": "native-89",
+      "firmware_log_sha256": "9fc52b397c7cbfbc3bfe65ba7b88c3085d083ac907fdca47caf410e000c294da",
+      "firmware_log_bytes": 979755,
+      "session_log_sha256": "f359308957ce2b8db7e5d2362104a778196963bf39fb1d28326cbc5040cfc788",
+      "final_sync_errno": [
+        "0"
+      ],
+      "returned_stock_android": true,
+      "markers": [
+        "UMI SecItem backend guardian: source and reconstructed executable hashes verified PASS",
+        "UMI SecItem backend: scope status=0x0 cookie=0x554f4b31",
+        "UMI SecItem backend: default bag cannot fall back to live system bag PASS",
+        "UMI SecItem backend: isolated default binding, invalid destination/handle, lock, wrong password and unload PASS",
+        "UMI SecItem backend: private filesystem root established before database access PASS",
+        "UMI SecItem backend: original missing-item query status=-25300 output=0",
+        "UMI SecItem backend: original add error The operation couldn\\U2019t be completed. (NSOSStatusErrorDomain error -25291 - ks_crypt: e00002c2 failed to 'oe' item (class 6, bag: 0))",
+        "UMI SecItem backend: synthetic add status=-25291",
+        "UMI SecItem backend: private database exists=0 bytes=0",
+        "UMI SecItem backend: private file Analytics bytes=170",
+        "UMI SecItem backend: synthetic default bag revoked after database probe PASS",
+        "UMI SecItem backend: synthetic add diagnostic complete; encryption NOT QUALIFIED",
+        "UMI SecItem backend guardian: real system bag serialization/flags unchanged PASS",
+        "UMI SecItem backend guardian: child finished=1 normal=1 status=0",
+        "UMI SecItem backend guardian: preflight complete"
+      ],
+      "boot_artifact": {
+        "helper": "helper-secitem-preflight-89",
+        "boot_sha256": "dbdc9b42b3d33e34f8ce650ea7c48431be8552fd7b7d24efd2b7ad93e08d394a",
+        "payload_sha256": "89d97e5facb049a7352e240fa3f9cd975ccae9bee2e682c9a230039e33ba6552",
+        "kernel_sha256": "bfa85d2bb24460dc6c8fb4fe595e1e1a1de94b37f1f3917b016b11ddfa804cbc",
+        "helper_sha256": "333a9b3b96d0504c7a887184f8e81a43e339f8912fe6cba6f6387d9774a6fe74"
+      },
+      "tested_source_sha256": {
+        "build-preflight.py": "285e41160a1eb1296eda6728a9850129a4bd06632381c3a1f00b5d61c666d867",
+        "backend-preflight.c": "8ea1931ecc7fd77d9fb280df4f9b8ce704d5b625cbfca12297045ad5d8abc5eb",
+        "build-backend.py": "768f3b65cc4bf50b59abc3c5740df5d9845f2b46578ccb45f19eb73162f9b2be",
+        "prepare-backend.py": "980ea20b4ae8ecdf40eae4dbff25475645b32344cbbdaad3ddb4c244a8b0a181",
+        "prepare-preflight.py": "ea6584ecaeed5707ae3a51bb8cc3697d105c0383c2807c53c40eca63c59bd75f",
+        "routing-probe.c": "2eac2d94d93c90d3dfd7a58936561faab3d5fc72bfabb71580c7968bd0553ca2",
+        "stage-default-bag.py": "9ec52a964dfd0af2f3a5639cfc28c26117b1e50113169128a9e473021629ccd5",
+        "backend-guardian.c": "b034ef90d4f32bb5b447624ec690566dd86915cb11083c8fc95840be7f715291",
+        "routing-guardian.c": "fbef96a68e503c5d57073ad3f3db55089b6d9c2107441a36719c2de244be1ac2",
+        "prepare-backend-helper.py": "c14e13981d6ddcb430a463bfd6c550fe23cf1e49fb88a070bdc291fc61381287"
+      },
+      "outcome": "mapping tests passed; add still failed on separate client"
+    },
+    {
+      "case": "native-90",
+      "firmware_log_sha256": "f7c34d279c833c41812958d75d806d5c6992bf384cb3dbff37f5379951dbc5e6",
+      "firmware_log_bytes": 982160,
+      "session_log_sha256": "3b06644b888872c17275e84e562772d0b99f7d6e758b63dc607337e009b3085d",
+      "final_sync_errno": [
+        "0"
+      ],
+      "returned_stock_android": true,
+      "markers": [
+        "UMI SecItem backend guardian: source and reconstructed executable hashes verified PASS",
+        "UMI SecItem backend: scope status=0x0 cookie=0x554f4b31",
+        "UMI SecItem backend: default bag cannot fall back to live system bag PASS",
+        "UMI SecItem backend: isolated default binding, invalid destination/handle, lock, wrong password and unload PASS",
+        "UMI SecItem backend: separate embedded AKS client isolated, bound and exact wrap compared PASS",
+        "UMI SecItem backend: private filesystem root established before database access PASS",
+        "UMI SecItem backend: original missing-item query status=-25300 output=0",
+        "UMI SecItem backend: original add error The operation couldn\\U2019t be completed. (NSOSStatusErrorDomain error -25291 - ks_crypt: e00002db failed to 'oe' item (class 6, bag: 0))",
+        "UMI SecItem backend: synthetic add status=-25291",
+        "UMI SecItem backend: FAIL line=175 errno=2 !status",
+        "UMI SecItem backend guardian: real system bag serialization/flags unchanged PASS",
+        "UMI SecItem backend guardian: child finished=1 normal=1 status=1",
+        "UMI SecItem backend guardian: FAIL line=45 errno=60 done&&WIFEXITED(status)&&WEXITSTATUS(status)==0"
+      ],
+      "boot_artifact": {
+        "helper": "helper-secitem-preflight-90",
+        "boot_sha256": "fcf4bf219cf77b7d9887a6ecd4142f3baa9f6d1b5190410cb0fb7eb1e1a0a359",
+        "payload_sha256": "f9b1a2b984de5285fbab392f3bcd31e9698a187c9da8e7c65a9f38ec448e3f4a",
+        "kernel_sha256": "bfa85d2bb24460dc6c8fb4fe595e1e1a1de94b37f1f3917b016b11ddfa804cbc",
+        "helper_sha256": "e71e87d00ec74cceedb383dd26748048fac56d839f858d52eb0fa64dd67515a0"
+      },
+      "tested_source_sha256": {
+        "build-preflight.py": "285e41160a1eb1296eda6728a9850129a4bd06632381c3a1f00b5d61c666d867",
+        "backend-preflight.c": "09b84674aa9ca04315c5a7fe98c73c597565abb43dd8148d185e956a8ba076bf",
+        "build-backend.py": "2604e7b9c0aaa1c6e7874ea67b16ab39e3baee14d0d90227d042fac2e32bdb90",
+        "prepare-backend.py": "980ea20b4ae8ecdf40eae4dbff25475645b32344cbbdaad3ddb4c244a8b0a181",
+        "prepare-preflight.py": "ea6584ecaeed5707ae3a51bb8cc3697d105c0383c2807c53c40eca63c59bd75f",
+        "routing-probe.c": "2eac2d94d93c90d3dfd7a58936561faab3d5fc72bfabb71580c7968bd0553ca2",
+        "stage-default-bag.py": "9ec52a964dfd0af2f3a5639cfc28c26117b1e50113169128a9e473021629ccd5",
+        "backend-guardian.c": "b034ef90d4f32bb5b447624ec690566dd86915cb11083c8fc95840be7f715291",
+        "routing-guardian.c": "fbef96a68e503c5d57073ad3f3db55089b6d9c2107441a36719c2de244be1ac2",
+        "prepare-backend-helper.py": "c14e13981d6ddcb430a463bfd6c550fe23cf1e49fb88a070bdc291fc61381287"
+      },
+      "outcome": "both clients bound; add failed due output capacity"
+    },
+    {
+      "case": "native-91",
+      "firmware_log_sha256": "0b3c375de3b7a31bd3349d8004f9978e40dd99207367cacdcf4cdff73bcfe45c",
+      "firmware_log_bytes": 989606,
+      "session_log_sha256": "8a2c17ea3bc9bc6c180c43ba08eb04e62c6a6cff11ad45a05e51cf01580209db",
+      "final_sync_errno": [
+        "0"
+      ],
+      "returned_stock_android": true,
+      "markers": [
+        "UMI SecItem backend guardian: source and reconstructed executable hashes verified PASS",
+        "UMI SecItem backend: scope status=0x0 cookie=0x554f4b31",
+        "UMI SecItem backend: default bag cannot fall back to live system bag PASS",
+        "UMI SecItem backend: isolated default binding, invalid destination/handle, lock, wrong password and unload PASS",
+        "UMI SecItem backend: separate embedded AKS client isolated, bound and exact wrap compared PASS",
+        "UMI SecItem backend: private filesystem root established before database access PASS",
+        "UMI SecItem backend: original missing-item query status=-25300 output=0",
+        "UMI SecItem backend: synthetic add status=0",
+        "UMI SecItem backend: synthetic C add status=0",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: original add error The operation couldn\\U2019t be completed. (NSOSStatusErrorDomain error -25299 - duplicate item O,genp,1D61DE1D,L,ak,com.hakios.synthetic.securityd,0,acct,svce,v_Data,musr,20261120024555.020061Z,D5734128)",
+        "UMI SecItem backend: read status=-25308 expected=-25308 output=0",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=-25308 expected=-25308 output=0",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=-25300 expected=-25300 output=0",
+        "UMI SecItem backend: read status=-25300 expected=-25300 output=0",
+        "UMI SecItem backend: original CRUD, duplicate refusal, A/C relock and wrong password PASS",
+        "UMI SecItem backend: private database exists=0 bytes=0",
+        "UMI SecItem backend: private file Analytics bytes=170",
+        "UMI SecItem backend: independent client lifetime and both default revocations PASS",
+        "UMI SecItem backend: synthetic default bag revoked after database probe PASS",
+        "UMI SecItem backend: synthetic add diagnostic complete; encryption NOT QUALIFIED",
+        "UMI SecItem backend guardian: real system bag serialization/flags unchanged PASS",
+        "UMI SecItem backend guardian: child finished=1 normal=1 status=0",
+        "UMI SecItem backend guardian: preflight complete",
+        "[   46.115523]: UMI isolated native wrap: op=10 class=6 input=32 capacity=80 result=0 bytes=40",
+        "[   46.115600]: UMI isolated native wrap: op=10 class=6 input=32 capacity=80 result=0 bytes=40",
+        "[   46.340240]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   46.340828]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   46.341969]: UMI isolated native wrap: op=10 class=7 input=32 capacity=40 result=0 bytes=40",
+        "[   46.342339]: UMI isolated native wrap: op=10 class=7 input=32 capacity=40 result=0 bytes=40",
+        "[   46.342981]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   46.343317]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   46.343695]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32",
+        "[   46.343939]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32",
+        "[   46.344684]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   46.345498]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   46.348373]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=1 bytes=80",
+        "[   46.348809]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32",
+        "[   48.153561]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=1 bytes=80",
+        "[   50.058079]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   50.059221]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   50.060331]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   50.061352]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32"
+      ],
+      "boot_artifact": {
+        "helper": "helper-secitem-preflight-91",
+        "boot_sha256": "da257289ef1754a5e26dcfdc254956a06d1b3b51f0f1c39957fb6ed482df047e",
+        "payload_sha256": "96acfe0fc177adf35dd0f018184e3bdd647c8c85b8b1f57608d08d8512fe4e15",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "e81fbfe5d9880d78e9d969e6b9c33317626631f7c938bdc9f2feb14331096f10"
+      },
+      "tested_source_sha256": {
+        "native-wrap-test.c": "d9ddef55c2e22e6a84bf66ff822e5f08a030ba357c773fbd838f7952df2b187e",
+        "build-preflight.py": "285e41160a1eb1296eda6728a9850129a4bd06632381c3a1f00b5d61c666d867",
+        "backend-preflight.c": "f0d57cae3b5d883ccfe23671a49ba8abbb3e976b95a6fabc1a6712372c1fb993",
+        "umi_native_item_keys.h": "3cccb4fb5c310592b1dc1be5f65d33f08c4ff7dd3b8a76d3e07ba0d7a693ddfe",
+        "build-backend.py": "2604e7b9c0aaa1c6e7874ea67b16ab39e3baee14d0d90227d042fac2e32bdb90",
+        "prepare-backend.py": "980ea20b4ae8ecdf40eae4dbff25475645b32344cbbdaad3ddb4c244a8b0a181",
+        "prepare-preflight.py": "ea6584ecaeed5707ae3a51bb8cc3697d105c0383c2807c53c40eca63c59bd75f",
+        "routing-probe.c": "2eac2d94d93c90d3dfd7a58936561faab3d5fc72bfabb71580c7968bd0553ca2",
+        "stage-default-bag.py": "9ec52a964dfd0af2f3a5639cfc28c26117b1e50113169128a9e473021629ccd5",
+        "abi.json": "d0d1e4a288e03a4a7f688ea4d825e920908454724c0fdd2fa17efe8d5d2dafb2",
+        "stage-native-wrap.py": "7ba45318d9c13c8ff5def864d615491b14129c1a0318297acb2f116273fccb5c",
+        "backend-guardian.c": "b034ef90d4f32bb5b447624ec690566dd86915cb11083c8fc95840be7f715291",
+        "routing-guardian.c": "fbef96a68e503c5d57073ad3f3db55089b6d9c2107441a36719c2de244be1ac2",
+        "prepare-backend-helper.py": "c14e13981d6ddcb430a463bfd6c550fe23cf1e49fb88a070bdc291fc61381287"
+      },
+      "outcome": "CRUD/protection passed in memory; not durable"
+    },
+    {
+      "case": "native-92",
+      "firmware_log_sha256": "496f4a29eb587150903048fb1917f21864189307b9248bd2c31947aadde8cb67",
+      "firmware_log_bytes": 987449,
+      "session_log_sha256": "78cbe9b17d33c67d7107bc64cc987f2e75625ce98fa36ea8db02091725da4d41",
+      "final_sync_errno": [
+        "0"
+      ],
+      "returned_stock_android": true,
+      "markers": [
+        "UMI SecItem backend guardian: source and reconstructed executable hashes verified PASS",
+        "UMI SecItem backend: scope status=0x0 cookie=0x554f4b31",
+        "UMI SecItem backend: default bag cannot fall back to live system bag PASS",
+        "UMI SecItem backend: isolated default binding, invalid destination/handle, lock, wrong password and unload PASS",
+        "UMI SecItem backend: separate embedded AKS client isolated, bound and exact wrap compared PASS",
+        "UMI SecItem backend: private filesystem root established before database access PASS",
+        "UMI SecItem backend: original missing-item query status=-25300 output=0",
+        "UMI SecItem backend: synthetic add status=0",
+        "UMI SecItem backend: synthetic C add status=0",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: original add error The operation couldn\\U2019t be completed. (NSOSStatusErrorDomain error -25299 - duplicate item O,genp,1D61DE1D,L,ak,com.hakios.synthetic.securityd,0,acct,svce,v_Data,musr,20261120025043.768347Z,C59A941A)",
+        "UMI SecItem backend: read status=-25308 expected=-25308 output=0",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=-25308 expected=-25308 output=0",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=-25300 expected=-25300 output=0",
+        "UMI SecItem backend: read status=-25300 expected=-25300 output=0",
+        "UMI SecItem backend: original CRUD, duplicate refusal, A/C relock and wrong password PASS",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: persistent A/C records and encrypted bag created PASS",
+        "UMI SecItem backend: private database exists=1 bytes=4096",
+        "UMI SecItem backend: private file Analytics bytes=170",
+        "UMI SecItem backend: private file keychain-2.db bytes=4096",
+        "UMI SecItem backend: private file keychain-2.db-shm bytes=32768",
+        "UMI SecItem backend: private file keychain-2.db-wal bytes=1182472",
+        "UMI SecItem backend: independent client lifetime and both default revocations PASS",
+        "UMI SecItem backend: synthetic default bag revoked after database probe PASS",
+        "UMI SecItem backend: synthetic add diagnostic complete; encryption NOT QUALIFIED",
+        "UMI SecItem backend guardian: real system bag serialization/flags unchanged PASS",
+        "UMI SecItem backend guardian: child finished=1 normal=1 status=0",
+        "UMI SecItem backend guardian: on-disk SQLite integrity and absent plaintext sentinel PASS",
+        "UMI SecItem backend guardian: preflight complete",
+        "[   44.682292]: UMI isolated native wrap: op=10 class=6 input=32 capacity=80 result=0 bytes=40",
+        "[   44.682368]: UMI isolated native wrap: op=10 class=6 input=32 capacity=80 result=0 bytes=40",
+        "[   45.130928]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   45.131711]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   45.133434]: UMI isolated native wrap: op=10 class=7 input=32 capacity=40 result=0 bytes=40",
+        "[   45.133839]: UMI isolated native wrap: op=10 class=7 input=32 capacity=40 result=0 bytes=40",
+        "[   45.134870]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   45.135315]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   45.135835]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32",
+        "[   45.136138]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32",
+        "[   45.137144]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   45.138232]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   45.142932]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=1 bytes=80",
+        "[   45.143572]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32",
+        "[   47.032346]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=1 bytes=80",
+        "[   48.947990]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   48.949204]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   48.950309]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   48.951601]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   48.954456]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   48.955418]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   48.956367]: UMI isolated native wrap: op=10 class=7 input=32 capacity=40 result=0 bytes=40",
+        "[   48.957370]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32"
+      ],
+      "boot_artifact": {
+        "helper": "helper-secitem-preflight-92",
+        "boot_sha256": "4b904eaebffa33ade081896e660a104453088439505cfbb4a0a514d0dbbb0a3d",
+        "payload_sha256": "683b3fcf6dad53b76259f9c0627c6243a605b37d93a336a6f5454d7da248d0c5",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "111a0ceca3c717e55de648f5592b23f3aa4839d9c9be48a63d1ad17bdb54cd7b"
+      },
+      "tested_source_sha256": {
+        "native-wrap-test.c": "d9ddef55c2e22e6a84bf66ff822e5f08a030ba357c773fbd838f7952df2b187e",
+        "build-preflight.py": "285e41160a1eb1296eda6728a9850129a4bd06632381c3a1f00b5d61c666d867",
+        "backend-preflight.c": "e0762645ae4faf2039d4d487e0e3c395193996b51fe271229631a324cdbbb1af",
+        "umi_native_item_keys.h": "3cccb4fb5c310592b1dc1be5f65d33f08c4ff7dd3b8a76d3e07ba0d7a693ddfe",
+        "build-backend.py": "bef904ffcea89fddfcbec86319e842b1ada9eb97616bc0a4d93c45ad864732db",
+        "prepare-backend.py": "d0dff7b507ffd0265f62c3e2a9f8a23e2e8a476e5aad030fa682606da021f0c0",
+        "prepare-preflight.py": "ea6584ecaeed5707ae3a51bb8cc3697d105c0383c2807c53c40eca63c59bd75f",
+        "routing-probe.c": "2eac2d94d93c90d3dfd7a58936561faab3d5fc72bfabb71580c7968bd0553ca2",
+        "stage-default-bag.py": "9ec52a964dfd0af2f3a5639cfc28c26117b1e50113169128a9e473021629ccd5",
+        "stage-native-wrap.py": "7ba45318d9c13c8ff5def864d615491b14129c1a0318297acb2f116273fccb5c",
+        "backend-guardian.c": "a7aa966628961f4542cb915f505ab9ad8cf34d91715638e0f4ffd5f0b4dd1192",
+        "routing-guardian.c": "fbef96a68e503c5d57073ad3f3db55089b6d9c2107441a36719c2de244be1ac2",
+        "prepare-backend-helper.py": "c14e13981d6ddcb430a463bfd6c550fe23cf1e49fb88a070bdc291fc61381287"
+      },
+      "outcome": "disk creation, CRUD/protection and integrity passed"
+    },
+    {
+      "case": "native-93",
+      "firmware_log_sha256": "b3f62ab6b8e93a56eae1d8234646ea11e9e8fc24b66269effe95126ef515b9f9",
+      "firmware_log_bytes": 979449,
+      "session_log_sha256": "7ce0df340a578a90c4327dba8f6228817a02282d7761ba16af484907a736d05b",
+      "final_sync_errno": [
+        "0"
+      ],
+      "returned_stock_android": true,
+      "markers": [
+        "UMI SecItem backend guardian: source and reconstructed executable hashes verified PASS",
+        "UMI SecItem backend: scope status=0x0 cookie=0x554f4b31",
+        "UMI SecItem backend: default bag cannot fall back to live system bag PASS",
+        "UMI SecItem backend: persisted bag reloaded locked, wrong password refused, correct password bound PASS",
+        "UMI SecItem backend: separate embedded AKS client isolated, bound and exact wrap compared PASS",
+        "UMI SecItem backend: private filesystem root established before database access PASS",
+        "UMI SecItem backend: original missing-item query status=-25300 output=0",
+        "UMI SecItem backend: synthetic add status=0",
+        "UMI SecItem backend: synthetic C add status=0",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: original add error The operation couldn\\U2019t be completed. (NSOSStatusErrorDomain error -25299 - duplicate item O,genp,1D61DE1D,L,ak,com.hakios.synthetic.securityd,0,acct,svce,v_Data,musr,20261120025239.054756Z,C184C966)",
+        "UMI SecItem backend: read status=-25308 expected=-25308 output=0",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=-25308 expected=-25308 output=0",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=-25300 expected=-25300 output=0",
+        "UMI SecItem backend: read status=-25300 expected=-25300 output=0",
+        "UMI SecItem backend: original CRUD, duplicate refusal, A/C relock and wrong password PASS",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: read status=0 expected=0 output=1",
+        "UMI SecItem backend: persisted A/C records recovered after reboot PASS",
+        "UMI SecItem backend: private database exists=1 bytes=4096",
+        "UMI SecItem backend: private file Analytics bytes=170",
+        "UMI SecItem backend: private file keychain-2.db bytes=4096",
+        "UMI SecItem backend: private file keychain-2.db-shm bytes=32768",
+        "UMI SecItem backend: private file keychain-2.db-wal bytes=1532672",
+        "UMI SecItem backend: independent client lifetime and both default revocations PASS",
+        "UMI SecItem backend: synthetic default bag revoked after database probe PASS",
+        "UMI SecItem backend: synthetic add diagnostic complete; encryption NOT QUALIFIED",
+        "UMI SecItem backend guardian: real system bag serialization/flags unchanged PASS",
+        "UMI SecItem backend guardian: child finished=1 normal=1 status=0",
+        "UMI SecItem backend guardian: on-disk SQLite integrity and absent plaintext sentinel PASS",
+        "UMI SecItem backend guardian: preflight complete",
+        "[   41.815953]: UMI isolated native wrap: op=10 class=6 input=32 capacity=80 result=0 bytes=40",
+        "[   41.816035]: UMI isolated native wrap: op=10 class=6 input=32 capacity=80 result=0 bytes=40",
+        "[   42.008869]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   42.012605]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   42.016180]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32",
+        "[   42.016774]: UMI isolated native wrap: op=10 class=7 input=32 capacity=40 result=0 bytes=40",
+        "[   42.018338]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   42.018902]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32",
+        "[   42.019713]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   42.020607]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   42.023300]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=1 bytes=80",
+        "[   42.024706]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32",
+        "[   43.985811]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=1 bytes=80",
+        "[   45.890891]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   45.892017]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   45.892942]: UMI isolated native wrap: op=10 class=6 input=32 capacity=40 result=0 bytes=40",
+        "[   45.894143]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   45.896524]: UMI isolated native wrap: op=11 class=6 input=40 capacity=32 result=0 bytes=32",
+        "[   45.897096]: UMI isolated native wrap: op=11 class=7 input=40 capacity=32 result=0 bytes=32"
+      ],
+      "boot_artifact": {
+        "helper": "helper-secitem-preflight-93",
+        "boot_sha256": "eddab91f9ade9622c35768a15448462309bf89d8afbae6c75dacbaa3aa532826",
+        "payload_sha256": "9ac6c68bf8c8bebf9bd241697b07b075a5c78932bfd5dcc02170a07aaa143f71",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "04fb7629f5bc954a2649e753e7aecbeaa17815c6ca6104028bed15beabfe18ac"
+      },
+      "tested_source_sha256": {
+        "native-wrap-test.c": "d9ddef55c2e22e6a84bf66ff822e5f08a030ba357c773fbd838f7952df2b187e",
+        "build-preflight.py": "285e41160a1eb1296eda6728a9850129a4bd06632381c3a1f00b5d61c666d867",
+        "backend-preflight.c": "e0762645ae4faf2039d4d487e0e3c395193996b51fe271229631a324cdbbb1af",
+        "umi_native_item_keys.h": "3cccb4fb5c310592b1dc1be5f65d33f08c4ff7dd3b8a76d3e07ba0d7a693ddfe",
+        "build-backend.py": "bef904ffcea89fddfcbec86319e842b1ada9eb97616bc0a4d93c45ad864732db",
+        "prepare-backend.py": "d0dff7b507ffd0265f62c3e2a9f8a23e2e8a476e5aad030fa682606da021f0c0",
+        "prepare-preflight.py": "ea6584ecaeed5707ae3a51bb8cc3697d105c0383c2807c53c40eca63c59bd75f",
+        "routing-probe.c": "2eac2d94d93c90d3dfd7a58936561faab3d5fc72bfabb71580c7968bd0553ca2",
+        "stage-default-bag.py": "9ec52a964dfd0af2f3a5639cfc28c26117b1e50113169128a9e473021629ccd5",
+        "stage-native-wrap.py": "7ba45318d9c13c8ff5def864d615491b14129c1a0318297acb2f116273fccb5c",
+        "backend-guardian.c": "a7aa966628961f4542cb915f505ab9ad8cf34d91715638e0f4ffd5f0b4dd1192",
+        "routing-guardian.c": "fbef96a68e503c5d57073ad3f3db55089b6d9c2107441a36719c2de244be1ac2",
+        "prepare-backend-helper.py": "c14e13981d6ddcb430a463bfd6c550fe23cf1e49fb88a070bdc291fc61381287"
+      },
+      "outcome": "same disk records recovered across Android reboot; CRUD/protection and integrity passed"
+    }
+  ],
+  "host_test": {
+    "log_sha256": "ca478657ca4b3b098124cc572b771541c5c663d6b27f750b0058d10e3ee41444",
+    "markers": [
+      "ordinary core PASS: previous-format cross-check, class isolation, master-free C lock access, reboot reset, corruption and bounds",
+      "native wrap PASS: 8-byte overhead, old-format separation, A/C policy, byte corruption, wrong bag/class, bounds and restart reset"
+    ],
+    "sanitizers": [
+      "address",
+      "undefined"
+    ]
+  },
+  "kernels": {
+    "16": {
+      "sha256": "bfa85d2bb24460dc6c8fb4fe595e1e1a1de94b37f1f3917b016b11ddfa804cbc",
+      "original_usb_executable_sha256": {
+        "com.apple.driver.AppleUSBDeviceMux": "189ea36f67d9576bab07b80a40e4e3ac4c36f9ba8cc1782b32141e8a07b705b6",
+        "com.apple.driver.AppleUSBXDCI": "cff3a644b6f88a8a4a6d099507e44a9836a4db2837fa790196a0c980f1571d49",
+        "com.apple.driver.usb.AppleUSBCommon": "86e8cb22b600cccdb0af4a0945090fe337ab61dbebe76ec445913d46c75c3997",
+        "com.apple.iokit.IOUSBDeviceFamily": "266bda6018de7fb275314215eb5ad23db31a6020b8e6d5edddc081c3e1fafe18"
+      }
+    },
+    "17": {
+      "sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+      "original_usb_executable_sha256": {
+        "com.apple.driver.AppleUSBDeviceMux": "189ea36f67d9576bab07b80a40e4e3ac4c36f9ba8cc1782b32141e8a07b705b6",
+        "com.apple.driver.AppleUSBXDCI": "cff3a644b6f88a8a4a6d099507e44a9836a4db2837fa790196a0c980f1571d49",
+        "com.apple.driver.usb.AppleUSBCommon": "86e8cb22b600cccdb0af4a0945090fe337ab61dbebe76ec445913d46c75c3997",
+        "com.apple.iokit.IOUSBDeviceFamily": "266bda6018de7fb275314215eb5ad23db31a6020b8e6d5edddc081c3e1fafe18"
+      }
+    }
+  },
+  "transport": "firmware log channel; original native USB pairing was not handed off or retested",
+  "loader_source_sha256": "7b0cf8c13e3e3f5d047e5b14c8c8ced820e1736d7777071d85ebc756b2bfa1e4",
+  "usb_bridge_objects_sha256": {
+    "UmiDwc3Xdci.late.o": "4ab512a09e154a9609e27b67b6ce42dee92fab2fb7dc5bc1d4727053ba229fdf",
+    "usb-bindings.o": "e970247ada47556711b5dd53957edffc6e62b546322c373fa9e260e2d850c16e"
+  }
+}

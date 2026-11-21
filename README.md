@@ -85,6 +85,18 @@ to read iOS 16.5 and `iPhone10,3` and capture 60 seconds of native system logs
 returned to stock Android. The cause of the USB drop before first unlock is
 still unknown. [USB handoff comparison](devices/xiaomi-mi-10/USB-PAIRING.md#handoff-after-first-unlock-2026-11-21).
 
+### Lock-screen passcode and data protection
+
+The temporary iOS build saves the native lock-screen passcode across reboots,
+requires it again after locking, and rejects an incorrect entry. Separate
+experiments verified class A/C file access on a 16 MiB encrypted HFS volume,
+password changes with recovery after a process exit, persistent retry counts,
+and transactional conversion of known synthetic keychain entries. The existing
+`/private/var` volume is still unencrypted. Integrating the real password
+service and keychain, completing the protection classes, and implementing
+encrypted UFS startup and recovery remain open. See the
+[encryption progress and plan](devices/xiaomi-mi-10/ENCRYPTION-PLAN.md).
+
 ### Storage validation
 
 The single-slot UMI menu selected iOS 16.5 from RAM and reached the home

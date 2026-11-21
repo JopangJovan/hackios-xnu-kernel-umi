@@ -1,0 +1,145 @@
+{
+  "schema": 1,
+  "date": "2026-11-20",
+  "scope": "Persistent retry policy in an opt-in original keybagd diagnostic copy; public fixtures only",
+  "host": {
+    "asan_ubsan": "PASS",
+    "retry_error_points": 36,
+    "retry_process_exit_points": 36,
+    "persistent_debit_and_reset": "PASS",
+    "restart_wait_and_clock_rollback": "PASS",
+    "clock_overflow_refusal": "PASS",
+    "distinct_concurrent_attempts": "PASS; a second owner is not deduplicated as a replay",
+    "legacy_policyless_record": "refused",
+    "strict_journal_and_commit_retry_regression": "PASS",
+    "ordinary_item_keys_regression": "PASS"
+  },
+  "native": {
+    "native-83": {
+      "result": "PASS",
+      "mode": "create",
+      "root": "/var/tmp/k83",
+      "markers": [
+        "UMI retry test: debit survives process exit before verification PASS",
+        "UMI retry test: restarted service enforces pending wait without another debit PASS",
+        "UMI retry test: failed debit prevents verification/change PASS",
+        "UMI retry test: failed reset rejects correct secret and retains previous bag PASS",
+        "UMI retry test: persistent five-failure fixture ready for reboot PASS",
+        "UMI retry test: real system bag serialization/flags unchanged PASS",
+        "UMI retry test: create PASS"
+      ],
+      "bag_generation_at_end": 3,
+      "failure_count_at_end": 5,
+      "real_system_bag_unchanged": true,
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "helper_validation": "apfsck clean; all 499 entries match",
+      "validated_actual_boot_artifact": {
+        "helper": "helper-retry-policy-83",
+        "boot_sha256": "28bc5e5b79679a71a8f3496c024abaf09f9173bc6fe847b559efac3236d53fac",
+        "payload_sha256": "ad5ac6c5bdf4c8e571b25a24ac05e1965d870b46418604a1adea29c799b4a2b1",
+        "kernel_sha256": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+        "helper_sha256": "59c0f93b21002ae4bd953ded935dfb0d0c4303310a65706fbdbe1182a7035627"
+      },
+      "log_sha256": "8c379ecb68a857c8658e96389a92cb9c75f4557c3f538ea43c34647309067d50",
+      "log_bytes": 1130814,
+      "tested_binaries": {
+        "bin/keybagd-txn": "3e7d25186e5a58db984499aee716b8d12c15f7d17bfcc3414f5f0558fab29c56",
+        "bin/umi-native-txn-test": "b51ead895ec385cb223e3a4b313adea193e286f2312a4a4a98921dbbe8e7f1c8",
+        "lib/umi-native-txn.dylib": "fb50e37fb46c9165dece30ea0c50727ada1b4c22383b7adb9ecbffe71fe3046f"
+      }
+    },
+    "native-84": {
+      "result": "PASS",
+      "mode": "verify",
+      "root": "/var/tmp/k83",
+      "markers": [
+        "UMI retry test: Android reboot retains failures and re-applies wait PASS",
+        "UMI retry test: post-wait reset and rekey preserve original wrapped key PASS",
+        "UMI retry test: real system bag serialization/flags unchanged PASS",
+        "UMI retry test: verify PASS"
+      ],
+      "bag_generation_at_end": 4,
+      "failure_count_at_end": 0,
+      "real_system_bag_unchanged": true,
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "helper_validation": "apfsck clean; all 499 entries match",
+      "validated_actual_boot_artifact": {
+        "helper": "helper-retry-policy-84",
+        "boot_sha256": "9997abc3702e5bed49dde331500ec5affed2d2553022ff44424af34572648b5d",
+        "payload_sha256": "39347de3b3fb5107ef818d4f7339f0ecf7a1462fae3f2fc529f80a1423c5b54d",
+        "kernel_sha256": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+        "helper_sha256": "07fc04717e78bb0720328b52d8495f37de36d3fb32839b43b7046ac014c42f52"
+      },
+      "log_sha256": "145af134bfeb8b0855199459c3359c690a750a0ec161ce3a8d6ad8de7dbab467",
+      "log_bytes": 1018157,
+      "tested_binaries": {
+        "bin/keybagd-txn": "3e7d25186e5a58db984499aee716b8d12c15f7d17bfcc3414f5f0558fab29c56",
+        "bin/umi-native-txn-test": "b51ead895ec385cb223e3a4b313adea193e286f2312a4a4a98921dbbe8e7f1c8",
+        "lib/umi-native-txn.dylib": "fb50e37fb46c9165dece30ea0c50727ada1b4c22383b7adb9ecbffe71fe3046f"
+      }
+    }
+  },
+  "boundaries": {
+    "kernel_sha256": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+    "loader_source_sha256": "7b0cf8c13e3e3f5d047e5b14c8c8ced820e1736d7777071d85ebc756b2bfa1e4",
+    "kernel_and_usb_source_changes": false,
+    "real_pin_operations": 0,
+    "native_usb_pairing_retested": false,
+    "firmware_log_channel_retained": true,
+    "android_gpt_boot_partition_writes": false,
+    "live_keychain_migration": false,
+    "full_80GiB_encryption": false,
+    "hardware_rollback_protection": false,
+    "physical_power_loss_test": false,
+    "live_password_service_policy_enabled": false,
+    "diagnostic_password_service_policy_enabled": true,
+    "other_kernel_clients_policy_enforced": false,
+    "public_test_policy_key": true
+  },
+  "source_sha256": {
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/adapter.c": "623bb5cfd9824e419161e02db61d0ff96819f31ae4af0243e919c616e3013310",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/build-test.py": "1ca4bdbe48c7b0934f920dd9c65507c457da2a4aa65590288c52d1ff74e8b2c7",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys-test.c": "b34fa1d491f08ee271eec2a4d5e321b9b0f7c7b86a47c6499f114b96a62c5f03",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys.c": "784950bebe98ad21358a29a299703327823a105c5e936bbf3003bf9e1b48bded",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys.h": "1720c8614bf1d6b59471af10b60e9c994e0b0f457d4b7c844a24afc05d1e293b",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal-retry-test.c": "850edf09d251b7b41b4b172b348950250a4be927feed690b2bfa6d691b1e30d9",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal-test.c": "9e10cefd2db0d3d7580d46ec43b9a242bfc1feef6640671a359af84c2af7959c",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal.c": "70eda0399de1afba7fe58a660b2f9266ce3a810e7669ced8b08adf403ea42703",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal.h": "8f5e0ae620d7716dca1c01a547e5460e89c2f8321f6cf05a4dc49f487463b268",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/keychain-probe.c": "34cf4afda94201c8cbe7ad9d1d29c8ce132de25e3319d49caa5604849df01707",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/native-test.c": "78288133b9c407d50be7b0592bcca67feac2474a087db6f79c0fd9a1aa66c265",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/ordinary-client.h": "8acd7e5d671319916115121394db6a17776334dee7ff8bdf33213118d581606c",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/prepare-recovery.py": "826d8f83b94d7d8e365aa3a9ff86d5efe8f2fd2a1a193d165246a91e69b18588",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/prepare-test.py": "061c3242abbd2f0435e0989bbbdea086e3f95d31534b63ea828a4251bad2e2e1",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/recovery-test.c": "b8ce29aea92d04784d76c527ca2eaa2b5b42e4d76b45f3e113e593f77772b4f3",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/request.m": "8ee6353c51281b7cb7ceb7626a45f4253f8a09d34a2a6ef0d3d97e6b66dd7947",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/retry-policy-test.c": "03dfefbc3fd94c996c13c8fd0d3a3afa9d1632b750030cdf1b0c2655b3a76dc9",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/retry-policy.c": "8164d30e2da59cd76130af6d0708d690be112befc702cc8f5688a8e9604fce1d",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/retry-policy.h": "883a9db7bb483ec8fbc91605803dd668f3d133f28167e8b723b31ec950dac40a",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/retry-test.c": "57dacddf896aad4ff65efe32f1265f5248d764ad6896253351d31be56f4bb432",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/test-secrets.h": "72af8c51217b0c6d6b1d593b6778e34e3d7741dd99ff605c279b42e6318cd593"
+  },
+  "host_log_sha256": "b0cf3992ce56dbb49ca0a1860ca6e1d94e520326c5e4eb588bd0b069056fee55",
+  "final_stock_android": {
+    "device": "umi",
+    "build": "V14.0.4.0.TJBCNXM",
+    "boot_completed": "1"
+  },
+  "preexisting_boot_smoke_failures": {
+    "count": 4,
+    "unchanged_from": "native-82",
+    "checks": [
+      "300 KB file read",
+      "seek",
+      "mmap",
+      "child program execution"
+    ],
+    "part_of_retry_policy_pass": false
+  }
+}
