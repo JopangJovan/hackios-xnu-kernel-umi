@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "date": "2026-11-20",
+  "scope": "isolated userspace synthetic keybags and item keys; not the live system bag or keychain",
+  "test_policy_key": "public fixture only, not a hardware or production policy key",
+  "host": {
+    "returncode": 0,
+    "elapsed_seconds": 145.5,
+    "asan_ubsan": true,
+    "repeat_verify": 2
+  },
+  "native": {
+    "native-67": {
+      "mode": "create",
+      "result": "PASS",
+      "markers": [
+        "PASS candidate/commit, old/new password, immutable file keys and item lifetimes",
+        "PASS persistent pre-debit, retry delay, clock rollback and failed-auth-result save",
+        "PASS current-generation mirror recovery; corrupt/missing authority, wrong policy and symlink refused",
+        "PASS 20 save interruption/process-exit checkpoints; no mixed or passwordless state",
+        "PASS retained synthetic fixture saved for later boot",
+        "UMI keybag recovery: create PASS; system credentials untouched"
+      ],
+      "flush_errno": 0,
+      "stock_android_return": true,
+      "log_sha256": "dd88ae0e2cd60608cd563a1678419a5670dd1163d42e42ecfe7f45eaa4dc120d",
+      "log_bytes": 1157819,
+      "helper_apfs_sha256": "5f35668a50c883805615d9799917f45bbdf99ddf70bf8f0bb969130ecdb24edc",
+      "helper_validation": "apfsck clean; 505 entries match source/manifest"
+    },
+    "native-68": {
+      "mode": "verify",
+      "result": "PASS",
+      "markers": [
+        "PASS later-process/boot recovery, persisted retry state, old secret refusal and identical item keys",
+        "UMI keybag recovery: verify PASS; system credentials untouched"
+      ],
+      "flush_errno": 0,
+      "stock_android_return": true,
+      "log_sha256": "701d5bbefa84b128e661b6d53416fb1135a16139bef8228ca36bd60f4335edc1",
+      "log_bytes": 1004384,
+      "helper_apfs_sha256": "552e188822cea85dde9fd0734fddfceffe02c1a9155551e19f57c7b2046b40f9",
+      "helper_validation": "apfsck clean; 505 entries match source/manifest"
+    }
+  },
+  "changes": {
+    "kernel_changed": false,
+    "loader_changed": false,
+    "native_usb_pairing_retested_in_these_two_boots": false,
+    "firmware_log_channel_retained": true,
+    "real_passcode_or_pairing_migration": false,
+    "android_gpt_boot_partition_writes": false,
+    "full_darwin_encryption": false
+  },
+  "sha256": {
+    "devices/xiaomi-mi-10/experimental/keybag-recovery/secure_store.h": "ed47f76d8a539d56155c29531d049a43fd45bc96a4e3f988398d4af7b28b2095",
+    "devices/xiaomi-mi-10/experimental/keybag-recovery/secure_store.c": "dace3e403bcbfabf5bdddcf0111f766726136626ec9313336d0a6b19af05c3c1",
+    "devices/xiaomi-mi-10/experimental/keybag-recovery/store-test.c": "36171d8ceac42f4b005731a1f9ec5fd7fadaf57df9ee4606b87bf01babd5b90f",
+    "devices/xiaomi-mi-10/experimental/keybag/umi_aks_crypto.h": "73433e659bc6a23cf39671feb9626d15cca6f3c2686898253efa2c98d014fef8",
+    "unchanged_prepared_kernel": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+    "unchanged_prepared_loader_source": "7b0cf8c13e3e3f5d047e5b14c8c8ced820e1736d7777071d85ebc756b2bfa1e4",
+    "ios_test_helper": "371659e50098660939d82be142d48fec3786e4fc41c448b5285684ffddaa37fc"
+  },
+  "repository_check": {
+    "prepare_verify": "pre-existing upstream manifest mismatch",
+    "path": "xnu/files/osfmk/arm64/loader_return.c",
+    "file_has_worktree_changes": false,
+    "last_commit_for_file": "4b09a24"
+  },
+  "final_device": {
+    "boot_completed": true,
+    "product": "umi",
+    "android_build": "V14.0.4.0.TJBCNXM"
+  }
+}
