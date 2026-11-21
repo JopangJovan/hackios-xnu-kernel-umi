@@ -5,6 +5,42 @@ saved as an [experimental source checkpoint](experimental/native-usb/README.md).
 It requires the prepared UFS/native-prelink test trees and does not enable
 native USB in the normal build.
 
+## Handoff after first unlock, 2026-11-21
+
+In `native-105`, the boot script handed off DWC3 before the first unlock.
+The Mac's retrospective USB log shows 480 Mbps enumeration, configuration 1
+and usbmux registration. About 13.5 seconds later the bulk IN endpoint `0x81`
+failed with `0xe00002ed` and the host reported `hardware connection lost`.
+The earlier host probe also compared a firmware diagnostic serial with the
+native USB serial and could miss a registered device. Configuration success
+and a missing device in that probe describe different stages of the failure.
+
+The controlled follow-up waits for the native passcode observer to report an
+authenticated, effectively unlocked session before releasing USB. It compares
+the host pairing record on the USB device selected by the actual usbmux
+identity. The host check starts an SSL session using the saved HostID and
+compares the pairing record bytes across both images.
+
+| Case | Temporary boot artifact | Device information | Native syslog |
+|---|---|---|---|
+| `native-106` | Exact archived image from paired `native-66` | iOS 16.5, `iPhone10,3`, `D22AP` | 18 s, 229,376 bytes, 1,311 lines |
+| `native-107` | Exact image from failing `native-105`, with handoff after unlock | Same identity, same stored trust record | 60 s, 1,449,984 bytes, 9,023 lines |
+
+Both runs used the existing passcode and pair record and returned through
+the loader to stock Android after a normal diagnostics restart. The updated
+handoff sequence passed with the current image. The DWC3 transaction error's
+underlying trigger before first unlock remains unconfirmed.
+
+For the temporary passcode build with the observer enabled, start
+`oem darwin-usb-delay` as usual, then use
+[`wait-unlocked-handoff.py`](experimental/native-usb/tools/wait-unlocked-handoff.py)
+with the selected device's Fastboot serial. The helper checks the current
+console before requesting handoff. The
+[`existing-pair`](experimental/native-usb/host/existing-pair.c) host tool takes
+the device's native USB identifier from usbmux. Use `info 0` for metadata or
+a new output file and a duration in seconds for syslog. The tool uses
+`StartSession` with the existing record and has no pairing creation path.
+
 ## Temporary-image result, 2026-11-17
 
 The Xiaomi Mi 10 reached the iOS 16.5 home screen with a temporary UEFI

@@ -72,6 +72,11 @@ CommCenter 服务入口的诊断作业。
 本轮未启用蜂窝功能，尚未合入日常构建；激活状态仍为未激活。
 [USB 配对结果和待验证项](devices/xiaomi-mi-10/USB-PAIRING.md)
 
+2026-11-21 的临时镜像在 iOS 首次解锁后才把 USB 控制器从 UEFI 交给 iOS。
+Mac 复用原有信任记录读到 iOS 16.5 和 `iPhone10,3`，连续采集 60 秒原生系统日志
+（1,449,984 字节、9,023 行）。配对记录逐字节一致，测试后手机已回原厂安卓。
+首次解锁前 USB 掉线的原因仍未查明。[交接对照结果](devices/xiaomi-mi-10/USB-PAIRING.md#handoff-after-first-unlock-2026-11-21)。
+
 ### 尚未完成
 
 - 传感器 DSP 后面的其他传感器（加速度计、陀螺仪、光线、距离、气压）：DSP 已经读取它们的 registry，但还没有提供给 iOS，所以没有

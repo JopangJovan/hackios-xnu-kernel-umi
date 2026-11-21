@@ -78,6 +78,13 @@ page still stops at the unactivated-device dialog. This temporary build
 isolates USB from the modem; normal-build integration and cellular regression
 tests remain pending. [USB pairing findings](devices/xiaomi-mi-10/USB-PAIRING.md).
 
+On 2026-11-21, the temporary USB test waited for the first iOS unlock before
+handing the controller from UEFI to iOS. The Mac reused the saved trust record
+to read iOS 16.5 and `iPhone10,3` and capture 60 seconds of native system logs
+(1,449,984 bytes, 9,023 lines). The pairing record was unchanged, and the phone
+returned to stock Android. The cause of the USB drop before first unlock is
+still unknown. [USB handoff comparison](devices/xiaomi-mi-10/USB-PAIRING.md#handoff-after-first-unlock-2026-11-21).
+
 ### Storage validation
 
 The single-slot UMI menu selected iOS 16.5 from RAM and reached the home

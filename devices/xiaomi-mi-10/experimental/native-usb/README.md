@@ -75,8 +75,11 @@ remain unchanged.
    helper permissions, and the saved data volume. Do not apply these
    omissions to the normal cellular build. Do not report activation success.
 6. Assemble with the existing temporary UFS boot packer. The verified flow
-   uses `fastboot boot`, `oem darwin-usb-delay`, then `oem pair-usb` after
-   confirming the desktop. XNU waits up to 90 seconds for the mailbox.
+   uses `fastboot boot` and `oem darwin-usb-delay`. For an image with the
+   passcode observer enabled, `tools/wait-unlocked-handoff.py` waits for
+   native authentication before sending `oem pair-usb`. XNU waits up to
+   90 seconds for the mailbox. See the [post-unlock comparison](../../USB-PAIRING.md)
+   for the archived and current image results.
    The early native-12/14 tests used a bounded return timer. Later passcode
    tests explicitly disable that countdown at the user's request; they use
    normal diagnostics restart or Settings shutdown to return through the loader
@@ -96,6 +99,11 @@ bash host/build.sh /path/to/host-output
 /path/to/host-output/paired-syslog /path/to/new-capture.raw 20
 /path/to/host-output/afc-photo-check /DCIM
 ```
+
+Use `existing-pair DEVICE_ID info 0` or
+`existing-pair DEVICE_ID /path/to/new-capture.raw 60` when verification must
+use an already saved pairing. `DEVICE_ID` is the native USB identifier from
+usbmux, separate from the Fastboot or firmware diagnostic identifier.
 
 For a selected file, pass its `/DCIM/...` path and a new local output path.
 The AFC tool only opens remote files read-only, limits downloads to 64 MiB,

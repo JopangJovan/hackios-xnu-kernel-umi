@@ -9,3 +9,6 @@ for name in i4-paired-info paired-syslog afc-photo-check; do
         -L"$framework_dir" -Wl,-rpath,"$framework_dir" -limobiledevice -lplist2 \
         -o "$output_dir/$name"
 done
+clang -Wall -Wextra -Werror -Wno-deprecated-declarations "$source_dir/existing-pair.c" \
+    -L"$framework_dir" -Wl,-rpath,"$framework_dir" -limobiledevice -lplist2 -lusbmuxd \
+    -o "$output_dir/existing-pair"
