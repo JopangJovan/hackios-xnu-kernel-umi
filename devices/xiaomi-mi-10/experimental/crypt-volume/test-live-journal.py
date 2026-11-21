@@ -15,6 +15,10 @@ pre=r'''
 #include <errno.h>
 #include <CommonCrypto/CommonHMAC.h>
 static void uv_hmac(const uint8_t*k,size_t kn,const uint8_t*d,size_t dn,uint8_t o[32]){CCHmac(kCCHmacAlgSHA256,k,kn,d,dn,o);}
+static void uv_hmac2(const uint8_t*k,size_t kn,const uint8_t*a,size_t an,const uint8_t*b,size_t bn,uint8_t o[32]) {
+ CCHmacContext c;CCHmacInit(&c,kCCHmacAlgSHA256,k,kn);CCHmacUpdate(&c,a,an);CCHmacUpdate(&c,b,bn);CCHmacFinal(&c,o);
+ volatile unsigned char *p=(volatile unsigned char *)&c;for(size_t i=0;i<sizeof(c);i++)p[i]=0;
+}
 #include "umi_volume_crypto.h"
 #include "umi_live_format.h"
 #define Z_WAITOK 1

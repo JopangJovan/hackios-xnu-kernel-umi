@@ -34,6 +34,14 @@ including a 64-bit sector number, match an independent
 `cryptography 44.0.3` / OpenSSL implementation. XTS is not itself an
 authentication mode; the MAC is a separate mandatory part of this format.
 
+The sector MAC now streams its 32-byte prefix and 4 KiB ciphertext separately.
+The original concatenation allocated a 4,128-byte automatic buffer, duplicated
+by inlining on a nested lock/pageout call path in the later class-A experiment.
+That experiment exposed a kernel stack overflow. Streaming preserves exactly
+the existing `UMICVOL1` sector tags: the host test compares them with the old
+one-shot CommonCrypto construction, including high sector numbers. The SHA-256
+context is bounded and cleared after use; no volume-format conversion is needed.
+
 ## Filesystem boundary and durability
 
 With `umi_aks_lab=1`, the experimental kernel registers two root-only nodes:

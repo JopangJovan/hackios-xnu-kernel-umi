@@ -9,6 +9,14 @@
 static void uv_hmac(const uint8_t *k,size_t kn,const uint8_t *d,size_t dn,uint8_t o[32]) {
     cchmac(ccsha256_di(),kn,k,dn,d,o);
 }
+static void uv_hmac2(const uint8_t *k,size_t kn,const uint8_t *a,size_t an,
+                     const uint8_t *b,size_t bn,uint8_t out[32]) {
+    const struct ccdigest_info *di=ccsha256_di();
+    cchmac_ctx_decl(CCSHA256_STATE_SIZE,CCSHA256_BLOCK_SIZE,ctx);
+    cchmac_init(di,ctx,kn,k);
+    cchmac_update(di,ctx,an,a);cchmac_update(di,ctx,bn,b);
+    cchmac_final(di,ctx,out);cchmac_ctx_clear(CCSHA256_STATE_SIZE,CCSHA256_BLOCK_SIZE,ctx);
+}
 #include "umi_volume_crypto.h"
 static LCK_GRP_DECLARE(uv_locks,"umi_crypt_lab");
 static LCK_MTX_DECLARE(uv_lock,&uv_locks);

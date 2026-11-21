@@ -1,4 +1,4 @@
-/* Authenticated experimental XTS volume; callback uv_hmac is platform-owned. */
+/* Authenticated experimental XTS volume; HMAC callbacks are platform-owned. */
 #ifndef UMI_VOLUME_CRYPTO_H
 #define UMI_VOLUME_CRYPTO_H
 #include "umi_ct_aes.h"
@@ -27,10 +27,12 @@ static int uv_header_ok(const struct uv_keys *k,const uint8_t in[UV_HEADER]) {
     int ok=uv_equal(expected,in,UV_HEADER);umi_ct_wipe(expected,sizeof(expected));return ok;
 }
 static void uv_tag(const struct uv_keys *k,uint64_t sector,const uint8_t *cipher,uint8_t out[32]) {
-    uint8_t message[UV_SECTOR+32];memcpy(message,"UVSECT01",8);
-    memcpy(message+8,k->uuid,16);uv_le64(message+24,sector);
-    memcpy(message+32,cipher,UV_SECTOR);uv_hmac(k->mac,32,message,sizeof(message),out);
-    umi_ct_wipe(message,sizeof(message));
+    /* Keep the on-disk MAC identical without a 4 KiB automatic buffer.
+     * This runs below VFS pageout when a lock event flushes protected files. */
+    uint8_t prefix[32];memcpy(prefix,"UVSECT01",8);
+    memcpy(prefix+8,k->uuid,16);uv_le64(prefix+24,sector);
+    uv_hmac2(k->mac,32,prefix,sizeof(prefix),cipher,UV_SECTOR,out);
+    umi_ct_wipe(prefix,sizeof(prefix));
 }
 static void uv_encrypt(const struct uv_keys *k,uint64_t sector,const uint8_t *plain,uint8_t record[UV_RECORD]) {
     umi_xts_sector(&k->data,&k->tweak,0,sector,plain,record);uv_tag(k,sector,record,record+UV_SECTOR);

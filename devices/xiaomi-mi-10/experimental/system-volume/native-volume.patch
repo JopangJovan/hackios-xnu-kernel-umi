@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/UmiAksNative.h
++++ b/iokit/Kernel/UmiAksNative.h
+@@ -41,6 +41,7 @@
+     n=lab_der_field(der,n,"sls",umi_native.awaitingLoad?1:3);n=lab_der_field(der,n,"sgpe",0);
+     n=lab_der_field(der,n,"srcd",0);der[0]=0x31;der[1]=(uint8_t)(n-2);return n;
+ }
++#include "UmiSystemVolume.h"
+ /* Called with the per-client lock held. Lock order: client, then system. */
+ static bool umi_native_method(UmiAksLab *s,uint32_t sel,IOExternalMethodArguments *a,
+                               bool admin,bool deviceEntitled,IOReturn *answer,uint32_t *events) {
+@@ -77,6 +78,14 @@
+         umi_native.enabled=false;umi_native.installed=false;umi_native.awaitingLoad=false;lab_wipe(&umi_native.bag,sizeof(umi_native.bag));
+         ret=kIOReturnSuccess;goto done;
+     }
++    if(sel==0x7d) {
++        int lab=0,volume=0;
++        if(!PE_parse_boot_argn("umi_aks_lab",&lab,sizeof(lab)) || lab!=1 ||
++           !PE_parse_boot_argn("umi_aks_system_volume",&volume,sizeof(volume)) || volume!=1) {
++            ret=kIOReturnUnsupported;goto done;
++        }
++        ret=umi_system_volume_key(a,admin && current_task()==s->owner);goto done;
++    }
+     if(!umi_native.enabled){handled=false;goto done;}
+     /* Deliberately retain the prior ordinary item-key path. This mode tests
+      * system-bag management, not migration of the existing system keychain. */

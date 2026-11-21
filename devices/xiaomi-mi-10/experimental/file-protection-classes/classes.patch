@@ -1,0 +1,139 @@
+--- a/iokit/Kernel/UmiAksNative.h
++++ b/iokit/Kernel/UmiAksNative.h
+@@ -156,6 +156,7 @@
+         UmiLabBag replacement={};memcpy(replacement.blob,bag->blob,LAB_BAG_SIZE);
+         replacement.unlocked=replacement.everUnlocked=unlocked;
+         if(unlocked)memcpy(replacement.master,master,32);
++        umi_hfs_forget_c_locked();
+         lab_wipe(&umi_native.bag,sizeof(umi_native.bag));umi_native.bag=replacement;
+         lab_wipe(&replacement,sizeof(replacement));umi_native.installed=true;umi_native.awaitingLoad=false;ret=kIOReturnSuccess;
+         IOLog("UMI AKS native: installed system candidate; locked=%d\n",!unlocked);goto done;
+@@ -199,6 +200,7 @@
+      * lock/unlock pair. Deliver after dropping both locks; observers re-query
+      * the current state. No notification on rejected authentication. */
+     if(handled && ret==kIOReturnSuccess) {
++        umi_hfs_native_sync_locked();
+         if(before!=umi_native_flags())*events|=1;
+         if(umi_native.enabled && umi_native.installed && umi_native.bag.everUnlocked && !umi_native.firstEventSent) {
+             umi_native.firstEventSent=true;*events|=2;
+--- a/iokit/Kernel/UmiHfsKeys.h
++++ b/iokit/Kernel/UmiHfsKeys.h
+@@ -1,4 +1,4 @@
+-/* Isolated class-A prototype. Callbacks accept only one explicitly registered
++/* Isolated class-A/C prototype. Callbacks accept only one explicitly registered
+  * fixture volume. The regular system keychain, user data and USB are untouched. */
+ #ifndef UMI_HFS_KEYS_H
+ #define UMI_HFS_KEYS_H
+@@ -11,11 +11,39 @@
+ #ifndef UMI_HFS_HOST_TEST
+ extern "C" int cp_key_store_action_for_volume(uuid_t, int);
+ #endif
+-static struct {IOLock *events;bool bound;uint8_t uuid[16];} umi_hfs;
++static struct {
++    IOLock *events;
++    bool bound, c_ready;
++    uint8_t uuid[16], c_root[32], c_bag_uuid[16];
++} umi_hfs;
+ static bool umi_hfs_init(void){umi_hfs.events=IOLockAlloc();return umi_hfs.events!=NULL;}
+ static bool umi_hfs_enabled(void) {
+     int enabled=0;
+     return PE_parse_boot_argn("umi_hfs_protect",&enabled,sizeof(enabled))&&enabled==1;
++}
++/* Native system lock held. Only this class-specific derivation survives a
++ * screen lock; the native master and class-A keys still follow their original
++ * wipe path. Reset it before EVERY successful system-bag replacement, even
++ * when the new bag has the same UUID or reports the same authentication state. */
++static void umi_hfs_forget_c_locked(void) {
++    lab_wipe(umi_hfs.c_root,sizeof(umi_hfs.c_root));
++    lab_wipe(umi_hfs.c_bag_uuid,sizeof(umi_hfs.c_bag_uuid));
++    umi_hfs.c_ready=false;
++}
++static void umi_hfs_native_sync_locked(void) {
++    if(!umi_hfs_enabled()||!umi_native.enabled||!umi_native.installed||
++       !umi_native.bag.everUnlocked) {
++        umi_hfs_forget_c_locked();return;
++    }
++    if(umi_hfs.c_ready&&memcmp(umi_hfs.c_bag_uuid,umi_native.bag.blob+48,16))
++        umi_hfs_forget_c_locked();
++    if(!umi_hfs.c_ready&&umi_native.bag.unlocked) {
++        uint8_t info[48]={0};memcpy(info,"UMI-HFS-CLASS-C-ROOT-v1",23);
++        memcpy(info+32,umi_native.bag.blob+48,16);
++        lab_hmac(umi_native.bag.master,32,info,sizeof(info),umi_hfs.c_root);
++        memcpy(umi_hfs.c_bag_uuid,umi_native.bag.blob+48,16);
++        umi_hfs.c_ready=true;lab_wipe(info,sizeof(info));
++    }
+ }
+ /* Called only with the native system lock held, after validating root/owner. */
+ static IOReturn umi_hfs_bind(IOExternalMethodArguments *a,bool authorized) {
+@@ -45,17 +73,22 @@
+ }
+ static int umi_hfs_access(aks_cred_t access,uint32_t cls) {
+     if(!umi_hfs_enabled()||!umi_hfs.bound||!access||memcmp(access->volume_uuid,umi_hfs.uuid,16))return ENOTSUP;
+-    if(cls!=PROTECTION_CLASS_A)return ENOTSUP;
+-    if(!umi_native.enabled||!umi_native.installed||!umi_native.bag.unlocked)return EPERM;
++    if(cls!=PROTECTION_CLASS_A&&cls!=PROTECTION_CLASS_C)return ENOTSUP;
++    if(!umi_native.enabled||!umi_native.installed)return EPERM;
++    if(cls==PROTECTION_CLASS_A&&!umi_native.bag.unlocked)return EPERM;
++    if(cls==PROTECTION_CLASS_C&&(!umi_native.bag.everUnlocked||!umi_hfs.c_ready||
++       memcmp(umi_hfs.c_bag_uuid,umi_native.bag.blob+48,16)))return EPERM;
+     return 0;
+ }
+-static void umi_hfs_kek(aks_cred_t access,uint8_t kek[32]) {
+-    uint8_t info[64]={0};memcpy(info,"UMI-HFS-CLASS-A-v1",18);
++static void umi_hfs_kek(aks_cred_t access,uint32_t cls,uint8_t kek[32]) {
++    uint8_t info[64]={0};
++    memcpy(info,cls==PROTECTION_CLASS_A?"UMI-HFS-CLASS-A-v1":"UMI-HFS-CLASS-C-v1",18);
+     memcpy(info+24,umi_native.bag.blob+48,16);memcpy(info+40,access->volume_uuid,16);
+     /* Bind to the inode as well as the volume and class. This intentionally
+      * does not implement Apple's backup/restore or key-rolling formats. */
+     for(unsigned i=0;i<8;i++)info[56+i]=(uint8_t)(access->inode>>(8*i));
+-    lab_hmac(umi_native.bag.master,32,info,sizeof(info),kek);lab_wipe(info,sizeof(info));
++    lab_hmac(cls==PROTECTION_CLASS_A?umi_native.bag.master:umi_hfs.c_root,
++             32,info,sizeof(info),kek);lab_wipe(info,sizeof(info));
+ }
+ static int umi_hfs_expand(const uint8_t master[32],struct aks_raw_key_s *out) {
+     if(!out)return 0;
+@@ -73,15 +106,19 @@
+     if(!in||!in->key||in->key_len!=56)return EINVAL;
+     int e=umi_hfs_access(access,in->dp_class);if(e)return e;
+     const uint8_t *b=(const uint8_t *)in->key;
+-    if(memcmp(b,"UMIHCP01",8)||lab_get32(b+8)!=1||lab_get32(b+12)!=0)return EINVAL;
+-    uint8_t kek[32]={0};umi_hfs_kek(access,kek);
++    uint32_t version=in->dp_class==PROTECTION_CLASS_A?1:2;
++    uint32_t tag=in->dp_class==PROTECTION_CLASS_A?0:PROTECTION_CLASS_C;
++    if(memcmp(b,"UMIHCP01",8)||lab_get32(b+8)!=version||lab_get32(b+12)!=tag)return EINVAL;
++    uint8_t kek[32]={0};umi_hfs_kek(access,in->dp_class,kek);
+     e=lab_unwrap(kek,b+16,40,master)?EPERM:0;lab_wipe(kek,32);return e;
+ }
+-static int umi_hfs_seal(aks_cred_t access,const uint8_t master[32],struct aks_wrapped_key_s *out) {
++static int umi_hfs_seal(aks_cred_t access,uint32_t cls,const uint8_t master[32],struct aks_wrapped_key_s *out) {
+     if(!out||!out->key||out->key_len<56)return EINVAL;
+-    uint8_t kek[32]={0},blob[56]={0};memcpy(blob,"UMIHCP01",8);lab_put32(blob+8,1);
+-    umi_hfs_kek(access,kek);int e=lab_wrap(kek,master,32,blob+16)?EIO:0;
+-    if(!e){memcpy(out->key,blob,sizeof(blob));out->key_len=sizeof(blob);out->dp_class=PROTECTION_CLASS_A;}
++    uint8_t kek[32]={0},blob[56]={0};memcpy(blob,"UMIHCP01",8);
++    lab_put32(blob+8,cls==PROTECTION_CLASS_A?1:2);
++    lab_put32(blob+12,cls==PROTECTION_CLASS_A?0:PROTECTION_CLASS_C);
++    umi_hfs_kek(access,cls,kek);int e=lab_wrap(kek,master,32,blob+16)?EIO:0;
++    if(!e){memcpy(out->key,blob,sizeof(blob));out->key_len=sizeof(blob);out->dp_class=cls;}
+     lab_wipe(kek,32);lab_wipe(blob,sizeof(blob));return e;
+ }
+ extern "C" int hfs_new_key(aks_cred_t access,uint32_t cls,struct aks_raw_key_s *raw,struct aks_wrapped_key_s *wrapped) {
+@@ -90,7 +127,7 @@
+     int e=umi_hfs_access(access,cls);
+     if(!e&&(!raw||!raw->key||raw->key_len<64||!raw->iv_key||raw->iv_key_len<16))e=EINVAL;
+     if(!e)e=lab_random(master,32)?EIO:0;
+-    if(!e)e=umi_hfs_seal(access,master,wrapped);
++    if(!e)e=umi_hfs_seal(access,cls,master,wrapped);
+     if(!e)e=umi_hfs_expand(master,raw);
+     lab_wipe(master,32);IOLockUnlock(umi_native.lock);return e;
+ }
+@@ -104,7 +141,7 @@
+     if(!umi_native.lock)return ENOTSUP;
+     uint8_t master[32]={0};IOLockLock(umi_native.lock);
+     int e=umi_hfs_access(access,cls);if(!e)e=umi_hfs_open(access,old,master);
+-    if(!e)e=umi_hfs_seal(access,master,out);
++    if(!e)e=umi_hfs_seal(access,cls,master,out);
+     lab_wipe(master,32);IOLockUnlock(umi_native.lock);return e;
+ }
+ extern "C" int hfs_backup_key(aks_cred_t access,const struct aks_wrapped_key_s *old,struct aks_wrapped_key_s *out) {

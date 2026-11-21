@@ -1,0 +1,42 @@
+{
+  "bsd/conf/files": {
+    "base": "2011e3be5e38e6fbfc392b3e94fee1b0564de820f1a5902079b66cd546c64bd8",
+    "patched": "c75b085a8dcac19d5167265ffd8e9238d69d3c09404f3f347ba5efb88f03a682"
+  },
+  "bsd/miscfs/hfs/hfs.h": {
+    "base": "4edada1c5cf028b6aae831e93fc6fd5c66bb504e5ac26c76c23a5bb4344a3023",
+    "patched": "dc1c137b49d9a9c56a426fdfb40a2d90b6c563e9b0a17909c395136968a3c2d1"
+  },
+  "bsd/miscfs/hfs/hfs_readwrite.c": {
+    "base": "f5393cee19f5c616b99a2c2ce0d5aeb465333e55c3b9c7ee29b7af7e0e17f009",
+    "patched": "457a9a0283f3ccbfc2fe07e5d45407ed42ddbab03641249282e75bafbf2ea5c3"
+  },
+  "bsd/miscfs/hfs/hfs_vfsutils.c": {
+    "base": "afb967d6937375816a09f07e073736c2373a01efb57db901e33da52563bf61d5",
+    "patched": "aeab495fe5b28aaf30ac8650eaa2d7f89f1bdd5478560cd60f37bb807f58e534"
+  },
+  "bsd/miscfs/hfs/hfs_iokit.h": {
+    "base": "a0225bb0e999972102a1dc29eb6bf493b0712abc13069baf00a37983866bb1ea",
+    "patched": "f2161e0f947074ae2dac7e53cca12da6166f8fdbe419795b44c61af63b2040a2"
+  },
+  "bsd/miscfs/hfs/hfs_cprotect.c": {
+    "base": "c7b7b8ec63626d4f2f6de48c363ea8483770b0e7d212e6ec409c627c277337b3",
+    "patched": "b59c35aaeb6dc60545fba7fab9021bf44bd0bfb2e868b2780c47d41f024e8464"
+  },
+  "bsd/dev/hakios.ufs.c": {
+    "base": "173923255ec03425e0f697555b313219ded1cb5ea4c6e3b6a2c5af924f2fb854",
+    "patched": "c0cda334af8f9db5f681f84b3214bbeb3fac562065155254adabbeb321559418"
+  },
+  "bsd/dev/umi_crypt_device.h": {
+    "base": "02099816ab4b44756aa6f1a05fe47a6d8c71dff54abdf886b27e4fea4ce98487",
+    "patched": "bed6ccd0a213ef67df76ea4c4d19eb97dda2f56accfaf0db4789bf3736788cf3"
+  },
+  "iokit/Kernel/UmiAksNative.h": {
+    "base": "8cdd2bda1f1d0332166b0da76e3b08460309f64774e2c70c8f6e846e2c6b2f9f",
+    "patched": "5e6f8a964b7de057d6eb8a89366ac047affee6bddfa27a5ee60d16f5254aa35e"
+  },
+  "iokit/Kernel/MiniAppleKeyStore.cpp": {
+    "base": "e65eb6387f977bc660022194089875184ed131a240a5e3211a161cf93a24fbbb",
+    "patched": "e3f87b9ca14351a17ff830de8396e1d2571969ebd6fd347304f2905086b5e88e"
+  }
+}
