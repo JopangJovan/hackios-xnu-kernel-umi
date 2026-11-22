@@ -91,11 +91,21 @@ The temporary iOS build saves the native lock-screen passcode across reboots,
 requires it again after locking, and rejects an incorrect entry. Separate
 experiments verified class A/C file access on a 16 MiB encrypted HFS volume,
 password changes with recovery after a process exit, persistent retry counts,
-and transactional conversion of known synthetic keychain entries. The existing
-`/private/var` volume is still unencrypted. Integrating the real password
-service and keychain, completing the protection classes, and implementing
-encrypted UFS startup and recovery remain open. See the
-[encryption progress and plan](devices/xiaomi-mi-10/ENCRYPTION-PLAN.md).
+and transactional conversion of known synthetic keychain entries.
+
+On 2026-11-22, `native-119/120` verified shared failure accounting, retry
+waiting, and recovery across an Android reboot on an independent 8 MiB HFSX
+fixture. These backend checks passed, but the synthetic UI did not: its volatile
+user directory and alphanumeric test credentials are not the normal lock-screen
+environment. `native-124` used the unchanged earlier image with existing user
+data; the user confirmed normal wallpaper and native passcode input. Failed
+display experiments were withdrawn, and shared retry remains experimental.
+
+Backend fixture packaging now excludes SpringBoard, PosterBoard and UI input
+jobs by default. Normal lock-screen/USB acceptance must use a separate image
+with the established user environment. Live password-service integration,
+keychain migration, remaining protection classes and user-volume encryption
+remain open. See the [encryption progress and plan](devices/xiaomi-mi-10/ENCRYPTION-PLAN.md).
 
 ### Storage validation
 

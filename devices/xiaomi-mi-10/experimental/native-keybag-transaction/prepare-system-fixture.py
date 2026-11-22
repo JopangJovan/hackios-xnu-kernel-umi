@@ -20,6 +20,8 @@ p.add_argument('--replace-rejected-fixture', type=Path,
                help='Optional SHA-256 of the entire rejected synthetic volume')
 p.add_argument('--resume-shared-retry', action='store_true',
                help='Resume the synthetic journal from native-118')
+p.add_argument('--ui-diagnostics', action='store_true',
+               help='Retain synthetic UI jobs for diagnosis only; not normal lock-screen acceptance')
 a = p.parse_args()
 
 old = a.daemon.read_bytes()
@@ -43,6 +45,15 @@ remove = {
     'bin/keybagd-txn', 'bin/umi-paired-keychain-test', 'bin/securityd.delta',
     'bin/umi-secd-guardian', 'lib/umi-secd-preflight.dylib', 'lib/umi-native-txn.dylib',
 }
+if not a.ui_diagnostics:
+    # Background system-bag mutations must not share a running user-facing
+    # authentication controller. These jobs also launch gestures/UI probes.
+    remove.update({
+        'LaunchDaemons/com.apple.SpringBoard.plist',
+        'LaunchDaemons/com.apple.PosterBoard.plist',
+        'LaunchDaemons/com.hakios.demo.plist',
+        'LaunchDaemons/com.hakios.umi-pair-screen-test.plist',
+    })
 test_job = 'LaunchDaemons/com.hakios.umi-system-service-fixture.plist'
 add = {'lib/umi-native-txn.dylib': '100755', 'bin/umi-system-service-test': '100755', test_job: '100644'}
 if a.retry_volume:
@@ -88,4 +99,5 @@ manifest = [line for line in Path(str(a.base) + '.manifest').read_text().splitli
 manifest += [mode + '\t0\t0\t' + name for name, mode in add.items()]
 assert len(manifest) == len({line.split('\t')[-1] for line in manifest})
 Path(str(h) + '.manifest').write_text('\n'.join(manifest) + '\n')
-print('Prepared backend-only acceptance scope: volatile user data and public alphanumeric credentials; normal lock-screen/wallpaper acceptance requires the separate interactive image')
+mode = 'synthetic UI diagnosis (not normal lock-screen acceptance)' if a.ui_diagnostics else 'background transaction test (SpringBoard/PosterBoard jobs excluded)'
+print(f'Prepared {mode}; existing user preferences and credentials are not loaded')
