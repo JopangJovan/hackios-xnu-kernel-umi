@@ -1,5 +1,5 @@
-/* Use the original KBXPCProtocol, with an explicit private service name.
- * Never call MKBKeyBagChangeSystemSecret: it addresses the live service. */
+/* Use the original KBXPCProtocol on the explicit fixture endpoint.
+ * The canonical endpoint additionally requires the RAM-volume boot guard. */
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <unistd.h>
 #include "test-secrets.h"
+#ifdef UMI_CANONICAL_FIXTURE
+#include "system-fixture.h"
+#endif
 static NSFileHandle *secret_pipe(const char *value) {
  int fd[2];if(pipe(fd))return nil;size_t n=strlen(value);
  if(write(fd[1],value,n)!=(ssize_t)n){close(fd[0]);close(fd[1]);return nil;}
@@ -14,6 +17,12 @@ static NSFileHandle *secret_pipe(const char *value) {
 }
 int native_request_pair(int old_index,int new_index) {
  @autoreleasepool {
+#ifdef UMI_CANONICAL_FIXTURE
+  if(geteuid()!=0||!umi_system_fixture_allowed())return 2;
+  NSString *service=@"com.apple.mobile.keybagd.xpc";
+#else
+  NSString *service=@"com.hakio.mobile.keybagd.xpc";
+#endif
   if(old_index < -1 || new_index < -1 || (old_index == -1 && new_index == -1) || old_index>=(int)(sizeof(pins)/sizeof(pins[0])) ||
      new_index>=(int)(sizeof(pins)/sizeof(pins[0])))return 2;
   void *lib=dlopen("/System/Library/PrivateFrameworks/MobileKeyBag.framework/MobileKeyBag",RTLD_NOW);
@@ -21,8 +30,8 @@ int native_request_pair(int old_index,int new_index) {
   SEL method=NSSelectorFromString(@"changeSystemSecretfromOldSecret:oldSize:toNewSecret:newSize:opaqueData:reply:");
   struct objc_method_description d=protocol_getMethodDescription(p,method,YES,YES);
   if(!d.name||!d.types)return 4;
-  fprintf(stderr,"UMI native txn request: explicit private service, original protocol types=%s\n",d.types);
-  id c=((id(*)(id,SEL,id,NSUInteger))objc_msgSend)([NSClassFromString(@"NSXPCConnection") alloc],NSSelectorFromString(@"initWithMachServiceName:options:"),@"com.hakio.mobile.keybagd.xpc",0);
+  fprintf(stderr,"UMI native txn request: service=%s original protocol types=%s\n",service.UTF8String,d.types);
+  id c=((id(*)(id,SEL,id,NSUInteger))objc_msgSend)([NSClassFromString(@"NSXPCConnection") alloc],NSSelectorFromString(@"initWithMachServiceName:options:"),service,0);
   id interface=((id(*)(id,SEL,Protocol*))objc_msgSend)(NSClassFromString(@"NSXPCInterface"),NSSelectorFromString(@"interfaceWithProtocol:"),p);
   if(!c||!interface)return 5;
   ((void(*)(id,SEL,id))objc_msgSend)(c,NSSelectorFromString(@"setRemoteObjectInterface:"),interface);

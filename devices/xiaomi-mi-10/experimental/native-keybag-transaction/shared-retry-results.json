@@ -1,0 +1,58 @@
+{
+  "date": "2026-11-22",
+  "scope": "Synthetic shared retry on independent 8 MiB HFSX; volatile user directory",
+  "overall_ui_acceptance": "failed",
+  "host_checks": "ASan/UBSan journal, commit retry, retry policy, item keys passed",
+  "runs": [
+    {
+      "case": "native-119",
+      "backend_assertions": "passed",
+      "wait_check_elapsed_ms": 220,
+      "wait_window_ms": 32000,
+      "fixture_sync_errno": 0,
+      "returned_to_stock_android": true,
+      "springboard_authentication_assertion": true,
+      "boot": {
+        "boot_sha256": "288fbb63e11b9c00e5bae48def4aa760d9b3f7d9abc0e8192ef18442553d6c5f",
+        "verified_command": "oem darwin-direct",
+        "mode": 2,
+        "only_write_extent": [
+          43323904,
+          2048
+        ]
+      },
+      "final_log_sha256": "ed903a3fd25221db9461a87e25f2c55c97dfed539a1470f4f04b13b096e784dc"
+    },
+    {
+      "case": "native-120",
+      "backend_assertions": "passed",
+      "wait_check_elapsed_ms": 494,
+      "wait_window_ms": 32000,
+      "fixture_sync_errno": 0,
+      "returned_to_stock_android": true,
+      "springboard_authentication_assertion": true,
+      "boot": {
+        "boot_sha256": "b6bcafc7e2d8699c633c25141115cdb30861210d2694eb5939df5fc995dabb5d",
+        "verified_command": "oem darwin-direct",
+        "mode": 2,
+        "only_write_extent": [
+          43323904,
+          2048
+        ]
+      },
+      "final_log_sha256": "c4c0dadc1423f255c03dea5570d371caf08cd649bd73d120a439b8d4b8bb29bd"
+    }
+  ],
+  "limitations": [
+    "Real user passcode and native USB pairing not exercised",
+    "SpringBoard authentication assertion and wallpaper extension termination observed; do not call overall lock screen fixed",
+    "No full user volume encryption or hardware anti-rollback validation"
+  ],
+  "source_sha256": {
+    "system-service-test.c": "869e378f2318e86d6ea296277d63896492bee9a0b8f09e863971da821f2fc7a3",
+    "adapter.c": "60f16088999076ffb82b60e0b2d06f892ae916ad5a9a553bfc25a92bbf76ec0e",
+    "UmiAksSharedRetry.h": "097da7d10a891b1bf89fde5696c115bd49a357cbb5900a789233d494c25dad19",
+    "shared-retry-kernel.patch": "b58bb4bfb57d96e2066541265a4545b52b0543ddc89f395a38658beaa5bb6062",
+    "retry-policy.c": "8164d30e2da59cd76130af6d0708d690be112befc702cc8f5688a8e9604fce1d"
+  }
+}

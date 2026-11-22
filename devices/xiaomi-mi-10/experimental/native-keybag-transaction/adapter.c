@@ -1,6 +1,6 @@
-/* Diagnostic-only bridge: path/service-relocated keybagd uses a per-client
- * opt-in kernel bag. No call with system handle 0 reaches the live driver.
- * Opaque original property lists are the durable transaction authority. */
+/* Diagnostic bridge for the per-client bag, or the canonical daemon on the
+ * explicitly enabled RAM fixture. The original property list is the journal
+ * payload in both cases. */
 #include "journal.h"
 #include "item-keys.h"
 #include "retry-policy.h"
@@ -19,6 +19,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
+#ifdef UMI_CANONICAL_FIXTURE
+#include "system-fixture.h"
+#include <stdarg.h>
+#endif
 #define INTERPOSE(new,old) __attribute__((used,section("__DATA,__interpose"))) static const struct {const void *a,*b;} ip_##old={(const void*)(new),(const void*)(old)}
 static const uint8_t policy[32]="PUBLIC-NATIVE-TRANSACTION-TEST";
 static const char *test_service="com.hakio.mobile.keybagd.xpc";
@@ -31,6 +35,10 @@ static uint64_t active,candidate,sequence;
 static uint8_t saved_blob[136];
 static int has_saved,committed,poisoned;
 static int retry_mode;
+static int system_fixture;
+static int shared_retry, change_reserved;
+static io_connect_t retry_worker_connection;
+static uint64_t retry_worker_generation;
 static struct retry_policy retry;
 static int notify_token=-1,first_token=-1;
 static char notify_name[64],first_name[64];
@@ -109,6 +117,12 @@ __attribute__((constructor)) static void start(void){
  daemon_role=!strcmp(role,"daemon");strcpy(root,p);snprintf(target,sizeof(target),"%s/keybags/systembag.kb",root);
  const char *retry_option=getenv("UMI_TXN_RETRY");
  if(retry_option){if(strcmp(retry_option,"1")||!daemon_role)_exit(120);retry_mode=1;}
+#ifdef UMI_CANONICAL_FIXTURE
+ if(!retry_mode||strcmp(root,UMI_SYSTEM_FIXTURE_ROOT)||!umi_system_fixture_allowed())_exit(120);
+ system_fixture=1;
+ shared_retry=umi_system_fixture_retry_mode();
+ fprintf(stderr,"UMI system transaction: canonical daemon on volatile fixture volume\n");
+#endif
  rootfd=open(root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(!directory(rootfd))_exit(121);
  keyfd=openat(rootfd,"keybags",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);int j=openat(rootfd,"journal",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
  if(!directory(keyfd)||!directory(j)||tj_open(&store,j,policy))_exit(122);close(j);
@@ -119,7 +133,7 @@ __attribute__((constructor)) static void start(void){
   else if(!e)e=ENOENT;
  }else e=tj_load(&store,pbuf,sizeof(pbuf),&n,&sequence);
  if(!e){e=extract(pbuf,n,saved_blob);if(!e&&daemon_role)e=restore_view(pbuf,n);if(!e)has_saved=1;}
- else if(e==ENOENT){struct stat st;if(!fstatat(keyfd,"systembag.kb",&st,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT)e=EIO;else e=0;}
+ else if(e==ENOENT){struct stat st;if(shared_retry==2||!fstatat(keyfd,"systembag.kb",&st,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT)e=EIO;else e=0;}
  clear(pbuf,sizeof(pbuf));if(e){fprintf(stderr,"UMI native txn: journal/view recovery refused errno=%d\n",e);_exit(123);}ready=1;
  const char *notifications=getenv("UMI_TXN_NOTIFY");
  if(notifications){
@@ -139,6 +153,32 @@ static kern_return_t call(uint32_t sel,const uint64_t *v,unsigned count,const vo
 }
 static kern_return_t envelope(uint64_t handle,uint8_t blob[136]){size_t n=136;kern_return_t e=call(3,&handle,1,NULL,0,NULL,blob,&n);return e?e:n==136?0:kIOReturnBadArgument;}
 static kern_return_t drop(uint64_t h){return h?call(4,&h,1,NULL,0,NULL,NULL,NULL):0;}
+static kern_return_t retry_control(uint64_t command){
+ return call(0x80,&command,1,NULL,0,NULL,NULL,NULL);
+}
+static void finish_change(void){
+ if(change_reserved&&!retry_control(3))change_reserved=0;
+}
+static kern_return_t recover_system_fixture(void){
+ uint8_t current[136]={0};uint64_t zero=0,flags=0,handle=0;
+ kern_return_t e=call(7,&zero,1,NULL,0,&flags,NULL,NULL);if(e)return e;
+ e=envelope(0,current);
+ if(!has_saved){
+  clear(current,sizeof(current));
+  return e==kIOReturnNotReady&&flags==6?kIOReturnSuccess:kIOReturnNotReady;
+ }
+ if(!e&&!memcmp(current,saved_blob,sizeof(current))){clear(current,sizeof(current));return 0;}
+ clear(current,sizeof(current));
+ if(e&&e!=kIOReturnNotReady)return e;
+ e=call(6,NULL,0,saved_blob,sizeof(saved_blob),&handle,NULL,NULL);
+ if(!e){uint64_t install[]={handle,0,0,0};e=call(5,install,4,NULL,0,NULL,NULL,NULL);}
+ kern_return_t release=drop(handle);
+ if(!e)e=release;
+ if(!e)e=call(7,&zero,1,NULL,0,&flags,NULL,NULL);
+ if(!e&&flags!=1)e=kIOReturnNotReady;
+ if(!e)fprintf(stderr,"UMI system transaction: recovered committed envelope as locked system bag\n");
+ return e;
+}
 static void poison(void){
  poisoned=1;ik_clear(&items);drop(candidate);drop(active);candidate=active=0;
  if(conn){kern_return_t e=real_close(conn);conn=0;if(e)_exit(126);}
@@ -150,8 +190,10 @@ static void poison(void){
 static int fault_marker(const char *name){struct stat st;return !fstatat(rootfd,name,&st,AT_SYMLINK_NOFOLLOW);}
 static kern_return_t retry_begin(void){
  /* No previously authenticated material survives a rejected new attempt. */
- if(!active||call(0xd,&active,1,NULL,0,NULL,NULL,NULL)){poison();return kIOReturnNotReady;}
- publish_auth_state(UMI_TXN_LOCKED);
+ if(!system_fixture){
+  if(!active||call(0xd,&active,1,NULL,0,NULL,NULL,NULL)){poison();return kIOReturnNotReady;}
+  publish_auth_state(UMI_TXN_LOCKED);
+ }
  int e=rp_begin(&retry);
  if(e==EAGAIN){fprintf(stderr,"UMI retry: waiting; failures=%u remaining-ms=%llu\n",retry.failures,rp_wait_ms(&retry));return kIOReturnNotReady;}
  if(e){poison();return kIOReturnNotReady;}
@@ -161,6 +203,32 @@ static void retry_finish(bool correct){
  if(rp_finish(&retry,correct)){poison();return;}
  sequence=retry.sequence;
  fprintf(stderr,"UMI retry: %s; failures=%u delay-ms=%u\n",correct?"reset durable before authorization":"verification refused",retry.failures,retry.delay);
+}
+static void *retry_broker(void *argument)
+{
+    uint64_t generation = (uintptr_t)argument;
+    for (;;) {
+        pthread_mutex_lock(&mutex);
+        if (!retry_worker_connection || generation != retry_worker_generation) {
+            pthread_mutex_unlock(&mutex);
+            return NULL;
+        }
+        io_connect_t worker = retry_worker_connection;
+        uint64_t request[2] = {0};
+        uint32_t count = 2;
+        kern_return_t rc = real_method(worker, 0x81, NULL, 0, NULL, 0, request, &count, NULL, NULL);
+        if (rc || count != 2) _exit(87);
+        if (request[0]) {
+            if (request[1] == 1) rc = retry_begin();
+            else if (request[1] == 2) retry_finish(false);
+            else if (request[1] == 3) retry_finish(true);
+            else _exit(87);
+            uint64_t reply[] = {request[0], !rc};
+            if (real_method(worker, 0x82, reply, 2, NULL, 0, NULL, NULL, NULL, NULL)) _exit(87);
+        }
+        pthread_mutex_unlock(&mutex);
+        usleep(20000);
+    }
 }
 static kern_return_t item_result(int e){
  if(!e)return 0;
@@ -180,6 +248,37 @@ static kern_return_t proxy(uint32_t sel,const uint64_t *v,uint32_t vc,const void
  if(poisoned)return kIOReturnNotReady;
  if(committed&&sel!=5){poison();return kIOReturnNotReady;}
  if(vc>11||(vc&&!v))return e;if(vc)memcpy(a,v,vc*8);
+ if(system_fixture){
+  if(sel==0xf){
+   if(vc!=11||v[0]||v[1]!=4||v[2]!=255||v[7]||v[8]||v[9]||v[10]||!out||!oc||*oc<1||n)return e;
+   if(has_saved&&!v[6]){
+    fprintf(stderr,"UMI system transaction: removal refused while data needs password protection\n");
+    return kIOReturnUnsupported;
+   }
+   if(candidate){drop(candidate);candidate=0;finish_change();}
+   if(shared_retry){e=retry_control(2);if(e)return e;change_reserved=1;}
+   if(has_saved){e=retry_begin();if(e){finish_change();return e;}}
+   e=real_method(conn,sel,v,vc,p,n,out,oc,bytes,size);
+   if(has_saved)retry_finish(!e);
+   if(!e)candidate=*out;else finish_change();
+   return e;
+  }
+  if(sel==5){
+   if(vc!=4||!candidate||v[0]!=candidate||v[1]||n||!committed)return kIOReturnNotReady;
+   e=envelope(candidate,blob);
+   if(!e&&memcmp(blob,saved_blob,sizeof(blob)))e=kIOReturnNotReady;
+   clear(blob,sizeof(blob));
+   if(!e)e=real_method(conn,sel,v,vc,p,n,out,oc,bytes,size);
+   if(e){poison();return e;}
+   committed=0;finish_change();
+   fprintf(stderr,"UMI system transaction: installed committed native candidate sequence=%llu\n",sequence);
+   return 0;
+  }
+  if(sel==4&&vc==1&&v[0]==candidate){e=drop(candidate);candidate=0;finish_change();return e;}
+  /* Retain the original system-bag ABI on the canonical fixture. Selector
+   * 0x69 confirms a completed change and is not a new user password attempt. */
+  return real_method(conn,sel,v,vc,p,n,out,oc,bytes,size);
+ }
  /* Open and notification registration are local to this diagnostic client. */
  if(sel==0||sel==0x2a||sel==0x2b)return 0;
  if(sel==0xe){if(!out||!oc||*oc<1)return e;out[0]=0;*oc=1;return 0;}
@@ -263,14 +362,33 @@ static kern_return_t hooked_open(io_service_t service,task_port_t task,uint32_t 
  if(!ready||poisoned||task!=mach_task_self())return kIOReturnNotPrivileged;
  pthread_mutex_lock(&mutex);kern_return_t e=conn?kIOReturnNoResources:real_open(service,task,type,out);
  fprintf(stderr,"UMI native txn: isolated IOServiceOpen result=0x%x\n",e);
- if(!e){conn=*out;uint64_t opt=0x554d494c;e=call(0x7e,&opt,1,NULL,0,NULL,NULL,NULL);fprintf(stderr,"UMI native txn: lab opt-in result=0x%x\n",e);
-  if(!e&&has_saved)e=call(6,NULL,0,saved_blob,136,&active,NULL,NULL);
-  if(!e&&has_saved)publish_auth_state(UMI_TXN_LOCKED);
-  if(e){real_close(conn);conn=0;*out=0;}
+ if(!e){conn=*out;
+  if(system_fixture){
+   if(shared_retry)e=retry_control(0);
+   if(!e)e=recover_system_fixture();
+   if(!e&&shared_retry){
+    e=real_open(service,task,type,&retry_worker_connection);
+    if(!e){
+     pthread_t broker;
+     if(pthread_create(&broker,NULL,retry_broker,(void *)(uintptr_t)++retry_worker_generation))e=kIOReturnNoResources;
+     else {pthread_detach(broker);e=retry_control(1);}
+    }
+   }
+  }
+  else {
+   uint64_t opt=0x554d494c;e=call(0x7e,&opt,1,NULL,0,NULL,NULL,NULL);fprintf(stderr,"UMI native txn: lab opt-in result=0x%x\n",e);
+   if(!e&&has_saved)e=call(6,NULL,0,saved_blob,136,&active,NULL,NULL);
+   if(!e&&has_saved)publish_auth_state(UMI_TXN_LOCKED);
+  }
+  if(e){if(retry_worker_connection)real_close(retry_worker_connection);retry_worker_connection=0;real_close(conn);conn=0;*out=0;}
  }
  pthread_mutex_unlock(&mutex);return e;
 }
-static kern_return_t hooked_close(io_connect_t c){pthread_mutex_lock(&mutex);kern_return_t e=real_close(c);if(c==conn){conn=0;active=candidate=0;ik_clear(&items);publish_auth_state(UMI_TXN_UNAVAILABLE);}pthread_mutex_unlock(&mutex);return e;}
+static kern_return_t hooked_close(io_connect_t c){pthread_mutex_lock(&mutex);kern_return_t e=real_close(c);if(c==conn){
+ if(retry_worker_connection)real_close(retry_worker_connection);
+ retry_worker_connection=0;change_reserved=0;conn=0;active=candidate=0;
+ ik_clear(&items);publish_auth_state(UMI_TXN_UNAVAILABLE);
+ }pthread_mutex_unlock(&mutex);return e;}
 static kern_return_t hooked_method(mach_port_t c,uint32_t sel,const uint64_t *v,uint32_t vc,const void *p,size_t n,uint64_t *out,uint32_t *oc,void *bytes,size_t *size){
  if(c!=conn)return real_method(c,sel,v,vc,p,n,out,oc,bytes,size);
  fprintf(stderr,"UMI native txn: selector enter=%u scalar-count=%u input-bytes=%zu\n",sel,vc,n);
@@ -298,6 +416,45 @@ static int target_path(const char *p,int writing){
  snprintf(b,sizeof(b),"%s//keybags/systembag.kb%s",root,writing?".writing":"");
  return p&&(!strcmp(p,a)||!strcmp(p,b));
 }
+#ifdef UMI_CANONICAL_FIXTURE
+/* The pinned daemon imports fcntl only for these three commands. Its two
+ * full-sync calls bracket rename; ramfs reports ENOTTY for the device flush.
+ * Preserve both sync checks inside this RAM test without changing disk I/O. */
+static int fixture_fcntl(int fd, int command, ...)
+{
+    static int (*const native_fcntl)(int, int, ...) = fcntl;
+    if (command == F_SETPROTECTIONCLASS) {
+        va_list args;
+        va_start(args, command);
+        int protection_class = va_arg(args, int);
+        va_end(args);
+        return native_fcntl(fd, command, protection_class);
+    }
+    if (command == F_GETPROTECTIONCLASS) return native_fcntl(fd, command);
+    if (command != F_FULLFSYNC) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    int result = native_fcntl(fd, command);
+    int error = errno;
+    if (result != -1 || error != ENOTTY || !system_fixture || shared_retry || !ready) return result;
+    struct stat opened, staged;
+    if (!fstat(fd, &opened) && S_ISREG(opened.st_mode) && opened.st_uid == 0 &&
+        opened.st_nlink == 1) {
+        const char *const names[] = {"systembag.kb.writing", "systembag.kb"};
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+            if (!fstatat(keyfd, names[i], &staged, AT_SYMLINK_NOFOLLOW) &&
+                opened.st_dev == staged.st_dev && opened.st_ino == staged.st_ino) {
+                fprintf(stderr, "UMI system transaction: fixture RAM sync (device flush unavailable)\n");
+                return fsync(fd);
+            }
+        }
+    }
+    errno = error;
+    return result;
+}
+INTERPOSE(fixture_fcntl,fcntl);
+#endif
 static int hooked_rename(const char *from,const char *to){
  if(!ready||!daemon_role||!target_path(to,0))return real_rename(from,to);
  pthread_mutex_lock(&mutex);int e=0;uint8_t data[TJ_MAX],blob[136],expected[136];size_t n=0;
@@ -320,6 +477,7 @@ static int hooked_rename(const char *from,const char *to){
    * disposable file a process exit during restore_view could leave behind. */
   int fd=openat(keyfd,".systembag.restore",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
   if(fd<0||write(fd,"PUBLIC-PARTIAL-VIEW",19)!=19||fsync(fd)||close(fd)||fsync(keyfd))_exit(88);
+  if(system_fixture){uint64_t zero=0;if(call(8,&zero,1,NULL,0,NULL,NULL,NULL))_exit(88);}
   publish_auth_state(UMI_TXN_UNAVAILABLE);
   fprintf(stderr,"UMI native txn: injected exit after durable commit before install/reply; partial restore view saved\n");_exit(86);
  }
@@ -332,7 +490,7 @@ static int hooked_renamex(const char *from,const char *to,unsigned flags){
 }
 static xpc_connection_t hooked_xpc(const char *name,dispatch_queue_t queue,uint64_t flags){
  static xpc_connection_t(*original)(const char*,dispatch_queue_t,uint64_t);if(!original)original=dlsym(RTLD_NEXT,"xpc_connection_create_mach_service");
- if(!strcmp(name,"com.apple.mobile.keybagd.xpc"))name=test_service;return original(name,queue,flags);
+ if(!system_fixture&&!strcmp(name,"com.apple.mobile.keybagd.xpc"))name=test_service;return original(name,queue,flags);
 }
 extern xpc_connection_t original_xpc_symbol(const char *,dispatch_queue_t,uint64_t) __asm__("_xpc_connection_create_mach_service");
 INTERPOSE(hooked_open,IOServiceOpen);INTERPOSE(hooked_close,IOServiceClose);
