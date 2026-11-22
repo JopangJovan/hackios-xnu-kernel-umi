@@ -4,6 +4,7 @@
 #include "journal.h"
 #include "item-keys.h"
 #include "retry-policy.h"
+#include "UmiAksRetryProtocol.h"
 #include "auth-notify.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -154,10 +155,10 @@ static kern_return_t call(uint32_t sel,const uint64_t *v,unsigned count,const vo
 static kern_return_t envelope(uint64_t handle,uint8_t blob[136]){size_t n=136;kern_return_t e=call(3,&handle,1,NULL,0,NULL,blob,&n);return e?e:n==136?0:kIOReturnBadArgument;}
 static kern_return_t drop(uint64_t h){return h?call(4,&h,1,NULL,0,NULL,NULL,NULL):0;}
 static kern_return_t retry_control(uint64_t command){
- return call(0x80,&command,1,NULL,0,NULL,NULL,NULL);
+ return call(UMI_RETRY_CONTROL,&command,1,NULL,0,NULL,NULL,NULL);
 }
 static void finish_change(void){
- if(change_reserved&&!retry_control(3))change_reserved=0;
+ if(change_reserved&&!retry_control(UMI_RETRY_END_CHANGE))change_reserved=0;
 }
 static kern_return_t recover_system_fixture(void){
  uint8_t current[136]={0};uint64_t zero=0,flags=0,handle=0;
@@ -216,15 +217,15 @@ static void *retry_broker(void *argument)
         io_connect_t worker = retry_worker_connection;
         uint64_t request[2] = {0};
         uint32_t count = 2;
-        kern_return_t rc = real_method(worker, 0x81, NULL, 0, NULL, 0, request, &count, NULL, NULL);
+        kern_return_t rc = real_method(worker, UMI_RETRY_POLL, NULL, 0, NULL, 0, request, &count, NULL, NULL);
         if (rc || count != 2) _exit(87);
         if (request[0]) {
-            if (request[1] == 1) rc = retry_begin();
-            else if (request[1] == 2) retry_finish(false);
-            else if (request[1] == 3) retry_finish(true);
+            if (request[1] == UMI_RETRY_DEBIT) rc = retry_begin();
+            else if (request[1] == UMI_RETRY_REJECT) retry_finish(false);
+            else if (request[1] == UMI_RETRY_ACCEPT) retry_finish(true);
             else _exit(87);
             uint64_t reply[] = {request[0], !rc};
-            if (real_method(worker, 0x82, reply, 2, NULL, 0, NULL, NULL, NULL, NULL)) _exit(87);
+            if (real_method(worker, UMI_RETRY_REPLY, reply, 2, NULL, 0, NULL, NULL, NULL, NULL)) _exit(87);
         }
         pthread_mutex_unlock(&mutex);
         usleep(20000);
@@ -256,7 +257,7 @@ static kern_return_t proxy(uint32_t sel,const uint64_t *v,uint32_t vc,const void
     return kIOReturnUnsupported;
    }
    if(candidate){drop(candidate);candidate=0;finish_change();}
-   if(shared_retry){e=retry_control(2);if(e)return e;change_reserved=1;}
+   if(shared_retry){e=retry_control(UMI_RETRY_BEGIN_CHANGE);if(e)return e;change_reserved=1;}
    if(has_saved){e=retry_begin();if(e){finish_change();return e;}}
    e=real_method(conn,sel,v,vc,p,n,out,oc,bytes,size);
    if(has_saved)retry_finish(!e);
@@ -364,14 +365,27 @@ static kern_return_t hooked_open(io_service_t service,task_port_t task,uint32_t 
  fprintf(stderr,"UMI native txn: isolated IOServiceOpen result=0x%x\n",e);
  if(!e){conn=*out;
   if(system_fixture){
-   if(shared_retry)e=retry_control(0);
+   if(shared_retry)e=retry_control(UMI_RETRY_REGISTER_OWNER);
    if(!e)e=recover_system_fixture();
    if(!e&&shared_retry){
     e=real_open(service,task,type,&retry_worker_connection);
     if(!e){
      pthread_t broker;
      if(pthread_create(&broker,NULL,retry_broker,(void *)(uintptr_t)++retry_worker_generation))e=kIOReturnNoResources;
-     else {pthread_detach(broker);e=retry_control(1);}
+     else {pthread_detach(broker);e=retry_control(UMI_RETRY_MARK_READY);}
+#if UMI_CANONICAL_FIXTURE
+     if(!e && getenv("UMI_TXN_GATE_PROBE") &&
+        !strcmp(getenv("UMI_TXN_GATE_PROBE"),"1")){
+      e=retry_control(UMI_RETRY_BEGIN_CHANGE);
+      if(!e){
+       kern_return_t admission=retry_control(UMI_RETRY_MARK_READY);
+       kern_return_t released=retry_control(UMI_RETRY_END_CHANGE);
+       e=admission==kIOReturnBusy?released:kIOReturnError;
+       fprintf(stderr,"UMI shared retry: ready during change rejected=%d release=0x%x\n",
+               admission==kIOReturnBusy,released);
+      }
+     }
+#endif
     }
    }
   }

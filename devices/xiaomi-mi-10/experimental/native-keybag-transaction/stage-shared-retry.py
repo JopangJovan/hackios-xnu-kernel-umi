@@ -18,12 +18,14 @@ for path, digest in inputs.items():
     if hashlib.sha256((args.xnu / path).read_bytes()).hexdigest() != digest:
         raise SystemExit(f'Unexpected v13 prerequisite {path}; nothing changed')
 
-header = args.xnu / 'iokit/Kernel/UmiAksSharedRetry.h'
-if header.exists():
+headers = [args.xnu / 'iokit/Kernel' / name for name in
+           ('UmiAksSharedRetry.h', 'UmiAksRetryProtocol.h')]
+if any(header.exists() for header in headers):
     raise SystemExit('Unexpected retry header in baseline; nothing changed')
 patch = source / 'shared-retry-kernel.patch'
 subprocess.run(['git', 'apply', '--check', str(patch)], cwd=args.xnu, check=True)
 if not args.check:
     subprocess.run(['git', 'apply', str(patch)], cwd=args.xnu, check=True)
-    shutil.copyfile(source / header.name, header)
+    for header in headers:
+        shutil.copyfile(source / header.name, header)
 print('Verified shared-retry prerequisites' if args.check else 'Staged opt-in shared retry gate')

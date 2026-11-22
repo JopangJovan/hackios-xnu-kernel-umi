@@ -3,6 +3,61 @@
 This device port follows the `hakios` branch of unified upstream `7867dc140043cdc3151886d67735b3894414e7bf`.
 The previous UMI kernel and userland history is retained by the integration merge.
 
+## 锁屏密码进度与剩余步骤（2026-11-22）
+
+**目前：原有临时镜像的锁屏、壁纸和原生密码输入可用；还不是完整的日常密码管理与数据保护。**
+设密保存、跨重启加载、重锁和错码拒绝已有实机记录；`native-124` 又由用户确认
+正常壁纸与密码输入。共享失败计数、等待和保存事务仍只在独立合成数据上验证，
+尚未切换到这个正常用户环境。GPU、Metal/OpenGL、音频及正常镜像本轮没有改动。
+
+按“正常用户环境下可靠管理锁屏密码，并接入日常启动”的验收范围，**剩余 4 个阶段**。
+这是工作与验收分组，不是剩余四次修改、四次重启，也不能据此估算完成日期。
+
+| 顺序 | 剩余阶段 | 当前进度与通过条件 |
+|---|---|---|
+| 1 | 完成共享重试与保存恢复的故障覆盖 | `native-119/120` 及后续 `native-127/128` 已通过正常及跨重启路径。本轮实际关口头文件的宿主测试通过归属/互斥、迟到与重复回执、超时、服务退出和恢复；仍须在无界面夹具中组合验证服务异常、持久卷提交/安装边界及等待恢复。不能用旧袋回退或无密码初始化掩盖失败 |
+| 2 | 接回正常用户环境的原生密码服务 | 保留现有密码袋、壁纸、偏好、PIN 类型和配对记录；准备可回退的候选，再验证原生设密/改密、错误提示和等待提示。禁止把英文合成密码、空白 RAM 用户目录的后台夹具当成正常界面 |
+| 3 | 完成密码生命周期 | 验证改密后旧密码失效、新密码跨重启可用、重锁正确；定义关闭密码时受保护数据如何重新封装或失效，验证取消、写盘失败、服务退出与恢复。目前诊断路径拒绝关闭密码，尚未实现完整关闭流程 |
+| 4 | 集中回归并接入日常构建 | 同一候选验证锁屏/壁纸/密码键盘、错误与正确密码、重启、USB 配对/日志，以及 GPU 绘制、触控、音频、网络和睡眠唤醒。通过后再切换默认构建，保留已知可用的恢复入口 |
+
+如果“完整使用”还要求照片、备忘录、钥匙串等用户数据真正加密，另外还有 **3 个阶段**：
+
+1. 补齐系统所需文件/钥匙串保护类、首次解锁前的密钥来源和可信旧条目迁移。
+2. 接入真实 UFS 加密读写、启动解锁与故障恢复，在独立介质验证容量、边界、并发和中断写。
+3. 完成组合验收后才初始化正式加密用户卷，并处理旧明文副本；不改安卓、GPT 或启动分区。
+
+当前 `/private/var` 未整体加密。软件密钥袋也不具备苹果 Secure Enclave 的硬件计数器、
+密钥绑定或防回滚保证，不能把上述阶段完成等同于原厂硬件安全能力。
+
+**密码修复推进：** 新增 `shared-retry-gate-test.cpp`，直接测试
+`UmiAksSharedRetry.h`，并接入 `build-test.py` 的 ASan/UBSan 检查。
+初轮是确定性的关口状态测试，不模拟真实 IOKit 调度、断电或用户界面；后续实机记录见下文。
+后台打包默认不启动 SpringBoard/PosterBoard，正常界面验收单独进行。
+继续修复：重试服务在认证或改密未结束时不得重新声明就绪，避免恢复与在途操作交叉。
+新增测试在原有头文件上触发断言；修复后的 ASan/UBSan 整套宿主检查已通过；后续已进入独立夹具实机复测。
+
+**后续实机结果：** `native-127/128` 已通过无 SpringBoard/PosterBoard 的独立夹具复测。
+真实内核拒绝改密占用期间重新声明就绪；原合成袋和受保护条目保持可读。
+混合错误累计至 8 次后，经原厂安卓重启仍恢复 32 秒等待；等待内拒绝认证，
+到期后正确密码成功、旧密码失败，选择器 9/12 均通过，退出同步 `errno=0`。
+`native-125/126` 分别因旧失败计数和构建引用旧源码被排除，不计入通过结果。
+已补构建依赖来源检查与可重复夹具入口。源文件及实机证据哈希见
+[gate-recovery-results.json](experimental/native-keybag-transaction/gate-recovery-results.json)。
+阶段 1 仍有服务中断/提交安装边界和真实并发故障组合待测；没有将新后台切到日常镜像。
+
+`native-129` 再次启动原正常镜像（SHA-256 与本轮开始前一致）：日志记录已设密码的
+锁定状态及随后认证解锁，采集的桌面画面中壁纸和图标正常。本轮未发送密码输入。
+这张画面是桌面，不是锁屏壁纸截图；没有重复完整 Metal/OpenGL 性能与功能回归。
+GPU/显示相关文件未改，原有正常镜像保留，新后台仍只在独立夹具中运行。
+`native-127/128/129` 均已确认正常同步退出并返回原厂安卓。
+随后把控制命令改为共享枚举：注册服务、声明就绪、开始改密、结束改密；
+协议数值保持 0/1/2/3 不变，内核、守护进程及测试共用定义。
+此次命名整理只做宿主回归和 iOS 编译，未再次启动手机；实机哈希记录保留原测试版本。
+
+详细证据与分区边界见 [加密计划](ENCRYPTION-PLAN.md)，历史锁屏记录见
+[LOCKSCREEN-PASSCODE.md](LOCKSCREEN-PASSCODE.md)，后台测试见
+[原生事务实验](experimental/native-keybag-transaction/README.md)。
+
 ## Source isolation
 
 All UMI implementations live here. Shared upstream sources in `drivers/`, `xnu/files/`,
@@ -87,6 +142,15 @@ The DMA completion is checked between two phase reads to reject refresh wraps.
 The wait sleeps through the known active scan interval and polls only near the
 idle boundary, rather than spinning a CPU core throughout the wait.
 
+## Keybag durability and keychain preparation
+
+The isolated [keybag recovery prototype](experimental/keybag-recovery/README.md)
+adds staged password changes, authenticated two-bank records, persistent retry
+accounting, and class-separated synthetic item-key wrapping. Host and temporary
+boot observations are recorded there. It does not replace the live system bag,
+ordinary keychain or USB pairing, and does not encrypt the 80 GiB partition.
+See [the integration plan](ENCRYPTION-PLAN.md) for the remaining boundaries.
+
 ## Native USB pairing
 
 Lock-screen passcodes are not yet enabled in the normal build. The separate
@@ -127,6 +191,30 @@ unchanged saved keybag ciphertext. This round used retained firmware diagnostics
 and did not re-test native USB pairing. Production boot orchestration, retry
 policy, protection-class integration and encrypted data migration remain
 incomplete; the current HFS user-data volume is not encrypted.
+
+The [native-password encrypted-volume test](experimental/system-volume/README.md)
+passed write/read/relock/reboot checks in `native-48/49`. The separate
+[class-A file-protection stage](experimental/file-protection/README.md) then
+passed `native-59/60`: with the fixture still mounted, locking denied both an
+already-open descriptor and new file opens, cleared cached file keys, and
+correct authentication restored the original hash. The same ciphertext survived
+a return through Android and a read-only remount. Wrong-password refusal was
+confirmed by the user. Existing USB pairing still read version/model, syslog
+was refused before authentication and worked afterward, and normal restart
+returned to original Android. These results cover only generated fixtures;
+current iOS data is unchanged. The next
+[class-C lifetime extension](experimental/file-protection-classes/README.md)
+passed locked read/create, uncached remount and three-file reboot recovery in
+`native-61/62`. However, native USB disconnected in `native-62` before a paired
+session could be verified, so that run failed USB regression.
+Normal iOS shutdown returned through the temporary loader, retained logs were
+saved, and original Android boot was confirmed. Full user-data encryption
+remains disabled pending the remaining protection/bootstrap work. A subsequent
+old-kernel control reproduced the USB failure; a loader fence preventing UEFI
+`GetChargingAction` calls after native USB handoff passed v12 and v13 controls
+(`native-65/66`). The latest A/C fixture retained its hashes, existing pairing
+survived physical reconnect, and 180-second plus post-reconnect 30-second
+syslog captures succeeded. See the [ownership fix and telemetry limits](experimental/native-usb/ownership/README.md).
 
 A temporary UMI image reached the iOS home screen and completed the stock
 **Trust This Computer** flow on 2026-11-17. An encrypted USB session read
@@ -618,3 +706,80 @@ sending and SMS without IMS still need hardware verification. MMS, group
 messages and iMessage are outside the bridge's scope. The SMS test included
 IMS registration and host call checks. Hardware calls were verified separately
 in the outbound call test above.
+
+
+### 2026-11-20: native keybag save transactions (isolated)
+
+The [native transaction experiment](experimental/native-keybag-transaction/README.md)
+connects a separate copy of the original iOS 16.5 keybagd to an authenticated,
+mirrored transaction journal and per-client test bags. A save failure cannot install
+its candidate; a successful save precedes installation. Ordinary item tests use
+verified AKS class numbers 6/7, explicit legacy fixture conversion and fail-closed
+handling for unsupported classes. See the experiment's results for device evidence.
+
+This does not replace the live password service or migrate the system keychain.
+The original shared-cache AKS calls bypassed diagnostic interposition, and the
+read-only guard stopped that attempt before authentication. The isolated IOKit
+client is not a claim that securityd/SecItem integration is complete. Existing
+credentials, native USB code, Android/GPT/boot partitions and the 80 GiB encryption
+state remain unchanged; no repeated user PIN testing is requested at this stage.
+
+The follow-up [ordinary AKS experiment](experimental/ordinary-aks/README.md) now
+routes the original shared-cache framework into an explicitly entitled, root-only
+kernel test client. `native-78/79` passed creation and cross-Android-reboot reading,
+A/C lifecycle checks, wrong-secret rejection and previous test-item compatibility.
+The real system bag's serialized contents and flags stayed unchanged. This resolves
+framework isolation for test clients only; live securityd/SecItem and full
+data-volume encryption remain pending. See the updated
+[encryption progress and plan](ENCRYPTION-PLAN.md) for the next steps and limits.
+
+The [save-recovery follow-up](experimental/native-keybag-transaction/SAVE-RECOVERY.md)
+adds explicit committed/unchanged/uncertain outcomes and exact-payload replay.
+`native-81/82` verified the original diagnostic daemon across a post-commit error,
+an exit before install/reply, rejection of the obsolete password request, and an
+Android reboot. Subsequent changes retained the original test file key. This is
+still isolated validation; live keychain migration and full data-volume encryption
+remain pending.
+
+The [retry-policy follow-up](experimental/native-keybag-transaction/RETRY-POLICY.md)
+now saves failure counts together with the opaque keybag record in the diagnostic
+daemon. Verification requires a durable attempt debit; authorization requires a
+durable successful reset. Host tests cover 36 error and 36 process-exit points.
+`native-83/84` passed service-exit recovery, failed-debit/reset refusal and retention
+of five failures across an Android reboot. After the recorded wait, a successful
+change still decrypted the original test file key; the real system bag stayed
+unchanged. This is an opt-in software experiment with public test policy keys,
+not hardware anti-rollback or a change to the live lockscreen policy. Native USB
+pairing still needs the later combined regression test.
+
+The [isolated SecItem experiment](experimental/isolated-securityd/README.md) now
+executes the original iOS keychain code in a private filesystem root with two
+explicitly isolated AKS clients. `native-91` passed CRUD and A/C relock semantics
+in memory; `native-92/93` then passed on-disk SQLite integrity, encrypted test-bag
+save/reload, wrong-password rejection and recovery of the same A/C values across
+an Android reboot. The real system bag stayed unchanged. These results do not
+replace live securityd, prove other protection classes or encrypt the 80 GiB
+partition. All sessions returned to stock Android; native USB pairing awaits
+the later combined regression. The updated [encryption plan](ENCRYPTION-PLAN.md)
+records the failed diagnostic rounds and the remaining integration work.
+
+The [paired transaction tests](experimental/isolated-securityd/TRANSACTIONS.md)
+connect the original diagnostic keybagd save/retry path to that isolated disk
+database. `native-94/95` passed candidate-save failure, post-commit error recovery,
+lost-reply recovery and a further password change after a stock Android reboot.
+The original A/C values remained readable and failure counts persisted. Six fresh
+database processes passed CRUD, relock and SQLite checks; the real system bag's
+serialization and flags stayed unchanged. The kernel and original service/USB
+helper files were retained. Live authentication notifications, other protection
+classes, legacy migration and combined native USB regression remain pending;
+these results do not authorize or implement full data-volume encryption.
+Both sessions flushed with `errno=0` and returned to stock Android; the final
+read-only check confirmed `umi / V14.0.4.0.TJBCNXM` with boot completion reported.
+
+The [isolated lifecycle tests](experimental/isolated-securityd/LIFECYCLE.md)
+observe first authentication and current lock state separately. A password
+removal request against a protected test bag preserves the committed bag and
+returns an error. A separate SQLite fixture verifies legacy wrapping conversion,
+rollback after a process exit, and readability after reboot and further rekeys.
+The test uses known synthetic `HKwr` records. Live keychain migration still
+requires a way to establish the origin and integrity of actual legacy records.

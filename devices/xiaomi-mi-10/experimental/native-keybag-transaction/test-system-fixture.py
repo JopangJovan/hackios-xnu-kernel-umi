@@ -25,23 +25,26 @@ def fingerprint(root):
 before = fingerprint(a.base)
 assert ui_jobs <= before.keys(), 'Use the complete interactive input fixture'
 with tempfile.TemporaryDirectory(prefix='umi-fixture-pack-') as directory:
-    for interactive in (False, True):
-        output = Path(directory) / ('ui' if interactive else 'backend')
+    for interactive, rearm in ((False, False), (True, False), (False, True)):
+        output = Path(directory) / ('rearm' if rearm else 'ui' if interactive else 'backend')
         command = ['python3', str(source / 'prepare-system-fixture.py')]
         for name in ('base', 'daemon', 'binaries', 'entitlements'):
             command += ['--' + name, str(getattr(a, name))]
         command += ['--output', str(output)]
         if interactive:
             command.append('--ui-diagnostics')
+        if rearm:
+            command += ['--rearm-shared-retry', '--gate-probe']
         subprocess.run(command, check=True)
         manifest = {line.split('\t')[-1] for line in Path(str(output)+'.manifest').read_text().splitlines()}
         for name in ui_jobs:
             assert (output / name).exists() == interactive, name
             assert (name in manifest) == interactive, name
         job = plistlib.loads((output / 'LaunchDaemons/com.hakios.umi-system-service-fixture.plist').read_bytes())
-        assert job['ProgramArguments'] == ['/redwood/bin/umi-system-service-test']
+        assert job['ProgramArguments'] == ['/redwood/bin/umi-system-service-test'] + (['--rearm'] if rearm else [])
         service = plistlib.loads((output / 'LaunchDaemons/com.apple.mobile.keybagd.plist').read_bytes())
         assert 'com.apple.mobile.keybagd.xpc' in service['MachServices']
+        assert service['EnvironmentVariables'].get('UMI_TXN_GATE_PROBE') == ('1' if rearm else None)
         after = fingerprint(output)
         for name, digest in before.items():
             if name.startswith('lib/') and name in after and name != 'lib/umi-native-txn.dylib':

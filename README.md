@@ -107,6 +107,17 @@ with the established user environment. Live password-service integration,
 keychain migration, remaining protection classes and user-volume encryption
 remain open. See the [encryption progress and plan](devices/xiaomi-mi-10/ENCRYPTION-PLAN.md).
 
+Four acceptance stages remain for reliable daily passcode use: shared retry and
+save-failure coverage; integration with the existing user environment; complete
+password lifecycle and recovery; then combined regression and daily-build rollout.
+Actual user-data encryption requires three further stages: protection classes and
+keychain migration, encrypted UFS startup/recovery, and final volume initialization
+with acceptance tests. These are work packages, not an estimate of edits or time.
+The current host suite now tests the actual retry-gate header under ASan/UBSan;
+subsequent native-127/128 isolated device runs passed change/readiness exclusion,
+shared failure counts, reboot backoff and recovery with the correct password.
+The daily password service has not been replaced. See the [stage checklist](devices/xiaomi-mi-10/README.md#锁屏密码进度与剩余步骤2026-11-22).
+
 ### Storage validation
 
 The single-slot UMI menu selected iOS 16.5 from RAM and reached the home

@@ -18,8 +18,13 @@ for name in ('base', 'daemon', 'binaries', 'entitlements', 'output'):
 p.add_argument('--retry-volume', type=Path)
 p.add_argument('--replace-rejected-fixture', type=Path,
                help='Optional SHA-256 of the entire rejected synthetic volume')
-p.add_argument('--resume-shared-retry', action='store_true',
+repeat = p.add_mutually_exclusive_group()
+repeat.add_argument('--resume-shared-retry', action='store_true',
                help='Resume the synthetic journal from native-118')
+repeat.add_argument('--rearm-shared-retry', action='store_true',
+               help='Re-arm a completed synthetic journal without replacing its bag or protected item')
+p.add_argument('--gate-probe', action='store_true',
+               help='Check ready/change exclusion through the real kernel in the isolated daemon')
 p.add_argument('--ui-diagnostics', action='store_true',
                help='Retain synthetic UI jobs for diagnosis only; not normal lock-screen acceptance')
 a = p.parse_args()
@@ -40,6 +45,8 @@ job['ProgramArguments'] = ['/redwood/bin/keybagd', '-t', '240']
 job['ThrottleInterval'] = 1
 job['EnvironmentVariables'].update(UMI_TXN_ROOT='/var/tmp/k06', UMI_TXN_ROLE='daemon', UMI_TXN_RETRY='1')
 job['EnvironmentVariables']['__OSINSTALL_ENVIRONMENT'] = '1'
+if a.gate_probe:
+    job['EnvironmentVariables']['UMI_TXN_GATE_PROBE'] = '1'
 remove = {
     'LaunchDaemons/com.hakios.umi-system-bag.plist', 'bin/umi-passcode-ui',
     'bin/keybagd-txn', 'bin/umi-paired-keychain-test', 'bin/securityd.delta',
@@ -87,7 +94,7 @@ shutil.copy2(a.binaries / 'system-service-test', h / 'bin/umi-system-service-tes
 (h / test_job).write_bytes(plistlib.dumps({
     'Label': 'com.hakios.umi-system-service-fixture', 'RunAtLoad': True,
     'ProgramArguments': ['/redwood/bin/umi-system-service-test'] +
-    (['--resume'] if a.resume_shared_retry else []),
+    (['--resume'] if a.resume_shared_retry else ['--rearm'] if a.rearm_shared_retry else []),
     'StandardOutPath': '/dev/console', 'StandardErrorPath': '/dev/console',
 }))
 if a.retry_volume:

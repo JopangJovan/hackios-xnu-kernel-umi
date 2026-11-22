@@ -2,14 +2,7 @@
 #ifndef UMI_AKS_SHARED_RETRY_H
 #define UMI_AKS_SHARED_RETRY_H
 
-enum {
-    UMI_RETRY_CONTROL = 0x80,
-    UMI_RETRY_POLL = 0x81,
-    UMI_RETRY_REPLY = 0x82,
-    UMI_RETRY_DEBIT = 1,
-    UMI_RETRY_REJECT = 2,
-    UMI_RETRY_ACCEPT = 3,
-};
+#include "UmiAksRetryProtocol.h"
 
 static struct {
     UmiAksLab *owner;
@@ -40,21 +33,24 @@ static IOReturn umi_retry_rpc(uint32_t selector, UmiAksLab *client, IOExternalMe
         return kIOReturnBadArgument;
     if (selector == UMI_RETRY_CONTROL) {
         if (!in || args->scalarInputCount != 1 || args->scalarOutputCount) return kIOReturnBadArgument;
-        if (in[0] == 0) {
+        if (in[0] == UMI_RETRY_REGISTER_OWNER) {
             if (gate.owner || gate.unlocking) return kIOReturnBusy;
             gate.owner = client;
             return kIOReturnSuccess;
         }
         if (gate.owner != client) return kIOReturnNotPrivileged;
         switch (in[0]) {
-        case 1:
+        case UMI_RETRY_MARK_READY:
+            /* Recovery must not re-enable admission while the previous
+             * authentication or password change still owns the gate. */
+            if (gate.unlocking || gate.changing) return kIOReturnBusy;
             gate.ready = true;
             return kIOReturnSuccess;
-        case 2:
+        case UMI_RETRY_BEGIN_CHANGE:
             if (!gate.ready || gate.changing || gate.unlocking) return kIOReturnBusy;
             gate.changing = true;
             return kIOReturnSuccess;
-        case 3:
+        case UMI_RETRY_END_CHANGE:
             if (!gate.changing) return kIOReturnNotReady;
             gate.changing = false;
             return kIOReturnSuccess;

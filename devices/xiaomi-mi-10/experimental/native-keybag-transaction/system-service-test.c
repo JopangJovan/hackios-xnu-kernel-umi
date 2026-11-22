@@ -34,6 +34,10 @@ static uint64_t snapshot(struct tj_store *store, uint64_t generation, unsigned f
 {
     struct retry_policy retry;
     CHECK(!rp_open(&retry, store, milliseconds, NULL) && retry.loaded);
+    if (retry.generation != generation || retry.failures != failures)
+        printf("UMI shared retry: state mismatch generation=%llu failures=%u expected=%llu/%u\n",
+               (unsigned long long)retry.generation, retry.failures,
+               (unsigned long long)generation, failures);
     CHECK(retry.generation == generation && retry.failures == failures);
     CHECK(!extract(retry.payload, retry.length, blob));
     uint64_t sequence = retry.sequence;
@@ -118,7 +122,7 @@ static void check_wait_window(uint64_t started, unsigned failures)
     CHECK(elapsed < window);
 }
 
-static int persistent(const char *program, int mode, int resume)
+static int persistent(const char *program, int mode, int resume, int rearm)
 {
     CHECK(!mount_fixture_volume(mode));
     int directory = open(UMI_SYSTEM_FIXTURE_ROOT, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -175,6 +179,36 @@ static int persistent(const char *program, int mode, int resume)
               test_config[1] == test_config[0] - 2 && test_config[2] == test_config[1] + 1);
         unsigned generation = test_config[0];
         int old_pin = test_config[1], new_pin = test_config[2];
+        if (rearm) {
+            /* Preserve the qualified bag even if a previous diagnostic left
+             * a bounded failure count. Clear it only by real authentication. */
+            struct retry_policy current;
+            CHECK(!rp_open(&current, &store, milliseconds, NULL) && current.loaded);
+            printf("UMI shared retry: rearm generation=%llu failures=%u\n",
+                   (unsigned long long)current.generation, current.failures);
+            CHECK(current.generation == generation && current.failures <= 8);
+            CHECK(!extract(current.payload, current.length, bag));
+            rp_clear(&current);
+            CHECK(!fileio(directory, "restart-envelope", saved, sizeof(saved), 0) &&
+                  !memcmp(bag, saved, sizeof(bag)));
+            CHECK(!fileio(directory, "restart-wrapped-key", wrapped, sizeof(wrapped), 0));
+            CHECK(request_change(program, 3, 2) != 0);
+            /* Starting the daemon restores the full persisted backoff. */
+            sleep(rp_delay_for(8) / 1000u + 1);
+            CHECK(!authenticate(9, new_pin));
+            snapshot(&store, generation, 0, saved);
+            CHECK(!memcmp(bag, saved, sizeof(bag)));
+            check_protected(&keys, bag, new_pin, wrapped);
+            CHECK(!call(8, &zero, 1, NULL, 0, NULL, NULL, NULL));
+            wrong_mixed(program, &store, generation, 8, saved);
+            CHECK(!memcmp(bag, saved, sizeof(bag)));
+            CHECK(!fsync(journal) && !fsync(directory));
+            tj_close(&store);
+            close(journal); close(directory); IOServiceClose(connection);
+            wipe(bag, sizeof(bag)); wipe(saved, sizeof(saved)); wipe(wrapped, sizeof(wrapped));
+            puts("SHARED RETRY REARM ALL PASS");
+            return 0;
+        }
         uint64_t sequence = snapshot(&store, generation, 8, bag);
         CHECK(!fileio(directory, "restart-envelope", saved, sizeof(saved), 0) && !memcmp(bag, saved, sizeof(bag)));
         CHECK(!fileio(directory, "restart-wrapped-key", wrapped, sizeof(wrapped), 0));
@@ -223,8 +257,9 @@ int main(int argc, char **argv)
     }
     int retry_mode = umi_system_fixture_retry_mode();
     int resume = argc == 2 && !strcmp(argv[1], "--resume");
-    CHECK(argc == 1 || (resume && retry_mode == 2));
-    if (retry_mode) return persistent(argv[0], retry_mode, resume);
+    int rearm = argc == 2 && !strcmp(argv[1], "--rearm");
+    CHECK(argc == 1 || ((resume || rearm) && retry_mode == 2));
+    if (retry_mode) return persistent(argv[0], retry_mode, resume, rearm);
     CHECK(umi_system_fixture_allowed());
     CHECK(!mkdir(UMI_SYSTEM_FIXTURE_ROOT, 0700));
     int directory = open(UMI_SYSTEM_FIXTURE_ROOT, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);

@@ -24,6 +24,9 @@ run([*host, src/'journal.c', src/'journal-test.c', '-o', out/'journal-test'])
 run([*host, src/'journal.c', src/'journal-retry-test.c', '-o', out/'journal-retry-test'])
 run([*host, src/'journal.c', src/'retry-policy.c', src/'retry-policy-test.c', '-o', out/'retry-policy-test'])
 run([*host, src/'item-keys-test.c', '-o', out/'item-keys-test'])
+run(['clang++', '-std=c++11', *flags, '-fsanitize=address,undefined',
+     src/'shared-retry-gate-test.cpp', '-o', out/'shared-retry-gate-test'])
+run([out/'shared-retry-gate-test'])
 with tempfile.TemporaryDirectory(prefix='native-txn-', dir=out) as temp:
     run([out/'journal-test', Path(temp)/'journal'])
     run([out/'journal-retry-test', Path(temp)/'retry'])
