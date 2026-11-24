@@ -53,6 +53,8 @@
 #                                   the kernel. adsp=1 needs none of it: the system image has the firmware in /fw.
 #                      MODEM=1      stage checked local MPSS firmware from ../fw-modem in system.apfs /fw.
 #                                   This does not start the modem; the XNU MPSS driver is still required.
+#                      UMI_CALLSERVICESD=FILE stages the iOS 20F66 callservicesd for UMI's RAM boot.
+#                                   UMI_GPS=1 includes the SDX55 user interface and firmware inputs.
 #   system.apfs      the system image, the root filesystem (the resident RAM disk, /dev/md0), an
 #                    APFS container: the part of iOS 16.5 chosen by ../sysimage/select-system.py at
 #                    its real paths, the dyld shared cache, and src/stage0.c as /sbin/launchd (the
@@ -126,6 +128,16 @@ IOS_JOBS=${JOBS-"
 # AudioSession and CoreHaptics need mediaserverd; its AVAudioSession setup waits for NanoRegistry's
 # paired-device Mach service. Keep both jobs in every image so the server and its clients can start.
 IOS_JOBS="$IOS_JOBS com.apple.mediaserverd com.apple.nanoregistryd"
+GPS_APFS=()
+if [ "${UMI_GPS:-0}" = 1 ]; then
+	if [ "${DEVICE:-}" != umi ] || [ ! -s "$IOS/rootfs/usr/libexec/locationd" ]; then
+		echo "UMI_GPS=1 needs the iOS 20F66 locationd in sysimage/rootfs/usr/libexec" >&2
+		exit 1
+	fi
+	IOS_JOBS="$IOS_JOBS com.apple.locationd"
+	GPS_APFS=(--plain sdx55m)
+	SYSTEM=1
+fi
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib).
@@ -139,7 +151,9 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
-/redwood/lib/libhakios.tweaks.dylib Preferences"}
+/redwood/lib/libhakios.tweaks.dylib Preferences
+/redwood/lib/libhakios.compass.dylib Compass
+/redwood/lib/umi-posterboard.dylib PosterBoard"}
 [ "${BLUETOOTH-0}" != 1 ] || INJECT="$INJECT
 /redwood/lib/libhakios.bluetooth.dylib bluetoothd"
 # STOREFRONT=1: and a library of ours inside appstored as well (src/inject_store.c). It is not in the
@@ -197,6 +211,16 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -z "$PREBUILT" ]; then
 		# ordinary dynamically linked programs of our own, built against the iOS SDK
 		$DYN -o obj/hello_dyn src/hello_dyn.c
+		$DYN -target arm64-apple-ios16.5 -Wall -Wextra -Werror -dynamiclib -fobjc-arc -framework Foundation \
+			-install_name /redwood/lib/umi-posterboard.dylib \
+			src/umi_posterboard.m -o obj/umi-posterboard.dylib
+		if [ "${UMI_COMMCENTER:-0}" = 1 ]; then
+			$DYN -target arm64-apple-ios16.5 -Wall -Wextra -Werror -dynamiclib -fobjc-arc \
+				-I../devices/xiaomi-mi-10/overlays/xnu/files/bsd \
+				-framework CoreFoundation -framework Foundation -framework CoreTelephony -framework IOKit \
+				-install_name /redwood/lib/umi-commcenter-boot.dylib \
+				src/umi_commcenter_boot.c src/umi_commcenter_state.m -o obj/umi-commcenter-boot.dylib
+		fi
 		if [ "${BLUETOOTH-0}" = 1 ]; then
 			$DYN -fblocks -framework CoreFoundation -framework IOKit -o obj/umi_bluetool src/umi_bluetool.c
 			$DYN -dynamiclib -install_name /redwood/lib/libhakios.bluetooth.dylib -framework CoreFoundation -framework IOKit -o obj/libhakios.bluetooth.dylib src/inject_bluetooth.c
@@ -251,6 +275,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# ... and inside an application, to say what killed it (src/inject_app.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
+		# ... and inside Compass, the magnetometer (kern.hakios.mag) as CoreMotion's device motion (src/inject_compass.c)
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.compass.dylib -lobjc \
+			-o obj/libhakios.compass.dylib src/inject_compass.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -320,7 +347,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ "${BLUETOOTH-0}" != 1 ] || cp obj/libhakios.bluetooth.dylib root/lib/
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
+	[ -f obj/libhakios.compass.dylib ] && cp obj/libhakios.compass.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+	[ ! -f obj/umi-posterboard.dylib ] || cp obj/umi-posterboard.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
 		cp obj/HakiosAudio root/lib/HakiosAudio.driver/
@@ -352,15 +381,29 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		esac
 	done > root/etc/inject.conf
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
-	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
-	# points back into /var); point them at the data that ships with the system, and use this machine's zone
-	zone=$(timedatectl show -p Timezone --value 2>/dev/null || true); zone=${zone:-UTC}
+	# Use the zoneinfo shipped with iOS and seed the host's configured time zone.
+	host_os=$(uname -s)
+	zone=
+	if [ "$host_os" = Linux ]; then
+		zone=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+	fi
+	if [ -z "$zone" ]; then
+		# macOS and Linux both link localtime into a zoneinfo directory.
+		zone_link=$(readlink /etc/localtime 2>/dev/null || true)
+		case "$zone_link" in */zoneinfo/*) zone=${zone_link#*/zoneinfo/} ;; esac
+	fi
+	if [ "$host_os" = Linux ] && [ -z "$zone" ] && [ -r /etc/timezone ]; then
+		IFS= read -r zone < /etc/timezone || true
+	fi
+	case "$zone" in ''|/*|*..*|*[!A-Za-z0-9_+/-]*) zone=UTC ;; esac
+	if [ ! -f "$IOS/rootfs/usr/share/zoneinfo.default/$zone" ]; then zone=UTC; fi
 	sed -i.bak -e 's|^l\t/usr/share/zoneinfo\t/private/var/db/timezone/zoneinfo$|l\t/usr/share/zoneinfo.default\t/private/var/db/timezone/zoneinfo|' \
 		-e "s|^l\t/var/db/timezone/zoneinfo/[^\t]*\t/private/var/db/timezone/localtime\$|l\t/var/db/timezone/zoneinfo/$zone\t/private/var/db/timezone/localtime|" root/etc/var.skel
 	rm -f root/etc/var.skel.bak
 	# ... and the files of ours it puts there (var/): those under mobile/ belong to the user mobile
 	cp -r var root/var
-	(cd var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
+	install -m 644 umi-zh-cn.plist root/var/mobile/Library/Preferences/.GlobalPreferences.plist
+	(cd root/var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
 		case $f in mobile/*) owner=501 ;; *) owner=0 ;; esac
 		printf 'f\t644\t%s\t%s\t/private/var/%s\t/var/%s\n' $owner $owner "$f" "$f"
 	done >> root/etc/var.skel
@@ -371,6 +414,12 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
 	# the local Files provider's root; /private/var is a fresh ramfs, so make it on every boot.
 	printf 'd\t755\t501\t501\t/private/var/mobile/Documents\n' >> root/etc/var.skel
+	# ScreenTimeAgent opens the local Remote Management store through Core Data.
+	# Its parent directory may be absent from the installed iOS data template.
+	screen_time_store_dir='/private/var/mobile/Library/Application Support/com.apple.remotemanagementd'
+	if ! awk -F '\t' -v path="$screen_time_store_dir" '$1 == "d" && $5 == path { found = 1 } END { exit !found }' root/etc/var.skel; then
+		printf 'd\t700\t501\t501\t%s\n' "$screen_time_store_dir" >> root/etc/var.skel
+	fi
 	# A key of ours for root, when there is one: ssh/authorized_keys, never in the repository (like
 	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
 	# Wi-Fi, which saves rebuilding an image for every question one wants to ask a running iOS. It
@@ -407,12 +456,29 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
+	# UMI's SDX55 integration supports voice and SMS but has no Visual Voicemail backend.
+	rm -f root/LaunchDaemons/com.apple.voicemail.vmd.plist
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
 # (it is the vendor's and never in the repository): the kernel's GPU bring-up, drivers/gpu/hakios.adreno.c, finds it in fw/
 if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
+fi
+# ... and the sensor DSP's image (SLPI), from /vendor/firmware_mnt/image of the same Android into
+# ../fw-slpi (8.2 MB): the kernel's probe (boot-arg slpi=1) hands it to TrustZone and loads it.
+if [ -d ../fw-slpi ]; then
+	mkdir -p root/fw
+	cp ../fw-slpi/slpi.* root/fw/
+fi
+# The Qualcomm sensor DSP requests its persistent registry back from APSS
+# through FastRPC.  Keep the registry pulled from this UMI's Android install
+# as a read-only archive: it is copied into the small image and never written
+# back to Android.  The SLPI listener will unpack only the registry paths it
+# serves once its RPC endpoint is registered.
+if [ -f ../fw-sensors/registry.tar ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-sensors/registry.tar root/fw/sensors-registry.tar
 fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (drivers/wifi/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
@@ -474,6 +540,47 @@ umi_firmware() {
 # Include UMI assets in the small image used before iOS's root is mounted. They remain local
 # firmware inputs and are never committed to either source repository.
 umi_firmware root/fw
+if [ "${UMI_COMMCENTER:-0}" = 1 ]; then
+	install -m 0755 obj/umi-commcenter-boot.dylib root/lib/
+	printf '1\n' > root/etc/umi-commcenter
+	printf '%s\n' '/redwood/lib/umi-commcenter-boot.dylib CommCenter' >> root/etc/inject.conf
+fi
+if [ "${UMI_GPS:-0}" = 1 ]; then
+	mkdir -p root/sdx55m
+	for f in devcfg.mbn hyp.mbn tz.mbn aop.mbn acdb.mbn apps.mbn multi_image_qti.mbn multi_image.mbn xbl_cfg.elf sec.elf 514_0_0.mbn mbn_hw.dig mbn_sw.dig; do
+		install -m 0644 "../fw-sdx55/$f" root/sdx55m/ || exit 1
+	done
+	bash ../devices/xiaomi-mi-10/tools/build-sdx55-settings.sh "$PWD/root/lib/umi-gps-ui.dylib" || exit 1
+	printf '%s\n' '/redwood/lib/umi-gps-ui.dylib Preferences SpringBoard MobilePhone' >> root/etc/inject.conf
+	# This executable is over the extractor's default framework size limit.
+	# Use the original binary from the same 20F66 root volume.
+	if [ -n "${UMI_CALLSERVICESD:-}" ]; then
+		install -m 0755 "$UMI_CALLSERVICESD" root/bin/callservicesd
+		printf '%s\n' '/redwood/lib/umi-gps-ui.dylib InCallService' >> root/etc/inject.conf
+		python3 - "$IOS/rootfs" <<'PY'
+import pathlib
+import plistlib
+import sys
+
+name = 'com.apple.telephonyutilities.callservicesd.plist'
+source = pathlib.Path(sys.argv[1]) / 'System/Library/LaunchDaemons' / name
+target = pathlib.Path('root/LaunchDaemons') / name
+with source.open('rb') as f:
+    job = plistlib.load(f)
+job['ProgramArguments'][0] = '/redwood/bin/callservicesd'
+job['StandardErrorPath'] = '/dev/console'
+with target.open('wb') as f:
+    plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
+PY
+	fi
+	if [ "${UMI_SMS:-0}" = 1 ]; then
+		$DYN -target arm64-apple-ios16.5 -Wall -Wextra -Werror -dynamiclib -fobjc-arc -framework Foundation \
+			-install_name /redwood/lib/umi-sms.dylib \
+			-I../devices/xiaomi-mi-10/overlays/xnu/files/bsd \
+			src/umi_sms_imagent.m -o root/lib/umi-sms.dylib
+		printf '%s\n' '/redwood/lib/umi-sms.dylib imagent' >> root/etc/inject.conf
+	fi
+fi
 
 # Segment names are device-specific. UMI's signed MDT references adsp.b00 through adsp.b18,
 # including b00 and b01; Redwood's image starts at b02 and keeps its existing selection.
@@ -512,6 +619,12 @@ if [ "${DEVICE:-}" = umi ]; then
 				--sensor-version "$version" --output "root/fw/camera-s5khmx-v$version.tab" >/dev/null
 		done
 	fi
+front_module=../fw-camera/com.qti.sensormodule.umi_sunny_s5k3t2.bin
+if [ -f "$front_module" ]; then
+    mkdir -p root/fw
+    python3 ../devices/xiaomi-mi-10/tools/umi-camsensor-v2.py "$front_module" \
+        --sensor-version 0 --output root/fw/camera-s5k3t2.tab >/dev/null
+fi
 else
 for module in ../fw-camera/com.qti.sensormodule.hakios_*.bin; do
 	[ -f "$module" ] || continue
@@ -567,7 +680,7 @@ done
 [ -d root/lib/HakiosAudio.driver ] && ln -s /redwood/lib/HakiosAudio.driver root/hal/HakiosAudio.driver
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (drivers/storage/hakios.image.c)
-python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
+python3 ../tools/apfs/mkapfs.py -z --plain fw "${GPS_APFS[@]}" -o root.apfs redwood=root | tail -1
 [ -z "$CHECK" ] || ../tools/apfs/check-image.sh root.apfs redwood=root
 
 # --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.apfs --------------------------------
@@ -670,8 +783,31 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	mkdir -p sysroot/System/Volumes/iOS
 	# the applications iOS installs on its first boot are system applications here (see select-system.py)
 	if [ -d sysroot/private/var/staged_system_apps ]; then
-		mv sysroot/private/var/staged_system_apps/* sysroot/Applications/
+		# (a merge: an app that the system image already has would stop a plain mv)
+		cp -a sysroot/private/var/staged_system_apps/. sysroot/Applications/ 2>/dev/null || true
 		rm -rf sysroot/private/var
+	fi
+	if [ "${UMI_GPS:-0}" = 1 ] && [ -n "${UMI_CALLSERVICESD:-}" ]; then
+		# CallKit's public transaction API requires the Phone app to declare VoIP background mode.
+		# Replace the file in the staged image to preserve the source on hard-link builds.
+		python3 - sysroot/Applications/MobilePhone.app/Info.plist <<'PY'
+import pathlib
+import plistlib
+import stat
+import sys
+
+target = pathlib.Path(sys.argv[1])
+with target.open('rb') as f:
+    info = plistlib.load(f)
+modes = info.setdefault('UIBackgroundModes', [])
+if 'voip' not in modes:
+    modes.append('voip')
+    temp = target.with_suffix('.new')
+    with temp.open('xb') as f:
+        plistlib.dump(info, f, fmt=plistlib.FMT_BINARY, sort_keys=False)
+    temp.chmod(stat.S_IMODE(target.stat().st_mode))
+    temp.replace(target)
+PY
 	fi
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.ios
 	cp obj/stage0 sysroot/sbin/launchd
@@ -744,7 +880,20 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	done
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
-	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	# dyld's standard path for the shared cache: a boot whose root IS this volume has no
+	# cryptex graft, and dyld looks in /System/Library/Caches, not under Cryptexes.
+	if [ -d sysroot/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld ]; then
+		mkdir -p sysroot/System/Library/Caches
+		ln -sfn ../../Cryptexes/OS/System/Library/Caches/com.apple.dyld \
+			sysroot/System/Library/Caches/com.apple.dyld
+	fi
+	if [ "${UMI_GPS:-0}" = 1 ]; then
+		install -d -m 0700 sysroot/sdx55m
+		for f in mdm1m9kefs1.bin mdm1m9kefs2.bin mdm1m9kefs3.bin qdsp6sw.mbn; do
+			install -m 0600 "../fw-sdx55/$f" sysroot/sdx55m/ || exit 1
+		done
+	fi
+	python3 ../tools/apfs/mkapfs.py -z "${GPS_APFS[@]}" -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=$IOS/system.manifest
 	rm -rf sysroot
 fi

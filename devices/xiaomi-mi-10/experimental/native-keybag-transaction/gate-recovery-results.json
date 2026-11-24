@@ -1,0 +1,51 @@
+{
+  "date": "2026-11-22",
+  "scope": "isolated 8 MiB synthetic fixture; not production password-service integration",
+  "source_sha256": {
+    "UmiAksSharedRetry.h": "e0d74a8bae42de2d4ffc85375058d6619510b833ec43a3681934d9e2bded6be4",
+    "adapter.c": "9921ec8aac3bcd973b10d2654445e5c6edc7011ca85b8aa3f7a043ced7a97402",
+    "system-service-test.c": "6460e9f1d05675d34fb7d09394697048472ec411e47f603fd96c75d489a3c91e",
+    "prepare-system-fixture.py": "81ac38aae71765775889c92479b55902bb268fe7553a53e9d25768793b7d1486",
+    "check-shared-retry-build.py": "86c4f578969f753e63c92a3ea4357bcbc80d49101769255f25f1e9a5a5d1e96a"
+  },
+  "kernel_sha256": "1b3ca40abfd6965679af7ca55744e39e61798cc0cc7be08ec321cb3f2d591528",
+  "normal_image_sha256": "262f21b5d664943e1ee504e202145915b85bb5a0402358946a7b78b3eb3762b7",
+  "sessions": {
+    "native-127": {
+      "profile": "restart",
+      "boot_sha256": "94dfa04a99ff527eca5304c39083b37ab30418a824a5d7c797e02ac6da3ca166",
+      "retained_log_sha256": "ef60677136496537dc20975de34aeae089a55d9523cad65c088a873479129f42",
+      "pass_marker": "SHARED RETRY REARM ALL PASS",
+      "flush_errno": 0,
+      "stock_android_return_confirmed": true
+    },
+    "native-128": {
+      "profile": "reboot",
+      "boot_sha256": "ab192203ed215942a6088ba05fb0a332c0ca301d5fa362491eeb0f5fc8b9771d",
+      "retained_log_sha256": "c49099701040d1c0b4b5f8fff4c3953489fe22a86a1c001774ad8060fd3e0431",
+      "pass_marker": "SHARED RETRY RESTART ALL PASS",
+      "flush_errno": 0,
+      "stock_android_return_confirmed": true
+    }
+  },
+  "gate_evidence_sha256": "9760e95280d405b86eb37ca82bac481b5ac687cbf2aae6931a2fce1329af7b8b",
+  "excluded_sessions": {
+    "native-125": "Rejected zero-failure precondition; actual fixture later reported generation 3 / failures 3",
+    "native-126": "Copied generated Makefiles selected old AKS sources; authentication failed; not a qualified kernel"
+  },
+  "remaining": [
+    "real concurrent authentication/recovery faults",
+    "production password lifecycle and UI integration",
+    "full GPU/USB combined regression"
+  ],
+  "normal_environment_control": {
+    "session": "native-129",
+    "image_sha256": "262f21b5d664943e1ee504e202145915b85bb5a0402358946a7b78b3eb3762b7",
+    "frame_sha256": "cb93eb4557531115cc961a971fae7d741074dea8c2ca84846e1d876c9cb29160",
+    "observed": "Home screen wallpaper and icons rendered; log transitions from passcode locked to authenticated unlocked; agent sent no password input",
+    "limits": "No lock-screen frame captured; not a full GPU/Metal/OpenGL regression",
+    "retained_log_sha256": "dbaf57ada8d0851d5f8e440cdeac32adb68ceab51ef13f267a94c371f83110be",
+    "flush_errno": 0,
+    "stock_android_return_confirmed": true
+  }
+}

@@ -1,0 +1,229 @@
+{
+  "scope": "Private original keybagd, native SecItem test database and synthetic legacy SQLite fixtures",
+  "protected_fixture_password_removal": "refused with original journal and envelope preserved",
+  "live_password_service_replaced": false,
+  "whole_data_volume_encrypted": false,
+  "android_gpt_boot_partitions_modified": false,
+  "fixture_transaction_root": "/var/tmp/k04",
+  "fixture_secitem_root": "/var/tmp/k05",
+  "rounds": [
+    {
+      "case": "native-96",
+      "result": "first_auth_notification_overwritten_by_original_followup_verification",
+      "final_sync_errno": 0,
+      "shutdown_path": "loader_stop",
+      "returned_stock_android": true,
+      "firmware_log_sha256": "5cffbcdb97199df8a3c9a96432bf21dab6cbbe84e4f2001e4c1505249376146a",
+      "host_session_sha256": "5a858aa07bf11e3a065d01e5128e67fc84e0999b4943e4ee4baf67743c9da6aa",
+      "prehandoff_log_sha256": null,
+      "boot": {
+        "helper": "helper-secitem-preflight-96",
+        "boot_sha256": "4e6246b4368b134bf28e54ce814f32ec9c694ab44165ab2f01cec85d1db4b206",
+        "payload_sha256": "09c28601061f3a5e0a4d45490927716d596b7dd12da5ecd6e608546859073720",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "8a26a34f09524ce8afa4c6d142f92294ddadd9ad3401cadc4a124a968a1dbd2e"
+      },
+      "markers": [
+        "UMI lifecycle test: notification mismatch state=27 expected=4"
+      ]
+    },
+    {
+      "case": "native-98",
+      "result": "notification_and_password_removal_passed_migration_open_rejected_var_symlink",
+      "final_sync_errno": 0,
+      "shutdown_path": "loader_stop",
+      "returned_stock_android": true,
+      "firmware_log_sha256": "c687a6c1aa8461e6cb1437accc29d58196e6d50c83bb54795f3dc3ae796e94c3",
+      "host_session_sha256": "7ca4f635ba6f8271e4e4c0f9c954c211dfbabd23f289aafb35686b82813a2cd1",
+      "prehandoff_log_sha256": null,
+      "boot": {
+        "helper": "helper-secitem-preflight-98",
+        "boot_sha256": "1e701824e8dc21cf4b9df008ec4bb337daf7513caf314e88784679379f7ee4b9",
+        "payload_sha256": "c9cf0b30b621c54eb192937ea4da8421101d481553f17b15196927b863215568",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "5e351ec2a0af209d93bed94745aadc3e64cc3f141903a0953d19c7cd62c9ebb6"
+      },
+      "markers": [
+        "UMI lifecycle test: observed auth state=4 sequence=1",
+        "UMI lifecycle test: observed auth state=3 sequence=3",
+        "UMI native txn: password removal refused for protected fixture",
+        "UMI lifecycle test: native empty-password request refused; journal and encrypted bag unchanged PASS",
+        "UMI lifecycle test: observed auth state=2 sequence=3",
+        "UMI lifecycle test: observed auth state=3 sequence=9",
+        "UMI lifecycle test: first authentication, revocation and subsequent authentication observed; obsolete password still refused PASS"
+      ]
+    },
+    {
+      "case": "native-100",
+      "result": "aborted_after_live_system_unlocked_during_guard_comparison",
+      "final_sync_errno": 0,
+      "shutdown_path": "loader_stop",
+      "returned_stock_android": true,
+      "firmware_log_sha256": "9b7f56a74285dd5fa22352e8c8837e0822d8af37fcad458a84fe9be447cf3212",
+      "host_session_sha256": "1b55d428542b992862231cfef8cbc80752133fb9cb84937fecf851011971f8dc",
+      "prehandoff_log_sha256": null,
+      "boot": {
+        "helper": "helper-secitem-preflight-100",
+        "boot_sha256": "5cf4b4e6161af457bf94b5ce3046e10a8a09dc85c04f0d5996cdb14c730d1ce8",
+        "payload_sha256": "70163edd6cd5762aa14211909c0eb7e03522061fcc8a545268968fa65ee521f0",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "076a05731a400796d102f2f3a726460ad778804288def0368f117c1d898a35d7"
+      },
+      "markers": [
+        "UMI lifecycle test: observed auth state=4 sequence=1",
+        "UMI lifecycle test: observed auth state=3 sequence=3"
+      ]
+    },
+    {
+      "case": "native-102",
+      "result": "lifecycle_create",
+      "final_sync_errno": 0,
+      "shutdown_path": "loader_stop",
+      "returned_stock_android": true,
+      "firmware_log_sha256": "05dc51658443f9137737d0593b43aef4d00a1a55579320cfc6313e6f98165e22",
+      "host_session_sha256": "a6eac66c5a89a7bfddb3c98c4ab09911f07d1bd76e15c2fb844ae9bc72eff86a",
+      "prehandoff_log_sha256": null,
+      "boot": {
+        "helper": "helper-secitem-preflight-102",
+        "boot_sha256": "7f550b72293009c3dcc1cd2ea84bbfa06862aec2acab24e0af4a6d9274baa772",
+        "payload_sha256": "c327f6419f94f3063c668d79d760829ba65d252e9d084b7de34b9bbbab2f87d8",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "39d7502ffe02286b9a2fd65b2815cb1452478e4577fb4cb5f3c22102bf771e84"
+      },
+      "markers": [
+        "UMI lifecycle test: observed auth state=4 sequence=1",
+        "UMI lifecycle test: observed auth state=3 sequence=3",
+        "UMI native txn: password removal refused for protected fixture",
+        "UMI lifecycle test: native empty-password request refused; journal and encrypted bag unchanged PASS",
+        "UMI lifecycle test: observed auth state=2 sequence=3",
+        "UMI lifecycle test: observed auth state=3 sequence=9",
+        "UMI lifecycle test: first authentication, revocation and subsequent authentication observed; obsolete password still refused PASS",
+        "UMI lifecycle test: injected process exit after flushing first converted row before commit",
+        "UMI lifecycle test: locked migration denied, uncommitted legacy rows recovered, two converted rows verified and replayed PASS",
+        "UMI paired keychain test: real system bag serialization/flags unchanged PASS",
+        "UMI paired keychain test: lifecycle-create ALL PASS"
+      ]
+    },
+    {
+      "case": "native-103",
+      "result": "migration_reopen_and_rekey_passed_live_flag_comparison_interrupted",
+      "final_sync_errno": 0,
+      "shutdown_path": "loader_stop",
+      "returned_stock_android": true,
+      "firmware_log_sha256": "be3d5e94bf50316ea36aeab4a35c3192afc1722d0fe18bb340ac1e0c2f125c28",
+      "host_session_sha256": "3e8f6ebf3d6cd335bfc62a482bfcad25f7bfd89f5809aff232fc8c037566571f",
+      "prehandoff_log_sha256": null,
+      "boot": {
+        "helper": "helper-secitem-preflight-103",
+        "boot_sha256": "5ed196a0c88756ac79fb5d83b2fc7b9df0bbb35c78d797ae7f6b7e494f854c44",
+        "payload_sha256": "7cce9fd048b49dad437faa3050e0cd31e2336f29b6d1e41da38c1d309984548c",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "704adbbc98170339c4f16856f86547b1642263505f36435c43b29e0203eb040c"
+      },
+      "markers": [
+        "UMI native txn: password removal refused for protected fixture",
+        "UMI lifecycle test: native empty-password request refused; journal and encrypted bag unchanged PASS",
+        "UMI lifecycle test: observed auth state=2 sequence=9",
+        "UMI lifecycle test: observed auth state=4 sequence=12",
+        "UMI lifecycle test: observed auth state=3 sequence=14",
+        "UMI lifecycle test: reboot loaded locked; rekey preserved migrated rows and native A/C records PASS"
+      ]
+    },
+    {
+      "case": "native-104",
+      "result": "rekey_and_migration_verified_envelope_unchanged_live_flags_changed",
+      "final_sync_errno": 0,
+      "shutdown_path": "loader_stop",
+      "returned_stock_android": true,
+      "firmware_log_sha256": "70b1bf81cd1a1099cda3f8b3ec8ae6d786785ecf2b8c04d3533e99df49cf3796",
+      "host_session_sha256": "b3f1d57ba488f8728940579fda9c454f347c21ad3fee3b6f5ab706fc41e94301",
+      "prehandoff_log_sha256": null,
+      "boot": {
+        "helper": "helper-secitem-preflight-104",
+        "boot_sha256": "a75eed23e7d0426a4f92210e0ca6656bd5bcfaeabe06e985db9928ac8e2df744",
+        "payload_sha256": "cb7c8ebe535367abb263b9fd826f7c190965e4f48fda09d647abe6578c55f37b",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "333bec2d124216e5d2c936088850277450a1a31acfe9c77018f00babc39052be"
+      },
+      "markers": [
+        "UMI native txn: password removal refused for protected fixture",
+        "UMI lifecycle test: native empty-password request refused; journal and encrypted bag unchanged PASS",
+        "UMI lifecycle test: observed auth state=2 sequence=14",
+        "UMI lifecycle test: observed auth state=4 sequence=17",
+        "UMI lifecycle test: observed auth state=3 sequence=19",
+        "UMI lifecycle test: reboot loaded locked; rekey preserved migrated rows and native A/C records PASS",
+        "UMI paired keychain test: real system bag serialization unchanged PASS"
+      ]
+    },
+    {
+      "case": "native-105",
+      "result": "native_lockscreen_and_usb_regression",
+      "final_sync_errno": null,
+      "shutdown_path": "normal_iOS_shutdown",
+      "returned_stock_android": true,
+      "firmware_log_sha256": "5c08276c6b483ed16852e85db21397e3ecf3e280115ae3f7057105cffef2b6cb",
+      "host_session_sha256": "becd4a9a2e1dc5bd0b529a828915ad16f64e36b6b007186aaafbd7ca7756eca4",
+      "prehandoff_log_sha256": "d7d4978836d67eec492250e1586dce83fd5e750c536bfdcb66fb22a76a039372",
+      "boot": {
+        "helper": "helper-secitem-preflight-105",
+        "boot_sha256": "262f21b5d664943e1ee504e202145915b85bb5a0402358946a7b78b3eb3762b7",
+        "payload_sha256": "f3b195f55906c125917e0a914a677bdd19042c1dd6763ddf7dd6954b7ac39457",
+        "kernel_sha256": "373a2e677e3775b2a5e03fa5f8113f9a4997a3c8944863c9c5be1f550feb0096",
+        "helper_sha256": "47489af8270fa9446e8d25f17361c7e4c04ee5e65f246559c1655958602412df"
+      },
+      "markers": []
+    }
+  ],
+  "native_usb_regression": {
+    "case": "native-105",
+    "manual_lockscreen": {
+      "relock_requested_passcode": true,
+      "wrong_password_denied": true,
+      "correct_password_accepted": true
+    },
+    "trust_prompt_reappeared": false,
+    "host_native_usb_enumerated": false,
+    "pair_record_validation_completed": false,
+    "native_syslog_capture_completed": false,
+    "diagnostic_launch_jobs_enabled": false,
+    "device_high_speed_connect_done": true,
+    "device_usb_address_set": true,
+    "device_set_configuration": true,
+    "lockdown_mux_connection_observed_in_final_log": false,
+    "returned_stock_android": true
+  },
+  "tested_source_sha256": {
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/legacy-migration.c": "421aecd8d8d44cd7fe9a5cbea26649477e01764639790ace0bb2d37ac1195e2d",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/legacy-migration.h": "63637553e7ae71b9943d1de4e8851bfc50fbc5b6e298d9d0f2d43fa4ca8b06fc",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/lifecycle-test.h": "0329d8636b45058586eee0014fd7bd5d56593d460196f6f5fbe975383ccb0bad",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/transaction-test.c": "1570f1c354583ff80995826d4a5758763dfc26a32e8febd9e82b5635a1390a82",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/build-transaction.py": "068efb831ceaebcd4c564dbb9a1895da891babb014edc5ffbdd3daedbe54a5b4",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/prepare-transaction.py": "4d9e112c5a2e363f21899dae5d58d0254561bd5d54adf3d00072c14d1c06d3cb",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/backend-guardian.c": "095c49f77719d22535a840d8ee420b026236ea80e43d3978b36b47837d34becb",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/backend-preflight.c": "163a8509ea4ab967343e8ec511de1772ba4e61d840ae96bbf55638bbc033eb32",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/txn-bridge.h": "8776639048f916048eddc0a3a9da0c6a03448cdded78089b604c9baf2e03b3ef",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/auth-notify.h": "2aa3fb92b3ecb354d237a375f2fe8b87500913e54a71ec11779fcf9b35822f06",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/adapter.c": "bbf741ee02d260e53f59f78c2a7a556d51a06adbf74a7c9e41f5cbee3ab83007",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys.c": "784950bebe98ad21358a29a299703327823a105c5e936bbf3003bf9e1b48bded",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal.c": "70eda0399de1afba7fe58a660b2f9266ce3a810e7669ced8b08adf403ea42703",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/retry-policy.c": "8164d30e2da59cd76130af6d0708d690be112befc702cc8f5688a8e9604fce1d",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/request.m": "88f2ae94095698c470e0e5ab959b3eca93744a2030a127cb10191552b0234a7f"
+  },
+  "native_102_103_source_sha256": {
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/legacy-migration.c": "421aecd8d8d44cd7fe9a5cbea26649477e01764639790ace0bb2d37ac1195e2d",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/legacy-migration.h": "63637553e7ae71b9943d1de4e8851bfc50fbc5b6e298d9d0f2d43fa4ca8b06fc",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/lifecycle-test.h": "03d7ba226216bde1b6eef7885f99c23c4474e459af9276b707d10eb0169e2b93",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/transaction-test.c": "fc87c2d02a55013aada5e086cf269821c07fda3a0eb5b048b8d40c78c4e02a15",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/build-transaction.py": "068efb831ceaebcd4c564dbb9a1895da891babb014edc5ffbdd3daedbe54a5b4",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/prepare-transaction.py": "d4dc100f08fb6fe4dcdf07538bd716589a41b0854719fac4df8faed759bc71ab",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/backend-guardian.c": "095c49f77719d22535a840d8ee420b026236ea80e43d3978b36b47837d34becb",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/backend-preflight.c": "163a8509ea4ab967343e8ec511de1772ba4e61d840ae96bbf55638bbc033eb32",
+    "devices/xiaomi-mi-10/experimental/isolated-securityd/txn-bridge.h": "8776639048f916048eddc0a3a9da0c6a03448cdded78089b604c9baf2e03b3ef",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/auth-notify.h": "2aa3fb92b3ecb354d237a375f2fe8b87500913e54a71ec11779fcf9b35822f06",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/adapter.c": "bbf741ee02d260e53f59f78c2a7a556d51a06adbf74a7c9e41f5cbee3ab83007",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys.c": "784950bebe98ad21358a29a299703327823a105c5e936bbf3003bf9e1b48bded",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal.c": "70eda0399de1afba7fe58a660b2f9266ce3a810e7669ced8b08adf403ea42703",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/retry-policy.c": "8164d30e2da59cd76130af6d0708d690be112befc702cc8f5688a8e9604fce1d",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/request.m": "88f2ae94095698c470e0e5ab959b3eca93744a2030a127cb10191552b0234a7f"
+  }
+}

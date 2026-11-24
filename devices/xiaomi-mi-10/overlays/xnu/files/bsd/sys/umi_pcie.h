@@ -26,6 +26,12 @@ int umi_pcie_enumerate(struct umi_pcie *, const struct umi_pcie_io *);
 int umi_pcie_enable_dma(struct umi_pcie *);
 int umi_pcie_prepare_radio(struct umi_pcie *);
 int umi_pcie_setup_mhi_msi(struct umi_pcie *, uint64_t address, uint32_t data);
+/* PCIe2 (SDX55 modem) bootstrap: same controller layout, different base. The
+ * struct umi_pcie is shared; each file's static base macros select the port. */
+int umi_pcie2_enumerate(struct umi_pcie *, const struct umi_pcie_io *);
+int umi_pcie2_enable_dma(struct umi_pcie *);
+int umi_pcie2_setup_mhi_msi(struct umi_pcie *, uint64_t address, uint32_t data);
+void umi_pcie2_quiesce(struct umi_pcie *);
 /* Hold endpoint in reset before returning to loader. Rail/clock votes remain
  * until hardware reset; shared supplies are never disabled here. */
 void umi_pcie_quiesce(struct umi_pcie *);

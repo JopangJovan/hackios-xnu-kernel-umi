@@ -1,7 +1,22 @@
 # UMI camera bring-up
 
-The iOS capture bridge displays synthetic frames with `cam=5 cam_fake=1`.
-Physical capture is still disabled in the UMI kernel overlay. `cam=1` reads
+Current local status (2026-11-01): experimental physical rear S5KHMX capture
+is enabled by default (`cam=5`). Session 092815 confirms visibly clearer rear
+preview and the periodic lens movement has stopped. The source is 3008x2256
+RAW10; the iOS bridge receives Bayer-preserving 1504x1128 input. AK7377 contrast
+focus is connected, using a conservative, uncalibrated DAC150..750 window.
+Camera power/focus is retained within an iOS open session; sensor/DMA transfers
+remain bounded. Every repeated capture resets owned, stopped CSID/IFE paths.
+Close and capture/reset failures restore resources. Both 090635 and 092815
+returned normally; the earlier overnight run did not prove clean exit.
+Front and other camera modules are not yet supported. The phone's Android
+logs identify front slot2 as S5K3T2 ID3142, CCI1/master0, PHY4, four D-PHY lanes.
+Front resources are being collected; do not describe it as a working iOS camera.
+Photo saving was verified earlier; the latest higher-resolution still-save and
+reopen combination has not yet been separately confirmed.
+
+The remaining sections record the earlier bring-up stages. Synthetic frames
+are available only with explicit `cam=5 cam_fake=1`. `cam=1` reads
 UMI GPIO and CamCC state and, when powered and clocked, the IFE-lite/CSID-lite identifiers.
 It first checks GCC's camera AHB vote and skips camera register reads when
 that bus is gated; CamCC reads with the bus off raise an external abort.
@@ -171,3 +186,27 @@ python3 devices/xiaomi-mi-10/tools/test-rpmh.py
 Clock and GPIO register definitions are from Xiaomi's
 [UMI GCC driver](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/umi-q-oss/drivers/clk/qcom/gcc-kona.c)
 and [Kona pin controller](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/umi-q-oss/drivers/pinctrl/qcom/pinctrl-kona.c).
+
+
+## 2026-11-01 physical preview validation
+UMI now has an experimental synchronous physical S5KHMX backend with `cam=5`.
+It captures 3008x2256 packed RAW10 and preserves the full field of view in a
+752x564 preview, using ABI Bayer code 1 (GRBG). `cam=7` probes C-PHY/clocks;
+`cam=8` captures a physical diagnostic frame. The earlier statement that
+physical capture is disabled describes the baseline before these local edits.
+Session 004724: user confirms real objects and outlines are visible. Captures
+report completion, intact guards and zero SMMU faults. Screen capture also
+confirms a real scene. Autofocus and front/other camera modules remain unported;
+preview is low-rate and visibly blurry. User confirms photos are saved to the photo library, but are very blurry.
+Reopen validation remains pending. The original module identifies actuator
+`umi_ak7377_s5khmx`; the current backend does not initialize or move it and
+reports HAKIOS_CAMERA_NO_FOCUS. Lens focus is the next diagnostic target. Camera is not yet enabled in default boot.args.
+
+Final checks for session 004724: user reports equally blurry near/far subjects.
+After stopping the kernel, loader export returned a complete physical
+3008x2256 RAW10 frame (source 1, frames 1). Direct 1504x1128 Bayer-cell
+decode is also optically blurred, before the 752x564 preview reduction.
+Thus preview reduction is not the sole cause. AK7377 initialization, verified
+lens movement and focus control remain to be implemented and tested. No focus
+register writes have been attempted. Run stopped normally; phone sent back
+to Android at the user's earlier request to stop after this test.

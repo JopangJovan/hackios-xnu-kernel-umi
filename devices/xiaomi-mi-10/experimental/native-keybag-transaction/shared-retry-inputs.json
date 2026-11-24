@@ -1,0 +1,5 @@
+{
+  "iokit/Kernel/UmiAksNative.h": "d2a855b71d998f9601b68ee44e0493b2340792d6fc14bafaa8a075e555fe0e82",
+  "iokit/Kernel/MiniAppleKeyStore.cpp": "e3f87b9ca14351a17ff830de8396e1d2571969ebd6fd347304f2905086b5e88e",
+  "bsd/dev/hakios.ufs.c": "c0cda334af8f9db5f681f84b3214bbeb3fac562065155254adabbeb321559418"
+}

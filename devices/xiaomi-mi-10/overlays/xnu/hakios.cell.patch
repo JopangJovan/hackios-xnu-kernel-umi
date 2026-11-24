@@ -1,0 +1,96 @@
+--- a/bsd/dev/hakios.cell.c
++++ b/bsd/dev/hakios.cell.c
+@@ -42,7 +42,9 @@
+ static struct {
+ 	uint64_t        arp, dhcp, to_modem, from_modem, dropped_out, dropped_in, not_ip4;
+ } cell_count;
+-static bool cell_attached, cell_trace;
++static bool cell_attached, cell_trace, sdx55_attached;
++static LCK_MTX_DECLARE(cell_attach_lock, &cell_lock_group);
++static bool sdx55_enqueue_locked(const uint8_t *packet, size_t length);
+ 
+ static inline uint32_t
+ get32(const uint8_t *p)
+@@ -187,7 +189,7 @@
+ 			if (session.dns1 != 0) { put32(o, session.dns1); o += 4; }
+ 			if (session.dns2 != 0) { put32(o, session.dns2); o += 4; }
+ 		}
+-		if (session.mtu >= 576 && session.mtu <= 1500) {
++		if (session.mtu >= (sdx55_attached ? 68u : 576u) && session.mtu <= 1500) {
+ 			*o++ = 26; *o++ = 2; put16(o, session.mtu); o += 2;
+ 		}
+ 	}
+@@ -211,13 +213,17 @@
+ 	memcpy(reply + 6, router_mac, 6);
+ 	put16(reply + 12, 0x0800);
+ 	cell_count.dhcp++;
+-	printf("cell: DHCP %s answered with %s: %u.%u.%u.%u/%u.%u.%u.%u, router %u.%u.%u.%u, DNS %u.%u.%u.%u %u.%u.%u.%u, MTU %u\n",
+-	    type == DHCP_DISCOVER ? "discover" : "request", kind == DHCP_OFFER ? "an offer" : kind == DHCP_ACK ? "an acknowledgement" : "a refusal",
+-	    session.address >> 24, (session.address >> 16) & 0xff, (session.address >> 8) & 0xff, session.address & 0xff,
+-	    session.mask >> 24, (session.mask >> 16) & 0xff, (session.mask >> 8) & 0xff, session.mask & 0xff,
+-	    session.router >> 24, (session.router >> 16) & 0xff, (session.router >> 8) & 0xff, session.router & 0xff,
+-	    session.dns1 >> 24, (session.dns1 >> 16) & 0xff, (session.dns1 >> 8) & 0xff, session.dns1 & 0xff,
+-	    session.dns2 >> 24, (session.dns2 >> 16) & 0xff, (session.dns2 >> 8) & 0xff, session.dns2 & 0xff, session.mtu);
++	if (sdx55_attached) {
++		printf("cell: SDX55 DHCP reply type %u on en1\n", kind);
++	} else {
++		printf("cell: DHCP %s answered with %s: %u.%u.%u.%u/%u.%u.%u.%u, router %u.%u.%u.%u, DNS %u.%u.%u.%u %u.%u.%u.%u, MTU %u\n",
++		    type == DHCP_DISCOVER ? "discover" : "request", kind == DHCP_OFFER ? "an offer" : kind == DHCP_ACK ? "an acknowledgement" : "a refusal",
++		    session.address >> 24, (session.address >> 16) & 0xff, (session.address >> 8) & 0xff, session.address & 0xff,
++		    session.mask >> 24, (session.mask >> 16) & 0xff, (session.mask >> 8) & 0xff, session.mask & 0xff,
++		    session.router >> 24, (session.router >> 16) & 0xff, (session.router >> 8) & 0xff, session.router & 0xff,
++		    session.dns1 >> 24, (session.dns1 >> 16) & 0xff, (session.dns1 >> 8) & 0xff, session.dns1 & 0xff,
++		    session.dns2 >> 24, (session.dns2 >> 16) & 0xff, (session.dns2 >> 8) & 0xff, session.dns2 & 0xff, session.mtu);
++	}
+ 	hakios_net_input_unit(CELL_UNIT, reply, 14 + 20 + 8 + size);
+ 	return true;
+ }
+@@ -238,12 +244,15 @@
+ 	}
+ 	type = (uint32_t)frame[12] << 8 | frame[13];
+ 	lck_mtx_lock(&cell_lock);
+-	if (type == 0x0806) {
++	if (sdx55_attached && !session.up) {
++		ok = false;
++	} else if (type == 0x0806) {
+ 		ok = arp_answer(frame, length);
+ 	} else if (type == 0x0800 && dhcp_request(frame, length, &udp)) {
+ 		ok = session.up && dhcp_answer(frame, length, udp);
+ 	} else if (type == 0x0800) {
+-		ok = session.up && hakios_ipa_transmit(CELL_MUX, frame + 14, length - 14);
++		ok = session.up && (sdx55_attached ? sdx55_enqueue_locked(frame + 14, length - 14) :
++		    hakios_ipa_transmit(CELL_MUX, frame + 14, length - 14));
+ 		if (ok) {
+ 			cell_count.to_modem++;
+ 		} else {
+@@ -312,6 +321,10 @@
+ 	uint32_t router;
+ 
+ 	lck_mtx_lock(&cell_lock);
++	if (sdx55_attached) {
++		lck_mtx_unlock(&cell_lock);
++		return;
++	}
+ 	session.modem_mask = mask;
+ 	session.modem_gateway = gateway;
+ 	/* a /24 around the address, with the router in it (see the top of the file) */
+@@ -346,7 +359,9 @@
+ {
+ 	uint32_t t = 0;
+ 
+-	if (cell_attached || !hakios_ipa_data_ready()) {
++	lck_mtx_lock(&cell_attach_lock);
++	if (sdx55_attached || cell_attached || !hakios_ipa_data_ready()) {
++		lck_mtx_unlock(&cell_attach_lock);
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("modem_ipa_data_trace", &t, sizeof(t));
+@@ -355,4 +370,7 @@
+ 	if (cell_attached && session.up) {
+ 		hakios_net_link_state_unit(CELL_UNIT, true);
+ 	}
+-}
++	lck_mtx_unlock(&cell_attach_lock);
++}
++
++#include "umi_sdx55_net.inc"

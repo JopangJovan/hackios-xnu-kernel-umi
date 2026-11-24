@@ -55,6 +55,29 @@ static vm_offset_t rh_rsc, rh_tcs, rh_db, rh_gic;
 static uint32_t rh_db_size;
 static unsigned rh_ncpt;
 static unsigned rh_lock;
+
+/*
+ * One arbiter, and three drivers that start during the same boot (Bluetooth, Wi-Fi's
+ * service thread, the camera). Taking the lock without waiting made whichever came
+ * second fail its whole bring-up with EBUSY: Wi-Fi did, while Bluetooth voted its rails.
+ * Wait for the other transaction instead; a vote is a handful of TCS commands.
+ */
+static int
+rh_acquire(void)
+{
+	for (unsigned us = 0; us < 1000000u; us += 100) {
+		if (!__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+			if (us != 0) {
+				printf("UMI RPMH: arbiter busy for %u us; the vote goes ahead\n", us);
+			}
+			return 0;
+		}
+		delay(100);
+	}
+	printf("UMI RPMH: arbiter still busy after 1 s\n");
+	return EBUSY;
+}
+
 static bool rh_poisoned;
 static uint32_t rh_uncertain_irq;
 
@@ -191,9 +214,17 @@ rh_lookup(const char *res, uint32_t *address)
 				continue;
 			}
 			uint32_t addr = rh_read(rh_db, e + 16);
-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
-			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+			/* VRM (4) needs 16-byte alignment; ARC (3) has a single address. */
+			if (slave != RH_VRM && slave != 3) {
+				printf("UMI RPMH: unsupported slave %u for %s\n", slave, res);
+				return EINVAL;
+			}
+			if (slave == RH_VRM && (((addr >> 16) & 0xf) != RH_VRM || (addr & 15u))) {
 				printf("UMI RPMH: invalid VRM entry for %s\n", res);
+				return EINVAL;
+			}
+			if (!rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+				printf("UMI RPMH: invalid aux range for %s\n", res);
 				return EINVAL;
 			}
 			/* UMI's firmware repeats some VRM entries across slave headers.
@@ -352,6 +383,96 @@ rh_send_state_locked(uint32_t address, unsigned mv, bool set_ldo_mode, bool enab
 	return 0;
 }
 
+/* Single-command corner (level) vote for ARC resources like cx.lvl. */
+static int
+rh_send_corner(uint32_t address, unsigned corner)
+{
+	int chosen = -1;
+	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+		uint32_t b = t * RH_TCS_STRIDE;
+		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+		if (enabled & ~((1u << rh_ncpt) - 1u)) {
+			return EIO;
+		}
+		for (unsigned c = 0; c < rh_ncpt; ++c) {
+			if ((enabled & (1u << c)) &&
+			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+				printf("UMI RPMH: conflicting inherited request in TCS%u\n", t);
+				return EBUSY;
+			}
+		}
+		if (chosen < 0 && rh_free(t)) {
+			chosen = (int)t;
+		}
+	}
+	if (chosen < 0) {
+		printf("UMI RPMH: no empty idle ACTIVE TCS\n");
+		return EBUSY;
+	}
+	unsigned t = (unsigned)chosen;
+	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
+	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
+	uint32_t inherited_control = rh_read(rh_tcs, b + RH_CONTROL);
+	if (irq_en == 0xffffffffu || !rh_free(t)) {
+		return EBUSY;
+	}
+	rh_uncertain_irq = bit;
+	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
+		rh_poisoned = true;
+		return EIO;
+	}
+	rh_poisoned = true;
+	uint32_t cmd = b + 0 * RH_CMD_STRIDE;
+	if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+	    !rh_sync(cmd + RH_ADDR, address) ||
+	    !rh_sync(cmd + RH_DATA, corner)) {
+		return EIO;
+	}
+	if (!rh_sync(b + RH_WAIT, 1) || !rh_sync(b + RH_ENABLE, 1) ||
+	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+		return EIO;
+	}
+	bool latch_irq = rh_gic && (rh_read(rh_gic, 0x84) & (1u << 5)) &&
+	    !(rh_read(rh_gic, 0x104) & (1u << 5)) && !(rh_read(rh_gic, 0xc08) & (2u << 10));
+	if (latch_irq && !rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) | bit)) return EIO;
+	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+	uint32_t irq = 0, idle = 0, status = 0;
+	bool done = false, progress = false;
+	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+		idle = rh_read(rh_tcs, b + RH_STATUS);
+		status = rh_read(rh_tcs, b + RH_CMD_STATUS);
+		bool complete = status != 0xffffffffu &&
+		    (status & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+		progress |= idle == 0 || !complete;
+		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
+		    ((irq & bit) || progress) && complete) {
+			done = true;
+			break;
+		}
+		delay(1);
+	}
+	printf("UMI RPMH: corner vote done=%d irq=%#x idle=%#x status=%#x\n",
+	    done, irq, idle, status);
+	if (!done) {
+		printf("UMI RPMH: corner vote timeout\n");
+		return ETIMEDOUT;
+	}
+	if (!rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) & ~bit) ||
+	    !rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, inherited_control) ||
+	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
+		return EIO;
+	}
+	rh_write(rh_tcs, RH_IRQ_CLEAR, bit);
+	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
+	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
+		return EIO;
+	}
+	rh_poisoned = false;
+	printf("UMI RPMH: corner vote complete\n");
+	return 0;
+}
+
 static int
 rh_send_state(uint32_t address, unsigned mv, bool set_ldo_mode, bool enable)
 {
@@ -386,10 +507,11 @@ umi_rpmh_camera_vreg(unsigned rail, bool enable)
 {
 	static const struct { const char *resource; unsigned mv; } rails[] = {
 		{ "ldof6", 2850 }, { "ldof7", 1800 }, { "ldof1", 1104 },
+		{ "ldof4", 1104 }, /* front S5K3T2 digital supply: live DT/trace */
 	};
-	static bool owned[3];
+	static bool owned[4];
 	if (rail >= sizeof(rails) / sizeof(rails[0])) return EINVAL;
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (rh_acquire() != 0) return EBUSY;
 	int error = 0;
 	uint32_t address = 0;
 	if (owned[rail] == enable) goto out;
@@ -456,7 +578,7 @@ umi_rpmh_wifi_power(void)
 		{ "ldoa9", 1200 }, /* PCIe vreg-1p8: DT actually requests 1.2 V */
 		{ "ldoa5", 880 },  /* PCIe vreg-0p9 */
 	};
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (rh_acquire() != 0) return EBUSY;
 	int error = EIO;
 	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
 	if (rh_poisoned) goto out;
@@ -484,7 +606,7 @@ umi_rpmh_bluetooth_power(void)
 		{ "smpc8", 1350 }, /* RFA2 */
 		{ "ldoa16", 3025 },/* ASD, minimum of stock 3025-3300 mV range */
 	};
-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+	if (rh_acquire() != 0) return EBUSY;
 	int error = EIO;
 	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
 	if (rh_poisoned) goto out;
@@ -496,6 +618,32 @@ umi_rpmh_bluetooth_power(void)
 		error = rh_send(addresses[i], rails[i].mv, false);
 	}
 out:
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
+}
+
+/* Vote a CX corner (cx.lvl, ARC). Higher corners power the CX rail further.
+ * SM8250 cx corners from cmd-db levels: 0=min, 1=low_svs, ... up to turbo_l1.
+ * The SDX55 PCIe2 core needs CX at a usable corner; vote turbo (7) to be safe. */
+int
+umi_rpmh_cx_vote(unsigned corner)
+{
+	if (rh_acquire() != 0) return EBUSY;
+	int error = EIO;
+	uint32_t address = 0;
+	if (rh_poisoned) goto out;
+	error = rh_map();
+	if (!error) {
+		error = rh_lookup("cx.lvl", &address);
+	}
+	if (!error) {
+		printf("UMI RPMH: cx.lvl corner vote addr=%#x corner=%u\n", address, corner);
+		error = rh_send_corner(address, corner);
+	}
+out:
+	if (error) {
+		printf("UMI RPMH: cx vote failed errno=%d\n", error);
+	}
 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 	return error;
 }

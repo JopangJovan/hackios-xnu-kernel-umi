@@ -657,6 +657,14 @@ to_handler(struct qmi_state *s, uint8_t type, uint16_t id, uint16_t message, uin
 		}
 		return;
 	}
+	{
+		/* bounded: the firmware's own chatter during calibration, named */
+		static unsigned traced;
+		if (traced < 40) {
+			traced++;
+			os_log("qmi: -> handler #%u type %u id %#x, %zu bytes\n", traced, type, message, length);
+		}
+	}
 	decoded = os_alloc(h->decoded_size);
 	if (decoded == NULL) {
 		return;

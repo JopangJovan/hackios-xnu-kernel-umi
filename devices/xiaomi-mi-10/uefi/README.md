@@ -92,3 +92,76 @@ Output: `out/umi-boot.img`, containing UMI UEFI and its USB-resident EFI loader.
 Test with `fastboot boot`, never `fastboot flash`.
 The UEFI sources live in `files/`; firmware modules remain in ignored
 `Mu-Silicium/Binaries/umi`. Update `files/` after source changes in Mu-Silicium.
+
+## Temporary single-slot menu
+
+Include an `umi-ram-menu` entry in the loader's initial USB payload when
+building an image for `fastboot boot`. A small marker file can supply the
+entry. After the loader enumerates as `xnuloader`, stage the iOS system and
+kernel payload in RAM as for a USB session. Use `bootcpu=7` in the kernel
+payload so the loader keeps a separate core to supervise the session.
+
+```sh
+printf '1\000' > umi-ram-menu.flag
+python3 xnuloader/mkpayload.py --usb -o umi-ram-menu.payload \
+    loader.efi=out/xiaomi-mi-10/loader.efi umi-ram-menu=umi-ram-menu.flag
+UEFI_TARGET=umi FD_BASE=0x9fc00000 FD_SIZE=0x300000 PAYLOAD_BASE=0xf0000000 \
+    UEFI_FD="$UMI_UEFI_FD" DTB=devices/xiaomi-mi-10/prebuilt/device-tree.dtb \
+    python3 devices/xiaomi-mi-10/tools/mkimage.py -p umi-ram-menu.payload -o umi-ram-menu.img
+fastboot boot umi-ram-menu.img
+fastboot getvar product  # wait for xnuloader
+fastboot oem ramdisk
+fastboot stage system.apfs
+fastboot stage ios-run.bin
+fastboot oem ram-menu
+```
+
+Short-press Volume Down to change the selection and Power to confirm.
+The loader starts with Android highlighted and returns to Android after 90
+seconds without confirmation. It also returns to Android when iOS stops or
+the four-minute supervised session expires. A normal return gives USB eight
+seconds to collect logs before resetting to the stock boot chain. Android
+then goes through its normal boot. All test images are staged through USB in RAM.
+
+On 2026-11-15, the following branches were tested on the single-slot UMI:
+
+| Menu selection | Result |
+|---|---|
+| Android via Power | The loader recorded the selection and reset. Stock Android completed boot. |
+| iOS (RAM) via Volume Down and Power | With the validated iOS 16.5 payload configuration, SpringBoard took over the display and the home screen appeared. The phone returned to stock Android after the session was stopped. An initial run with reduced boot arguments left the display black. |
+| iOS (RAM) with an early-stop payload | XNU stopped at checkpoint 1. The loader reset automatically, and stock Android completed boot. This exercised a controlled startup failure. |
+
+The six UFS units' primary and backup GPT regions, `boot`, `recovery`,
+`vbmeta`, and four sampled Android files matched their pre-test hashes.
+
+## Read-only UFS survey
+
+The UMI loader accepts a local `umi-ufs-driver` payload entry. In this mode it
+waits at the USB command interface. `oem survey` checks the dependencies of
+the phone's own `UFSDxe.efi`, starts the driver from RAM, then reads the
+primary and backup GPT headers and entry arrays through UEFI Block I/O. The
+loader limits USB commands to the survey, log retrieval, variable queries and
+reboot. The survey reads GPT only and does not start an OS or enable the
+partition or filesystem drivers in the UEFI build.
+
+Build the UMI loader as usual. From the repository root, use the UMI FD and
+`UFSDxe.efi` extracted from your own phone's XBL as described above:
+
+```sh
+python3 xnuloader/mkpayload.py --usb -o umi-ufs-survey.payload \
+    loader.efi=out/xiaomi-mi-10/loader.efi "umi-ufs-driver=$UMI_UFS_DXE"
+UEFI_TARGET=umi FD_BASE=0x9fc00000 FD_SIZE=0x300000 PAYLOAD_BASE=0xf0000000 \
+    UEFI_FD="$UMI_UEFI_FD" DTB=devices/xiaomi-mi-10/prebuilt/device-tree.dtb \
+    python3 devices/xiaomi-mi-10/tools/mkimage.py -p umi-ufs-survey.payload -o umi-ufs-survey.img
+fastboot boot umi-ufs-survey.img
+fastboot getvar product  # wait for xnuloader
+fastboot oem survey
+fastboot oem log
+fastboot get_staged umi-ufs-survey.log
+fastboot reboot
+```
+
+The 2026-11-15 run enumerated six UFS logical units with 4 KiB blocks. Both
+GPT headers and both entry arrays on each unit passed CRC checks against
+Android's view. Android booted normally afterwards and the SHA-256 hashes of
+all 12 GPT regions were identical across the test.

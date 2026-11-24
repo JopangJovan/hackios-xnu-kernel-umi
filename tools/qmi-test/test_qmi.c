@@ -735,7 +735,9 @@ router_close(struct hakios_qrtr_port *port)
 	port->closed++;
 }
 
-static const struct hakios_qrtr_ops router_ops = { router_open, router_send, router_lookup, router_close };
+static const struct hakios_qrtr_ops router_ops = {
+	.open = router_open, .send = router_send, .lookup = router_lookup, .close = router_close,
+};
 
 /* A datagram from the server to the handle, as the router's thread would bring it. */
 static void
@@ -1125,6 +1127,40 @@ test_helpers(void)
 	qmi_handle_release(&qmi);
 	check(router.closed == 1 && !router.open && qmi.sock == NULL, "release does not close the port");
 	hakios_qmi_set_transport(NULL);
+}
+
+/* The first 64 bytes of UMI's 92-byte SNS report from 232535-run.log.  The
+ * remaining protobuf bytes are immaterial to QMI envelope decoding, so this
+ * fixture pads them with zero rather than claiming to reconstruct the event. */
+static void
+test_slpi_report(void)
+{
+	struct slpi_report { uint64_t timestamp; uint32_t payload_len; uint8_t payload[2048]; } decoded = { 0 };
+	static const struct qmi_elem_info report_ei[] = {
+		{ QMI_UNSIGNED_8_BYTE, 1, sizeof(uint64_t), NO_ARRAY, 1, offsetof(struct slpi_report, timestamp), NULL },
+		{ QMI_DATA_LEN, 1, sizeof(uint16_t), NO_ARRAY, 2, offsetof(struct slpi_report, payload_len), NULL },
+		{ QMI_UNSIGNED_1_BYTE, 2048, sizeof(uint8_t), VAR_LEN_ARRAY, 2, offsetof(struct slpi_report, payload), NULL },
+		{ QMI_EOTI, 0, 0, NO_ARRAY, 0, 0, NULL },
+	};
+	uint8_t indication[92] = {
+		0x04, 0x01, 0x00, 0x21, 0x00, 0x55, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x02, 0x47, 0x00, 0x45, 0x00, 0x0a, 0x12, 0x09, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+		0xab, 0xab, 0x11, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0x12, 0x2f, 0x0d, 0x00, 0x03,
+		0x00, 0x00, 0x11, 0xde, 0x88, 0xfb, 0xa9, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x1f, 0x0a, 0x09, 0x72,
+	};
+	int result = hakios_qmi_decode(indication, sizeof(indication), report_ei, &decoded);
+
+	check(result == (int)sizeof(indication) && decoded.payload_len == 69 && decoded.payload[0] == 0x0a &&
+	    decoded.payload[1] == 0x12, "UMI SNS report's 69-byte protobuf was lost (QMI %d, len %u)", result, decoded.payload_len);
+	indication[21] = 0x01;
+	indication[22] = 0x08; /* 2049 exceeds the declared 2048-byte array */
+	check(hakios_qmi_decode(indication, sizeof(indication), report_ei, &decoded) == -EINVAL,
+	    "an oversized UMI SNS report was decoded");
+	indication[5] = 11;
+	indication[6] = 0;
+	memset(&decoded, 0, sizeof(decoded));
+	check(hakios_qmi_decode(indication, 18, report_ei, &decoded) == 18 && decoded.payload_len == 0,
+	    "a missing TLV 2 was incorrectly treated as sensor data");
 }
 
 #ifndef NO_ATH11K
@@ -1545,6 +1581,7 @@ main(void)
 		{ "the coding, every table of ath11k: full, at random, damaged", test_ath11k_tables },
 #endif
 		{ "the helpers over a made-up router", test_helpers },
+		{ "UMI SNS report envelope and missing TLV", test_slpi_report },
 #ifndef NO_ATH11K
 		{ "a WCN6750's exchange with ath11k up to \"firmware ready\"", test_conversation },
 #endif

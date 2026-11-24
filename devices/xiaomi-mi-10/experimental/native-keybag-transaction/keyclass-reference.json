@@ -1,0 +1,39 @@
+{
+  "source": "local iOS 16.5 securityd from previously extracted image; binary not distributed",
+  "sha256": "d94e7307b196107572b44eb4bb4aeefbd7446a3719b447132ae9c915bb67d4d9",
+  "function_range": [
+    "0x1000ee4b4",
+    "0x1000ee610"
+  ],
+  "mapping": {
+    "WhenUnlocked": {
+      "value": 6,
+      "return_address": "0x1000ee500"
+    },
+    "AfterFirstUnlock": {
+      "value": 7,
+      "return_address": "0x1000ee558"
+    },
+    "AlwaysPrivate": {
+      "value": 8,
+      "return_address": "0x1000ee578"
+    },
+    "WhenUnlockedThisDeviceOnly": {
+      "value": 9,
+      "return_address": "0x1000ee598"
+    },
+    "AfterFirstUnlockThisDeviceOnly": {
+      "value": 10,
+      "return_address": "0x1000ee5b8"
+    },
+    "AlwaysThisDeviceOnlyPrivate": {
+      "value": 11,
+      "return_address": "0x1000ee5d8"
+    },
+    "WhenPasscodeSetThisDeviceOnly": {
+      "value": 12,
+      "return_address": "0x1000ee5f8"
+    }
+  },
+  "implementation_scope": "initial ordinary-key adapter supports only 6 and 7; device-only semantics and boot-available classes remain explicitly unsupported"
+}

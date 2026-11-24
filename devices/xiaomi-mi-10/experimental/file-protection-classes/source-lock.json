@@ -1,0 +1,10 @@
+{
+  "iokit/Kernel/UmiAksNative.h": {
+    "base": "5e6f8a964b7de057d6eb8a89366ac047affee6bddfa27a5ee60d16f5254aa35e",
+    "patched": "d2a855b71d998f9601b68ee44e0493b2340792d6fc14bafaa8a075e555fe0e82"
+  },
+  "iokit/Kernel/UmiHfsKeys.h": {
+    "base": "f1d85db135ddb2af8e5e9a3a745ac4a0be89a3046e7208d934e5f4e84bd4c906",
+    "patched": "d56408dcda68aa49bc68151c9baf4f5e397800edca1e7ea779f5bce540be7959"
+  }
+}

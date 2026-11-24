@@ -404,32 +404,58 @@ umi_touch_run(void)
 		printf("UMI FTS: initialization failed\n");
 		return;
 	}
-	unsigned ticks = 0, events = 0, errors = 0;
+	unsigned ticks = 0, events = 0, errors = 0, stuck = 0;
+	bool said_irq = false;
 	while (!st.dead) {
-		/* Match the working recovery IRQ path: leave an empty FIFO alone. */
-		if (touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_GPIO_IRQ)) & 1u) {
-			/* no pending controller interrupt */
-		} else if (!umi_fts_fifo(event)) {
-			unsigned count = event[7] & 0x1fu;
-			if (event[0]) {
-				++events;
-				umi_fts_event(event);
-			}
-			if (count) {
-				uint8_t batch[31 * 8];
-				const uint8_t cmd = UMI_FTS_FIFO;
-				/* Vendor drains all remaining records in one transaction. */
-				if (umi_fts_xfer(&cmd, 1, batch, count * 8)) {
-					++errors;
-				} else for (unsigned i = 0; i < count; ++i) {
-					if (batch[i * 8]) {
-						++events;
-						umi_fts_event(batch + i * 8);
+		bool asserted = (touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_GPIO_IRQ)) & 1u) == 0;
+		bool got = false;
+		/* Once a second, look even when the controller says it has nothing: an
+		 * interrupt line that stays deasserted would otherwise end input silently. */
+		bool probe = !asserted && (ticks % 125u == 0);
+
+		if (asserted || probe) {
+			if (umi_fts_fifo(event)) {
+				++errors;
+			} else {
+				unsigned count = event[7] & 0x1fu;
+				if (event[0]) {
+					++events;
+					got = true;
+					umi_fts_event(event);
+				}
+				if (count) {
+					uint8_t batch[31 * 8];
+					const uint8_t cmd = UMI_FTS_FIFO;
+					/* Vendor drains all remaining records in one transaction. */
+					if (umi_fts_xfer(&cmd, 1, batch, count * 8)) {
+						++errors;
+					} else for (unsigned i = 0; i < count; ++i) {
+						if (batch[i * 8]) {
+							++events;
+							got = true;
+							umi_fts_event(batch + i * 8);
+						}
 					}
 				}
+				if (got && probe && !said_irq) {
+					said_irq = true;
+					printf("UMI FTS: records without the interrupt line asserted; "
+					    "the FIFO is polled every second from now on\n");
+				}
 			}
+		}
+		/* The controller asking for ~2 s and yielding nothing is a wedged one. */
+		if (asserted && !got) {
+			++stuck;
 		} else {
-			++errors;
+			stuck = 0;
+		}
+		if (stuck > 250) {
+			printf("UMI FTS: %u polls asked and nothing came: resetting the controller\n", stuck);
+			stuck = 0;
+			if (umi_fts_initialize()) {
+				printf("UMI FTS: the reset failed\n");
+			}
 		}
 		if (++ticks % 625u == 0) {
 			printf("UMI FTS: poll=%u events=%u errors=%u irq=%u active=%#x\n",

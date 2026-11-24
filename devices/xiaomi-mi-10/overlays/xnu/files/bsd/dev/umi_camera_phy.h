@@ -1,0 +1,332 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Kona camera PLL0/RCG definitions and CSIPHY1.2.1 programming from Xiaomi's
+ * umi-q-oss drivers/clk/qcom and cam_sensor_module/cam_csiphy. Included only
+ * by the UMI diagnostic after uisp_probe has reserved and reset the engines.
+ */
+static unsigned uphy_timer_cmd(unsigned cmd) {return uc.front && cmd==0x6060?0x6080:cmd;}
+static const unsigned up_pll_regs[] = {0,4,8,0xc,0x10,0x14,0x18,0x1c,0x20,0x38,0x40};
+static const struct { unsigned cmd, cfg; } up_rcgs[] = {
+    {0x7058,0x20e}, /* PLL0 even /7.5: 80 MHz slow AHB */
+    {0xc0f8,0x203}, /* PLL0 even /2: 300 MHz CAMNOC */
+    {0xa068,0x301}, /* PLL0 odd /1: 400 MHz C-PHY RX */
+    {0x6060,0x203}, /* PLL0 even /2: 300 MHz PHY3 timer */
+    {0xc000,0x301}, /* PLL0 odd /1: 400 MHz IFE-lite */
+    {0xc01c,0x301}, /* PLL0 odd /1: 400 MHz CSID-lite */
+};
+static uint32_t up_pll_saved[11], up_rcg_saved[6];
+static unsigned up_rcg_changed;
+static bool up_pll_changed;
+
+static void
+uphyclocks_down(void)
+{
+    while (up_rcg_changed) {
+        unsigned i=--up_rcg_changed, cmd=uphy_timer_cmd(up_rcgs[i].cmd);
+        uw(uc.cc,cmd+4,up_rcg_saved[i]);
+        uw(uc.cc,cmd,ur(uc.cc,cmd)|1);
+        if(!upoll(uc.cc,cmd,1,0,1000))
+            hakios_tl("UMI camera PHY: RCG %#x restore timeout\n",cmd);
+    }
+    if(!up_pll_changed)return;
+    uw(uc.cc,0,ur(uc.cc,0)&~1u);
+    uw(uc.cc,0xc,ur(uc.cc,0xc)&~7u);
+    uw(uc.cc,0x38,0);
+    for(unsigned i=1;i<sizeof(up_pll_regs)/sizeof(up_pll_regs[0]);i++)
+        uw(uc.cc,up_pll_regs[i],up_pll_saved[i]);
+    uw(uc.cc,0,up_pll_saved[0]&~(1u<<31));
+    up_pll_changed=false;
+}
+
+static int
+uphyclocks_up(void)
+{
+    if(!isp_resetting || up_pll_changed)return EBUSY;
+    uint32_t mode=ur(uc.cc,0), opmode=ur(uc.cc,0x38);
+    hakios_tl("UMI camera PHY: PLL0 mode=%#x opmode=%#x L=%#x alpha=%#x user=%#x\n",
+        mode,opmode,ur(uc.cc,4),ur(uc.cc,0x40),ur(uc.cc,0xc));
+    if((mode&((1u<<20)|1))||(opmode&1))return EBUSY;
+    for(unsigned i=0;i<sizeof(up_pll_regs)/sizeof(up_pll_regs[0]);i++)
+        up_pll_saved[i]=ur(uc.cc,up_pll_regs[i]);
+    up_pll_changed=true;
+    /* Lucid 1200 MHz: 19.2 MHz * (62 + 0.5); even /2, odd /3. */
+    static const struct {unsigned off,value;} cfg[]={
+        {4,0x3e},{8,0x44},{0x40,0x8000},{0x18,0x20485699},
+        {0x1c,0x2261},{0x20,0x029a699c},{0xc,0x3100},{0x10,0x805},{0x14,0}
+    };
+    for(unsigned i=0;i<sizeof(cfg)/sizeof(cfg[0]);i++) {
+        uw(uc.cc,cfg[i].off,cfg[i].value);
+        if(ur(uc.cc,cfg[i].off)!=cfg[i].value)return EIO;
+    }
+    uw(uc.cc,0,(mode|(1u<<23))&~1u); uw(uc.cc,0x38,0);
+    uw(uc.cc,0,ur(uc.cc,0)|4); uw(uc.cc,0x38,1);
+    if(!upoll(uc.cc,0,1u<<31,1u<<31,10000))return ETIMEDOUT;
+    uw(uc.cc,0xc,ur(uc.cc,0xc)|7); uw(uc.cc,0,ur(uc.cc,0)|1);
+    for(unsigned i=0;i<sizeof(up_rcgs)/sizeof(up_rcgs[0]);i++) {
+        unsigned cmd=uphy_timer_cmd(up_rcgs[i].cmd);
+        up_rcg_saved[i]=ur(uc.cc,cmd+4); up_rcg_changed=i+1;
+        uint32_t want=(up_rcg_saved[i]&~0x371fu)|up_rcgs[i].cfg;
+        uw(uc.cc,cmd+4,want); uw(uc.cc,cmd,ur(uc.cc,cmd)|1);
+        if(!upoll(uc.cc,cmd,1,0,1000)||ur(uc.cc,cmd+4)!=want)return ETIMEDOUT;
+    }
+    hakios_tl("UMI camera PHY: PLL0 locked; IFE/CSID/C-PHY 400 MHz, PHY timer/CAMNOC 300 MHz\n");
+    return 0;
+}
+/* PHY TABLES */
+struct up_phy_reg {unsigned reg,value;};
+static const struct up_phy_reg up_phy_table[] = {
+    {0x990,0x0},
+    {0x994,0x0},
+    {0x998,0x0},
+    {0x990,0x8},
+    {0x994,0x8},
+    {0x998,0x1a},
+    {0x98c,0xaf},
+    {0x168,0xac},
+    {0x104,0x6},
+    {0x10c,0x13},
+    {0x108,0x0},
+    {0x114,0x20},
+    {0x150,0x0},
+    {0x188,0x0},
+    {0x18c,0x7f},
+    {0x190,0x7f},
+    {0x118,0x3e},
+    {0x11c,0x41},
+    {0x120,0x41},
+    {0x124,0x7f},
+    {0x128,0x0},
+    {0x12c,0x0},
+    {0x160,0x2},
+    {0x1cc,0x41},
+    {0x164,0x33},
+    {0x1dc,0x50},
+    {0x9c0,0x80},
+    {0x9c4,0x7d},
+    {0x9c8,0x7f},
+    {0x984,0x20},
+    {0x988,0x5},
+    {0x980,0x60},
+    {0x9b0,0x1},
+    {0x800,0xe},
+    {0xa90,0x0},
+    {0xa94,0x0},
+    {0xa98,0x0},
+    {0xa90,0x8},
+    {0xa94,0x0},
+    {0xa98,0x1f},
+    {0xa8c,0xbf},
+    {0x368,0xac},
+    {0x304,0x6},
+    {0x30c,0x13},
+    {0x308,0x0},
+    {0x314,0x20},
+    {0x350,0x0},
+    {0x388,0x0},
+    {0x38c,0x7f},
+    {0x390,0x7f},
+    {0x318,0x3e},
+    {0x31c,0x41},
+    {0x320,0x41},
+    {0x324,0x7f},
+    {0x328,0x0},
+    {0x32c,0x0},
+    {0x360,0x2},
+    {0x3cc,0x41},
+    {0x364,0x33},
+    {0x3dc,0x50},
+    {0xac0,0x80},
+    {0xac4,0x7d},
+    {0xac8,0x7f},
+    {0xa84,0x20},
+    {0xa88,0x5},
+    {0xa80,0x60},
+    {0xab0,0x1},
+    {0x800,0xe},
+    {0xb90,0x0},
+    {0xb94,0x0},
+    {0xb98,0x0},
+    {0xb90,0x8},
+    {0xb94,0x8},
+    {0xb98,0x1a},
+    {0xb8c,0xaf},
+    {0x568,0xac},
+    {0x504,0x6},
+    {0x50c,0x13},
+    {0x508,0x0},
+    {0x514,0x20},
+    {0x550,0x0},
+    {0x588,0x0},
+    {0x58c,0x7f},
+    {0x590,0x7f},
+    {0x518,0x3e},
+    {0x51c,0x41},
+    {0x520,0x41},
+    {0x524,0x7f},
+    {0x528,0x0},
+    {0x52c,0x0},
+    {0x560,0x2},
+    {0x5cc,0x41},
+    {0x564,0x33},
+    {0x5dc,0x50},
+    {0xbc0,0x80},
+    {0xbc4,0x7d},
+    {0xbc8,0x7f},
+    {0xb84,0x20},
+    {0xb88,0x5},
+    {0xb80,0x60},
+    {0xbb0,0x1},
+    {0x800,0xe},
+    {0x15c,0x66},
+    {0x35c,0x66},
+    {0x55c,0x66},
+    {0x9b4,0x3},
+    {0xab4,0x3},
+    {0xbb4,0x3},
+    {0x144,0x22},
+    {0x344,0x22},
+    {0x544,0x22},
+    {0x16c,0xad},
+    {0x36c,0xad},
+    {0x56c,0xad},
+};
+
+/* The complete five-lane (four data + clock) 2-phase v1.2.1 table. */
+static const struct up_phy_reg up_phy_front_table[]={
+    {0x0030,0x0},
+    {0x0900,0x5},
+    {0x0908,0x10},
+    {0x0904,0x0},
+    {0x0904,0x3},
+    {0x0004,0xc},
+    {0x002C,0x1},
+    {0x0034,0x7},
+    {0x0010,0x2},
+    {0x001C,0x8},
+    {0x003C,0xb8},
+    {0x0008,0x13},
+    {0x0000,0x8d},
+    {0x0038,0xfe},
+    {0x0014,0x60},
+    {0x0800,0x2},
+    {0x0884,0x1},
+    {0x0730,0x0},
+    {0x0C80,0x5},
+    {0x0C88,0x10},
+    {0x0C84,0x0},
+    {0x0C84,0x3},
+    {0x0704,0xc},
+    {0x072C,0x1},
+    {0x0734,0x7},
+    {0x0710,0x2},
+    {0x071C,0x8},
+    {0x073C,0xb8},
+    {0x0708,0x13},
+    {0x0700,0x80},
+    {0x070c,0xa5},
+    {0x0738,0x1f},
+    {0x0714,0x60},
+    {0x0728,0x4},
+    {0x0800,0x2},
+    {0x0884,0x1},
+    {0x0230,0x0},
+    {0x0A00,0x5},
+    {0x0A08,0x10},
+    {0x0A04,0x0},
+    {0x0A04,0x3},
+    {0x0204,0xc},
+    {0x022C,0x1},
+    {0x0234,0x7},
+    {0x0210,0x2},
+    {0x021C,0x8},
+    {0x023C,0xb8},
+    {0x0208,0x13},
+    {0x0200,0x8d},
+    {0x0238,0xfe},
+    {0x0214,0x60},
+    {0x0800,0x2},
+    {0x0884,0x1},
+    {0x0430,0x0},
+    {0x0B00,0x5},
+    {0x0B08,0x10},
+    {0x0B04,0x0},
+    {0x0B04,0x3},
+    {0x0404,0xc},
+    {0x042C,0x1},
+    {0x0434,0x7},
+    {0x0410,0x2},
+    {0x041C,0x8},
+    {0x043C,0xb8},
+    {0x0408,0x13},
+    {0x0400,0x8d},
+    {0x0438,0xfe},
+    {0x0414,0x60},
+    {0x0800,0x2},
+    {0x0884,0x1},
+    {0x0630,0x0},
+    {0x0C00,0x5},
+    {0x0C08,0x10},
+    {0x0C04,0x0},
+    {0x0C04,0x3},
+    {0x0604,0xc},
+    {0x062C,0x1},
+    {0x0634,0x7},
+    {0x0610,0x2},
+    {0x061C,0x8},
+    {0x063C,0xb8},
+    {0x0608,0x13},
+    {0x0600,0x8d},
+    {0x0638,0xfe},
+    {0x0614,0x60},
+    {0x0800,0x2},
+    {0x0884,0x1},
+};
+
+static vm_offset_t up_phy;
+static struct {unsigned reg;uint32_t value;} up_phy_saved[160];
+static unsigned up_phy_count;
+static bool up_phy_active;
+static bool
+uphy_write(unsigned reg,uint32_t value)
+{
+    unsigned i;
+    for(i=0;i<up_phy_count;i++)if(up_phy_saved[i].reg==reg)break;
+    if(i==up_phy_count) {
+        if(up_phy_count>=sizeof(up_phy_saved)/sizeof(up_phy_saved[0]))return false;
+        up_phy_saved[i].reg=reg;up_phy_saved[i].value=ur(up_phy,reg);up_phy_count++;
+    }
+    uw(up_phy,reg,value);return true;
+}
+static void
+uphy_down(void)
+{
+    if(!up_phy_active)return;
+    uw(up_phy,0x814,0); /* disable trios before undoing any analogue settings */
+    while(up_phy_count) {
+        unsigned i=--up_phy_count;
+        uw(up_phy,up_phy_saved[i].reg,up_phy_saved[i].value);
+    }
+    up_phy_active=false;
+    hakios_tl("UMI camera PHY: PHY%u settings restored\n",uc.front?4:3);
+}
+static int
+uphy_on(void)
+{
+    if(up_phy_active)return EBUSY;
+    /* PHY3 ac70000 and PHY4 ac72000 share one 16K CPU page. */
+    vm_offset_t mapped=umap(0x0ac70000,0x4000);
+    if(mapped && uc.front)mapped+=0x2000;
+    if(!mapped)return ENOMEM;
+    if(ur(mapped,0x814))return EBUSY;
+    up_phy=mapped;up_phy_active=true;
+    unsigned lane_enable=uc.front?0xd5:0x2a,mode=uc.front?2:0x52;
+    if(!uphy_write(0x814,lane_enable)||!uphy_write(0x818,1)||
+       !uphy_write(0x81c,mode)||!uphy_write(0x800,uc.front?2:0x0e))return EIO;
+    const struct up_phy_reg *table=uc.front?up_phy_front_table:up_phy_table;
+    unsigned count=uc.front?sizeof(up_phy_front_table)/sizeof(*table):sizeof(up_phy_table)/sizeof(*table);
+    for(unsigned i=0;i<count;i++)
+        if(!uphy_write(table[i].reg,table[i].value))return EIO;
+    for(unsigned i=0;i<11;i++)if(!uphy_write(0x82c+4*i,0))return EIO;
+    if(ur(up_phy,0x814)!=lane_enable || ur(up_phy,0x81c)!=mode)return EIO;
+    hakios_tl("UMI camera PHY: CSIPHY%u %s, assignment %#x, settle19 ready\n",uc.front?4:3,uc.front?"four D-PHY lanes":"three C-PHY trios",uc.front?0x3210:0x210);
+    return 0;
+}

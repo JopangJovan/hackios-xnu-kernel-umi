@@ -1,0 +1,128 @@
+{
+  "schema": 1,
+  "date": "2026-11-20",
+  "scope": "Opaque journal commit recovery and original keybagd diagnostic copy; no live credential migration",
+  "host": {
+    "asan_ubsan": "PASS",
+    "existing_strict_journal_error_points": 18,
+    "existing_strict_journal_process_exit_points": 18,
+    "commit_retry_error_points": 18,
+    "commit_retry_process_exit_points": 18,
+    "exact_replay_and_conflicting_stale_requests": "PASS",
+    "recovery_sync_failure": "PASS at two injected points; outcome remains unknown",
+    "incomplete_initialization": "refused",
+    "concurrent_owner": "refused",
+    "current_mirror_recovery_and_missing_authority": "PASS",
+    "ordinary_item_keys_regression": "PASS"
+  },
+  "native": {
+    "native-81": {
+      "result": "PASS",
+      "mode": "create",
+      "markers": [
+        "UMI save recovery: before-commit failure kept old authority PASS",
+        "UMI native txn: exact committed payload reconciled; no duplicate generation",
+        "UMI save recovery: post-rename error reconciled and installed once PASS",
+        "UMI native txn: injected exit after durable commit before install/reply; partial restore view saved",
+        "UMI save recovery: lost reply; restarted daemon rejects old request without duplicate commit PASS",
+        "UMI save recovery: new-secret change preserves original wrapped key PASS",
+        "UMI save recovery: real system bag serialization/flags unchanged PASS",
+        "UMI save recovery: create PASS"
+      ],
+      "root": "/var/tmp/k81",
+      "committed_sequence_at_end": 4,
+      "real_system_bag_unchanged": true,
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "helper_validation": "apfsck clean; 499 entries match",
+      "validated_actual_boot_artifact": {
+        "helper": "helper-save-recovery-81",
+        "boot_sha256": "3929cbf94084b6c47261f13bdd69d83ea63035590d4d8b6401eb9278aeac4f91",
+        "payload_sha256": "ca413b8844c8f8cb791f2644491f3d4be6db14a0123135bbfe626eda7938a9f5",
+        "kernel_sha256": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+        "helper_sha256": "6fde5a13b7b2361e9fd078321afeb34e9dc38c8d375e6dbeeed5636a3b77a409"
+      },
+      "log_sha256": "e5e41df0e40c0c146943a30ee177670e79105a6ca95f5e589eba7a8f7eaa0099",
+      "log_bytes": 1141279,
+      "tested_binaries": {
+        "bin/keybagd-txn": "91c7c8ac9a932334c28fcbfed6393d526a96f868ed95d50fb2383396773592af",
+        "bin/umi-native-txn-test": "d6e4a108612ddda3c33471de3115d761063dea35fee5050aba3b1c649566cf8c",
+        "lib/umi-native-txn.dylib": "3c28801354bbb8e04d0c7d4ebef83c67a6a5128497110fca222ef9727937fe57"
+      }
+    },
+    "native-82": {
+      "result": "PASS",
+      "mode": "verify",
+      "markers": [
+        "UMI save recovery: cross-Android-reboot recovery and next transaction PASS",
+        "UMI save recovery: real system bag serialization/flags unchanged PASS",
+        "UMI save recovery: verify PASS"
+      ],
+      "root": "/var/tmp/k81",
+      "committed_sequence_at_end": 5,
+      "real_system_bag_unchanged": true,
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "helper_validation": "apfsck clean; 499 entries match",
+      "validated_actual_boot_artifact": {
+        "helper": "helper-save-recovery-82",
+        "boot_sha256": "f6250a7537ac3a4b4b289e04ab608138587f3b2dbba813c878e6dedc03b54c0f",
+        "payload_sha256": "a5be59fde59262f049d1943a56c6dc60311cc28e04208b2c9e9de28aba3d4f6f",
+        "kernel_sha256": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+        "helper_sha256": "4c7ca0b00ce605173f749dcbe7808011cee2b8ac844f51d9c9087b4cfd3af2e3"
+      },
+      "log_sha256": "ba8db63a3a5ae585a969de7152ff4ea2d878d1b004e9f3837811e54cc0aeb481",
+      "log_bytes": 1070286,
+      "tested_binaries": {
+        "bin/keybagd-txn": "91c7c8ac9a932334c28fcbfed6393d526a96f868ed95d50fb2383396773592af",
+        "bin/umi-native-txn-test": "d6e4a108612ddda3c33471de3115d761063dea35fee5050aba3b1c649566cf8c",
+        "lib/umi-native-txn.dylib": "3c28801354bbb8e04d0c7d4ebef83c67a6a5128497110fca222ef9727937fe57"
+      }
+    }
+  },
+  "aborted_attempt": {
+    "case": "native-80",
+    "result": "NOT A SAVE-RECOVERY TEST",
+    "observation": "The image-check helper exited its Python process before the following build; the prior boot artifact was started and immediately stopped before this probe. Explicit build and actual compressed-payload verification added. Oversized recovery helper was reduced by removing an unused test binary, without enlarging the qualified payload limit.",
+    "stock_android_return": true,
+    "log_sha256": "842eee9b33a16dc65097a8c9f2c8f7015638a1a7057a547646f76a01a61620a5"
+  },
+  "boundaries": {
+    "kernel_sha256": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+    "loader_source_sha256": "7b0cf8c13e3e3f5d047e5b14c8c8ced820e1736d7777071d85ebc756b2bfa1e4",
+    "kernel_and_usb_source_changes": false,
+    "real_pin_operations": 0,
+    "native_usb_pairing_retested": false,
+    "firmware_log_channel_retained": true,
+    "android_gpt_boot_partition_writes": false,
+    "live_keychain_migration": false,
+    "full_80GiB_encryption": false,
+    "hardware_rollback_protection": false,
+    "physical_power_loss_test": false,
+    "native_uncertain_sync_branch_tested": false,
+    "persistent_retry_policy_integrated": false
+  },
+  "source_sha256": {
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/adapter.c": "91ed23183fcfcd378a70ee039cf10f5155914f2730a8287bf476695d79c2b2a0",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/build-test.py": "d7a59dc4e09d97de426b98d22e78a24513a24c75a530f3b1807b4ee491db2c1a",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys-test.c": "b34fa1d491f08ee271eec2a4d5e321b9b0f7c7b86a47c6499f114b96a62c5f03",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys.c": "784950bebe98ad21358a29a299703327823a105c5e936bbf3003bf9e1b48bded",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys.h": "1720c8614bf1d6b59471af10b60e9c994e0b0f457d4b7c844a24afc05d1e293b",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal-retry-test.c": "850edf09d251b7b41b4b172b348950250a4be927feed690b2bfa6d691b1e30d9",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal-test.c": "9e10cefd2db0d3d7580d46ec43b9a242bfc1feef6640671a359af84c2af7959c",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal.c": "70eda0399de1afba7fe58a660b2f9266ce3a810e7669ced8b08adf403ea42703",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal.h": "8f5e0ae620d7716dca1c01a547e5460e89c2f8321f6cf05a4dc49f487463b268",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/keychain-probe.c": "34cf4afda94201c8cbe7ad9d1d29c8ce132de25e3319d49caa5604849df01707",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/native-test.c": "78288133b9c407d50be7b0592bcca67feac2474a087db6f79c0fd9a1aa66c265",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/ordinary-client.h": "8acd7e5d671319916115121394db6a17776334dee7ff8bdf33213118d581606c",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/prepare-recovery.py": "ea6e9e1b7e907c0f39426c4a1d0b85fa5c64acbfff6c320843032e030574e3bf",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/prepare-test.py": "061c3242abbd2f0435e0989bbbdea086e3f95d31534b63ea828a4251bad2e2e1",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/recovery-test.c": "b8ce29aea92d04784d76c527ca2eaa2b5b42e4d76b45f3e113e593f77772b4f3",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/test-secrets.h": "72af8c51217b0c6d6b1d593b6778e34e3d7741dd99ff605c279b42e6318cd593"
+  },
+  "host_log_sha256": "48d059404ff20cdff252ef8cb52273d9a454598d06da62ef2200d4aec9775b56"
+}

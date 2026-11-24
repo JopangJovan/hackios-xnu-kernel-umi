@@ -1,0 +1,49 @@
+{
+  "scope": "No-modem temporary native USB/UFS images; existing PIN and pairing. Not normal-build or full-volume-encryption qualification.",
+  "control_kernel_sha256": "12c2b7e1ff0076f929c0a280763f077f31f28ad426e9bb8ee3929a906969e235",
+  "integration_kernel_sha256": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+  "source_pins": "source-lock.json",
+  "results": {
+    "native63": {
+      "all_charger_queries": true,
+      "usb_disconnected": true,
+      "android_return": true
+    },
+    "native64": {
+      "all_charger_queries_suspended": true,
+      "paired_session": true,
+      "locked_syslog_refused": true,
+      "syslog_seconds": 45,
+      "syslog_bytes": 671744,
+      "syslog_lines": 3770,
+      "android_return": true
+    },
+    "native65": {
+      "only_get_charging_action_suspended": true,
+      "paired_samples": 13,
+      "sample_span_seconds": 120.83,
+      "locked_syslog_and_restart_refused": true,
+      "unlocked_syslog_seconds": 30,
+      "syslog_bytes": 434176,
+      "syslog_lines": 2336,
+      "fixture_verify": true,
+      "android_return": true
+    },
+    "native66": {
+      "only_get_charging_action_suspended": true,
+      "class_A_C_file_hashes_match": true,
+      "paired_session": true,
+      "continuous_syslog_seconds": 180,
+      "syslog_bytes": 4341760,
+      "syslog_lines": 29185,
+      "lock_unlock_callbacks_success": true,
+      "physical_reconnect": true,
+      "pairing_reused": true,
+      "reconnect_syslog_seconds": 30,
+      "reconnect_syslog_bytes": 368640,
+      "reconnect_syslog_lines": 1984,
+      "normal_restart_success": true,
+      "android_return": true
+    }
+  }
+}

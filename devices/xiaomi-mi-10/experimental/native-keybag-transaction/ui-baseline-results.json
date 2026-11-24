@@ -1,0 +1,18 @@
+{
+  "date": "2026-11-22",
+  "case": "native-124",
+  "image_sha256": "262f21b5d664943e1ee504e202145915b85bb5a0402358946a7b78b3eb3762b7",
+  "image": "unchanged native-107 current.img",
+  "user_confirmed": [
+    "lock and home wallpaper restored",
+    "normal native passcode input restored"
+  ],
+  "new_gpu_changes": false,
+  "diagnostic_display_patches_deployed": false,
+  "wrong_password_retested": false,
+  "shared_retry_production_deployed": false,
+  "log_sha256": "3f3946aaf3e157c10bfd5a9c7887011912336a3224b0747f7880aa06a50f930a",
+  "final_data_sync_errno": 0,
+  "returned_to_stock_android": true,
+  "stock_boot_completed": true
+}

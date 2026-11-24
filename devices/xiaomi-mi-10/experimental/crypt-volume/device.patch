@@ -1,0 +1,17 @@
+--- a/bsd/dev/hakios.ufs.c
++++ b/bsd/dev/hakios.ufs.c
+@@ -1592,11 +1592,14 @@
+ SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_native_fallbacks, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_native_fallbacks,
+     "times a read of this kernel's own UFS driver failed and the loader's was used instead");
+ 
++#include "umi_crypt_device.h"
++
+ /* ---- bringing it up ---- */
+ 
+ void
+ hakios_ufs_init(void)
+ {
++	umi_crypt_lab_init();
+ 	if (ufs_ready) {
+ 		return;
+ 	}

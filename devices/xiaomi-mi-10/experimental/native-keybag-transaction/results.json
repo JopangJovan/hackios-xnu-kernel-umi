@@ -1,0 +1,202 @@
+{
+  "schema": 1,
+  "date": "2026-11-20",
+  "scope": "original keybagd diagnostic copy + independent IOKit ordinary item client; not live keybagd/securityd/SecItem",
+  "policy_key": "PUBLIC TEST KEY ONLY; no production root or hardware rollback protection",
+  "host": {
+    "asan_ubsan": true,
+    "journal_error_points": 18,
+    "journal_process_exit_points": 18,
+    "policy_mismatch_and_commit_mac_corruption": "PASS",
+    "current_mirror_recovery": "PASS",
+    "item_classes_6_7": "PASS",
+    "new_format_byte_corruption_and_bounds": "PASS",
+    "explicit_legacy_synthetic_conversion": "PASS",
+    "build_script_host_and_device_build": "PASS"
+  },
+  "native": {
+    "native-69": {
+      "markers": [
+        "UMI native txn test: FAIL line=47 errno=60 request(argv[0],argv[2],0)==0"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "b631d6b82ac4af66dcd101cd95d3240e625d1fcc3a0417db4edd5eba83957d79",
+      "log_bytes": 1010979,
+      "helper_apfs_sha256": "0f2a83d8de8a96f1a670ddd5adc5f1c513dab4d71488c202876cb38c847d002e",
+      "result": "NOT PASSED",
+      "observation": "No adapter constructor marker; required library dependency added later"
+    },
+    "native-70": {
+      "markers": [
+        "UMI native txn test: FAIL line=47 errno=60 request(argv[0],argv[2],0)==0"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "0e1c281e6cd4442a2efb39f731846a85f61c5a4ea4c58fa1ded1a16e7364f9de",
+      "log_bytes": 1125268,
+      "helper_apfs_sha256": "51c9c3d57e66ea47855a93a6235d48cbd742426be1fb8401c91f1285a1d47700",
+      "result": "NOT PASSED",
+      "observation": "Request timed out; original import routing and tracing corrected later"
+    },
+    "native-71": {
+      "markers": [
+        "UMI native txn test: FAIL line=47 errno=60 request(argv[0],argv[2],0)==0"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "09435fc067d89fe4a3860be4d550c134fca977dcbd1a61f3bb19c2956116e935",
+      "log_bytes": 1007211,
+      "helper_apfs_sha256": "c4c331f055a087f8cb965fbf31b00ecbb2ee12a08200180e6d4c2b24d31e18a0",
+      "result": "NOT PASSED",
+      "observation": "Diagnostic adapter rejected connection-open selector 0"
+    },
+    "native-72": {
+      "markers": [
+        "UMI native txn test: FAIL line=47 errno=60 request(argv[0],argv[2],0)==0"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "e7b42cfaffcd19db2805b698e2fca569904fdc464aa2dde32d37a0faff53b649",
+      "log_bytes": 1028217,
+      "helper_apfs_sha256": "9bb0d5deef9052c645590c9e53437801cb67fe1ec6e071e94d82b5e78ee76b58",
+      "result": "NOT PASSED",
+      "observation": "XPC error; request was corrected to NSFileHandle pipes and NSError reply"
+    },
+    "native-73": {
+      "markers": [
+        "UMI native txn test: original XPC save failure preserves old bag; later change commits PASS",
+        "UMI native txn test: real system bag serialization/flags unchanged PASS",
+        "UMI native txn test: create PASS"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "7ea28167991d1a06abb0f6de1119b94afd0216486fdd9392c7ec2c451a3d4fe1",
+      "log_bytes": 1108049,
+      "helper_apfs_sha256": "94c3cad860aab02109b78354db83a8e262c42e8b3ffa2a4a3ee74a5a62ff0bb4",
+      "result": "PASS"
+    },
+    "native-74": {
+      "markers": [
+        "UMI native txn test: original XPC save failure preserves old bag; later change commits PASS",
+        "UMI ordinary keychain FAIL line=33: umi_txn_probe_state()",
+        "UMI native txn test: FAIL line=35 errno=60 done&&WIFEXITED(status)&&WEXITSTATUS(status)==0"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "7e4fa710b7635ea570398e4cf64d5b819415d63fd0969ad8a3eef9602ab671f1",
+      "log_bytes": 1124321,
+      "helper_apfs_sha256": "e839a4d617510e93e990623c62fb5ba704695022f4758dc8257f7fec71b410be",
+      "result": "native save PASS; ordinary framework isolation guard REFUSED before authentication",
+      "observation": "Shared-cache framework state query bypassed interposition; read-only guard stopped before unlock/lock/wrap"
+    },
+    "native-75": {
+      "markers": [
+        "UMI native txn test: original XPC save failure preserves old bag; later change commits PASS",
+        "UMI ordinary keychain: ordinary IOKit ABI, class 6/7 lifecycle, legacy opt-in PASS",
+        "UMI ordinary keychain: create PASS",
+        "UMI native txn test: real system bag serialization/flags unchanged PASS",
+        "UMI native txn test: create PASS"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "015d4bad1a780ef0d23aefc5e930c231a27328befea00c1d31f28a9212a29b0e",
+      "log_bytes": 1079548,
+      "helper_apfs_sha256": "a08838782c5e63fdce36ab079787451ff89be273d5bfc83c0d6b360d4f7e2c32",
+      "result": "PASS",
+      "helper_validation": "apfsck clean; 500 entries match",
+      "tested_binary_sha256": {
+        "bin/keybagd-txn": "7bf89f9f682ca979896201af72ddd75208f66536613d6b6723c4a0312ecc5337",
+        "bin/umi-native-txn-test": "f4ceb27ef099927aa125e3d1deedb2c435d109d656156fb47fe6776be90e9510",
+        "bin/umi-ordinary-keychain-test": "6b536b3ee4924fb9fb742ec19f83806b776df3c67c4b0f05649ab4da0ea3bde3",
+        "lib/umi-native-txn.dylib": "8f18c65cff4c50f104c3409056b0e031c529b35426638c5e2a4f68217face65b"
+      }
+    },
+    "native-76": {
+      "result": "PASS",
+      "mode": "verify after stock Android reboot; same /var/tmp/k75 fixture",
+      "markers": [
+        "UMI native txn test: original daemon recovered committed journal after Android reboot PASS",
+        "UMI ordinary keychain: ordinary IOKit ABI, class 6/7 lifecycle, legacy opt-in PASS",
+        "UMI ordinary keychain: verify PASS",
+        "UMI native txn test: real system bag serialization/flags unchanged PASS",
+        "UMI native txn test: verify PASS"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "bd563ff45a715a063b0eb69243cef3f36f209dbd8ca9a69566a771ca340c6957",
+      "log_bytes": 1081540,
+      "helper_apfs_sha256": "a18df599054a1d225dd6708969e7621e2e673da801a8eef803e87519d421fc10",
+      "helper_validation": "apfsck clean; 500 entries match",
+      "tested_binary_sha256": {
+        "bin/keybagd-txn": "7bf89f9f682ca979896201af72ddd75208f66536613d6b6723c4a0312ecc5337",
+        "bin/umi-native-txn-test": "f4ceb27ef099927aa125e3d1deedb2c435d109d656156fb47fe6776be90e9510",
+        "bin/umi-ordinary-keychain-test": "6b536b3ee4924fb9fb742ec19f83806b776df3c67c4b0f05649ab4da0ea3bde3",
+        "lib/umi-native-txn.dylib": "8f18c65cff4c50f104c3409056b0e031c529b35426638c5e2a4f68217face65b"
+      }
+    }
+  },
+  "boundaries": {
+    "kernel_changed": false,
+    "loader_source_changed": false,
+    "live_system_bag_serialization_and_flags_verified_unchanged": true,
+    "native_usb_pairing_retested": false,
+    "firmware_log_channel_retained": true,
+    "live_keychain_or_pairing_migration": false,
+    "android_gpt_boot_partition_writes": false,
+    "full_80GiB_encryption": false,
+    "manual_user_pin_tests": 0,
+    "live_system_bag_unchanged_verified_runs": [
+      "native-73",
+      "native-75",
+      "native-76"
+    ]
+  },
+  "sha256": {
+    "unchanged_prepared_kernel": "03c3b75b24a972228744b38fb996094e4d47dead1b5f560edd7e98475c4758f8",
+    "unchanged_prepared_loader_source": "7b0cf8c13e3e3f5d047e5b14c8c8ced820e1736d7777071d85ebc756b2bfa1e4",
+    "original_framework_for_abi_reference": "b24692987632d627aff129050d5fcb66288618011ec628e79195defd1b8a4e03",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/adapter.c": "02e15d7dd5eb127bd746cc32e55d0f51a37d77446e41e49a53b2f12b785d5238",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/build-test.py": "fd912c2352b60293e6b71ae46477dbfc9765e2f7778203b40e7f4759f3ea24a0",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys-test.c": "b34fa1d491f08ee271eec2a4d5e321b9b0f7c7b86a47c6499f114b96a62c5f03",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys.c": "784950bebe98ad21358a29a299703327823a105c5e936bbf3003bf9e1b48bded",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/item-keys.h": "1720c8614bf1d6b59471af10b60e9c994e0b0f457d4b7c844a24afc05d1e293b",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal-test.c": "9e10cefd2db0d3d7580d46ec43b9a242bfc1feef6640671a359af84c2af7959c",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal.c": "d7cf64414cb019a522e05f041b5fee6c4b83032c2092c12d6cd07fae10ef8d48",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/journal.h": "d88e1408be428e6540709cb32916ad1861800ed4fb4d5a7a445775b91df4d017",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/keychain-probe.c": "34cf4afda94201c8cbe7ad9d1d29c8ce132de25e3319d49caa5604849df01707",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/native-test.c": "0a03ee3646573ddb6dc518dd073b5997fd10a654d1058d5cec55364d9f5970a1",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/ordinary-client.h": "8acd7e5d671319916115121394db6a17776334dee7ff8bdf33213118d581606c",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/prepare-test.py": "061c3242abbd2f0435e0989bbbdea086e3f95d31534b63ea828a4251bad2e2e1",
+    "devices/xiaomi-mi-10/experimental/native-keybag-transaction/request.m": "3d68f31563511018592c2c7b23992d2821f3ecbe8e726ac8e3207f7c0eb0f3cb",
+    "devices/xiaomi-mi-10/experimental/keybag/umi_aks_crypto.h": "73433e659bc6a23cf39671feb9626d15cca6f3c2686898253efa2c98d014fef8"
+  },
+  "remaining": [
+    "Persistent retry policy is not yet integrated into the original service transaction",
+    "Original shared-cache AKS routing and independent securityd/SecItem database",
+    "Protection classes 8-12 and device-only/boot semantics",
+    "Transactional migration of real legacy entries",
+    "Live passcode and native USB combined regression"
+  ],
+  "final_device": {
+    "boot_completed": true,
+    "product": "umi",
+    "android_build": "V14.0.4.0.TJBCNXM"
+  }
+}

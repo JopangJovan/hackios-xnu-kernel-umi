@@ -61,6 +61,12 @@ extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* drivers/storage/hakios.ufs.c: the data volume into the flash */
 void loader_checkpoint(uint64_t n);
+void hakios_external_modem_stop(void);
+void hakios_external_modem_quiesce(void);
+
+/* Some boards have a separate PCIe modem in addition to the on-chip DSP. */
+__attribute__((weak)) void hakios_external_modem_stop(void) {}
+__attribute__((weak)) void hakios_external_modem_quiesce(void) {}
 
 /* Also referenced from the early exception vector in start.s. */
 char     loader_log[LOADER_LOG_SIZE];
@@ -374,6 +380,7 @@ loader_return(void)
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
+	hakios_external_modem_quiesce();
 	hakios_adsp_quiesce();         /* nor the audio DSP */
 	hakios_mpss_quiesce();         /* nor the modem */
 	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
@@ -442,6 +449,7 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 		hakios_var_save_on_return();   /* the data volume kept, while the system is still whole */
 		hakios_adreno_stop();          /* a GPU kept for the system is given back while there is a thread to wait in */
 		hakios_wifi_stop();            /* and the Wi-Fi DSP, if it runs, shut down */
+		hakios_external_modem_stop();  /* let an active call release its audio path first */
 		hakios_adsp_stop();            /* and the audio DSP */
 		hakios_mpss_stop();            /* and the modem */
 	}
@@ -489,6 +497,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		hakios_var_save_on_return();
 		hakios_adreno_stop();
 		hakios_wifi_stop();
+		hakios_external_modem_stop();
 		hakios_adsp_stop();
 		loader_return();
 	}

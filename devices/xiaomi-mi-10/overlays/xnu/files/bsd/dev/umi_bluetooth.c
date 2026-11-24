@@ -467,6 +467,13 @@ static void bt_control_worker(void *unused,wait_result_t result)
                     hakios_tl("UMI BT: iOS HCI opcode=%#x length=%u\n",bt_le16(tx.bytes+1),tx.used);
                 if(tx.bytes[0]==1 && tx.used>=6 && bt_le16(tx.bytes+1)==0x200c)
                     hakios_tl("UMI BT: scan enable=%#x duplicates=%#x\n",tx.bytes[4],tx.bytes[5]);
+                /* (LE advertising: the commands that would make this phone discoverable over BLE) */
+                if(tx.bytes[0]==1) {
+                    uint16_t op=bt_le16(tx.bytes+1);
+                    if(op==0x2006||op==0x2008||op==0x2009||op==0x200a)
+                        hakios_tl("UMI BT: LE advertising opcode=%#x length=%u first=%02x %02x\n",op,tx.used,
+                            tx.used>4?tx.bytes[4]:0,tx.used>5?tx.bytes[5]:0);
+                }
                 if(tx.bytes[0]==1 && tx.used==11 && bt_le16(tx.bytes+1)==0x200b)
                     hakios_tl("UMI BT: scan params type=%#x interval=%u window=%u own-address=%#x policy=%#x\n",tx.bytes[4],bt_le16(tx.bytes+5),bt_le16(tx.bytes+7),tx.bytes[9],tx.bytes[10]);
                 error=bt_uart_tx(bt_control_uart,tx.bytes,tx.used);

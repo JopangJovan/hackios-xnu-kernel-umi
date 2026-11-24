@@ -4233,9 +4233,17 @@ look(void)
 #define UMI_CAM_CBCR_OFF        (1u << 31)
 
 extern int umi_camera_probe(void);
+extern int umi_camera_front_probe(void);
+extern int umi_camera_front_prepare(void);
+extern int umi_camera_front_phy_probe(void);
+extern int umi_camera_front_capture(void);
 extern int umi_camera_prepare(void);
 extern int umi_camera_isp_probe(void);
 extern int umi_camera_capture_tpg(void);
+extern int umi_camera_phy_probe(void);
+extern int umi_camera_capture_sensor(void);
+extern void umi_camera_dma_reserve(void);
+extern void umi_camera_serve_ios(void);
 extern void umi_camera_probe_quiesce(void);
 
 static void
@@ -4321,9 +4329,20 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
 	char which[16] = "";
 
 	(void)PE_parse_boot_argn("cam_after", &secs, sizeof(secs));
-	if (!fake && ((level >= 2 && level <= 4) || level == 6)) {
+	if (!fake && level == 5) {
+		umi_camera_serve_ios();
+		thread_terminate(current_thread());
+		return;
+	}
+	if (!fake && ((level >= 2 && level <= 4) || level == 6 || level == 7 || level == 8 || (level>=9 && level<=12))) {
 		wait_ms(secs * 1000);
-		if (level == 6) (void)umi_camera_capture_tpg();
+		if (level == 12) (void)umi_camera_front_capture();
+		else if (level == 11) (void)umi_camera_front_phy_probe();
+		else if (level == 10) (void)umi_camera_front_prepare();
+		else if (level == 9) (void)umi_camera_front_probe();
+		else if (level == 8) (void)umi_camera_capture_sensor();
+		else if (level == 7) (void)umi_camera_phy_probe();
+		else if (level == 6) (void)umi_camera_capture_tpg();
 		else if (level == 4) (void)umi_camera_isp_probe();
 		else if (level == 3) (void)umi_camera_prepare();
 		else (void)umi_camera_probe();
@@ -4413,11 +4432,11 @@ hakios_camera_init(void)
 	if (!PE_parse_boot_argn("cam", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	level = level > 6 ? 6 : level;
+	level = level > 12 ? 12 : level;
 	uint32_t fake_n = 0;
 
 	fake = level == 5 && PE_parse_boot_argn("cam_fake", &fake_n, sizeof(fake_n)) && fake_n != 0;
-	if (level == 5) {
+	if (level == 5 && fake) {
 		/*
 		 * Memory in one piece for the host (cam_keep_mb, default 24: a 12-megapixel NV12 picture of cam=5,
 		 * or two frames of cam=3 and cam=4 up to 12 MB each), taken now, while the system's memory still
@@ -4433,6 +4452,8 @@ hakios_camera_init(void)
 			keep = 0;
 			keep_bytes = 0;
 		}
+	} else if (level == 5) {
+		umi_camera_dma_reserve();
 	}
 	if (kernel_thread_start(camera_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

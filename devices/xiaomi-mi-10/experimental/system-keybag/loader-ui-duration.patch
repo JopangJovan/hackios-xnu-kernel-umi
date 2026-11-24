@@ -1,0 +1,9 @@
+--- a/rammenu.c
++++ b/rammenu.c
+@@ -2,5 +2,5 @@
+ 
+ #define UMI_MENU_TIMEOUT_SECONDS 150
+-#define UMI_MENU_RUN_SECONDS    390
++#define UMI_MENU_RUN_SECONDS    1320
+ #define UMI_MENU_RESET_SECONDS  25
+ #define UMI_PMIC_CORE          0x0c440000u

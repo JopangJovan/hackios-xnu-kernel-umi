@@ -1,0 +1,18 @@
+From: Wenjie Qi <qwjhust@gmail.com>
+Subject: [PATCH] f2fs: flush SIT journal during filesystem resize
+
+Upstream: a6ede405455106bf42164ec96fd84008c5aabdd9
+Apply to the UMI Android kernel at 73a8cedfee02256cb19a7974f0beadf95c580048.
+
+diff --git a/fs/f2fs/segment.c b/fs/f2fs/segment.c
+--- a/fs/f2fs/segment.c
++++ b/fs/f2fs/segment.c
+@@ -4097,7 +4097,7 @@
+ 
+ 	down_write(&sit_i->sentry_lock);
+ 
+-	if (!sit_i->dirty_sentries)
++	if (!sit_i->dirty_sentries && to_journal)
+ 		goto out;
+ 
+ 	/*

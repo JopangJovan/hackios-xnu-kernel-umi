@@ -728,6 +728,14 @@ hakios_apple80211_ioctl(u_long command, void *data)
 	}
 	proc_selfname(who, sizeof(who));
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
+	/* (the AWDL/virtual-interface ioctls decide whether AirDrop can advertise at all: say them
+	 *  every time, not only among the first eight hundred) */
+	if (request->req_type == 94 || request->req_type == 95 || request->req_type == 199 ||
+	    request->req_type == 200 || request->req_type == 201 || request->req_type == 202) {
+		printf("apple80211 AWDL/VIF: %s %s %u (%s), value %d, %u bytes: %d\n", who,
+		    is_set ? "sets" : "gets", request->req_type, type_name(request->req_type), request->req_val,
+		    request->req_len, error);
+	}
 	note(request, is_set, error);
 	/* (a request that is repeated for ever is said a few hundred times) */
 	if (said < 800) {

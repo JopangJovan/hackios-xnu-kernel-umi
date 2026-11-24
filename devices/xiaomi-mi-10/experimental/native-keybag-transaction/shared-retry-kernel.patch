@@ -1,0 +1,139 @@
+--- a/iokit/Kernel/UmiAksNative.h
++++ b/iokit/Kernel/UmiAksNative.h
+@@ -11,10 +11,14 @@
+     UmiLabBag bag;
+ } umi_native;
+ #include "UmiHfsKeys.h"
++#include "UmiAksSharedRetry.h"
++
+ static bool umi_native_init(void) {
+     umi_native.lock=IOLockAlloc();
+     if(!umi_native.lock||!umi_hfs_init())return false;
+-    int lab=0,boot=0;
++    int lab=0,boot=0,retry=0;
++    umi_retry_gate.enabled=PE_parse_boot_argn("umi_aks_shared_retry",&retry,sizeof(retry)) &&
++        (retry==1||retry==2);
+     if(PE_parse_boot_argn("umi_aks_lab",&lab,sizeof(lab)) && lab==1 &&
+        PE_parse_boot_argn("umi_aks_system_boot",&boot,sizeof(boot)) && boot==1) {
+         /* The service is locked before registerService: there is no interval
+@@ -56,6 +60,12 @@
+     uint8_t oldpass[LAB_MAX_SECRET]={0},newpass[LAB_MAX_SECRET]={0};
+     uint8_t master[32]={0},uuid[16]={0},blob[LAB_BAG_SIZE]={0},der[128]={0};
+     UmiLabBag *bag=NULL,*candidate=NULL;
++    auto &gate=umi_retry_gate;
++    if(sel>=UMI_RETRY_CONTROL&&sel<=UMI_RETRY_REPLY) {
++        if(!gate.enabled||!umi_native.enabled||!admin||current_task()!=s->owner)ret=kIOReturnNotPrivileged;
++        else ret=umi_retry_rpc(sel,s,a);
++        goto done;
++    }
+     if(sel==0x7c) {
+         int boot=0;
+         if(!admin||current_task()!=s->owner||!PE_parse_boot_argn("umi_aks_lab",&boot,sizeof(boot))||boot!=1){ret=kIOReturnNotPrivileged;goto done;}
+@@ -75,6 +85,7 @@
+             ret=kIOReturnSuccess;goto done;
+         }
+         if(!umi_native.enabled||umi_native.controller!=s->owner){ret=kIOReturnNotPrivileged;goto done;}
++        if(gate.owner||gate.unlocking){ret=kIOReturnBusy;goto done;}
+         task_deallocate(umi_native.controller);umi_native.controller=NULL;
+         umi_native.enabled=false;umi_native.installed=false;umi_native.awaitingLoad=false;lab_wipe(&umi_native.bag,sizeof(umi_native.bag));
+         ret=kIOReturnSuccess;goto done;
+@@ -122,6 +133,7 @@
+         if(!bag){ret=kIOReturnNotFound;goto done;}
+     } else if(umi_native.installed)bag=&umi_native.bag;
+     if(sel==0xf) {
++        if(gate.enabled && (gate.owner!=s || !gate.changing)){ret=kIOReturnNotReady;goto done;}
+         /* Missing persisted credentials must never become a fresh passwordless bag. */
+         if(umi_native.awaitingLoad){ret=kIOReturnNotReady;goto done;}
+         if(a->scalarInputCount!=11||!out||a->scalarOutputCount!=1||a->structureInputSize||
+@@ -147,6 +159,7 @@
+         IOLog("UMI AKS native: staged password candidate; active bag unchanged\n");goto done;
+     }
+     if(sel==5) {
++        if(gate.enabled && (gate.owner!=s || (gate.ready&&!gate.changing))){ret=kIOReturnNotReady;goto done;}
+         if(a->scalarInputCount!=4||!v[0]||!bag||v[1]||a->structureInputSize||a->scalarOutputCount)goto done;
+         bool unlocked=v[3]!=0;
+         if(unlocked) {
+@@ -162,6 +175,7 @@
+         IOLog("UMI AKS native: installed system candidate; locked=%d\n",!unlocked);goto done;
+     }
+     if(sel==0x69) {
++        if(gate.enabled && gate.owner!=s){ret=kIOReturnNotReady;goto done;}
+         /* Verify the installed secret after save/install. This is not an
+          * effaceable-storage roll or protection against old serialized bags. */
+         if(a->scalarInputCount!=3||a->structureInputSize||a->scalarOutputCount||!bag)goto done;
+@@ -186,13 +200,30 @@
+     }
+     if(sel==8||sel==0x20||sel==0xd) {
+         if(a->scalarInputCount!=1||a->structureInputSize||a->scalarOutputCount)goto done;
++        if(gate.enabled) ++gate.lockEpoch;
+         if(bag){lab_wipe(bag->master,32);bag->unlocked=false;}ret=kIOReturnSuccess;goto done;
+     }
+     if(sel==9||sel==0xc) {
+         if(a->scalarInputCount!=3||a->structureInputSize||a->scalarOutputCount)goto done;
+         if(!bag){ret=umi_native.awaitingLoad?kIOReturnNotReady:(!v[1]&&!v[2])?kIOReturnSuccess:kIOReturnNotPermitted;goto done;}
+         ret=lab_secret(v[1],v[2],newpass);if(ret)goto done;
+-        if(lab_open_bag(bag->blob,LAB_BAG_SIZE,newpass,v[2],master)){ret=kIOReturnNotPermitted;goto done;}
++        if(gate.enabled) {
++            if(gate.unlocking||gate.changing){ret=kIOReturnBusy;goto done;}
++            gate.unlocking=true;
++            uint64_t epoch=gate.lockEpoch;
++            ret=umi_retry_exchange(UMI_RETRY_DEBIT);
++            if(!ret) {
++                bool verified=!lab_open_bag(bag->blob,LAB_BAG_SIZE,newpass,v[2],master);
++                ret=umi_retry_exchange(verified?UMI_RETRY_ACCEPT:UMI_RETRY_REJECT);
++                if(!ret&&!verified)ret=kIOReturnNotPermitted;
++                if(!ret&&epoch!=gate.lockEpoch)ret=kIOReturnNotReady;
++            }
++            gate.unlocking=false;
++            if(ret)goto done;
++            before=umi_native_flags();
++        } else if(lab_open_bag(bag->blob,LAB_BAG_SIZE,newpass,v[2],master)){
++            ret=kIOReturnNotPermitted;goto done;
++        }
+         memcpy(bag->master,master,32);bag->unlocked=bag->everUnlocked=true;ret=kIOReturnSuccess;goto done;
+     }
+ done:
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -171,6 +171,7 @@
+ void
+ AppleKeyStoreUserClient::free(void)
+ {
++    umi_retry_close(fLab);
+     umi_lab_free(fLab); fLab = NULL;
+     IOUserClient::free();
+ }
+--- a/bsd/dev/hakios.ufs.c
++++ b/bsd/dev/hakios.ufs.c
+@@ -999,6 +999,11 @@
+ 		int error = VFS_SYNC(mount, MNT_WAIT, vfs_context_kernel());
+ 		printf("UMI data: synchronous flush completed, errno=%d\n", error);
+ 	}
++	if (!strcmp(information->f_mntonname, "/private/var/tmp/k06") &&
++	    !strcmp(information->f_mntfromname, "/dev/ufs_retry")) {
++		int error = VFS_SYNC(mount, MNT_WAIT, vfs_context_kernel());
++		printf("UMI retry: fixture synchronous flush errno=%d\n", error);
++	}
+ 	return VFS_RETURNED;
+ }
+ 
+@@ -1671,6 +1676,19 @@
+ 			}
+ 		}
+ 		if (ufs_volume_part < 0) printf("UMI data: loader did not offer the exact writable volume\n");
++	}
++
++	uint32_t retry_mode = 0;
++	if (PE_parse_boot_argn("umi_aks_shared_retry", &retry_mode, sizeof(retry_mode)) &&
++	    (retry_mode == 1 || retry_mode == 2) && ufs_parts == 2 &&
++	    ufs_page->write_part_plus_one == 2 && !ufs_page->write_first) {
++		const volatile struct loader_block_part *retry = &ufs_page->part[1];
++		if (!memcmp((const void *)retry->name, "retry", 6) && !retry->flags &&
++		    !retry->unit && !retry->lun && retry->block_size == 4096 &&
++		    retry->start_lba == UFS_DARWIN_FIRST + 2094080ULL && retry->blocks == 2048) {
++			ufs_volume_part = ufs_write_part = 1;
++			printf("UMI retry: writable 8 MiB independent fixture only\n");
++		}
+ 	}
+ 
+ 	/*

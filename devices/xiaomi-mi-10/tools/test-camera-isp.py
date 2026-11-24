@@ -5,7 +5,7 @@ import subprocess, tempfile
 src=(Path(__file__).resolve().parents[1]/'overlays/xnu/files/bsd/dev/umi_camera.c').read_text()
 a=src.index('static struct {\n\tunsigned cmd;')
 b=src.index('static void\nucleanup',a)
-body=src[a:b]
+body=src[a:b].replace('#include "umi_camera_phy.h"', 'static void uphy_down(void) {}\nstatic void uphyclocks_down(void) {}\nstatic unsigned uphy_timer_cmd(unsigned cmd){return uc.front&&cmd==0x6060?0x6080:cmd;}')
 pre=r'''
 #include <stdint.h>
 #include <stdbool.h>
@@ -14,7 +14,7 @@ pre=r'''
 #include <assert.h>
 #include <errno.h>
 typedef uintptr_t vm_offset_t;
-static struct { vm_offset_t cc,gcc; bool panic; } uc={.cc=0xad00000,.gcc=0x100000};
+static struct { vm_offset_t cc,gcc; bool panic,front; } uc={.cc=0xad00000,.gcc=0x100000};
 static uint32_t regs[0x10000/4], gccregs[0x80000/4], iferegs[0x4000/4];
 static unsigned fail_reg, writes, reset_failure;
 static bool map_failure, ownership_checked;
@@ -42,8 +42,8 @@ static void uw(vm_offset_t p,unsigned o,uint32_t v){
   unsigned r=a-0xad00000;
   if(r==0xc114 && (v&1))assert(ownership_checked);
   regs[r/4]=v;
-  for(unsigned i=0;i<sizeof(isp_rcgs)/sizeof(isp_rcgs[0]);i++)if(r==isp_rcgs[i].cmd && r!=fail_reg)regs[r/4]&=~1u;
-  for(unsigned i=0;i<sizeof(isp_branches)/sizeof(isp_branches[0]);i++)if(!isp_branches[i].gcc && r==isp_branches[i].reg && r!=fail_reg)regs[r/4]=v&~(1u<<31);
+  for(unsigned i=0;i<sizeof(isp_rcgs)/sizeof(isp_rcgs[0]);i++)if(r==uphy_timer_cmd(isp_rcgs[i].cmd) && r!=fail_reg)regs[r/4]&=~1u;
+  for(unsigned i=0;i<sizeof(isp_branches)/sizeof(isp_branches[0]);i++)if(!isp_branches[i].gcc && r==uisp_branch_reg(isp_branches[i].reg) && r!=fail_reg)regs[r/4]=v&~(1u<<31);
   return;
  }
  if(a>=0x100000 && a<0x180000){
@@ -64,13 +64,14 @@ static void uw(vm_offset_t p,unsigned o,uint32_t v){
  if(r==0xc){assert(v==2);if(reset_failure!=2)iferegs[0x40/4]|=1u<<17;}
  if(r==0x34)iferegs[0x40/4]&=~v;
 }
-static void reset(void){
+static void reset(void){uc.front=false;
  memset(regs,0,sizeof(regs));memset(gccregs,0,sizeof(gccregs));memset(iferegs,0,sizeof(iferegs));
+ regs[0x6084/4]=0xa0000203;regs[0x6098/4]=regs[0x609c/4]=1u<<31;
  writes=fail_reg=reset_failure=0;map_failure=ownership_checked=false;isp_ife=isp_csid=0;isp_resetting=false;
- for(unsigned i=0;i<sizeof(isp_rcgs)/sizeof(isp_rcgs[0]);i++){isp_rcgs[i].changed=false;regs[(isp_rcgs[i].cmd+4)/4]=0xa0000203;}
+ for(unsigned i=0;i<sizeof(isp_rcgs)/sizeof(isp_rcgs[0]);i++){isp_rcgs[i].changed=false;regs[(uphy_timer_cmd(isp_rcgs[i].cmd)+4)/4]=0xa0000203;}
  for(unsigned i=0;i<sizeof(isp_branches)/sizeof(isp_branches[0]);i++){
   isp_branches[i].changed=false;
-  uint32_t *r=isp_branches[i].gcc?gccregs:regs;r[isp_branches[i].reg/4]=1u<<31;
+  uint32_t *r=isp_branches[i].gcc?gccregs:regs;r[uisp_branch_reg(isp_branches[i].reg)/4]=1u<<31;
  }
  iferegs[0]=0x10000001;iferegs[0x200/4]=0x20000001;iferegs[0x1a00/4]=0x20000000;
  iferegs[0x28/4]=1u<<17;
@@ -80,13 +81,18 @@ static void cleanup(void){
  uint32_t expected_mask=isp_resetting?isp_saved_ife_mask:iferegs[0x28/4];
  uisp_down();
  assert(iferegs[0x28/4]==expected_mask);
- for(unsigned i=0;i<sizeof(isp_rcgs)/sizeof(isp_rcgs[0]);i++)assert(regs[(isp_rcgs[i].cmd+4)/4]==0xa0000203);
+ for(unsigned i=0;i<sizeof(isp_rcgs)/sizeof(isp_rcgs[0]);i++)assert(regs[(uphy_timer_cmd(isp_rcgs[i].cmd)+4)/4]==0xa0000203);
  for(unsigned i=0;i<sizeof(isp_branches)/sizeof(isp_branches[0]);i++){
-  uint32_t *r=isp_branches[i].gcc?gccregs:regs;assert(!(r[isp_branches[i].reg/4]&1));
+  uint32_t *r=isp_branches[i].gcc?gccregs:regs;assert(!(r[uisp_branch_reg(isp_branches[i].reg)/4]&1));
  }
 }
 int main(void){
- reset();assert(!uisp_probe());cleanup();
+ reset();uc.front=true;assert(!uisp_probe());assert(regs[0x6098/4]&1);assert(regs[0x609c/4]&1);assert(!(regs[0x6078/4]&1));cleanup();
+ reset();assert(!uisp_probe());assert(!uisp_capture_reset());cleanup();
+ reset();assert(!uisp_probe());iferegs[0x1c00/4]=1;unsigned before=writes;
+ assert(uisp_capture_reset()==EBUSY&&writes==before);iferegs[0x1c00/4]=0;cleanup();
+ reset();assert(!uisp_probe());iferegs[0x400/4]|=1u<<31;before=writes;
+ assert(uisp_capture_reset()==EBUSY&&writes==before);iferegs[0x400/4]=2;cleanup();
  for(unsigned i=0;i<sizeof(isp_rcgs)/sizeof(isp_rcgs[0]);i++){reset();fail_reg=isp_rcgs[i].cmd;assert(uisp_probe()==ETIMEDOUT);cleanup();}
  for(unsigned i=0;i<sizeof(isp_branches)/sizeof(isp_branches[0]);i++){
   if(isp_branches[i].delay_only)continue;

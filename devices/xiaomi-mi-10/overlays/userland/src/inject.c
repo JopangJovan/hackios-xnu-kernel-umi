@@ -1152,8 +1152,30 @@ input_thread(__unused void *arg)
 		return NULL;
 	}
 
-	while (read(device, &t, sizeof(t)) == (ssize_t)sizeof(t)) {
-		uint64_t read_at = mach_absolute_time();
+	for (;;) {
+		ssize_t got = read(device, &t, sizeof(t));
+		uint64_t read_at;
+
+		if (got != (ssize_t)sizeof(t)) {
+			int why = errno;
+
+			/* A signal is not the end of input: one interrupted read used to end
+			 * this thread, and the touch screen stayed dead for the session. */
+			if (got < 0 && why == EINTR) {
+				continue;
+			}
+			say("hakios: input: %s: %s (read %ld); reopening\n", HAKIOS_TOUCH_DEVICE, strerror(why), (long)got);
+			sleep(1);
+			close(device);
+			device = open(HAKIOS_TOUCH_DEVICE, O_RDONLY);
+			if (device < 0) {
+				say("hakios: input: reopen failed: %s\n", strerror(errno));
+				return NULL;
+			}
+			waking = 0;
+			continue;
+		}
+		read_at = mach_absolute_time();
 
 		if (count++ < 4) {
 			say("hakios: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
@@ -1169,6 +1191,7 @@ input_thread(__unused void *arg)
 			 */
 			struct hakios_touch press = { .time = t.time, .type = HAKIOS_BUTTON_DOWN, .finger = HAKIOS_BUTTON_LOCK };
 
+			say("hakios: input: wake press for a tap on the sleeping display (mode %#x)\n", touch_mode);
 			send_button(buttons, &press);
 			press.type = HAKIOS_BUTTON_UP;
 			send_button(buttons, &press);
@@ -1176,6 +1199,15 @@ input_thread(__unused void *arg)
 		} else if (waking & (1u << (t.finger & 31))) {
 			if (t.type == HAKIOS_TOUCH_UP) {
 				waking &= ~(1u << (t.finger & 31));
+			} else if (t.type == HAKIOS_TOUCH_DOWN) {
+				/*
+				 * The UP of the touch that woke the display never came (the panel
+				 * dropped it while the screen slept). A new DOWN is a new touch;
+				 * without this that finger stayed swallowed for the session and the
+				 * screen looked dead.
+				 */
+				waking &= ~(1u << (t.finger & 31));
+				send_touch(screen, &t);
 			}
 		} else {
 			send_touch(screen, &t);
@@ -1185,7 +1217,6 @@ input_thread(__unused void *arg)
 			}
 		}
 	}
-	say("hakios: input: %s: %s\n", HAKIOS_TOUCH_DEVICE, strerror(errno));
 	return NULL;
 }
 

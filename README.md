@@ -28,6 +28,169 @@ Every part, as each device's own `device.conf` records it: [Devices](docs/device
 apps describe what happens when you add layer 2 below yourself.
 
 The Xiaomi Mi 10 (UMI) port is maintained in [devices/xiaomi-mi-10/](devices/xiaomi-mi-10/README.md), with device-specific drivers and build overlays.
+Its status follows.
+
+## Xiaomi Mi 10 (UMI, Snapdragon 865): status
+
+These features were checked in RAM sessions on the phone (`fastboot boot`). A reboot returns
+the phone to Android. The latest cellular call and SMS checks were on **2026-11-15**. The default boot arguments are
+[`devices/xiaomi-mi-10/boot.args`](devices/xiaomi-mi-10/boot.args); building and running are described in
+[devices/xiaomi-mi-10/README.md](devices/xiaomi-mi-10/README.md).
+
+### Working on the phone
+
+| Area | Boot arguments | Notes |
+|---|---|---|
+| iOS 16.5 user space: lock screen, home screen, stock apps, Simplified Chinese resources | — | layer 2, built from your own IPSW |
+| Settings → Screen Time | — | Opens on iOS 16.5 after isolating the wallpaper store. [Cause and validation](devices/xiaomi-mi-10/README.md#screen-time-and-wallpaper-storage) |
+| Home screen idle | `cpufreq=1` | The UMI build omits the unsupported Visual Voicemail job. Average XNU CPU load fell from 21.6% to 2.1% in a two-minute test. [Thermal comparison](devices/xiaomi-mi-10/README.md#home-screen-idle-heat) |
+| Touch screen (FTS), multitouch, power and volume keys | `umi_touch=1 umi_keys=1` | |
+| All eight CPU cores at their frequencies | `cpus=8 cpufreq=1` | `bootcpu=7 cpus=7` instead, to fetch live logs over USB |
+| GPU rendering on the Adreno 650 (OpenGL ES through Mesa) | `gpu=1` | at the stock maximum of 587 MHz |
+| AMOLED brightness | — | DSI DCS `0x51`, with backboardd hooks |
+| Speakers and microphone | `adsp=1 adsp_umi=1 sound=4 mic=4` | through the audio DSP |
+| Battery level, UEFI charger protocol | `battery=1` | |
+| Vibration | `umi_haptic=5` | |
+| Flashlight | `torch=3` | channel 0 only, 125 mA at most, off after 30 s or at 45 °C ([FLASHLIGHT.md](devices/xiaomi-mi-10/FLASHLIGHT.md)) |
+| **Wi-Fi** (QCA6390 over PCIe/MHI): scanning, joining, browsing | `wifi=1` | **fixed 2026-11-07**, see below |
+| **Compass** (ak0991x magnetometer behind the sensor DSP, SLPI) | `slpi=1 slpi_attach=1` | **working 2026-11-07**; limits below |
+| **SDX55 cellular data** | `UMI_CELLULAR=1` | Mobile data, network name, signal bars, and cellular data controls verified in RAM sessions. [Build and run](devices/xiaomi-mi-10/README.md#sdx55-mobile-data-ram-test) |
+| **SDX55 carrier SMS** | `UMI_CELLULAR=1 UMI_VOICE=1`, built with `UMI_GPS=1 UMI_SMS=1` | Stock Messages sent a text over IMS and displayed the carrier's multipart reply. [Setup and validation](devices/xiaomi-mi-10/README.md#sdx55-carrier-sms-in-messages) |
+| Models with up to 8 GiB of memory | — | |
+
+### Partly working or experimental
+
+| Area | State | What is missing |
+|---|---|---|
+| Rear camera (S5KHMX, `cam=5`) | real preview and photos saved to the library; 3008×2256 RAW10 source, AK7377 contrast focus in a conservative, uncalibrated range | front camera (S5K3T2) and the other rear modules; calibrated focus; a separately confirmed save-and-reopen of full-resolution photos ([CAMERA.md](devices/xiaomi-mi-10/CAMERA.md)). `cam=5` is not yet in the committed `boot.args` |
+| Metal (`metal=1`) | native buffers, command queues and blits verified; an AIR shader executed on the Adreno 650 in an isolated test | a render pipeline and a Metal compositor: the home screen stays on OpenGL ES ([METAL.md](devices/xiaomi-mi-10/METAL.md)) |
+| Bluetooth (QCA6390 over H4, `umi_bt=1`) | the controller's firmware loads, the H4 endpoint is ready, iOS's bluetoothd scans | pairing and audio are not verified |
+| Compass accuracy | the dial follows the phone; hard iron is calibrated by one closed flat turn | the mapping of the sensor's X/Y axes to the phone's frame still needs correcting; without the SLPI fused orientation the heading assumes the phone lies flat |
+| SDX55 cellular calls | Outgoing calls from the Phone keypad and Recents, the system call screen, speaker switching, and hangup verified on iOS 16.5 | In-call keypad (DTMF) is pending. Incoming calls and microphone mute still need hardware verification. [Call setup and validation](devices/xiaomi-mi-10/README.md#sdx55-outbound-call-ram-test) |
+| Native CommCenter on SDX55 | Reads SIM readiness, the serving operator, and the active IPv4 Internet session as PDP 0 on `en1`. Disconnect, reconnect, calls, SMS, and browsing passed on the RAM test image. | The SDX55 driver owns session start and stop. [Scope and validation](devices/xiaomi-mi-10/README.md#native-commcenter-ram-test) |
+
+The 2026-11-17 native USB test completed the system trust prompt, reused
+pairing across a reboot, and captured 720 KiB of iOS logs in 20 seconds.
+i4Tools displayed iPhone X and iOS 16.5 (20F66). A follow-up exported an
+existing HEIC photo through i4Tools File Management; its bytes matched a
+read-only AFC download and ImageIO decoded it successfully. The Photos
+page still stops at the unactivated-device dialog. This temporary build
+isolates USB from the modem; normal-build integration and cellular regression
+tests remain pending. [USB pairing findings](devices/xiaomi-mi-10/USB-PAIRING.md).
+
+On 2026-11-21, the temporary USB test waited for the first iOS unlock before
+handing the controller from UEFI to iOS. The Mac reused the saved trust record
+to read iOS 16.5 and `iPhone10,3` and capture 60 seconds of native system logs
+(1,449,984 bytes, 9,023 lines). The pairing record was unchanged, and the phone
+returned to stock Android. The cause of the USB drop before first unlock is
+still unknown. [USB handoff comparison](devices/xiaomi-mi-10/USB-PAIRING.md#handoff-after-first-unlock-2026-11-21).
+
+### Lock-screen passcode and data protection
+
+The temporary iOS build saves the native lock-screen passcode across reboots,
+requires it again after locking, and rejects an incorrect entry. Separate
+experiments verified class A/C file access on a 16 MiB encrypted HFS volume,
+password changes with recovery after a process exit, persistent retry counts,
+and transactional conversion of known synthetic keychain entries.
+
+On 2026-11-22, `native-119/120` verified shared failure accounting, retry
+waiting, and recovery across an Android reboot on an independent 8 MiB HFSX
+fixture. These backend checks passed, but the synthetic UI did not: its volatile
+user directory and alphanumeric test credentials are not the normal lock-screen
+environment. `native-124` used the unchanged earlier image with existing user
+data; the user confirmed normal wallpaper and native passcode input. Failed
+display experiments were withdrawn, and shared retry remains experimental.
+
+Backend fixture packaging now excludes SpringBoard, PosterBoard and UI input
+jobs by default. Normal lock-screen/USB acceptance must use a separate image
+with the established user environment. Live password-service integration,
+keychain migration, remaining protection classes and user-volume encryption
+remain open. See the [encryption progress and plan](devices/xiaomi-mi-10/ENCRYPTION-PLAN.md).
+
+Four acceptance stages remain for reliable daily passcode use: shared retry and
+save-failure coverage; integration with the existing user environment; complete
+password lifecycle and recovery; then combined regression and daily-build rollout.
+Actual user-data encryption requires three further stages: protection classes and
+keychain migration, encrypted UFS startup/recovery, and final volume initialization
+with acceptance tests. These are work packages, not an estimate of edits or time.
+The current host suite now tests the actual retry-gate header under ASan/UBSan;
+subsequent native-127/128 isolated device runs passed change/readiness exclusion,
+shared failure counts, reboot backoff and recovery with the correct password.
+The daily password service has not been replaced. See the [stage checklist](devices/xiaomi-mi-10/README.md#锁屏密码进度与剩余步骤2026-11-22).
+
+### Storage validation
+
+The single-slot UMI menu selected iOS 16.5 from RAM and reached the home
+screen. Directly selecting Android and simulating an early iOS startup
+failure both returned to stock Android. See the
+[temporary boot menu test results](devices/xiaomi-mi-10/uefi/README.md#temporary-single-slot-menu).
+
+On 2026-11-15, a temporary UMI UEFI loaded the phone's own UFS driver and read
+the primary and backup GPT headers and entry arrays on all six logical units.
+Both sets of CRCs matched Android. SHA-256 hashes of all 12 GPT regions matched
+before and after the test, and the phone returned to Android. See the
+[read-only UFS survey](devices/xiaomi-mi-10/uefi/README.md#read-only-ufs-survey).
+
+On the same device, a separate RAM-boot comparison reproduced an Android F2FS
+shrink failure when live blocks occupied the tail. The patched kernel shrank
+the 512 MiB encrypted fixture to 384 MiB, remounted it and verified all eight
+test files. Restoring the pre-shrink ciphertext image also passed its whole
+image and file hash checks. On native UFS LUN 4, a separate `62 MiB → 54 MiB`
+fixture passed tail relocation, exact ciphertext restoration and a read-only
+remount after reboot using freshly exported hardware-wrapped keys. All three
+file hashes matched, and the test range returned to its original all-zero
+state. See the [native UFS F2FS test results](devices/xiaomi-mi-10/README.md#native-ufs-f2fs-shrink-and-restore).
+
+On stock Android, the vendor `FBE_ICE` tag let Keymaster export a temporary
+wrapped form of a TEE-generated test key without rollback resistance. Read-only
+UFS mappings reproduced all 256 sampled sectors with the same key and gave
+different results in all 256 sectors with a different key. The known-key
+import and export also worked through the vendor HAL. The software AES-XTS
+control matched all 256 sectors, while the UFS inline result matched zero.
+See the
+[wrapped-key test results](devices/xiaomi-mi-10/README.md#hardware-wrapped-keys).
+
+### Not yet
+
+- The other sensors behind the sensor DSP (accelerometer, gyroscope, light, proximity, pressure): the DSP reads their registry,
+  but nothing is given to iOS yet, so there is no auto-rotation and no level.
+- Apple's services: not supported and not a goal.
+
+### Fixed recently
+
+| Date | Problem | Cause | Fix | Commit |
+|---|---|---|---|---|
+| 2026-11-07 | Wi-Fi showed as on but found no networks and could not be turned off, in every session since 2026-11-05 | `cbcal_restart_fw` had been set to `false`, so the firmware was not restarted between cold boot calibration (mode 7) and mission mode (mode 0); MHI failed with EIO and ath11k gave up 15 s after its start | `cbcal_restart_fw = true` again: ath11k's power down/up runs UMI's endpoint reset and post-calibration firmware reboot | `2df9ad2` |
+| 2026-11-07 | Compass got no data in an ordinary boot | `slpi_attach=1` was missing from `boot.args`, so the sensor DSP's FastRPC session never started | added to `boot.args` | `93596c5` |
+| 2026-11-07 | A fresh checkout could not build the kernel | `umi_sensor_registry.inc` was included, but its generator was not in the repository | `tools/embed-sensor-registry.py`, run by `build-kernel.sh` | `93596c5` |
+| 2026-11-07 | Hard-iron calibration could be faked by a partial or back-and-forth movement | the center was taken from spans alone | closed-loop calibration: the field must leave its start, travel, enclose area and return | `93596c5` |
+| 2026-11-06 | Compass crashed as soon as it opened (SIGSEGV at `0x8`) | a synthesized `CMDeviceMotion` with no internal state | the app's own `CompassTestDeviceMotion`, handed out only through its `CompassMotionManager` | `479e05a` |
+| 2026-11-05/06 | The magnetometer never appeared (empty `mag` SUID) | the DSP asked for its persistent registry as a directory that was not served; FastRPC intents ran out at callback 65; QRTR flow control was ignored | apps_std `stat`/`opendir`/`readdir`, the phone's own 187 registry files, the right GLINK channel for `DONE_REUSE`, `RESUME_TX`, the SNS stream subscription | `866d151`, `e70070a`, `479e05a` |
+| 2026-10-29 | Flashlight unavailable in a normal boot | `torch=3` missing from the profile | added | `818e0fc` |
+| 2026-10-29 | Brightness, battery | — | DSI DCS `0x51`; battery indicator and UEFI charger protocol | `3343a83`, `77fa050` |
+
+### Known problems
+
+1. **Scrolling skips and freezes.** The display copy now uses the whole safe DMA idle interval and sleeps through the active scan
+   (`403e230`), but scrolling still stutters. Open.
+2. **The loader's USB link can stop.** After a long session, or after the kernel returns to the loader ("the session is over"),
+   `fastboot devices` still lists the phone while every command fails with `Write to device failed (no link)`; the host can then
+   neither fetch logs nor reboot it. The 2.6 GB system image upload also fails now and then (`xl: upload failed`) and leaves the
+   phone in the loader. In both cases hold the power button for about 15 seconds. `loader_reboot_after=1` makes the loader reboot
+   to Android by itself 60 seconds after the kernel returns (with a hardware watchdog behind it); this change is still in the working
+   tree, not committed, and it does not cover a failed upload.
+3. **Live logs stop during long sessions.** The phone keeps running, but the host's periodic log fetch over USB stops; the host then
+   reports a hang although the session was fine.
+4. **Compass limits**: axis mapping and tilt, above; the calibration needs one full flat turn after every boot.
+5. **Camera limits**: above.
+
+### Next
+
+1. Commit the loader's autonomous recovery and extend it to a failed upload and to an idle loader, so a session can run unattended.
+2. Correct the compass's axis mapping; give iOS the accelerometer for tilt compensation, the level and auto-rotation.
+3. Bluetooth pairing and audio.
+4. The scrolling performance of the display path.
+5. The front camera, calibrated focus, and `cam=5` in the committed defaults.
 
 ## The three layers
 
@@ -57,6 +220,17 @@ iOS in QEMU (Linux, 12 GB of disk, Apple's IPSW downloaded for you), and a sessi
 make redwood_defconfig   # the phone's configuration: the common kernel + the SC7280's + the phone's own
 make kernel              # the kernel with the drivers that configuration builds
 make phone SECS=600      # a 10-minute session on the phone, in RAM
+```
+
+The Xiaomi Mi 10 is built and run with its device directory's scripts:
+
+```sh
+devices/xiaomi-mi-10/build-wifi.sh          # the Wi-Fi driver object (ath11k.o)
+devices/xiaomi-mi-10/build-kernel.sh -j8 -k # the kernel (and the SLPI registry table)
+devices/xiaomi-mi-10/build-loader.sh
+devices/xiaomi-mi-10/build-userland.sh
+devices/xiaomi-mi-10/run.sh ramdisk         # upload the system image (it stays in the phone's RAM)
+XL_SECS=600 devices/xiaomi-mi-10/run.sh run # a 10-minute session
 ```
 
 ## Repositories: common, SoC, device, UEFI

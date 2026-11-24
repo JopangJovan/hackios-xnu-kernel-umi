@@ -1,0 +1,135 @@
+{
+  "schema": 1,
+  "date": "2026-11-20",
+  "scope": "Original AppleKeyStore shared-cache exports with an explicitly isolated kernel client; not live securityd/SecItem",
+  "host": {
+    "asan_ubsan_core": "PASS",
+    "prior_UKW2_byte_exact_and_cross_decode": "PASS",
+    "A_C_lifecycle_bounds_corruption_and_legacy_refusal": "PASS",
+    "host_and_device_build_script": "PASS",
+    "stale_kernel_rejected_by_packaging_guard": "PASS",
+    "stale_build_rejected_before_mutation": "PASS",
+    "fresh_stage_reproduces_tested_sources": "PASS",
+    "already_patched_source_rejected": "PASS"
+  },
+  "native": {
+    "native-77": {
+      "result": "NOT PASSED",
+      "mode": "create",
+      "markers": [
+        "UMI framework AKS: read-only scope status=0xe00002f0 cookie=0x0",
+        "UMI framework AKS FAIL line=46 errno=2: !gate&&flags==0x554f4b31",
+        "UMI framework guardian: real system bag serialization/flags unchanged PASS",
+        "UMI framework guardian FAIL line=25 errno=60: done&&WIFEXITED(status)&&WEXITSTATUS(status)==0"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "b428317a5ee02bf2212ad4bd139b512c9de08b2724cd2415a20a01cfa203702e",
+      "log_bytes": 1008993,
+      "helper_apfs_sha256": "3e6349a2024d0167c159a51e1f6d9f9e61de117c94c53a0eeeb816b898404b3b",
+      "helper_validation": "apfsck clean; 497 entries match",
+      "kernel_sha256": "0f4c06e7ede17d1e7bb17ee5028c5ab365e2ea409078064f8ab4fd51471aedbd",
+      "tested_binaries": {
+        "umi-framework-aks-probe": "773c429a286e329e1a837c90e41ccc845cb4ce2f34f6cb4b1553ffcdf1d4084c",
+        "umi-framework-aks-guardian": "761b0bab823bf606137908d5bdf5cf60726ac0aa7ca70fdc0537539f60018cf1"
+      },
+      "observation": "Copied generated Makefiles still used the baseline source path; new gate absent. Read-only guard stopped before bag load/authentication. Clean build fixed the source path; explicit stale-kernel check added."
+    },
+    "native-78": {
+      "result": "PASS",
+      "mode": "create",
+      "markers": [
+        "UMI framework guardian: unentitled client cannot enter ordinary lab PASS",
+        "UMI framework AKS: read-only scope status=0x0 cookie=0x554f4b31",
+        "UMI framework AKS: original framework isolated in kernel; no interposition PASS",
+        "UMI framework AKS: create PASS; A/C lifecycle, wrong secret, prior format, damaged/legacy/unsupported refusal",
+        "UMI framework guardian: real system bag serialization/flags unchanged PASS",
+        "UMI framework guardian: create PASS"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "751832062e6de72f29a86499d27578894c7a5163a6a523ef6988c3a34957f5eb",
+      "log_bytes": 999780,
+      "helper_apfs_sha256": "21ceb92ae1178118c7c1df15983a8ba10c0b54434149660c58f3e25ff0881d4a",
+      "helper_validation": "apfsck clean; 497 entries match",
+      "kernel_sha256": "21ba8bde7a1eb9f27f282f29e5854f04587512c5e272f461e2b4f98fb1b41e44",
+      "tested_binaries": {
+        "umi-framework-aks-probe": "16725458ed53b279590990a11979ac20f21ed58687a67a7cc5c6809ed9274f01",
+        "umi-framework-aks-guardian": "a268fa072cd8dc911979efeedf5a97478d28862b16582cd4f99ee8c341ff3876"
+      }
+    },
+    "native-79": {
+      "result": "PASS",
+      "mode": "verify",
+      "markers": [
+        "UMI framework guardian: unentitled client cannot enter ordinary lab PASS",
+        "UMI framework AKS: read-only scope status=0x0 cookie=0x554f4b31",
+        "UMI framework AKS: original framework isolated in kernel; no interposition PASS",
+        "UMI framework AKS: verify PASS; A/C lifecycle, wrong secret, prior format, damaged/legacy/unsupported refusal",
+        "UMI framework guardian: real system bag serialization/flags unchanged PASS",
+        "UMI framework guardian: verify PASS"
+      ],
+      "flush_errno": [
+        0
+      ],
+      "stock_android_return": true,
+      "log_sha256": "35713e888b4aafe2c40db0d4037b52d2443accbb2ab8e8013bb6442f1ec2df9d",
+      "log_bytes": 1032168,
+      "helper_apfs_sha256": "4dd1dc5f3d6eee96cf7f1f83a2ec39a6f4c3570edc864d08280ea35f95ccd84a",
+      "helper_validation": "apfsck clean; 497 entries match",
+      "kernel_sha256": "21ba8bde7a1eb9f27f282f29e5854f04587512c5e272f461e2b4f98fb1b41e44",
+      "tested_binaries": {
+        "umi-framework-aks-probe": "16725458ed53b279590990a11979ac20f21ed58687a67a7cc5c6809ed9274f01",
+        "umi-framework-aks-guardian": "a268fa072cd8dc911979efeedf5a97478d28862b16582cd4f99ee8c341ff3876"
+      },
+      "observation": "Same /var/tmp/k78 encrypted synthetic bag and A/C entries after stock Android reboot; pre-authentication access refused, wrong secret refused, original contents recovered."
+    }
+  },
+  "boundaries": {
+    "changed_kernel_sources": {
+      "changed_existing_sources": [
+        "iokit/Kernel/MiniAppleKeyStore.cpp",
+        "iokit/Kernel/UmiAksLab.h"
+      ],
+      "added_sources": [
+        "iokit/Kernel/umi_ordinary_keys.h"
+      ],
+      "usb_sources_unchanged": true,
+      "python_syntax": "PASS"
+    },
+    "loader_source_unchanged": true,
+    "original_usb_executable_bytes_unchanged": true,
+    "real_system_bag_serialization_and_flags_unchanged": true,
+    "manual_real_pin_tests": 0,
+    "native_usb_pairing_retested": false,
+    "firmware_log_channel_retained": true,
+    "live_securityd_or_SecItem_CRUD": false,
+    "live_keychain_or_pairing_migration": false,
+    "android_gpt_boot_partition_writes": false,
+    "full_80GiB_encryption": false,
+    "hardware_binding_or_rollback_protection": false
+  },
+  "sha256": {
+    "devices/xiaomi-mi-10/experimental/ordinary-aks/build-test.py": "a0c8d281ce30fa0bcb68239788435d09a59d2ba9af1a0357f2b4f8d1bc618910",
+    "devices/xiaomi-mi-10/experimental/ordinary-aks/check-kernel.py": "936d008c15ac1c5318701d849649a9c3f293e885ada6ff377d09d114747c93bc",
+    "devices/xiaomi-mi-10/experimental/ordinary-aks/core-test.c": "b5a50d14b44f451c1146a33cbfb25aca8d2ba76cb28ac9216e6070448907868d",
+    "devices/xiaomi-mi-10/experimental/ordinary-aks/guardian.c": "d68a5c1daac452c10a48900c7a6d7c5279069f9bfa997c00ae4194a90d4396f1",
+    "devices/xiaomi-mi-10/experimental/ordinary-aks/prepare-helper.py": "743bb494107aafd541701c83b79666aa4bdec15185cf383ce4747a83741e85c5",
+    "devices/xiaomi-mi-10/experimental/ordinary-aks/probe.c": "201942f05b7f2eec281c456d5e08cf9c84cabfe8bd5d94630843f39be2622667",
+    "devices/xiaomi-mi-10/experimental/ordinary-aks/stage.py": "2bc5b1e34e9f3072d97a1a7ad7a6d450a728841844c43ad06399130bbb40dabd",
+    "devices/xiaomi-mi-10/experimental/ordinary-aks/umi_ordinary_keys.h": "e2a5ea20489eeb63f1cba806fb325142fa19cc21f853ba2c52796536db558cc5",
+    "unchanged_loader_source": "7b0cf8c13e3e3f5d047e5b14c8c8ced820e1736d7777071d85ebc756b2bfa1e4",
+    "clean_native_kernel": "d454cad8f5ac19d023809be78c35b60d7cc246fdbd92e98703567ad0d4a7d4d4",
+    "qualified_probe_prelinked_kernel": "21ba8bde7a1eb9f27f282f29e5854f04587512c5e272f461e2b4f98fb1b41e44"
+  },
+  "original_usb_executable_sha256": {
+    "com.apple.driver.AppleUSBDeviceMux": "189ea36f67d9576bab07b80a40e4e3ac4c36f9ba8cc1782b32141e8a07b705b6",
+    "com.apple.driver.AppleUSBXDCI": "cff3a644b6f88a8a4a6d099507e44a9836a4db2837fa790196a0c980f1571d49",
+    "com.apple.driver.usb.AppleUSBCommon": "86e8cb22b600cccdb0af4a0945090fe337ab61dbebe76ec445913d46c75c3997",
+    "com.apple.iokit.IOUSBDeviceFamily": "266bda6018de7fb275314215eb5ad23db31a6020b8e6d5edddc081c3e1fafe18"
+  }
+}

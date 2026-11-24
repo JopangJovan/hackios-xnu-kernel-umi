@@ -1,0 +1,22 @@
+{
+  "source_sha256": "d94e7307b196107572b44eb4bb4aeefbd7446a3719b447132ae9c915bb67d4d9",
+  "os": "iOS 16.5, locally supplied securityd",
+  "original_main_file_offset": "0x155ec",
+  "local_dispatch_table": "0x1002db270",
+  "dispatch_slots": [
+    "0x1001151b4",
+    "0x1000061e0",
+    "0x1001168d8",
+    "0x10000f144"
+  ],
+  "embedded_aks_connection": "0x100011cdc",
+  "embedded_aks_wrap": "0x10000dc58",
+  "note": "All virtual addresses require dyld slide; main is trapped, no live XPC listener is installed.",
+  "diagnostic_disk_database_branch": {
+    "virtual_address": "0x100113658",
+    "expected_instruction": "0xb40003c0",
+    "diagnostic_instruction": "0x1400001e",
+    "destination": "0x1001136d0",
+    "purpose": "Select existing filesystem path; preserve OSINSTALL guards elsewhere"
+  }
+}

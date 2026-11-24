@@ -1,0 +1,25 @@
+--- a/iokit/Kernel/UmiAksLab.h
++++ b/iokit/Kernel/UmiAksLab.h
+@@ -29,6 +29,7 @@
+     bool unlocked, everUnlocked;
+     uint8_t blob[LAB_BAG_SIZE], master[32];
+ };
++#include "umi_aks_state.h"
+ struct UmiAksLab {
+     IOLock *lock;
+     task_t owner;
+@@ -105,6 +106,14 @@
+     for (unsigned i = 0; i < 4; ++i) if (s->bags[i].handle && s->bags[i].handle == in[0]) { bag = &s->bags[i]; break; }
+     if (!bag) { ret = kIOReturnNotFound; goto done; }
+     switch (selector) {
++    case 0x11: case 0x23: { /* public state of this independent bag only */
++        if (a->scalarInputCount != 1 || n || a->scalarOutputCount) break;
++        uint8_t der[128] = {0}; size_t length = lab_state_der(bag, der);
++        ret = lab_answer(a, der, length); lab_wipe(der, sizeof(der)); break;
++    }
++    case 0x17: /* stable identifier, not secret key material */
++        if (a->scalarInputCount != 1 || n || a->scalarOutputCount) break;
++        ret = lab_answer(a, bag->blob + 48, 16); break;
+     case 3: /* save: serialize only the authenticated encrypted envelope */
+         if (a->scalarInputCount != 1 || n) break;
+         ret = lab_answer(a, bag->blob, LAB_BAG_SIZE); break;
